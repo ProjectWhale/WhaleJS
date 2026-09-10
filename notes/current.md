@@ -1011,3 +1011,34 @@ wtok(TOK_DOUBLE); wtok_id("v"); wtok_int(i); wtok('='); wtok_int(0); wtok(';');
 ## 状态
 工作区回到 **f5e9667**：`whale api test: ok`、`fib(32)=2178309 44ms`（8×），无未跟踪文件。
 下一步：改 `whale_emit` 的调用点为直接发 token（小步、可验证、不再写词法器）。
+# <30>: Step 27 —— 直接发 token：两端接上了，但 token 流中途停（已回退到绿）
+PARTIAL
+
+## 这几轮的两大发现（都是真知识）
+1. **根因一（关键）**：`whale_tcc_compile` 里**一直还在调 `tcc_compile_string(s, src)`** ——
+   生成器早已改成发 token，编译器却还在读那份**残缺的 C 文本**。两头根本没接上，
+   这就是"折腾这么多轮始终不通"的答案。
+2. **根因二**：**发 token 必须在 TU 打开之后**。`tok_alloc` 需要 token 表，而
+   `whale_jit_gen` 原先在 `tcc_new`/`preprocess_start` **之前**被调用 → 直接访问违例。
+   现在改成 `JS_WhaleCompileTokens(s, emit_cb, ctx)`，回调在 `preprocess_start` 之后执行。
+
+## 现在的卡点（未解决）
+`dump` 重建出来的 token 文本**只有 952 字节**，停在 `... { double v0 = `；
+而 `whale_jit_gen` 并没有报 `gen gave up`（返回 1），所以是**发 token 中途断了**，
+不是生成器拒绝编译。TCC 报 `declaration expected`。这两个现象必须一起解释：
+**下一步就从"为什么 token 只发到 `v0 = `"入手**（在 `wt_*` 里加计数打点，看是哪一个 helper
+或哪一处 `goto out` 提前结束）。
+
+## 定位手法（这次真正奏效的，值得固化）
+`JS_WhaleTokDump()`（iface 里）把 token 流用 `get_tok_str()` 重建为文本，直接和预期的 C 对照。
+- `TOK_INT = 256 = TOK_IDENT`，所以 `int` 在 dump 里会渲染成空 —— 那是 dump 的表现，不是缺失；
+- 一旦看到**序列在某处戛然而止**，就说明生成端停了，而不是 TCC 挑剔。
+
+## 完成度
+- `whale_load_expr` → `whale_load_analyze` + `whale_load_emit`（peephole 不能试探性地发 token）
+- `whale_binop_c` → `whale_binop_op`（返回 `JS_OP_*`）；新增 `JS_WhaleTokKw/Ident2/Slot/Int/Double/Char/Op`
+- `whale_jit_gen` 里**所有**真实 emit 点已改成直接发 token（`whale_emit` 只剩定义 + 一处死代码）
+- 关键字/运算符**用我们自己的 id**（`JS_WK_*` / `JS_OP_*`），TCC 侧映射到 `TOK_*` —— 生成器永不写 `TOK_*`，也就不会再撞 `out` 那种关键字
+
+**代码已回退到 f5e9667**（绿：`whale api test: ok`、`fib(32)=2178309 38ms`）；
+上述工作保留在 git 历史 `5716d97`→`0bb5b25` 里，需要时 `git checkout 0bb5b25 -- src` 取回。
