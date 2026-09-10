@@ -692,3 +692,48 @@ ir: tcc_new  →  ir: paths  →  ir: unit opened  →  ir: tok_alloc  →  ir: 
 ## 状态
 IR 调用已从 `whale_test` 摘除，回归保持绿：`whale api test: ok`、`fib(30)=832040`。
 打点保留在 iface 里（默认静默，`WHALE_IR_DEBUG=1` 才打印）。
+# <22>: Step 19 —— IR 直出的机器码已经正确生成，卡在"入口地址"这一步
+PARTIAL（只差入口地址）
+
+## 这一轮的实质进展：**IR 通路全线打通，直到生成出正确机器码**
+`WHALE_IR_DEBUG=1` 的分步打点全部通过：
+```
+tcc_new → paths → unit opened → canonical types → tok_alloc → symbols
+→ prolog → body start → push a → push b → gen_op → (tcc 内部 gv 正常: r=0x30=VT_CONST)
+→ gfunc_return → epilog → unit closing → unit closed → relocated
+```
+并且 dump 出的机器码**结构完全正确**（`double f(void){ return 2.5+4.0; }`）：
+```
+55                     push rbp
+48 89 e5               mov rsp, rbp
+48 81 ec 00 00 00 00   sub rsp, 0
+f3 0f 7e 05 00 00 00 00  movq xmm0, [rip+0]   ← 常量折叠成一个 double，装进 xmm0
+c9                     leave
+c3                     ret
+```
+（`[rip+0]` 的偏移由重定位填，relocate 之前 dump 看到 0 是正常的。）
+
+## 关键修复（三个真 bug）
+1. **`vtop`/`nocode_wanted` 等解析状态**：不能拿 `tcc_compile_string` 当初始化（它末尾 `preprocess_end`
+   会拆掉 token 环境 → 之后的 `tok_alloc` 写已释放内存 = 堆损坏）。改为照 `tcc_compile()`(libtcc.c:623)
+   的序列开/关翻译单元。
+2. **漏了 `tccgen_compile()`(tccgen.c:235) 开头的全局规范类型**：`int_type`、`size_type`、`ptrdiff_type`、
+   `func_old_type`（还有 `anon_sym`/`section_sym`/`const_wanted`/`nocode_wanted`）。`gen_op`/`gv` 内部要用
+   它们 —— 缺了就直接在 `gv` 里访问违例。补上后 `gv` 正常（`r=VT_CONST`）。
+   这是本轮最有价值的发现：**"照抄帧序列"不够，还要照抄解析器的全局类型初始化**。
+3. **不要自己 `gv(RC_FLOAT)`**：`gfunc_return(&func_vt)` 自己会取值且知道正确的寄存器类。
+   我先前手写的 `gv(RC_FLOAT)` 是多余的（也曾是崩点）。
+
+## 现在唯一的卡点：relocate 之后取不到可调用的入口
+- `text_section->data + func_ind`：relocate 后 `text_section->data` **不可读**（一读就访问违例），
+  说明它不再指向那块可执行内存（可执行但不可读，或已被回收）。
+- `tcc_get_symbol(s, "whale_ir_fn")`：返回的地址比段基址高 1272 字节（`0x4f8`），
+  但调用它**同样**访问违例。
+→ 所以要么入口地址取法不对，要么常量段的重定位没落到可执行内存里。
+**下一步**：查 TCC 在 Windows/`TCC_OUTPUT_MEMORY` 下 `tcc_relocate()` 之后正确的入口获取方式
+（看 `x86_64-link.c`/`tcc_run` 怎么用 `tcc_get_symbol`），以及 `tccelf_end_file` 之后
+常量段（rodata）是否也被搬进可执行映像。**不要再 dump `section->data`，那里已经不可读。**
+
+## 状态
+IR 调用已从 `whale_test` 摘除（避免崩），打点与字节 dump 保留在 iface 里（`WHALE_IR_DEBUG=1`）。
+回归保持绿：`whale api test: ok`、`fib(30)=832040`。

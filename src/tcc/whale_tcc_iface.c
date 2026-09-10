@@ -93,7 +93,36 @@ void *JS_WhaleIrCompileConst2(const char *tcc_dir, double a, double b, int op)
     tcc_open_bf(s, "<whale-ir>", 0);
     tccelf_begin_file(s);
     preprocess_start(s, 0);
-    IRSTEP("unit opened");
+
+    /* The small prologue of tccgen_compile(): parser flags plus the global
+       canonical types (int_type, size_type, ptrdiff_type, func_old_type) that
+       gen_op()/gv() consult internally. Skipping this is what made gv crash -
+       it needs those types even though our own emit only uses double. */
+    cur_text_section = NULL;
+    funcname = "";
+    anon_sym = SYM_FIRST_ANOM;
+    section_sym = 0;
+    const_wanted = 0;
+    nocode_wanted = 0x80000000;
+    int_type.t = VT_INT;
+    char_pointer_type.t = VT_BYTE;
+    mk_pointer(&char_pointer_type);
+#if PTR_SIZE == 4
+    size_type.t = VT_INT | VT_UNSIGNED;
+    ptrdiff_type.t = VT_INT;
+#elif LONG_SIZE == 4
+    size_type.t = VT_LLONG | VT_UNSIGNED;
+    ptrdiff_type.t = VT_LLONG;
+#else
+    size_type.t = VT_LONG | VT_LLONG | VT_UNSIGNED;
+    ptrdiff_type.t = VT_LONG | VT_LLONG;
+#endif
+    func_old_type.t = VT_FUNC;
+    func_old_type.ref = sym_push(SYM_FIELD, &int_type, 0, 0);
+    func_old_type.ref->f.func_call = FUNC_CDECL;
+    func_old_type.ref->f.func_type = FUNC_OLD;
+    tcc_debug_start(s);
+    IRSTEP("canonical types");
 
     ts = tok_alloc("whale_ir_fn", 11);
     IRSTEP("tok_alloc");
@@ -139,8 +168,8 @@ void *JS_WhaleIrCompileConst2(const char *tcc_dir, double a, double b, int op)
     IRSTEP("push b");
     gen_op(tok);
     IRSTEP("gen_op");
-    gv(RC_FLOAT);
-    IRSTEP("gv");
+    /* no explicit gv() here: gfunc_return() fetches the value itself and knows
+       the right register class for the return type (guessing RC_FLOAT crashed) */
     gfunc_return(&func_vt);
     IRSTEP("gfunc_return");
 
@@ -151,6 +180,7 @@ void *JS_WhaleIrCompileConst2(const char *tcc_dir, double a, double b, int op)
     check_vstack();
     IRSTEP("epilog");
 
+    IRSTEP("unit closing");
     preprocess_end(s);
     sym_pop(&global_stack, NULL, 0);
     sym_pop(&local_stack, NULL, 0);
@@ -159,7 +189,22 @@ void *JS_WhaleIrCompileConst2(const char *tcc_dir, double a, double b, int op)
     IRSTEP("unit closed");
 
     if (tcc_relocate(s, TCC_RELOCATE_AUTO) >= 0) {
-        fn = (void *)(cur_text_section->data + func_ind);
+        void *by_name = tcc_get_symbol(s, "whale_ir_fn");
+        void *by_off = (void *)(text_section->data + func_ind);
+        if (getenv("WHALE_IR_DEBUG"))
+            fprintf(stderr, "  ir: sym=%p off=%p base=%p\n", by_name, by_off,
+                    (void *)text_section->data);
+        fn = by_off;
+        if (getenv("WHALE_IR_DEBUG")) {
+            int i;
+            fprintf(stderr, "  ir: after relocate: sym=%p off=%p base=%p exec=%d\n",
+                    by_name, by_off, (void *)text_section->data,
+                    text_section->sh_addr ? 1 : 0);
+            fprintf(stderr, "  ir: bytes:");
+            for (i = 0; i < 40; i++)
+                fprintf(stderr, " %02x", ((unsigned char *)text_section->data)[i]);
+            fprintf(stderr, "\n");
+        }
         IRSTEP("relocated");
     } else {
         IRSTEP("relocate FAILED");

@@ -1254,6 +1254,8 @@ ST_FUNC int gv(int rc)
 {
     int r, bit_pos, bit_size, size, align, rc2;
 
+    if (getenv("WHALE_IR_DEBUG")) fprintf(stderr, "  tcc gv: rc=%d type=%x r=%x loc=%d depth=%d\n", rc, vtop->type.t, vtop->r, loc, (int)(vtop - vstack));
+
     /* NOTE: get_reg can modify vstack[] */
     if (vtop->type.t & VT_BITFIELD) {
         CType type;
