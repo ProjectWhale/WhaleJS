@@ -562,3 +562,63 @@ SOLVED（骨架与链路）/ 待办（真正的 IR 通路）
 ## 验证
 - `whale api test: ok`；pristine 与 whalejs 在 fib/fibi 上 `bad=0`；用户 fib.js 2.2~2.6s（抖动区间内）。
 - 探针 256 == tcc.h 的 `VSTACK_SIZE`。
+# <19>: Step 16 —— IR 直出：框架就位，首次调用崩（待修）+ 优先级 2/3 与扩大受益面规划
+PARTIAL / PLANNED
+
+## 已做
+`src/tcc/whale_tcc_iface.c` 增加 `JS_WhaleIrCompileConst2(a,b,op)`：**不生成任何 C 源码**，
+完全照 `gen_function`(tccgen.c:7054) 的帧序列手工走 ——
+`sym_push2` 建返回类型 Sym + 函数 Sym（`CType.t = VT_FUNC`、`.ref` = 返回类型 Sym、参数链为空）
+→ `cur_text_section = text_section` → `put_extern_sym` → `gfunc_prolog` →
+`vsetc(&double, VT_CONST, …)` ×2 → `gen_op('+')` → `gv(RC_FLOAT)` → `gfunc_return(&func_vt)` →
+`gfunc_epilog` → `tcc_relocate` + `tcc_get_symbol`。
+
+两个发现值得留：① TCC 的**单字符运算符直接用字符值**（`gen_op('+')`，不是 `TOK_PLUS`，tccgen.c 里到处是 `gen_op('*')`/`gen_op('&')`）；
+② `TOK_*` 枚举已由 `tcc.h:1070` 的 `enum tcc_token` 提供，**不要再造一份**（我造了一次 → `TOK_INT` 重定义）。
+
+**状态**：能编过，但第一次实际调用**崩**（`WHALE_IR_PROBE=1` 时连 `fib(30)` 都打不出来）→ 已改成环境变量开关，
+默认关闭；正常路径不受影响（`fib(30)=832040 13ms`、`whale api test: ok`）。
+
+## 崩溃排查方向（下一步，按可疑度排序）
+1. **段还没建**：`tcc_new()` 只建 state，`text_section` 等是 `tcc_add_file` 时才建的 →
+   可能要先显式 `tccelf_new(s)`（或走 `tcc_add_file` 后再补 `cur_text_section`）。
+2. **全局解析状态不完整**：`file`、`loc`、`func_ind`、`local_scope`、`nocode_wanted`、`funcname` 的期望值
+   （`gen_function` 是在解析上下文里被调的，我们是裸调）。
+3. `sym_push2(&local_stack, …)` 在函数体外是否合法。
+4. `gv(RC_FLOAT)` / `gfunc_return` 对 double 的值栈形态期望。
+做法：在 iface 里逐句打点（或 gdb），先分出是「建帧」「发码」还是「relocate」阶段崩。
+
+## 优先级 2/3 规划（TCC 侧，依 temp/tcc_to_optimize.md）
+- **优先级 2 · 窥孔（低风险，预期 +5~15%）**：落点 `x86_64-gen.c` 的 `g()`146 / `o()`158 / `gen_le16`166 / `gen_modrm`326。
+  在 `g()` 外挂一层**小缓冲**（记最近若干指令的字节与 `ind`），识别：冗余 `mov rA,rB; mov rB,rA`、
+  用 `lea` 取代 `add`/小常数乘、`gsym_addr` 跳转缩短。因为 TCC 是**单遍流式发码**，
+  缓冲必须建在 `ind` 层（`cur_text_section->data + offset` 可以回写）。
+- **优先级 3 · 跨语句寄存器保留（中高风险，预期 +20~50%）**：落点 `tccgen.c` 的 `gen_op`2154 / `gv`1253 / `vstore`3069。
+  让 vstack 上的值尽量留在寄存器（现在 `load`/`save_regs` 太保守）；彻底版是缓存整个函数的 op 流再做寄存器分配。
+  **这条只有 IR 直出通了才动得了** —— 否则 TCC 从 C 源码出发，发码形态我们插不上手。
+
+## 扩大受益面（比峰值分数重要）
+现状：只有「纯 double 计算 + 自递归」的函数会 JIT，其它一律回退解释器。要扩三块：
+1. **整数域去守卫**：现在所有数值统一当 double（`for` 计数器也走 double）。
+   加 `WHALE_T_INT` 类型格，整型发 `int64`/`lea`/`imul`；超出 int32 范围时转 double 以保 JS 语义。
+   **诚实的预期**：x86-64 上 double 与 int64 的算术吞吐接近，收益主要在**比较、取模、数组下标**，不会翻倍。
+2. **混合函数（数字 + 属性访问 + 字符串）**：现在是「遇到一条不认识的 opcode 就整体放弃」。
+   (a) **分块 JIT**：按可编译性切基本块，可编的编、其余 call 解释器；
+   (b) **慢路径内联**：生成代码里留 call 到解释器 helper（第一版 JIT 用过，后来为了「保证纯函数」删了）。
+   推荐 (a)，风险在**精确的栈/寄存器状态映射**（进出解释器时必须严丝合缝）。
+3. **外部调用**（`Math.*`、`console.log`、C 扩展经 `tcc_add_symbol` 注册）：
+   认 `get_field` + `call` 形态，能静态认出 callee 就发**直接调用**，否则发**通用 call helper**；
+   收益点是调用点不必回解释器建帧。
+- **共同前提**：类型格要能表达「未知但已守卫」（现在只有 UNKNOWN/NUM/BOOL/SELF），
+  且 deopt 要能**从任意点安全重入**（当前只保证「整帧重跑」）。
+
+## 指令集与架构（用户提到的）
+- **x86-64**：TCC 64 位已走 SSE 标量（不用 x87），可在此基础上加 —— `lea` 做整数乘加、`cmov` 消分支、
+  必要时手写 **AVX2**（TCC 可改，`x86_64-gen.c` 里 `o(...)` 直接发字节即可）。
+- **SIMD 的真正用武之地是数组/TypedArray 循环**（`for(i) s += a[i]*b[i]`），需要先认循环形态再发向量指令 —— 记为方向。
+- **arm/arm64**：暂无测试环境，**保持兼容即可**：生成器与架构无关（只认 ops），
+  架构相关部分全在 TCC（`arm64-gen.c`/`arm-gen.c` 已在 repo 里），换 `TCC_TARGET_ARM64` 就能编，本轮不动。
+
+## 验证
+- 正常路径：`fib(30)=832040` 13ms、`whale api test: ok`。
+- IR 直出：`WHALE_IR_PROBE=1` 可复现崩溃（已知，未修）。
