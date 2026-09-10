@@ -19,3 +19,5 @@ The process of project: WhaleJS —— 基于 QuickJS-ng + TinyCC 实现带 JIT/
 <9>(UNRESOLVED 性能): Step 6 续 —— 栈槽提升为 C 局部变量（v0..vN，编译期跟踪 sp，跳转深度不一致就放弃）已入库（commit d019316），但没提速：原版解释器 2200 ns/call vs TCC JIT 3200 ns/call（慢 45%）。诊断：瓶颈不是栈访问，而是 TCC 不做优化、打不过 gcc -O3 的解释器；收益只能来自去装箱/类型特化（int 域内循环 + guard + 去优化），保底路线是 AOT 用 gcc -O3。见 current.md
 
 <10>(UNRESOLVED 性能/大幅改善): Step 7 —— 数值特化（int + double 统一到 C double 域）已落地：抽象解释 + guard + deopt 重跑同一帧（commit b6d8569）。fibi(30) 从 3200 降到 1800 ns/call（原版解释器 1600），即从"慢 100%"追到"慢 12%"，仍未反超；根因是 TCC 无寄存器分配、代码质量差。下一步：寄存器形态生成（消栈槽）/ AOT gcc -O3 / 分支预测与 CPU 缓存优化（已记录，待实现）/ 支持 call 以覆盖递归 fib。见 current.md
+
+<11>(SOLVED): Step 8 —— 表达式形态生成 + 参数解箱：两条 peephole（`load load binop [put_loc]`、`load put_loc`）消掉栈槽往返，参数入口一次性解箱，另修三个让生成器静默放弃的 bug，并加 `WHALE_JIT_DUMP=1` 转储生成源码（commit cd04d7f）。结果：fibi(30) **200 ns/call vs 解释器 1800**（9×），语义全对。下一步：opcode 层 DCE/不变式外提、支持 `call`（递归 fib）、预留 AOT 后端接口。见 current.md

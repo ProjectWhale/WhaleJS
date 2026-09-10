@@ -283,6 +283,50 @@ opcode 分派），但被代码质量吃掉了。
 4. TCC 选项（`-O1` 之类）试一下；编译缓存 + `free_function_bytecode` 里 `tcc_delete`（老账）。
 5. 递归版 fib 仍走解释器（`call1` + `get_var_ref0` 不在支持面内）；支持 `call` 后才会覆盖 goal 要求的递归 fibonacci。
 
+# <11>: Step 8 —— 表达式形态生成 + 参数解箱：JIT 反超解释器 9 倍
+SOLVED
+
+## 结果（fibi(30)，5 轮取最小）
+| 实现 | ns/call |
+|------|---------|
+| 原版 QuickJS-ng 解释器（gcc -O3） | 1800 |
+| JIT：栈机形态 + double 特化（<10> 的版本） | 1800 ~ 2000 |
+| **JIT：表达式形态 + 参数解箱（本版）** | **200（9×）** |
+正确性：400× `fibi(30)` 全对；300× 浮点变体 `fsum(1000)=249750` 全对。
+
+## 关键改动（都在 `whale_jit_gen`，commit cd04d7f）
+1. **两条 peephole 把"栈机形态"改成"表达式形态"**：
+   - `<load> <load> <binop> [put_loc]` → 一条赋值 `L3 = L0 + L1;`
+   - `<load> put_loc` → 直接拷贝 `L0 = L1;`
+   于是 fibi 的内循环就是：
+   ```c
+   L6: v0 = (L2 < A0) ? 1 : 0;
+       if (v0 == 0) goto L22;
+       L3 = L0 + L1;  L0 = L1;  L1 = L3;  L2 = L2 + 1;
+       goto L6;
+   ```
+   **为什么这一步是决定性的**：TCC 没有像样的寄存器分配、spill 凶（正是用户提示的那个 TCC 小毛病）。
+   少一个活变量、少一次栈槽往返，就多一个值留在寄存器里。
+   **常量折叠也从这条 peephole 里自然掉出来**（纯常量操作数在编译期就算完了）。
+2. **参数入口一次性解箱**到 `A0..An`（仍有 guard：非数值 → deopt），不再每次 `get_arg` 重新解箱。
+3. 修掉三个让生成器**静默放弃**的 bug：peephole 的栈效果算反（净 +1，我写成 -2/-1）、
+   生成的函数**漏了结尾 `}`**（TCC 在 EOF 报 identifier expected）、"字节码正常走完"被当成失败。
+4. 新增 `WHALE_JIT_DUMP=1` 把生成的 C 源码打到 stderr —— 上面三个 bug 全靠它找出来，调 JIT 先开它。
+
+## 这印证了 <9>/<10> 的判断
+不是 TCC 无药可救，而是**生成形态**问题：同一个循环，tcc 编"最优形态"要 135 ns/call、gcc -O3 是 15 ns/call，
+都比解释器的 1800 好一个数量级。形态对了就赢回来。
+
+## 下一步
+1. **更多 opcode 层优化**（用户提的 AST/opcode 方向）：现在只有 peephole 级折叠；
+   还没做 **不可达代码删除**（CFG 信息已有一半）、无用赋值消除、循环不变式外提、强度削减。
+2. **支持 `call`**（`call1` + `get_var_ref0`）：递归版 fib 现在仍走解释器，goal 的 fibonacci 验证需要它。
+3. **AOT 插入点（用户要求先留接口、不要依赖外部 gcc）**：把 `whale_jit_compile()` 抽成后端接口
+   （`compile(src) -> entry`），当前实现是 TCC，将来可插 gcc/LLVM 做离线编译。
+4. **分支预测 / CPU 缓存**：现在生成的代码分支很少，优先级降低（清单见 <10>），等有 profile 再做。
+5. 老账：TCCState 泄漏、编译缓存、`qjs`/`whale_test` 共享静态库。
+
+
 
 
 
