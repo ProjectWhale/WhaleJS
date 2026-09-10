@@ -896,6 +896,8 @@ typedef struct JSFunctionBytecode {
     /* WhaleJS: JIT/AOT 状态（零初始化，见 src/whalejs.h） */
     uint32_t whale_call_count; /* 调用次数，用于热点判定 */
     void *whale_jit_entry;     /* 非 NULL 表示已有机器码入口 */
+    uint8_t whale_jit_tried;   /* JIT compile already attempted */
+    void *whale_jit_tcc;       /* owning TCCState (keeps the code alive) */
 } JSFunctionBytecode;
 
 typedef struct JSBoundFunction {
@@ -2990,6 +2992,9 @@ void JS_WhaleNoteJitResult(JSContext *ctx, int ok, uint64_t code_bytes)
 /* WhaleJS: JS_CallInternal 的热点入口。
    当前只统计；TinyCC 编译接入后在这里产出机器码并填 b->whale_jit_entry。
    注意：JIT=OFF 时必须零开销返回。 */
+/* Defined at the end of this file (JIT codegen section). */
+static int whale_jit_compile(JSContext *ctx, JSFunctionBytecode *b);
+
 static void whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
 {
     JSWhaleContext *w = &ctx->whale;
@@ -2999,8 +3004,15 @@ static void whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
 
     w->stat_requests++;
     b->whale_call_count++;
-    if (b->whale_call_count < WHALE_JIT_HOT_THRESHOLD || b->whale_jit_entry)
+    if (b->whale_call_count < WHALE_JIT_HOT_THRESHOLD)
         return;
+    if (b->whale_jit_entry || b->whale_jit_tried)
+        return;
+    b->whale_jit_tried = 1;
+    if (whale_jit_compile(ctx, b))
+        JS_WhaleNoteJitResult(ctx, 1, 0);
+    else
+        JS_WhaleNoteJitResult(ctx, 0, 0);   /* compile failed: stay interpreted */
     /* 热点已达阈值：下一步在这里调 TinyCC 把 b 编译成机器码 */
 }
 
@@ -18230,6 +18242,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
     /* WhaleJS: 热点统计（JIT 代码生成接入前先只计数，见 src/whalejs.h） */
     whale_on_call(ctx, b);
+
+    /* WhaleJS: native entry ready -> run it and skip the interpreter loop */
+    if (b->whale_jit_entry) {
+        JSValue whale_ret;
+        rt->current_stack_frame = sf->prev_frame;
+        whale_ret = ((JSValue (*)(JSContext *, JSValue *, JSValue *))b->whale_jit_entry)
+                        (ctx, arg_buf, var_buf);
+        if (unlikely(sf->var_ref_count != 0))
+            close_var_refs(rt, sf);
+        for (pval = local_buf; pval < stack_buf; pval++)
+            JS_FreeValue(ctx, *pval);
+        return whale_ret;
+    }
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
     if (check_dump_flag(ctx->rt, JS_DUMP_BYTECODE_STEP))
@@ -64971,3 +64996,317 @@ uintptr_t js_std_cmd(int cmd, ...) {
 #undef malloc
 #undef free
 #undef realloc
+
+/* =========================================================================
+ * WhaleJS: JIT code generation (TinyCC backend)
+ *
+ * 优先原生：int 快路径直接内联成几次位测试 + 一条机器加法，不调 helper、不分配、
+ * 不碰 GC。原生不成立（浮点/字符串/对象/溢出）时退化：调 helper，helper 复用解释器
+ * 的 js_*_slow()，等于把那一条 opcode 的 switch 分支搬过来 —— 语义与解释器一致。
+ * 值栈是生成函数自己的局部数组，每槽持有引用，出口转移所有权。
+ * ========================================================================= */
+
+#include "libtcc.h"
+
+#ifndef WHALE_JIT_TCC_DIR
+#define WHALE_JIT_TCC_DIR "thirdparty/tcc-runtime"
+#endif
+#ifndef WHALE_JIT_SRC_DIR
+#define WHALE_JIT_SRC_DIR "src"
+#endif
+
+typedef struct JSWhaleJitState {
+    JSValue *st;
+    int sp;
+} JSWhaleJitState;
+
+/* ---- 退化路径（只在原生快路径不成立时进入） ---- */
+
+static int whale_jit_slow_add(JSContext *ctx, JSWhaleJitState *s)
+{
+    if (js_add_slow(ctx, s->st + s->sp - 2))
+        return 0;
+    s->sp -= 1;
+    return 1;
+}
+
+static int whale_jit_slow_sub(JSContext *ctx, JSWhaleJitState *s)
+{
+    if (js_binary_arith_slow(ctx, s->st + s->sp - 2, OP_sub))
+        return 0;
+    s->sp -= 1;
+    return 1;
+}
+
+static int whale_jit_slow_mul(JSContext *ctx, JSWhaleJitState *s)
+{
+    if (js_binary_arith_slow(ctx, s->st + s->sp - 2, OP_mul))
+        return 0;
+    s->sp -= 1;
+    return 1;
+}
+
+static int whale_jit_slow_lt(JSContext *ctx, JSWhaleJitState *s)
+{
+    if (js_relational_slow(ctx, s->st + s->sp - 2, OP_lt))
+        return 0;
+    s->sp -= 1;
+    return 1;
+}
+
+static int whale_jit_slow_inc_loc(JSContext *ctx, JSValue *var_buf, int idx)
+{
+    JSValue tmp = js_dup(var_buf[idx]);
+
+    if (js_unary_arith_slow(ctx, &tmp, OP_inc))
+        return 0;
+    JS_FreeValue(ctx, var_buf[idx]);
+    var_buf[idx] = tmp;
+    return 1;
+}
+
+/* ---- C 源码生成器 ---- */
+
+#define WHALE_JIT_SRC_MAX 65536
+
+static char whale_jit_src[WHALE_JIT_SRC_MAX];
+static size_t whale_jit_src_len;
+
+static void whale_emit(const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+
+    if (whale_jit_src_len + 1 >= WHALE_JIT_SRC_MAX)
+        return;
+    va_start(ap, fmt);
+    n = vsnprintf(whale_jit_src + whale_jit_src_len,
+                  WHALE_JIT_SRC_MAX - whale_jit_src_len, fmt, ap);
+    va_end(ap);
+    if (n > 0)
+        whale_jit_src_len += (size_t)n;
+}
+
+/* 生成代码的固定头部：宏全部写成单行，展开后就是原生代码 */
+static const char *whale_jit_preamble =
+    "#include \"quickjs.h\"\n"
+    "typedef struct { JSValue *st; int sp; } WhaleSt;\n"
+    "extern int whale_jit_slow_add(JSContext *ctx, WhaleSt *s);\n"
+    "extern int whale_jit_slow_sub(JSContext *ctx, WhaleSt *s);\n"
+    "extern int whale_jit_slow_mul(JSContext *ctx, WhaleSt *s);\n"
+    "extern int whale_jit_slow_lt(JSContext *ctx, WhaleSt *s);\n"
+    "extern int whale_jit_slow_inc_loc(JSContext *ctx, JSValue *var_buf, int idx);\n"
+    "#define WHALE_DUP(v) ((JS_VALUE_HAS_REF_COUNT(v)) ? JS_DupValue(ctx, (v)) : (v))\n"
+    "#define WHALE_GET_LOC(i) do { JSValue _v = var_buf[i]; st[s.sp++] = WHALE_DUP(_v); } while (0)\n"
+    "#define WHALE_PUT_LOC(i) do { JSValue _o = var_buf[i]; var_buf[i] = st[--s.sp]; if (JS_VALUE_HAS_REF_COUNT(_o)) JS_FreeValue(ctx, _o); } while (0)\n"
+    "#define WHALE_GET_ARG(i) do { JSValue _v = args[i]; st[s.sp++] = WHALE_DUP(_v); } while (0)\n"
+    "#define WHALE_DROP() do { JSValue _v = st[--s.sp]; if (JS_VALUE_HAS_REF_COUNT(_v)) JS_FreeValue(ctx, _v); } while (0)\n"
+    "#define WHALE_DUP_TOP() do { st[s.sp] = WHALE_DUP(st[s.sp - 1]); s.sp++; } while (0)\n"
+    "#define WHALE_ADD() do { JSValue _a = st[s.sp - 2], _b = st[s.sp - 1]; if (JS_VALUE_GET_TAG(_a) == JS_TAG_INT && JS_VALUE_GET_TAG(_b) == JS_TAG_INT) { long long _v = (long long)JS_VALUE_GET_INT(_a) + (long long)JS_VALUE_GET_INT(_b); st[s.sp - 2] = (_v >= -2147483647LL - 1 && _v <= 2147483647LL) ? JS_MKVAL(JS_TAG_INT, (int)_v) : JS_NewFloat64(ctx, (double)_v); s.sp--; } else if (!whale_jit_slow_add(ctx, &s)) goto exc; } while (0)\n"
+    "#define WHALE_SUB() do { JSValue _a = st[s.sp - 2], _b = st[s.sp - 1]; if (JS_VALUE_GET_TAG(_a) == JS_TAG_INT && JS_VALUE_GET_TAG(_b) == JS_TAG_INT) { long long _v = (long long)JS_VALUE_GET_INT(_a) - (long long)JS_VALUE_GET_INT(_b); st[s.sp - 2] = (_v >= -2147483647LL - 1 && _v <= 2147483647LL) ? JS_MKVAL(JS_TAG_INT, (int)_v) : JS_NewFloat64(ctx, (double)_v); s.sp--; } else if (!whale_jit_slow_sub(ctx, &s)) goto exc; } while (0)\n"
+    "#define WHALE_MUL() do { JSValue _a = st[s.sp - 2], _b = st[s.sp - 1]; if (JS_VALUE_GET_TAG(_a) == JS_TAG_INT && JS_VALUE_GET_TAG(_b) == JS_TAG_INT) { long long _v = (long long)JS_VALUE_GET_INT(_a) * (long long)JS_VALUE_GET_INT(_b); st[s.sp - 2] = (_v >= -2147483647LL - 1 && _v <= 2147483647LL) ? JS_MKVAL(JS_TAG_INT, (int)_v) : JS_NewFloat64(ctx, (double)_v); s.sp--; } else if (!whale_jit_slow_mul(ctx, &s)) goto exc; } while (0)\n"
+    "#define WHALE_LT() do { JSValue _a = st[s.sp - 2], _b = st[s.sp - 1]; if (JS_VALUE_GET_TAG(_a) == JS_TAG_INT && JS_VALUE_GET_TAG(_b) == JS_TAG_INT) { st[s.sp - 2] = JS_NewBool(ctx, JS_VALUE_GET_INT(_a) < JS_VALUE_GET_INT(_b)); s.sp--; } else if (!whale_jit_slow_lt(ctx, &s)) goto exc; } while (0)\n"
+    "#define WHALE_IF_FALSE(t) do { JSValue _v = st[--s.sp]; int _c; if (JS_VALUE_GET_TAG(_v) == JS_TAG_INT) { _c = (JS_VALUE_GET_INT(_v) != 0); } else { _c = JS_ToBool(ctx, _v); JS_FreeValue(ctx, _v); if (_c < 0) goto exc; } if (!_c) goto t; } while (0)\n"
+    "#define WHALE_INC_LOC(i) do { JSValue _v = var_buf[i]; if (JS_VALUE_GET_TAG(_v) == JS_TAG_INT && JS_VALUE_GET_INT(_v) != 2147483647) var_buf[i] = JS_MKVAL(JS_TAG_INT, JS_VALUE_GET_INT(_v) + 1); else if (!whale_jit_slow_inc_loc(ctx, var_buf, i)) goto exc; } while (0)\n";
+
+/* 扫描 + 生成。返回 0 表示该函数不适合 JIT（保持解释执行）。 */
+static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
+{
+    const uint8_t *pc = b->byte_code_buf;
+    int len = b->byte_code_len;
+    int pos;
+    uint8_t *targets = NULL;
+    int ret = 0;
+
+    if (b->func_kind != JS_FUNC_NORMAL)
+        return 0;
+    if (b->stack_size <= 0 || b->stack_size > 4096)
+        return 0;
+
+    /* pass 1：挑出跳转目标，同时拒绝不支持 / 有副作用的 opcode */
+    targets = js_mallocz(ctx, len + 1);
+    if (!targets)
+        return 0;
+    for (pos = 0; pos < len; ) {
+        int op = pc[pos];
+        int sz = short_opcode_info(op).size;
+
+        if (sz <= 0 || pos + sz > len)
+            goto fail;
+        switch (op) {
+        case OP_push_minus1: case OP_push_0: case OP_push_1: case OP_push_2:
+        case OP_push_3: case OP_push_4: case OP_push_5: case OP_push_6:
+        case OP_push_7:
+        case OP_push_i8: case OP_push_i16: case OP_push_i32:
+        case OP_undefined: case OP_null: case OP_push_true: case OP_push_false:
+        case OP_get_loc0: case OP_get_loc1: case OP_get_loc2: case OP_get_loc3:
+        case OP_get_loc8: case OP_get_loc:
+        case OP_put_loc0: case OP_put_loc1: case OP_put_loc2: case OP_put_loc3:
+        case OP_put_loc8: case OP_put_loc:
+        case OP_get_loc0_loc1:
+        case OP_get_arg0: case OP_get_arg1: case OP_get_arg2: case OP_get_arg3:
+        case OP_get_arg:
+        case OP_lt: case OP_add: case OP_sub: case OP_mul:
+        case OP_inc_loc: case OP_drop: case OP_dup:
+        case OP_return: case OP_return_undef:
+            break;
+        case OP_goto8:
+        case OP_if_false8:
+            targets[pos + 1 + (int8_t)pc[pos + 1]] = 1;
+            break;
+        default:
+            goto fail;
+        }
+        pos += sz;
+    }
+
+    /* pass 2：生成 */
+    whale_jit_src_len = 0;
+    whale_emit("%s", whale_jit_preamble);
+    whale_emit("JSValue whale_jit_fn(JSContext *ctx, JSValue *args, JSValue *var_buf)\n{\n");
+    whale_emit("    JSValue st[%d];\n", b->stack_size);
+    whale_emit("    WhaleSt s; s.st = st; s.sp = 0;\n");
+    whale_emit("    (void)var_buf; (void)s; (void)ctx; (void)args;\n");
+
+    for (pos = 0; pos < len; ) {
+        int op = pc[pos];
+        int sz = short_opcode_info(op).size;
+        int need_label = targets[pos];
+
+        if (need_label)
+            whale_emit("  L%d:\n", pos);
+
+        switch (op) {
+        case OP_push_minus1: whale_emit("    st[s.sp++] = JS_MKVAL(JS_TAG_INT, -1);\n"); break;
+        case OP_push_0: whale_emit("    st[s.sp++] = JS_MKVAL(JS_TAG_INT, 0);\n"); break;
+        case OP_push_1: whale_emit("    st[s.sp++] = JS_MKVAL(JS_TAG_INT, 1);\n"); break;
+        case OP_push_2: whale_emit("    st[s.sp++] = JS_MKVAL(JS_TAG_INT, 2);\n"); break;
+        case OP_push_3: whale_emit("    st[s.sp++] = JS_MKVAL(JS_TAG_INT, 3);\n"); break;
+        case OP_push_4: whale_emit("    st[s.sp++] = JS_MKVAL(JS_TAG_INT, 4);\n"); break;
+        case OP_push_5: whale_emit("    st[s.sp++] = JS_MKVAL(JS_TAG_INT, 5);\n"); break;
+        case OP_push_6: whale_emit("    st[s.sp++] = JS_MKVAL(JS_TAG_INT, 6);\n"); break;
+        case OP_push_7: whale_emit("    st[s.sp++] = JS_MKVAL(JS_TAG_INT, 7);\n"); break;
+        case OP_push_i8:
+            whale_emit("    st[s.sp++] = JS_MKVAL(JS_TAG_INT, %d);\n", (int)(int8_t)pc[pos + 1]);
+            break;
+        case OP_push_i16:
+            whale_emit("    st[s.sp++] = JS_MKVAL(JS_TAG_INT, %d);\n", (int)(int16_t)get_u16(pc + pos + 1));
+            break;
+        case OP_push_i32:
+            whale_emit("    st[s.sp++] = JS_MKVAL(JS_TAG_INT, %d);\n", (int)(int32_t)get_u32(pc + pos + 1));
+            break;
+        case OP_undefined: whale_emit("    st[s.sp++] = JS_UNDEFINED;\n"); break;
+        case OP_null: whale_emit("    st[s.sp++] = JS_NULL;\n"); break;
+        case OP_push_true: whale_emit("    st[s.sp++] = JS_TRUE;\n"); break;
+        case OP_push_false: whale_emit("    st[s.sp++] = JS_FALSE;\n"); break;
+
+        case OP_get_loc0: case OP_get_loc1: case OP_get_loc2: case OP_get_loc3:
+            whale_emit("    WHALE_GET_LOC(%d);\n", op - OP_get_loc0);
+            break;
+        case OP_get_loc8:
+            whale_emit("    WHALE_GET_LOC(%d);\n", (int)pc[pos + 1]);
+            break;
+        case OP_get_loc:
+            whale_emit("    WHALE_GET_LOC(%d);\n", (int)get_u16(pc + pos + 1));
+            break;
+        case OP_put_loc0: case OP_put_loc1: case OP_put_loc2: case OP_put_loc3:
+            whale_emit("    WHALE_PUT_LOC(%d);\n", op - OP_put_loc0);
+            break;
+        case OP_put_loc8:
+            whale_emit("    WHALE_PUT_LOC(%d);\n", (int)pc[pos + 1]);
+            break;
+        case OP_put_loc:
+            whale_emit("    WHALE_PUT_LOC(%d);\n", (int)get_u16(pc + pos + 1));
+            break;
+        case OP_get_loc0_loc1:
+            whale_emit("    WHALE_GET_LOC(0); WHALE_GET_LOC(1);\n");
+            break;
+        case OP_get_arg0: case OP_get_arg1: case OP_get_arg2: case OP_get_arg3:
+            whale_emit("    WHALE_GET_ARG(%d);\n", op - OP_get_arg0);
+            break;
+        case OP_get_arg:
+            whale_emit("    WHALE_GET_ARG(%d);\n", (int)get_u16(pc + pos + 1));
+            break;
+
+        case OP_add: whale_emit("    WHALE_ADD();\n"); break;
+        case OP_sub: whale_emit("    WHALE_SUB();\n"); break;
+        case OP_mul: whale_emit("    WHALE_MUL();\n"); break;
+        case OP_lt:  whale_emit("    WHALE_LT();\n"); break;
+        case OP_inc_loc: whale_emit("    WHALE_INC_LOC(%d);\n", (int)pc[pos + 1]); break;
+        case OP_drop: whale_emit("    WHALE_DROP();\n"); break;
+        case OP_dup: whale_emit("    WHALE_DUP_TOP();\n"); break;
+
+        case OP_if_false8:
+            whale_emit("    WHALE_IF_FALSE(L%d);\n", pos + 1 + (int8_t)pc[pos + 1]);
+            break;
+        case OP_goto8:
+            whale_emit("    goto L%d;\n", pos + 1 + (int8_t)pc[pos + 1]);
+            break;
+        case OP_return: whale_emit("    return st[--s.sp];\n"); break;
+        case OP_return_undef: whale_emit("    return JS_UNDEFINED;\n"); break;
+        default:
+            goto fail;
+        }
+        pos += sz;
+    }
+
+    whale_emit("    return JS_UNDEFINED;\n");
+    whale_emit("  exc:\n");
+    whale_emit("    while (s.sp > 0) { JSValue _v = st[--s.sp]; if (JS_VALUE_HAS_REF_COUNT(_v)) JS_FreeValue(ctx, _v); }\n");
+    whale_emit("    return JS_EXCEPTION;\n");
+    whale_emit("}\n");
+    ret = 1;
+  fail:
+    js_free(ctx, targets);
+    return ret;
+}
+
+/* 编译并挂到 b 上。返回 1 表示 b->whale_jit_entry 可用。 */
+static int whale_jit_compile(JSContext *ctx, JSFunctionBytecode *b)
+{
+    TCCState *s;
+    void *fn;
+    int ok = 0;
+
+    if (!whale_jit_gen(ctx, b))
+        return 0;
+
+    s = tcc_new();
+    if (!s)
+        return 0;
+
+    tcc_set_lib_path(s, WHALE_JIT_TCC_DIR);
+    tcc_add_include_path(s, WHALE_JIT_TCC_DIR "/include");
+    tcc_add_include_path(s, WHALE_JIT_SRC_DIR);
+    tcc_add_library_path(s, WHALE_JIT_TCC_DIR "/lib");
+    tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
+
+    tcc_add_symbol(s, "whale_jit_slow_add", (void *)whale_jit_slow_add);
+    tcc_add_symbol(s, "whale_jit_slow_sub", (void *)whale_jit_slow_sub);
+    tcc_add_symbol(s, "whale_jit_slow_mul", (void *)whale_jit_slow_mul);
+    tcc_add_symbol(s, "whale_jit_slow_lt", (void *)whale_jit_slow_lt);
+    tcc_add_symbol(s, "whale_jit_slow_inc_loc", (void *)whale_jit_slow_inc_loc);
+
+    /* public API that generated code may reference (only on slow paths) */
+    tcc_add_symbol(s, "JS_DupValue", (void *)JS_DupValue);
+    tcc_add_symbol(s, "JS_FreeValue", (void *)JS_FreeValue);
+    tcc_add_symbol(s, "JS_ToBool", (void *)JS_ToBool);
+
+    if (tcc_compile_string(s, whale_jit_src) < 0)
+        goto fail;
+    if (tcc_relocate(s, TCC_RELOCATE_AUTO) < 0)
+        goto fail;
+    fn = tcc_get_symbol(s, "whale_jit_fn");
+    if (!fn)
+        goto fail;
+
+    b->whale_jit_entry = fn;
+    b->whale_jit_tcc = s;
+    /* ponytail: TCCState（机器码就挂在它上面）暂时不在 free_function_bytecode 里回收，
+       等 JIT 缓存策略稳定后再接上，代价是每个 JIT 过的函数泄漏一个 TCCState。 */
+    ok = 1;
+  fail:
+    if (!ok)
+        tcc_delete(s);
+    return ok;
+}

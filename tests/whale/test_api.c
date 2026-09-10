@@ -175,6 +175,17 @@ int main(void)
     JS_WhaleNoteJitResult(NULL, 1, 1);
 
     /* 8. TCC 后端可用（JIT 地基） */
+    /* 9. JIT: a hot non-recursive function must actually get compiled */
+    JS_WhaleSetJitMode(ctx, JS_JIT_LAZY);
+    {
+        double v = eval_number(ctx,
+            "function fibi(n){var a=0,b=1;for(var i=0;i<n;i++){var t=a+b;a=b;b=t;}return a;}"
+            "var acc=0; for (var k=0;k<400;k++) acc=fibi(30); acc");
+        CHECK(v == 832040.0);
+        JS_WhaleGetJitStats(ctx, &st);
+        CHECK(st.compiled >= 1);
+    }
+
     check_tcc_backend();
 
     JS_FreeContext(ctx);
