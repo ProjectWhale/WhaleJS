@@ -17,6 +17,9 @@
 
 #include "libtcc.h"
 
+/* implemented inside the TinyCC translation unit (src/tcc/whale_tcc_iface.c) */
+int JS_WhaleTccProbe(void);
+
 /* Opcode ids and sizes, taken from the same quickjs-opcode.h the interpreter
    uses. The enum mirrors OPCodeEnum in quickjs.c: the DEF entries first, then
    the short (def) entries that alias the temporary opcode range. */
@@ -87,6 +90,9 @@ static uint32_t whale_get_u16(const uint8_t *p)
  * ========================================================================= */
 
 #include "libtcc.h"
+
+/* implemented inside the TinyCC translation unit (src/tcc/whale_tcc_iface.c) */
+int JS_WhaleTccProbe(void);
 
 #ifndef WHALE_JIT_TCC_DIR
 #define WHALE_JIT_TCC_DIR "thirdparty/tcc-runtime"
@@ -962,8 +968,10 @@ int JS_WhaleJitCompileFunction(JSContext *ctx, const JSWhaleFuncInfo *info,
     if (!whale_jit_gen(ctx, info))
         return 0;
 
-    if (getenv("WHALE_JIT_DUMP"))
+    if (getenv("WHALE_JIT_DUMP")) {
         fprintf(stderr, "--- whale jit source ---\n%s--- end ---\n", whale_jit_src);
+        fprintf(stderr, "whale tcc internal probe: ok=%d\n", JS_WhaleTccProbe());
+    }
 
     if (!whale_jit_backend->compile(ctx, whale_jit_src, &entry, &handle))
         return 0;

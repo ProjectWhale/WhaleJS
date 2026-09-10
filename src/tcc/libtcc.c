@@ -1979,3 +1979,6 @@ PUB_FUNC void tcc_print_stats(TCCState *s, unsigned total_time)
     fprintf(stderr, "* %d bytes memory used\n", mem_max_size);
 #endif
 }
+
+/* WhaleJS: internal interface, compiled inside the TinyCC TU (see the file). */
+#include "whale_tcc_iface.c"
