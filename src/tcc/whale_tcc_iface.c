@@ -19,7 +19,8 @@
    and that the JIT generator can drive TinyCC directly from here. */
 int JS_WhaleTccProbe(void)
 {
-    /* reaching here at all means this file is compiled inside TinyCC and can
-       see its internals; report whether a state is live */
-    return tcc_state ? 1 : 0;
+    /* __vstack is TinyCC's value stack (tcc.h). Reading its capacity proves we
+       are compiled inside TinyCC's translation unit AND that the value is the
+       real one: VSTACK_SIZE is 256 in tcc.h. */
+    return (int)(sizeof(__vstack) / sizeof(__vstack[0])) - 1;
 }

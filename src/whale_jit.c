@@ -970,7 +970,7 @@ int JS_WhaleJitCompileFunction(JSContext *ctx, const JSWhaleFuncInfo *info,
 
     if (getenv("WHALE_JIT_DUMP")) {
         fprintf(stderr, "--- whale jit source ---\n%s--- end ---\n", whale_jit_src);
-        fprintf(stderr, "whale tcc internal probe: ok=%d\n", JS_WhaleTccProbe());
+        fprintf(stderr, "whale tcc internal probe: vstack cap=%d\n", JS_WhaleTccProbe());
     }
 
     if (!whale_jit_backend->compile(ctx, whale_jit_src, &entry, &handle))
