@@ -21,3 +21,5 @@ The process of project: WhaleJS —— 基于 QuickJS-ng + TinyCC 实现带 JIT/
 <10>(UNRESOLVED 性能/大幅改善): Step 7 —— 数值特化（int + double 统一到 C double 域）已落地：抽象解释 + guard + deopt 重跑同一帧（commit b6d8569）。fibi(30) 从 3200 降到 1800 ns/call（原版解释器 1600），即从"慢 100%"追到"慢 12%"，仍未反超；根因是 TCC 无寄存器分配、代码质量差。下一步：寄存器形态生成（消栈槽）/ AOT gcc -O3 / 分支预测与 CPU 缓存优化（已记录，待实现）/ 支持 call 以覆盖递归 fib。见 current.md
 
 <11>(SOLVED): Step 8 —— 表达式形态生成 + 参数解箱：两条 peephole（`load load binop [put_loc]`、`load put_loc`）消掉栈槽往返，参数入口一次性解箱，另修三个让生成器静默放弃的 bug，并加 `WHALE_JIT_DUMP=1` 转储生成源码（commit cd04d7f）。结果：fibi(30) **200 ns/call vs 解释器 1800**（9×），语义全对。下一步：opcode 层 DCE/不变式外提、支持 `call`（递归 fib）、预留 AOT 后端接口。见 current.md
+
+<12>(SOLVED): Step 9 —— 自递归 fib 也能 JIT：`get_var_ref` 只接受"闭包槽就是本函数自己"（运行时校验，保证纯函数→deopt 重跑安全），`call` 直接调自己的 JIT 入口（不经引擎建帧），加栈溢出检查；修 3 个 bug（exc 标签丢失、强转少参数、is_self 读错 `sf->var_refs` 而非闭包 `var_refs`——这个让守卫永远失败、静默退回解释器）。结果：递归 fib(24)×30 353→293ms（1.2×），迭代 fibi 保持 200 ns/call（9×），语义全过。commit c03e345。见 current.md

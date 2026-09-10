@@ -326,6 +326,50 @@ SOLVED
 4. **分支预测 / CPU 缓存**：现在生成的代码分支很少，优先级降低（清单见 <10>），等有 profile 再做。
 5. 老账：TCCState 泄漏、编译缓存、`qjs`/`whale_test` 共享静态库。
 
+# <12>: Step 9 —— 自递归 fib 也能 JIT（call + get_var_ref）
+SOLVED
+
+## 支持面扩了两条
+- **`get_var_refX`：只接受"闭包槽就是本函数自己"**的情况 —— 运行时用
+  `whale_jit_is_self(whale_var_refs, whale_self, idx)` 校验。这条限制是关键：它保证被编译的函数是
+  **纯函数**（自递归 + 数值运算），于是 deopt 之后重跑同一帧才是安全的（不会重复副作用）。
+  检查已提升到函数入口（闭包在一个调用期间不变）。
+- **`callN`：被调者必须是上面那种"就是自己"的槽** → 直接调用**自己的 JIT 入口**，不经 `JS_CallInternal`
+  （自递归不需要新引擎帧：局部变量全是 `double` C 变量，闭包也是同一个）。
+  第一版走了 `JS_CallInternal`，结果**一点没提速**（建帧开销把收益吃光了）。
+- `var_refs` 以 `void *` 传给生成代码（免得生成的 C 需要内部类型 `JSVarRef`）。
+- 新增 `whale_jit_stack_ok()`（`js_check_stack_overflow` + `JS_ThrowStackOverflow`），
+  入口和每次自递归调用前都查 → 深递归抛 `RangeError`，不会把 C 栈压爆。
+
+## 三个 bug（全靠 `WHALE_JIT_DUMP` 找出来）
+1. 生成函数**丢了 `exc:` 标签**（重写时删掉了异常出口 emit）→ TCC: `label 'exc' used but not defined`。
+2. 自递归调用的**函数指针强转少了新参数** → TCC: `too many arguments to function`。
+3. **`is_self` 读错了数组**（最隐蔽）：解释器的 `get_var_ref` 用的是 `JS_CallInternal` 里的局部
+   `var_refs`（= `p->u.func.var_refs`，闭包持有的引用数组），我读成了 `sf->var_refs`
+   （帧上给**本函数内部闭包**预留的槽位）。后果：守卫必然失败 → 第一次之后 deopt、永远解释执行；
+   表面"能跑、语义全对"，只是**没有提速**。教训：同一个函数里两个名字很像的数组，含义完全不同。
+
+## 结果
+| 用例 | 原版解释器 | WhaleJS JIT |
+|------|-----------|-------------|
+| 迭代 `fibi(30)` | 1800 ns/call | **200 ns/call（9×）** |
+| 递归 `fib(24)` ×30 | 353 ms | **293 ms（1.2×）** |
+语义全过：递归 fib、浮点递归、迭代 fibi、fsum、深递归 RangeError；`whale api test: ok`。commit c03e345。
+
+## 递归只有 1.2× 的原因
+每次自递归调用仍有：参数装箱 → 间接调用 → 返回值解箱 → 栈检查。要更快就得做**数值直传**：
+给 JIT 函数再加一个"参数已解箱"的入口（`double whale_jit_num(JSContext*, double n, ...)`），
+自递归直接用它，绕开装箱/解箱。
+
+## 下一步
+1. 数值直传入口（上面这条）。
+2. opcode 层 **DCE / 循环不变式外提**（对应 `temp/tcc_to_optimize.md` 优先级 1、6）。
+3. AOT 后端接口预留（`compile(src)->entry` 抽象，仍用 TCC，不硬依赖 gcc）。
+4. `temp/tcc_to_optimize.md` 的 TCC 自身清单：语句边界强制刷寄存器（仅次于 spill）、无内联、
+   无循环优化、常量传播弱、窥孔弱、无 CSE、分支/对齐缺失、栈槽不复用、别名分析缺失……
+   其中"常量传播/DCE"和"窥孔"我们在生成器层就能吃；"跨语句寄存器保留"要动 TCC 的 vstack 管理（大工程）。
+
+
 
 
 
