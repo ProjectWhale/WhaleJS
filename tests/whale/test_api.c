@@ -100,8 +100,25 @@ static void check_tcc_backend(void)
     tcc_delete(s);
 }
 
+/* ---- custom token stream driving TinyCC's own parser, no C source involved. */
+extern void *JS_WhaleTokCompileAdd2(const char *tcc_dir);
+
+static void check_ir_direct(void)
+{
+    double (*add2)(double, double) = (double (*)(double, double))JS_WhaleTokCompileAdd2(WHALE_TCC_DIR);
+
+    printf("  [tok] token-stream compile: %s\n", add2 ? "compiled" : "NULL");
+    if (add2) {
+        double r = add2(2.5, 4.0);
+        printf("        result = %.2f (expected 6.50)\n", r);
+        CHECK(r == 6.5);
+    }
+}
+
 int main(void)
 {
+    check_ir_direct();
+
     JSRuntime *rt = JS_NewRuntime();
     JSContext *ctx = rt ? JS_NewContext(rt) : NULL;
     JSWhaleJitStats st;

@@ -898,3 +898,50 @@ static const char *whale_jit_preamble =
 ## 状态
 回归绿、无性能损失：`whale api test: ok`、`fib(30)=832040 15ms`。
 本轮未提交的改动已回退，工作区干净。IR 直出仍停在"机器码正确、调用崩"（<24>/<25>）。
+# <27>: Step 24 —— **突破**：断开 lexer、接自定义 token 流 → IR 直出通了
+SOLVED（通路验证成功）
+
+## 用户的方案是对的，实测通过
+用户指出：**不要手工模仿 TCC 的流程**，而是「**把 token generator 断开，连接自定义的流**」，
+让 TCC 自己的解析器跑；并指出上下文不该成为问题 —— 除了 QuickJS 那几个定义（可以在初始化时
+编译一遍，甚至转换成结构体定义免去解析），**其余一切应该当作空文件**。
+
+## 实现（三处，都很小）
+1. **hook 点**：`src/tcc/tccpp.c:2990` 的 `next_nomacro()` —— 它是"取一个 token、设 `tok`/`tokc`"的
+   核心，`next()`(3529) 只是它外面包了宏展开。在它开头加：
+   ```c
+   if (whale_tok_active) { whale_next_token(); return; }
+   ```
+2. **token 源**（`src/tcc/whale_tcc_iface.c`，与 TCC 同一个 TU）：
+   - `whale_tok_buf[64]` + 长度/游标；`whale_next_token()` 设 `tok`、`tokc`、`tok_flags`；
+   - 标识符用 **`tok_alloc(name, len)->tok`**（必须走这个才能进 token 表）；
+   - 关键字直接用 `tcctok.h` 的枚举（`TOK_DOUBLE`/`TOK_RETURN` 等），标点用自己的字符值。
+3. **驱动**：`tcc_open_bf` → `tccelf_begin_file` → `preprocess_start` → 构造 token → 开 `whale_tok_active`
+   → **`tccgen_compile(s)`** → 关 → 收尾 → `tcc_relocate` → `tcc_get_symbol`。
+
+## 结果（本仓库实测）
+```
+[tok] token-stream compile: compiled
+      result = 6.50 (expected 6.50)
+whale api test: ok
+```
+即：**用 token 流编译出的 `double whale_ir_add(double a, double b){ return a + b; }` 能被调用并返回正确结果。**
+
+## 为什么这条路是对的（对比我前面十几轮的弯路）
+- **上下文问题彻底消失**：`decl()`/`block()`/`gen_function()`/`gen_op()` 全是 TCC 自己跑的，
+  状态由构造保证正确 —— 不再需要手工照抄 `tccgen_compile()` 的初始化、`gen_function()` 的序列，
+  也就不会再遇到"机器码正确但调用崩"那种状态错位。
+- **外部文件依赖彻底消失**：token 里只有内建类型（`double`），**没有任何 `#include`** ——
+  `quickjs.h` 的头文件路径问题、以及"生成 C 源再词法分析"这一整层都没了。
+- 这同时验证了 <26> 的判断：WhaleJS 可以做成**不依赖外部头文件**的库。
+
+## 下一步
+1. **把 JIT 生成器从"拼 C 源码"改成"发 token"**：`whale_jit_gen` 现在往字符串里写 C 文本
+   （`whale_emit`），改成往 `whale_tok_buf` 里写 token；类型落到内建类型上（double/int64），
+   外部函数用 `tcc_add_symbol` 注册 + 自声明原型。**这样整个 JIT 不再需要 C 文本和 include。**
+2. 之后才是循环展开、SIMD（用户提的后续），SIMD 可以在 token 层发内建类型 + 我们注册的
+   向量 helper，或者改 `x86_64-gen.c` 直接发指令。
+
+## 状态
+回归绿、无性能损失：`whale api test: ok`、`fib(30)=832040`。
+（`check_ir_direct` 目前只在测试里跑 token 流这一条路径，不影响原有 JIT。）

@@ -288,3 +288,100 @@ void JS_WhaleIrDumpText(TCCState *s, const char *tag)
         fprintf(stderr, " %02x", ts->data[k]);
     fprintf(stderr, "\n");
 }
+/* ========================================================================
+ * WhaleJS: custom token source
+ *
+ * This is the piece that makes WhaleJS a self-contained library: instead of
+ * handing TinyCC C source to lex (which would force us to include quickjs.h and
+ * carry headers around), the JIT builds a TOKEN stream and TinyCC's own parser
+ * consumes it. Everything after the lexer - decl(), block(), gen_function(),
+ * gen_op() - runs untouched, so all the parser state is correct by construction.
+ * ======================================================================== */
+
+int whale_tok_active;
+static int whale_tok_buf[64];
+static int whale_tok_len;
+static int whale_tok_pos;
+
+static int whale_tok_ident(const char *name)
+{
+    return tok_alloc(name, strlen(name))->tok;
+}
+
+static void whale_tok_push(int t)
+{
+    if (whale_tok_len < (int)(sizeof(whale_tok_buf) / sizeof(whale_tok_buf[0])))
+        whale_tok_buf[whale_tok_len++] = t;
+}
+
+/* called by next_nomacro() in place of the lexer */
+void whale_next_token(void)
+{
+    tok = (whale_tok_pos < whale_tok_len) ? whale_tok_buf[whale_tok_pos++] : TOK_EOF;
+    tokc.i = 0;
+    tokc.d = 0;
+    tok_flags = 0;
+}
+
+/* Build `double whale_ir_add(double a, double b) { return a + b; }` as tokens.
+   Nothing but built-in types appear here, which is the whole point. */
+static void whale_tok_build_add2(void)
+{
+    whale_tok_len = 0;
+    whale_tok_pos = 0;
+    whale_tok_push(TOK_DOUBLE);
+    whale_tok_push(whale_tok_ident("whale_ir_add"));
+    whale_tok_push('(');
+    whale_tok_push(TOK_DOUBLE);
+    whale_tok_push(whale_tok_ident("whale_a"));
+    whale_tok_push(',');
+    whale_tok_push(TOK_DOUBLE);
+    whale_tok_push(whale_tok_ident("whale_b"));
+    whale_tok_push(')');
+    whale_tok_push('{');
+    whale_tok_push(TOK_RETURN);
+    whale_tok_push(whale_tok_ident("whale_a"));
+    whale_tok_push('+');
+    whale_tok_push(whale_tok_ident("whale_b"));
+    whale_tok_push(';');
+    whale_tok_push('}');
+}
+
+/* Compile that function by driving TinyCC's parser with our tokens. */
+void *JS_WhaleTokCompileAdd2(const char *tcc_dir)
+{
+    char lib_dir[1024];
+    TCCState *s;
+    void *fn = NULL;
+
+    snprintf(lib_dir, sizeof(lib_dir), "%s/lib", tcc_dir);
+    s = tcc_new();
+    if (!s)
+        return NULL;
+    tcc_set_lib_path(s, tcc_dir);
+    tcc_add_library_path(s, lib_dir);
+    tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
+
+    /* Need the token table: open the unit the normal way first, then let our
+       stream take over before any real parsing happens. */
+    tcc_open_bf(s, "<whale-tok>", 0);
+    tccelf_begin_file(s);
+    preprocess_start(s, 0);
+    tcc_debug_start(s);
+
+    whale_tok_build_add2();
+    whale_tok_active = 1;
+
+    tccgen_compile(s);          /* the real parser, fed by our tokens */
+    whale_tok_active = 0;
+
+    preprocess_end(s);
+    free_inline_functions(s);
+    sym_pop(&global_stack, NULL, 0);
+    tccelf_end_file(s);
+    tcc_close();
+
+    if (tcc_relocate(s, TCC_RELOCATE_AUTO) >= 0)
+        fn = tcc_get_symbol(s, "whale_ir_add");
+    return fn;
+}
