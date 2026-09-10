@@ -1,0 +1,19 @@
+# 临时数据：第三方源码、下载物、环境记录
+temp/
+
+# 构建产物
+build/
+.xmake/
+*.o
+*.obj
+*.a
+*.lib
+*.exe
+*.dll
+*.pdb
+
+# 编辑器
+.vs/
+.vscode/
+.idea/
+.reasonix/
