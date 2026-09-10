@@ -18243,17 +18243,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     /* WhaleJS: 热点统计（JIT 代码生成接入前先只计数，见 src/whalejs.h） */
     whale_on_call(ctx, b);
 
-    /* WhaleJS: native entry ready -> run it and skip the interpreter loop */
+    /* WhaleJS: native entry ready -> run it. On deopt fall through to the
+       interpreter with the same frame (nothing was written to var_buf). */
     if (b->whale_jit_entry) {
+        int whale_deopt = 0;
         JSValue whale_ret;
         rt->current_stack_frame = sf->prev_frame;
-        whale_ret = ((JSValue (*)(JSContext *, JSValue *, JSValue *))b->whale_jit_entry)
-                        (ctx, arg_buf, var_buf);
-        if (unlikely(sf->var_ref_count != 0))
-            close_var_refs(rt, sf);
-        for (pval = local_buf; pval < stack_buf; pval++)
-            JS_FreeValue(ctx, *pval);
-        return whale_ret;
+        whale_ret = ((JSValue (*)(JSContext *, JSValue *, JSValue *, int *))b->whale_jit_entry)
+                        (ctx, arg_buf, var_buf, &whale_deopt);
+        if (unlikely(whale_deopt)) {
+            b->whale_jit_entry = NULL;   /* give up and interpret this one */
+            b->whale_jit_tried = 1;
+            rt->current_stack_frame = sf;
+        } else {
+            if (unlikely(sf->var_ref_count != 0))
+                close_var_refs(rt, sf);
+            for (pval = local_buf; pval < stack_buf; pval++)
+                JS_FreeValue(ctx, *pval);
+            return whale_ret;
+        }
     }
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
@@ -65000,17 +65008,24 @@ uintptr_t js_std_cmd(int cmd, ...) {
 /* =========================================================================
  * WhaleJS: JIT code generation (TinyCC backend)
  *
- * Two tiers, in this order:
- *   native  - integer fast paths are emitted inline (bit tests + one machine
- *             add), and the JS value stack is promoted to C locals (st[k] -> vk)
- *             so stack traffic never touches memory.
- *   fallback- when the fast path cannot apply, call a helper that reuses the
- *             interpreter's own js_*_slow(), so semantics are identical.
+ * Shape compiled today: functions that are numeric end to end.
+ * A small abstract interpreter walks the bytecode with the type lattice
+ * {UNKNOWN, NUM, BOOL}. When every value reaching an arithmetic op, a local
+ * read, or the return is NUM/BOOL, we emit code that runs the whole function in
+ * the C `double` domain: locals and stack slots become `double` C locals, so the
+ * inner loop is a few machine instructions instead of a JSValue dance.
  *
- * JS is dynamically typed: every value here is still a full JSValue and every
- * arithmetic re-tests tags at run time. Nothing assumes "this is an int"
- * globally - that kind of specialization needs guards plus deoptimization and
- * is a separate step.
+ * Why double for everything numeric: a JS Number IS a double, so `a + b` in the
+ * double domain is already the spec behaviour, including int32 overflow (which
+ * simply produces a non-integral result and gets boxed as a float). No range
+ * checks and no deoptimization for overflow are needed - only for types that are
+ * not numbers at all.
+ *
+ * JS is dynamically typed, so numeric-ness is never assumed - it is guarded:
+ *   - reading an argument checks the tag (int or float64); anything else sets
+ *     *deopt and JS_CallInternal re-runs the function on the interpreter.
+ * Deoptimization is safe to re-run because the compiled subset has no side
+ * effects: no calls, no property access, and var_buf is never written.
  * ========================================================================= */
 
 #include "libtcc.h"
@@ -65022,73 +65037,15 @@ uintptr_t js_std_cmd(int cmd, ...) {
 #define WHALE_JIT_SRC_DIR "src"
 #endif
 
-/* ---- fallback paths: only reached when the native fast path does not apply.
-   Each one reuses the interpreter's implementation, so the behaviour is the
-   same as the corresponding switch branch of JS_CallInternal. ---- */
-
-static int whale_jit_slow_add(JSContext *ctx, JSValue *a, JSValue *b)
-{
-    JSValue tmp[2];
-    tmp[0] = *a;
-    tmp[1] = *b;
-    if (js_add_slow(ctx, tmp))
-        return 0;
-    *a = tmp[0];
-    *b = JS_UNDEFINED;
-    return 1;
-}
-
-static int whale_jit_slow_sub(JSContext *ctx, JSValue *a, JSValue *b)
-{
-    JSValue tmp[2];
-    tmp[0] = *a;
-    tmp[1] = *b;
-    if (js_binary_arith_slow(ctx, tmp, OP_sub))
-        return 0;
-    *a = tmp[0];
-    *b = JS_UNDEFINED;
-    return 1;
-}
-
-static int whale_jit_slow_mul(JSContext *ctx, JSValue *a, JSValue *b)
-{
-    JSValue tmp[2];
-    tmp[0] = *a;
-    tmp[1] = *b;
-    if (js_binary_arith_slow(ctx, tmp, OP_mul))
-        return 0;
-    *a = tmp[0];
-    *b = JS_UNDEFINED;
-    return 1;
-}
-
-static int whale_jit_slow_lt(JSContext *ctx, JSValue *a, JSValue *b)
-{
-    JSValue tmp[2];
-    tmp[0] = *a;
-    tmp[1] = *b;
-    if (js_relational_slow(ctx, tmp, OP_lt))
-        return 0;
-    *a = tmp[0];
-    *b = JS_UNDEFINED;
-    return 1;
-}
-
-static int whale_jit_slow_inc_loc(JSContext *ctx, JSValue *var_buf, int idx)
-{
-    JSValue tmp = js_dup(var_buf[idx]);
-
-    if (js_unary_arith_slow(ctx, &tmp, OP_inc))
-        return 0;
-    JS_FreeValue(ctx, var_buf[idx]);
-    var_buf[idx] = tmp;
-    return 1;
-}
-
-/* ---- C source generator ---- */
-
 #define WHALE_JIT_SRC_MAX 65536
 #define WHALE_JIT_MAX_SLOTS 64
+
+/* type lattice for the specialization pass */
+enum {
+    WHALE_T_UNKNOWN = 0,
+    WHALE_T_NUM = 1,  /* Number: held as double while specialized */
+    WHALE_T_BOOL = 2, /* true / false, usable as 1 / 0 */
+};
 
 static char whale_jit_src[WHALE_JIT_SRC_MAX];
 static size_t whale_jit_src_len;
@@ -65108,107 +65065,85 @@ static void whale_emit(const char *fmt, ...)
         whale_jit_src_len += (size_t)n;
 }
 
-/* All macros are single-line on purpose. `sp` is the run-time slot count; it is
-   only ever read by the `exc:` cleanup, so keeping it in sync costs one mov. */
-static const char *whale_jit_preamble =
-    "#include \"quickjs.h\"\n"
-    "extern int whale_jit_slow_add(JSContext *ctx, JSValue *a, JSValue *b);\n"
-    "extern int whale_jit_slow_sub(JSContext *ctx, JSValue *a, JSValue *b);\n"
-    "extern int whale_jit_slow_mul(JSContext *ctx, JSValue *a, JSValue *b);\n"
-    "extern int whale_jit_slow_lt(JSContext *ctx, JSValue *a, JSValue *b);\n"
-    "extern int whale_jit_slow_inc_loc(JSContext *ctx, JSValue *var_buf, int idx);\n"
-    "#define WHALE_DUP(v) ((JS_VALUE_HAS_REF_COUNT(v)) ? JS_DupValue(ctx, (v)) : (v))\n"
-    "#define WHALE_FREE(v) do { if (JS_VALUE_HAS_REF_COUNT(v)) JS_FreeValue(ctx, (v)); } while (0)\n"
-    "#define WHALE_PUSH_INT(d, k) do { d = JS_MKVAL(JS_TAG_INT, k); sp++; } while (0)\n"
-    "#define WHALE_GET_LOC(d, i) do { JSValue _v = var_buf[i]; d = WHALE_DUP(_v); sp++; } while (0)\n"
-    "#define WHALE_GET_ARG(d, i) do { JSValue _v = args[i]; d = WHALE_DUP(_v); sp++; } while (0)\n"
-    "#define WHALE_PUT_LOC(i, s) do { JSValue _o = var_buf[i]; var_buf[i] = (s); if (JS_VALUE_HAS_REF_COUNT(_o)) JS_FreeValue(ctx, _o); sp--; } while (0)\n"
-    "#define WHALE_DROP(s) do { WHALE_FREE(s); sp--; } while (0)\n"
-    "#define WHALE_DUP_TOP(d, s) do { d = WHALE_DUP(s); sp++; } while (0)\n"
-    "#define WHALE_ADD(a, b) do { if (JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT) { long long _v = (long long)JS_VALUE_GET_INT(a) + (long long)JS_VALUE_GET_INT(b); a = (_v >= -2147483647LL - 1 && _v <= 2147483647LL) ? JS_MKVAL(JS_TAG_INT, (int)_v) : JS_NewFloat64(ctx, (double)_v); sp--; } else if (!whale_jit_slow_add(ctx, &(a), &(b))) goto exc; else sp--; } while (0)\n"
-    "#define WHALE_SUB(a, b) do { if (JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT) { long long _v = (long long)JS_VALUE_GET_INT(a) - (long long)JS_VALUE_GET_INT(b); a = (_v >= -2147483647LL - 1 && _v <= 2147483647LL) ? JS_MKVAL(JS_TAG_INT, (int)_v) : JS_NewFloat64(ctx, (double)_v); sp--; } else if (!whale_jit_slow_sub(ctx, &(a), &(b))) goto exc; else sp--; } while (0)\n"
-    "#define WHALE_MUL(a, b) do { if (JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT) { long long _v = (long long)JS_VALUE_GET_INT(a) * (long long)JS_VALUE_GET_INT(b); a = (_v >= -2147483647LL - 1 && _v <= 2147483647LL) ? JS_MKVAL(JS_TAG_INT, (int)_v) : JS_NewFloat64(ctx, (double)_v); sp--; } else if (!whale_jit_slow_mul(ctx, &(a), &(b))) goto exc; else sp--; } while (0)\n"
-    "#define WHALE_LT(a, b) do { if (JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT) { a = JS_NewBool(ctx, JS_VALUE_GET_INT(a) < JS_VALUE_GET_INT(b)); sp--; } else if (!whale_jit_slow_lt(ctx, &(a), &(b))) goto exc; else sp--; } while (0)\n"
-    "#define WHALE_IF_FALSE(s, t) do { int _c; if (JS_VALUE_GET_TAG(s) == JS_TAG_INT) { _c = (JS_VALUE_GET_INT(s) != 0); } else { _c = JS_ToBool(ctx, (s)); WHALE_FREE(s); } sp--; if (_c < 0) goto exc; if (!_c) goto t; } while (0)\n"
-    "#define WHALE_INC_LOC(i) do { JSValue _v = var_buf[i]; if (JS_VALUE_GET_TAG(_v) == JS_TAG_INT && JS_VALUE_GET_INT(_v) != 2147483647) var_buf[i] = JS_MKVAL(JS_TAG_INT, JS_VALUE_GET_INT(_v) + 1); else if (!whale_jit_slow_inc_loc(ctx, var_buf, i)) goto exc; } while (0)\n";
+static const char *whale_jit_preamble = "#include \"quickjs.h\"\n";
 
-/* Scan and emit. Returns 0 when the function is not a JIT candidate. */
+static int whale_type_is_num(int t)
+{
+    return t == WHALE_T_NUM || t == WHALE_T_BOOL;
+}
+
+/* Generate + type-check in one pass. Returns 0 when the function is not a
+   candidate (unsupported opcode, unknown type, inconsistent jump target). */
 static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
 {
     const uint8_t *pc = b->byte_code_buf;
     int len = b->byte_code_len;
-    int pos, i, sp, ret = 0, stack_size = b->stack_size;
-    uint8_t *targets = NULL;
-    int32_t *target_sp = NULL;
-    uint8_t *target_sp_known = NULL;
+    int var_count = b->var_count;
+    int stack_size = b->stack_size;
+    int arg_count = b->arg_count;
+    int state_len = var_count + stack_size + 1; /* +1: sp */
+    int pos, i, sp, ret = 0;
+    uint8_t *targets = NULL, *seen = NULL, *snap = NULL, *cur = NULL, *args_used = NULL;
 
     if (b->func_kind != JS_FUNC_NORMAL)
         return 0;
     if (stack_size <= 0 || stack_size > WHALE_JIT_MAX_SLOTS)
         return 0;
+    /* a closure capturing our locals would make promotion to C locals wrong */
+    if (b->var_ref_count != 0)
+        return 0;
 
     targets = js_mallocz(ctx, len + 1);
-    target_sp = js_mallocz(ctx, sizeof(int32_t) * (len + 1));
-    target_sp_known = js_mallocz(ctx, len + 1);
-    if (!targets || !target_sp || !target_sp_known)
-        goto fail;
+    seen = js_mallocz(ctx, len + 1);
+    snap = js_mallocz(ctx, (size_t)(len + 1) * state_len);
+    cur = js_mallocz(ctx, state_len);
+    args_used = js_mallocz(ctx, arg_count > 0 ? arg_count : 1);
+    if (!targets || !seen || !snap || !cur || !args_used)
+        goto out;
 
-    /* pass 1: jump targets + reject anything we cannot lower */
+    /* pass 1: jump targets + which arguments are read */
     for (pos = 0; pos < len; ) {
         int op = pc[pos];
         int sz = short_opcode_info(op).size;
 
         if (sz <= 0 || pos + sz > len)
-            goto fail;
-        switch (op) {
-        case OP_push_minus1: case OP_push_0: case OP_push_1: case OP_push_2:
-        case OP_push_3: case OP_push_4: case OP_push_5: case OP_push_6:
-        case OP_push_7:
-        case OP_push_i8: case OP_push_i16: case OP_push_i32:
-        case OP_undefined: case OP_null: case OP_push_true: case OP_push_false:
-        case OP_get_loc0: case OP_get_loc1: case OP_get_loc2: case OP_get_loc3:
-        case OP_get_loc8: case OP_get_loc:
-        case OP_put_loc0: case OP_put_loc1: case OP_put_loc2: case OP_put_loc3:
-        case OP_put_loc8: case OP_put_loc:
-        case OP_get_loc0_loc1:
-        case OP_get_arg0: case OP_get_arg1: case OP_get_arg2: case OP_get_arg3:
-        case OP_get_arg:
-        case OP_lt: case OP_add: case OP_sub: case OP_mul:
-        case OP_inc_loc: case OP_drop: case OP_dup:
-        case OP_return: case OP_return_undef:
-            break;
-        case OP_goto8:
-        case OP_if_false8:
+            goto out;
+        if (op == OP_goto8 || op == OP_if_false8) {
             targets[pos + 1 + (int8_t)pc[pos + 1]] = 1;
-            break;
-        default:
-            goto fail;
+        } else if (op >= OP_get_arg0 && op < OP_get_arg0 + 4) {
+            args_used[op - OP_get_arg0] = 1;
+        } else if (op == OP_get_arg) {
+            int a = (int)get_u16(pc + pos + 1);
+            if (a >= 0 && a < arg_count)
+                args_used[a] = 1;
         }
         pos += sz;
     }
 
-    /* pass 2: emit, tracking the compile-time stack depth so slot accessors
-       become plain C locals. A jump target reached with a different depth means
-       the bytecode does something we did not model - bail out. */
+    /* pass 2: emit + abstract-interpret */
     whale_jit_src_len = 0;
     whale_emit("%s", whale_jit_preamble);
-    whale_emit("JSValue whale_jit_fn(JSContext *ctx, JSValue *args, JSValue *var_buf)\n{\n");
+    whale_emit("JSValue whale_jit_fn(JSContext *ctx, JSValue *args, JSValue *var_buf, int *deopt)\n{\n");
+    whale_emit("    (void)ctx; (void)var_buf; (void)args; (void)deopt;\n");
+    for (i = 0; i < var_count; i++)
+        whale_emit("    double L%d = 0;\n", i);
     for (i = 0; i < stack_size; i++)
-        whale_emit("    JSValue v%d = JS_UNDEFINED;\n", i);
-    whale_emit("    int sp = 0;\n");
+        whale_emit("    double v%d = 0;\n", i);
 
     sp = 0;
     for (pos = 0; pos < len; ) {
         int op = pc[pos];
         int sz = short_opcode_info(op).size;
+        int ta, tb, t;
 
+        cur[state_len - 1] = (uint8_t)sp;
         if (targets[pos]) {
-            if (target_sp_known[pos]) {
-                if (target_sp[pos] != sp)
-                    goto fail;
+            if (seen[pos]) {
+                if (memcmp(snap + (size_t)pos * state_len, cur, state_len) != 0)
+                    goto out; /* reached with a different slot/type state */
             } else {
-                target_sp_known[pos] = 1;
-                target_sp[pos] = sp;
+                seen[pos] = 1;
+                memcpy(snap + (size_t)pos * state_len, cur, state_len);
             }
             whale_emit("  L%d:\n", pos);
         }
@@ -65217,144 +65152,198 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
         case OP_push_minus1:
         case OP_push_0: case OP_push_1: case OP_push_2: case OP_push_3:
         case OP_push_4: case OP_push_5: case OP_push_6: case OP_push_7:
-            whale_emit("    WHALE_PUSH_INT(v%d, %d);\n", sp, op - OP_push_0 <= 7 && op >= OP_push_0 ? op - OP_push_0 : -1);
+            whale_emit("    v%d = %d;\n", sp, op == OP_push_minus1 ? -1 : op - OP_push_0);
+            cur[var_count + sp] = WHALE_T_NUM;
             sp++;
             break;
         case OP_push_i8:
-            whale_emit("    WHALE_PUSH_INT(v%d, %d);\n", sp, (int)(int8_t)pc[pos + 1]);
+            whale_emit("    v%d = %d;\n", sp, (int)(int8_t)pc[pos + 1]);
+            cur[var_count + sp] = WHALE_T_NUM;
             sp++;
             break;
         case OP_push_i16:
-            whale_emit("    WHALE_PUSH_INT(v%d, %d);\n", sp, (int)(int16_t)get_u16(pc + pos + 1));
+            whale_emit("    v%d = %d;\n", sp, (int)(int16_t)get_u16(pc + pos + 1));
+            cur[var_count + sp] = WHALE_T_NUM;
             sp++;
             break;
         case OP_push_i32:
-            whale_emit("    WHALE_PUSH_INT(v%d, %d);\n", sp, (int)(int32_t)get_u32(pc + pos + 1));
+            whale_emit("    v%d = %d;\n", sp, (int)(int32_t)get_u32(pc + pos + 1));
+            cur[var_count + sp] = WHALE_T_NUM;
             sp++;
             break;
-        case OP_undefined:
-            whale_emit("    v%d = JS_UNDEFINED; sp++;\n", sp);
-            sp++;
-            break;
-        case OP_null:
-            whale_emit("    v%d = JS_NULL; sp++;\n", sp);
-            sp++;
+        case OP_push_const:
+        case OP_push_const8:
+            {
+                int idx = (op == OP_push_const8) ? (int)pc[pos + 1] : (int)get_u32(pc + pos + 1);
+                JSValue c;
+                int ct;
+
+                if (idx < 0 || idx >= b->cpool_count)
+                    goto out;
+                c = b->cpool[idx];
+                ct = JS_VALUE_GET_TAG(c);
+                if (ct == JS_TAG_INT) {
+                    whale_emit("    v%d = %d;\n", sp, (int)JS_VALUE_GET_INT(c));
+                    cur[var_count + sp] = WHALE_T_NUM;
+                    sp++;
+                } else if (JS_TAG_IS_FLOAT64(ct)) {
+                    whale_emit("    v%d = %.17g;\n", sp, JS_VALUE_GET_FLOAT64(c));
+                    cur[var_count + sp] = WHALE_T_NUM;
+                    sp++;
+                } else {
+                    goto out; /* strings / bigints / objects: not our shape */
+                }
+            }
             break;
         case OP_push_true:
-            whale_emit("    v%d = JS_TRUE; sp++;\n", sp);
+            whale_emit("    v%d = 1;\n", sp);
+            cur[var_count + sp] = WHALE_T_BOOL;
             sp++;
             break;
         case OP_push_false:
-            whale_emit("    v%d = JS_FALSE; sp++;\n", sp);
+            whale_emit("    v%d = 0;\n", sp);
+            cur[var_count + sp] = WHALE_T_BOOL;
             sp++;
             break;
 
         case OP_get_loc0: case OP_get_loc1: case OP_get_loc2: case OP_get_loc3:
-            whale_emit("    WHALE_GET_LOC(v%d, %d);\n", sp, op - OP_get_loc0);
-            sp++;
-            break;
         case OP_get_loc8:
-            whale_emit("    WHALE_GET_LOC(v%d, %d);\n", sp, (int)pc[pos + 1]);
-            sp++;
-            break;
         case OP_get_loc:
-            whale_emit("    WHALE_GET_LOC(v%d, %d);\n", sp, (int)get_u16(pc + pos + 1));
-            sp++;
+            {
+                int idx = (op == OP_get_loc8) ? (int)pc[pos + 1] :
+                          (op == OP_get_loc) ? (int)get_u16(pc + pos + 1) :
+                          op - OP_get_loc0;
+                t = (idx >= 0 && idx < var_count) ? cur[idx] : WHALE_T_UNKNOWN;
+                if (t == WHALE_T_UNKNOWN)
+                    goto out;
+                whale_emit("    v%d = L%d;\n", sp, idx);
+                cur[var_count + sp] = (uint8_t)t;
+                sp++;
+            }
             break;
         case OP_put_loc0: case OP_put_loc1: case OP_put_loc2: case OP_put_loc3:
-            whale_emit("    WHALE_PUT_LOC(%d, v%d);\n", op - OP_put_loc0, sp - 1);
-            sp--;
-            break;
         case OP_put_loc8:
-            whale_emit("    WHALE_PUT_LOC(%d, v%d);\n", (int)pc[pos + 1], sp - 1);
-            sp--;
-            break;
         case OP_put_loc:
-            whale_emit("    WHALE_PUT_LOC(%d, v%d);\n", (int)get_u16(pc + pos + 1), sp - 1);
-            sp--;
+            {
+                int idx = (op == OP_put_loc8) ? (int)pc[pos + 1] :
+                          (op == OP_put_loc) ? (int)get_u16(pc + pos + 1) :
+                          op - OP_put_loc0;
+                t = cur[var_count + sp - 1];
+                if (t == WHALE_T_UNKNOWN || idx < 0 || idx >= var_count)
+                    goto out;
+                whale_emit("    L%d = v%d;\n", idx, sp - 1);
+                cur[idx] = (uint8_t)t;
+                sp--;
+            }
             break;
         case OP_get_loc0_loc1:
-            whale_emit("    WHALE_GET_LOC(v%d, 0); WHALE_GET_LOC(v%d, 1);\n", sp, sp + 1);
+            if (var_count < 2 || cur[0] == WHALE_T_UNKNOWN || cur[1] == WHALE_T_UNKNOWN)
+                goto out;
+            whale_emit("    v%d = L0; v%d = L1;\n", sp, sp + 1);
+            cur[var_count + sp] = cur[0];
+            cur[var_count + sp + 1] = cur[1];
             sp += 2;
             break;
         case OP_get_arg0: case OP_get_arg1: case OP_get_arg2: case OP_get_arg3:
-            whale_emit("    WHALE_GET_ARG(v%d, %d);\n", sp, op - OP_get_arg0);
-            sp++;
-            break;
         case OP_get_arg:
-            whale_emit("    WHALE_GET_ARG(v%d, %d);\n", sp, (int)get_u16(pc + pos + 1));
-            sp++;
+            {
+                int idx = (op == OP_get_arg) ? (int)get_u16(pc + pos + 1) : op - OP_get_arg0;
+
+                if (idx < 0 || idx >= arg_count)
+                    goto out;
+                /* guard: only numbers may enter the specialized code */
+                whale_emit("    { JSValue _a = args[%d]; int _t = JS_VALUE_GET_TAG(_a); if (_t == JS_TAG_INT) v%d = (double)JS_VALUE_GET_INT(_a); else if (JS_TAG_IS_FLOAT64(_t)) v%d = (double)JS_VALUE_GET_FLOAT64(_a); else { *deopt = 1; return JS_EXCEPTION; } }\n",
+                           idx, sp, sp);
+                cur[var_count + sp] = WHALE_T_NUM;
+                sp++;
+            }
             break;
 
-        case OP_add:
-            whale_emit("    WHALE_ADD(v%d, v%d);\n", sp - 2, sp - 1);
-            sp--;
-            break;
-        case OP_sub:
-            whale_emit("    WHALE_SUB(v%d, v%d);\n", sp - 2, sp - 1);
-            sp--;
-            break;
-        case OP_mul:
-            whale_emit("    WHALE_MUL(v%d, v%d);\n", sp - 2, sp - 1);
+        case OP_add: case OP_sub: case OP_mul:
+            ta = cur[var_count + sp - 2];
+            tb = cur[var_count + sp - 1];
+            if (!whale_type_is_num(ta) || !whale_type_is_num(tb))
+                goto out;
+            whale_emit("    v%d = v%d %c v%d;\n", sp - 2, sp - 2,
+                       op == OP_add ? '+' : op == OP_sub ? '-' : '*', sp - 1);
+            cur[var_count + sp - 2] = WHALE_T_NUM;
             sp--;
             break;
         case OP_lt:
-            whale_emit("    WHALE_LT(v%d, v%d);\n", sp - 2, sp - 1);
+            ta = cur[var_count + sp - 2];
+            tb = cur[var_count + sp - 1];
+            if (!whale_type_is_num(ta) || !whale_type_is_num(tb))
+                goto out;
+            whale_emit("    v%d = (v%d < v%d) ? 1 : 0;\n", sp - 2, sp - 2, sp - 1);
+            cur[var_count + sp - 2] = WHALE_T_BOOL;
             sp--;
             break;
         case OP_inc_loc:
-            whale_emit("    WHALE_INC_LOC(%d);\n", (int)pc[pos + 1]);
+            {
+                int idx = (int)pc[pos + 1];
+                if (idx < 0 || idx >= var_count || !whale_type_is_num(cur[idx]))
+                    goto out;
+                whale_emit("    L%d = L%d + 1;\n", idx, idx);
+                cur[idx] = WHALE_T_NUM;
+            }
             break;
         case OP_drop:
-            whale_emit("    WHALE_DROP(v%d);\n", sp - 1);
+            if (sp <= 0)
+                goto out;
             sp--;
             break;
         case OP_dup:
-            whale_emit("    WHALE_DUP_TOP(v%d, v%d);\n", sp, sp - 1);
+            if (sp <= 0)
+                goto out;
+            whale_emit("    v%d = v%d;\n", sp, sp - 1);
+            cur[var_count + sp] = cur[var_count + sp - 1];
             sp++;
             break;
 
         case OP_if_false8:
-            whale_emit("    WHALE_IF_FALSE(v%d, L%d);\n", sp - 1,
-                       pos + 1 + (int8_t)pc[pos + 1]);
+            t = cur[var_count + sp - 1];
+            if (!whale_type_is_num(t))
+                goto out;
+            whale_emit("    if (v%d == 0) goto L%d;\n", sp - 1, pos + 1 + (int8_t)pc[pos + 1]);
             sp--;
             break;
         case OP_goto8:
             whale_emit("    goto L%d;\n", pos + 1 + (int8_t)pc[pos + 1]);
             break;
         case OP_return:
-            whale_emit("    return v%d;\n", sp - 1);
-            break;
-        case OP_return_undef:
-            whale_emit("    return JS_UNDEFINED;\n");
+            t = cur[var_count + sp - 1];
+            if (t == WHALE_T_BOOL) {
+                whale_emit("    return JS_NewBool(ctx, v%d != 0);\n", sp - 1);
+            } else if (t == WHALE_T_NUM) {
+                whale_emit("    { double _d = v%d; if (_d >= -2147483648.0 && _d <= 2147483647.0) { int _i = (int)_d; if ((double)_i == _d) return JS_MKVAL(JS_TAG_INT, _i); } return JS_NewFloat64(ctx, _d); }\n", sp - 1);
+            } else {
+                goto out;
+            }
             break;
         default:
-            goto fail;
+            goto out; /* anything else: keep interpreting */
         }
         pos += sz;
     }
+    /* falling off the end would return undefined - not our shape */
+    goto out;
 
-    whale_emit("    return JS_UNDEFINED;\n");
-    whale_emit("  exc:\n");
-    whale_emit("    switch (sp) {\n");
-    for (i = stack_size; i >= 1; i--)
-        whale_emit("    case %d: WHALE_FREE(v%d);\n", i, i - 1);
-    whale_emit("    default: break;\n");
-    whale_emit("    }\n");
-    whale_emit("    return JS_EXCEPTION;\n");
-    whale_emit("}\n");
     ret = 1;
-  fail:
+  out:
     if (targets)
         js_free(ctx, targets);
-    if (target_sp)
-        js_free(ctx, target_sp);
-    if (target_sp_known)
-        js_free(ctx, target_sp_known);
+    if (seen)
+        js_free(ctx, seen);
+    if (snap)
+        js_free(ctx, snap);
+    if (cur)
+        js_free(ctx, cur);
+    if (args_used)
+        js_free(ctx, args_used);
     return ret;
 }
 
-/* Compile and attach to b. Returns 1 when b->whale_jit_entry is usable. */
+/* Compile the emitted source with TCC and attach the entry to b. */
 static int whale_jit_compile(JSContext *ctx, JSFunctionBytecode *b)
 {
     TCCState *s;
@@ -65373,15 +65362,7 @@ static int whale_jit_compile(JSContext *ctx, JSFunctionBytecode *b)
     tcc_add_include_path(s, WHALE_JIT_SRC_DIR);
     tcc_add_library_path(s, WHALE_JIT_TCC_DIR "/lib");
     tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
-
-    tcc_add_symbol(s, "whale_jit_slow_add", (void *)whale_jit_slow_add);
-    tcc_add_symbol(s, "whale_jit_slow_sub", (void *)whale_jit_slow_sub);
-    tcc_add_symbol(s, "whale_jit_slow_mul", (void *)whale_jit_slow_mul);
-    tcc_add_symbol(s, "whale_jit_slow_lt", (void *)whale_jit_slow_lt);
-    tcc_add_symbol(s, "whale_jit_slow_inc_loc", (void *)whale_jit_slow_inc_loc);
-    tcc_add_symbol(s, "JS_DupValue", (void *)JS_DupValue);
-    tcc_add_symbol(s, "JS_FreeValue", (void *)JS_FreeValue);
-    tcc_add_symbol(s, "JS_ToBool", (void *)JS_ToBool);
+    tcc_add_symbol(s, "JS_NewFloat64", (void *)JS_NewFloat64);
 
     if (tcc_compile_string(s, whale_jit_src) < 0)
         goto fail;
@@ -65393,9 +65374,8 @@ static int whale_jit_compile(JSContext *ctx, JSFunctionBytecode *b)
 
     b->whale_jit_entry = fn;
     b->whale_jit_tcc = s;
-    /* ponytail: the TCCState (which owns the machine code) is not freed when
-       the bytecode goes away; one leaks per JIT-ed function until the cache
-       strategy lands. */
+    /* ponytail: the TCCState (owning the machine code) is not freed with the
+       bytecode; one leaks per JIT-ed function until the cache work lands. */
     ok = 1;
   fail:
     if (!ok)
