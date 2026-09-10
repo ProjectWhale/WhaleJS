@@ -852,3 +852,49 @@ PARTIAL
 ## 状态
 回归绿、无性能损失：`whale api test: ok`、`fib(30)=832040 14ms`。
 IR 直出仍是"机器码正确但调用崩"。`JS_WhaleIrDumpText` 留在 iface 里备用。
+# <26>: Step 23 —— 外部文件依赖已证明**可以消掉**（这次真的看到了）；方向定为 AST 优先
+PARTIAL（可行性已验证，实现被打断）
+
+## 用户指出的结构性矛盾（这是关键判断）
+C 编译路径的致命问题不是性能，而是**外部文件依赖**：生成的 C 代码引用 `JSValue`，就必须
+`#include "quickjs.h"` —— **这使 WhaleJS 不能成为一个干净的库**（要带着头文件才能 JIT）。
+用户给的方案：**不要手工模仿 TCC 的流程**，而是 **hook / 手写简易协程覆盖原本 codegen 的输入**
+—— 直接从源头输入，**优先直接输入 AST，退而求其次才是 token 流**；并明确"TCC 不需要更新，
+做侵入性更改完全没有问题"。
+
+## 本轮实测：依赖确实可以去掉（重要）
+外部依赖的全部来源就是 `src/whale_jit.c:172` 的 preamble 第一行：
+```c
+static const char *whale_jit_preamble =
+    "#include \"quickjs.h\"\n"      ← 就这一行
+    ...
+```
+把它换成内联声明后：
+```c
+"typedef unsigned long long JSValue;\n"      /* 64 位下 JSValue 就是 8 字节按值传递，ABI 一致 */
+"typedef struct JSContext JSContext;\n"      /* 不透明指针 */
+"#define JS_EXCEPTION ((JSValue)6 << 32)\n"  /* JS_TAG_EXCEPTION=6, JS_MKVAL 在 64 位是 tag<<32 */
+```
+并**删掉 `tcc_add_include_path(s, WHALE_JIT_SRC_DIR)`** —— 结果 **JIT 在没有设置任何 include 路径的
+情况下跑通了**：`fib(32)=2178309`。也就是说 **<16> 里"`.h` 路径问题从根上消失"不再是推测，
+是实测过的**。唯一缺的是生成代码用到的 quickjs 常量/原型，需要逐个内联。
+
+## 本轮为什么回退了
+补常量时我一次性塞进 `JS_UNDEFINED`/`JS_NULL` 两个 `#define`，结果 `fibi(30)` 算错
+（`v == 832040.0` 断言失败）。原因未查明（很可能是宏与生成代码里的同名标识符冲突）。
+已 `git checkout` 回退，**回归恢复绿**。下次要**一次只内联一个符号**，并单独跑
+`fib`/`fibi` 两个用例验证。
+
+## 下一步（按用户的优先级）
+1. **AST 直出优先**：TCC 的 codegen（`gen_op`/`gv`/`gfunc_*`）本来就是"AST 消费者"，我们构造
+   表达式直接喂它 —— 我一直在做的就是这个，卡点是**解析期上下文不完整**。
+   要继续的话，重点排查 `tccgen_compile()`(tccgen.c:235) 与 `gen_function()`(7054) 之外、
+   由 `block()`/`stmt()` 建立的那些状态（`define_stack`/`label`/`local_scope` 等）。
+2. **退路 token 流**：hook `tccpp` 的 `next()` 或直接驱动 `tccgen` 的 token 接口，
+   让 TCC 自己走完整流程（状态永远正确），我们只提供 token —— 这条路对"状态正确性"最稳。
+3. 顺带：**把 preamble 的依赖彻底消掉**（按上面"一次一个符号"的办法补完），
+   这一步和 1/2 独立，可以随时做，收益是整个库不再需要外部头文件。
+
+## 状态
+回归绿、无性能损失：`whale api test: ok`、`fib(30)=832040 15ms`。
+本轮未提交的改动已回退，工作区干净。IR 直出仍停在"机器码正确、调用崩"（<24>/<25>）。
