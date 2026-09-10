@@ -125,6 +125,12 @@ static size_t whale_jit_src_len;
  * keywords are compile-time constants here (TOK_DOUBLE, TOK_RETURN, ...), so
  * nothing can be mistaken for an identifier or collide with a TinyCC keyword.
  * ---------------------------------------------------------------------- */
+/* wk = keyword (JS_WK_*), wt = punctuation / single-char operator */
+static void wk(int w)
+{
+    JS_WhaleTokKw(w);
+}
+
 static void wt(int t)
 {
     JS_WhaleTokChar(t);          /* punctuation / single-character operators */
@@ -237,54 +243,52 @@ static const char *whale_binop_c(int op, int *is_cmp)
 
 /* load-like opcode -> C expression (identifier or literal), plus its type.
    Returns 0 if the opcode at that position is not a simple load. */
-static int whale_load_expr(const JSWhaleFuncInfo *info, const uint8_t *pc, int pos, const uint8_t *cur, int var_count,
-                           const uint8_t *lo_c, const double *lo_cv,
-                           char *out, size_t out_size,
-                           int *len_out, int *type_out, int *const_out, double *cval_out)
+/* A load-like opcode, resolved. The emitter needs two steps because the
+   peepholes must look at two loads before deciding what to emit, and tokens
+   cannot be pushed speculatively. */
+enum {
+    WLD_SLOT = 0,  /* local: L<idx> */
+    WLD_ARG = 1,   /* argument: A<idx> */
+    WLD_INT = 2,   /* integer constant in cval */
+    WLD_REAL = 3,  /* floating constant in cval */
+};
+
+/* Decide what this load means. Returns 0 if it is not a simple load. */
+static int whale_load_analyze(const JSWhaleFuncInfo *info, const uint8_t *pc, int pos, const uint8_t *cur,
+                              int var_count, const uint8_t *lo_c, const double *lo_cv,
+                              int *len_out, int *type_out, int *kind_out, int *idx_out, double *cval_out)
 {
     int op = pc[pos];
 
     *len_out = whale_op_size_of(op);
     *type_out = WHALE_T_NUM;
-    *const_out = 0;
+    *kind_out = WLD_INT;
+    *idx_out = 0;
     *cval_out = 0;
     switch (op) {
     case OP_push_minus1:
-        snprintf(out, out_size, "-1");
-        *const_out = 1;
         *cval_out = -1;
         return 1;
     case OP_push_0: case OP_push_1: case OP_push_2: case OP_push_3:
     case OP_push_4: case OP_push_5: case OP_push_6: case OP_push_7:
-        snprintf(out, out_size, "%d", op - OP_push_0);
-        *const_out = 1;
         *cval_out = (double)(op - OP_push_0);
         return 1;
     case OP_push_i8:
-        snprintf(out, out_size, "%d", (int)(int8_t)pc[pos + 1]);
-        *const_out = 1;
         *cval_out = (double)(int)(int8_t)pc[pos + 1];
         return 1;
     case OP_push_i16:
-        snprintf(out, out_size, "%d", (int)(int16_t)whale_get_u16(pc + pos + 1));
-        *const_out = 1;
         *cval_out = (double)(int)(int16_t)whale_get_u16(pc + pos + 1);
         return 1;
     case OP_push_i32:
-        snprintf(out, out_size, "%d", (int)(int32_t)whale_get_u32(pc + pos + 1));
-        *const_out = 1;
         *cval_out = (double)(int)(int32_t)whale_get_u32(pc + pos + 1);
         return 1;
     case OP_push_true:
-        snprintf(out, out_size, "1");
         *type_out = WHALE_T_BOOL;
-        *const_out = 1;
         *cval_out = 1;
         return 1;
     case OP_push_false:
-        snprintf(out, out_size, "0");
         *type_out = WHALE_T_BOOL;
-        *const_out = 1;
+        *cval_out = 0;
         return 1;
     case OP_get_loc0: case OP_get_loc1: case OP_get_loc2: case OP_get_loc3:
     case OP_get_loc8:
@@ -298,14 +302,14 @@ static int whale_load_expr(const JSWhaleFuncInfo *info, const uint8_t *pc, int p
             if (tt == WHALE_T_UNKNOWN)
                 return 0;
             *type_out = tt;
-            /* constant propagation: a local that is written exactly once with a
+            /* constant propagation: a local written exactly once with a
                compile-time constant is that constant everywhere afterwards */
             if (idx >= 0 && idx < var_count && lo_c && lo_c[idx]) {
-                snprintf(out, out_size, "%.17g", lo_cv[idx]);
-                *const_out = 1;
+                *kind_out = WLD_REAL;
                 *cval_out = lo_cv[idx];
             } else {
-                snprintf(out, out_size, "L%d", idx);
+                *kind_out = WLD_SLOT;
+                *idx_out = idx;
             }
             return 1;
         }
@@ -321,14 +325,10 @@ static int whale_load_expr(const JSWhaleFuncInfo *info, const uint8_t *pc, int p
             c = info->cpool[idx];
             ct = JS_VALUE_GET_TAG(c);
             if (ct == JS_TAG_INT) {
-                snprintf(out, out_size, "%d", (int)JS_VALUE_GET_INT(c));
-                *const_out = 1;
                 *cval_out = (double)JS_VALUE_GET_INT(c);
                 return 1;
             }
             if (JS_TAG_IS_FLOAT64(ct)) {
-                snprintf(out, out_size, "%.17g", JS_VALUE_GET_FLOAT64(c));
-                *const_out = 1;
                 *cval_out = JS_VALUE_GET_FLOAT64(c);
                 return 1;
             }
@@ -336,13 +336,25 @@ static int whale_load_expr(const JSWhaleFuncInfo *info, const uint8_t *pc, int p
         }
     case OP_get_arg0: case OP_get_arg1: case OP_get_arg2: case OP_get_arg3:
     case OP_get_arg:
-        snprintf(out, out_size, "A%d",
-                 (op == OP_get_arg) ? (int)whale_get_u16(pc + pos + 1) : op - OP_get_arg0);
+        *kind_out = WLD_ARG;
+        *idx_out = (op == OP_get_arg) ? (int)whale_get_u16(pc + pos + 1) : op - OP_get_arg0;
         return 1;
     default:
         return 0;
     }
 }
+
+/* push the resolved load as tokens */
+static void whale_load_emit(int kind, int idx, double cval)
+{
+    switch (kind) {
+    case WLD_SLOT: wt_slot("L", idx); break;
+    case WLD_ARG:  wt_slot("A", idx); break;
+    case WLD_INT:  wt_int((int)cval); break;
+    default:       wt_num(cval); break;
+    }
+}
+
 /* Generate + type-check in one pass. Returns 0 when the function is not a
    candidate (unsupported opcode, unknown type, inconsistent jump target). */
 static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
@@ -431,21 +443,50 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         pos += sz;
     }
 
-    /* pass 2: emit + abstract-interpret */
-    whale_jit_src_len = 0;
-    whale_emit("%s", whale_jit_preamble);
+    /* pass 2: emit tokens. Nothing here builds text - the generator pushes
+       tokens into TinyCC's parser directly, so there is no lexer and no
+       keyword table, and keywords are compile-time constants. */
+
+    /* preamble: types only (JSValue is 8 bytes by value, ABI-identical to a
+       quickjs JSValue), the one extern constant, and the entry points we call.
+       No #include, so the compile needs no file on disk. */
+    wk(JS_WK_TYPEDEF); wk(JS_WK_UNSIGNED); wk(JS_WK_LONG); wk(JS_WK_LONG); wt_id("JSValue"); wt(';');
+    wk(JS_WK_TYPEDEF); wk(JS_WK_VOID); wt_id("JSContext"); wt(';');
+    wt(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_EXCEPTION"); wt(';');
+    wt(JS_WK_EXTERN); wt_id("JSContext"); wt('*'); wt_id("JS_WhaleVarRefIsSelf"); wt('(');
+        wt_id("JSContext"); wt('*'); wt_id("ctx"); wt(','); wt_id("void"); wt('*'); wt('*');
+        wt_id("var_refs"); wt(','); wt(JS_WK_INT); wt_id("idx"); wt(',');
+        wt_id("JSValue"); wt_id("self"); wt(')'); wt(';');
+    wt(JS_WK_EXTERN); wt_id("JSValue"); wt_id("whale_jit_box_num"); wt('(');
+        wt_id("JSContext"); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_DOUBLE); wt_id("d"); wt(')'); wt(';');
+    wt(JS_WK_EXTERN); wt(JS_WK_INT); wt_id("JS_WhaleCheckStack"); wt('(');
+        wt_id("JSContext"); wt('*'); wt_id("ctx"); wt(')'); wt(';');
+    wt(JS_WK_EXTERN); wt(JS_WK_INT); wt_id("whale_jit_unbox_num"); wt('(');
+        wt_id("JSContext"); wt('*'); wt_id("ctx"); wt(','); wt_id("JSValue"); wt_id("v"); wt(',');
+        wk(JS_WK_DOUBLE); wt('*'); wt_id("dst"); wt(')'); wt(';');
+    wt(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_NewFloat64"); wt('(');
+        wt_id("JSContext"); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_DOUBLE); wt_id("d"); wt(')'); wt(';');
+    wt(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_NewBool"); wt('(');
+        wt_id("JSContext"); wt('*'); wt_id("ctx"); wt(','); wt(JS_WK_INT); wt_id("b"); wt(')'); wt(';');
+
     /* whale_jit_core works purely in doubles: every number is unboxed at the
        boundary. Self-recursion calls it directly, so the recursive fast path
        costs no boxing at all - only the engine entry does that. */
-    whale_emit("static double whale_jit_core(JSContext *ctx, JSValue *args, double *An, int *deopt)\n{\n");
-    whale_emit("    (void)ctx; (void)args; (void)An; (void)deopt;\n");
-    for (i = 0; i < var_count; i++)
-        whale_emit("    double L%d = 0;\n", i);
-    for (i = 0; i < stack_size; i++)
-        whale_emit("    double v%d = 0;\n", i);
+    wk(JS_WK_STATIC); wk(JS_WK_DOUBLE); wt_id("whale_jit_core"); wt('(');
+        wt_id("JSContext"); wt('*'); wt_id("ctx"); wt(',');
+        wt_id("JSValue"); wt('*'); wt_id("args"); wt(',');
+        wk(JS_WK_DOUBLE); wt('*'); wt_id("An"); wt(',');
+        wt(JS_WK_INT); wt('*'); wt_id("deopt"); wt(')'); wt('{');
+    for (i = 0; i < var_count; i++) {
+        wk(JS_WK_DOUBLE); wt_slot("L", i); wt('='); wt_int(0); wt(';');
+    }
+    for (i = 0; i < stack_size; i++) {
+        wk(JS_WK_DOUBLE); wt_slot("v", i); wt('='); wt_int(0); wt(';');
+    }
     for (i = 0; i < arg_count; i++) {
-        if (args_used[i])
-            whale_emit("    double A%d = An[%d];\n", i, i);
+        if (args_used[i]) {
+            wk(JS_WK_DOUBLE); wt_slot("A", i); wt('='); wt_id("An"); wt('['); wt_int(i); wt(']'); wt(';');
+        }
     }
 
     sp = 0;
