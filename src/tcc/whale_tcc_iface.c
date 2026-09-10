@@ -209,3 +209,82 @@ void *JS_WhaleIrCompileAdd2(const char *tcc_dir)
 done:
     return fn;
 }
+/* ------------------------------------------------------------------------
+ * Control experiment: the SAME function, same name and signature, produced by
+ * the working C-source path. Diffing its bytes against the IR version is the
+ * fastest way to find what IR emission is missing - and calling both tells us
+ * whether the fault is in the code or in the state.
+ * ---------------------------------------------------------------------- */
+void *JS_WhaleIrAdd2C(const char *tcc_dir)
+{
+    char lib_dir[1024];
+    TCCState *s;
+    void *fn = NULL;
+    const char *src = "double whale_ir_add(double a, double b) { return a + b; }";
+
+    snprintf(lib_dir, sizeof(lib_dir), "%s/lib", tcc_dir);
+    s = tcc_new();
+    if (!s)
+        return NULL;
+    tcc_set_lib_path(s, tcc_dir);
+    tcc_add_library_path(s, lib_dir);
+    tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
+
+    if (tcc_compile_string(s, src) < 0)
+        return NULL;
+
+    if (getenv("WHALE_IR_DEBUG")) {
+        int i;
+        Section *tsec = NULL;
+        /* find the text section by name without relying on the global */
+        for (i = 0; i < s->nb_sections; i++) {
+            if (s->sections[i]->sh_type == 1 /* SHT_PROGBITS */ &&
+                (s->sections[i]->sh_flags & 0x4) /* SHF_EXECINSTR */) {
+                tsec = s->sections[i];
+                break;
+            }
+        }
+        if (tsec) {
+            int n = tsec->data_offset > 80 ? 80 : (int)tsec->data_offset;
+            fprintf(stderr, "  irC: c-source code %d bytes:", n);
+            for (i = 0; i < n; i++)
+                fprintf(stderr, " %02x", tsec->data[i]);
+            fprintf(stderr, "\n");
+        } else {
+            fprintf(stderr, "  irC: no text section found\n");
+        }
+    }
+
+    if (tcc_relocate(s, TCC_RELOCATE_AUTO) < 0)
+        return NULL;
+    fn = tcc_get_symbol(s, "whale_ir_add");
+    if (getenv("WHALE_IR_DEBUG"))
+        fprintf(stderr, "  irC: entry=%p\n", fn);
+    return fn;
+}
+/* Dump the first bytes of the text section - only the interface file can see
+   Section/TCCState internals, so whale_jit.c asks through here. */
+void JS_WhaleIrDumpText(TCCState *s, const char *tag)
+{
+    Section *ts = NULL;
+    int k, n;
+
+    if (!s)
+        return;
+    for (k = 0; k < s->nb_sections; k++) {
+        Section *sec = s->sections[k];
+        if (sec->sh_type == 1 /* SHT_PROGBITS */ && (sec->sh_flags & 0x4) /* SHF_EXECINSTR */) {
+            ts = sec;
+            break;
+        }
+    }
+    if (!ts) {
+        fprintf(stderr, "  irDump[%s]: no text section\n", tag);
+        return;
+    }
+    n = ts->data_offset > 96 ? 96 : (int)ts->data_offset;
+    fprintf(stderr, "  irDump[%s]: %d bytes:", tag, n);
+    for (k = 0; k < n; k++)
+        fprintf(stderr, " %02x", ts->data[k]);
+    fprintf(stderr, "\n");
+}

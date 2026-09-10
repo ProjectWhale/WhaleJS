@@ -816,3 +816,39 @@ PARTIAL
 ## 状态
 IR 调用已从 `whale_test` 摘除，回归保持绿：`whale api test: ok`、`fib(30)=832040`（无性能损失）。
 `JS_WhaleIrCompileAdd2(tcc_dir)` 保留完整实现 + 分步打点（`WHALE_IR_DEBUG=1`）。
+# <25>: Step 22 —— 双路径对照：工具层面踩了两个坑，对照本身还没做成
+PARTIAL
+
+## 这轮想做的事
+在 `src/whale_jit.c` 里 dump **C 源路径**生成的函数字节（它一定能跑、8×），与 IR 版逐字节比对。
+只要字节有差异，差异点就是答案；若字节一致，问题就在 state 层。
+
+## 踩到的两个坑
+1. **`whale_jit.c` 看不到 TinyCC 的内部类型**：它只 include `libtcc.h`（公开头），
+   所以写 `Section *ts = s->sections[k]` 直接编译失败（`unknown type name 'Section'`、
+   `invalid use of incomplete typedef 'TCCState'`）。dump 这类活儿必须由
+   `whale_tcc_iface.c` 提供（那个文件才在 TinyCC 的 TU 里）—— 我为此在 iface 里加了
+   `JS_WhaleIrDumpText(TCCState *s, const char *tag)`。
+2. **但在 JIT 路径里调这个 dump 会把正常的 JIT 弄崩**（`qjs` 跑 fib 直接 exit 1、
+   没有任何输出）。原因未查清（很可能是 dump 触碰了 `s->sections` 里尚未就绪的段，
+   或者与 JIT 自身的编译顺序冲突）。**已把它从 JIT 路径移除**，回归恢复。
+
+## 另一条被证伪的尝试
+在 iface 里加 `JS_WhaleIrAdd2C()`（用 `tcc_compile_string` 编**同一签名同名字**的函数，
+与 IR 版做对照）—— 它**在 printf 之前就崩**，比 IR 版还早就死。
+说明"另一个 state 里的 C 源编译"在这条调用路径上也不成立，所以对照必须在
+`whale_tcc_compile` 那条**已被证明可用**的路径里做（而不是另起一个函数）。
+
+## 结论：对照实验的正确做法（下次直接照做）
+不要新写对照函数，**改 `whale_tcc_compile` 自己**：
+1. 在它 `tcc_compile_string` **之后**、`tcc_relocate` **之前**，
+   调 `JS_WhaleIrDumpText(s, "c-source")` —— 但这次要先确认第 2 个坑的原因
+   （先只在 dump 里打印 `s->nb_sections` 和每段的 `sh_type/sh_flags/data_offset`，不读 `data`，
+   看是哪一步崩）。
+2. 拿到 C 源路径的字节后，与 IR 版（`WHALE_IR_DEBUG=1` 已能打印）逐字节比对，
+   重点看函数开头/结尾的填充、`.pdata` 展开记录、以及函数之间是否有额外符号表项。
+3. 若字节一致 → 问题在 state 层（临时文件、`s->runtime_mem`、`win64_add_function_table` 注册）。
+
+## 状态
+回归绿、无性能损失：`whale api test: ok`、`fib(30)=832040 14ms`。
+IR 直出仍是"机器码正确但调用崩"。`JS_WhaleIrDumpText` 留在 iface 里备用。
