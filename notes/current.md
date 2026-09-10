@@ -945,3 +945,36 @@ whale api test: ok
 ## 状态
 回归绿、无性能损失：`whale api test: ok`、`fib(30)=832040`。
 （`check_ir_direct` 目前只在测试里跑 token 流这一条路径，不影响原有 JIT。）
+# <28>: Step 25 —— token 通路定位到根因：**标识符撞上了 TCC 的 asm 关键字**（未修完，已回退）
+PARTIAL
+
+## 根因（本轮唯一的真正产出，但很值）
+把生成的 C 源码 dump 出来（`WHALE_JIT_DUMP=1`）后发现：**用 `gcc -fsyntax-only` 验证它完全合法**。
+所以问题不在源码，而在**我的词法器把某个标识符 token 化成了关键字**。全量 dump token 后一眼看到：
+
+```
+... [294]double [42]* [702]out [41]) ...
+```
+
+别的参数名（`ctx`/`var_refs`/`idx`/`self`/`d`/`v`/`An`/`deopt`）都拿到了新标识符 id（1269、1270…），
+**只有 `out` 拿到 702** —— 那是 `tcctok.h` 里 **asm 汇编器的 `out` 指令（`TOK_OUT`）**。
+于是 `double *out` 的参数名被吞成关键字，TCC 看到 `double * )` 就报 **`function pointer expected`**。
+
+**教训**：`whale_keywords` 表是从 `#include "tcctok.h"` 生成的，它包含的**不只是 C 关键字**，
+还有 asm 助记符（`out`/`in`/`push`/`pop`…）等。**生成代码里的标识符必须避开整张表**，
+否则会被静默当成关键字。修法二选一：给表加白名单（只收真正的 C 关键字），或让生成器避开这些名字。
+
+## 本轮做过的改动（**已全部回退**，文件被我改坏且预算耗尽）
+hook `next_nomacro()`(tccpp.c:2990)、token 源、`whale_lex_fragment`、`JS_WhaleCompileTokens`、
+preamble 自包含（无 `#include`、无 `#define`、`<<`/`>>` 进运算符表、`JS_EXCEPTION` 用 `tcc_add_symbol` 注册）、
+`whale_jit.c` 改走 token 通路并去掉 include 路径。
+**其中已验证成立的**：去掉任何 include 路径后最小 token 通路仍能跑（`result = 6.50`）—— 这条在 f5e9667 里。
+
+## 下一步（按此顺序，别再摸黑）
+1. 给 `whale_keywords` 加白名单，或让生成器避开 `TOK_OUT` 这类撞名。
+2. 重做上述改动（描述见 <26>/<27>），**先只做 `out` 改名**并验证。
+3. **把 `gcc -fsyntax-only temp/gen.c` 固化成常规自检**：生成的 C 先让 gcc 验一遍，再喂 token 流。
+   这次正是它一句话把方向从"TCC 嫌语法"扭到了"我的词法出错"。
+
+## 状态
+工作区已回到 **f5e9667**：`whale api test: ok`、`fib(32)=2178309 44ms`（8× 仍在），无未跟踪文件。
