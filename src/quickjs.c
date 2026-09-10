@@ -65293,6 +65293,7 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
     uint8_t lo_c[WHALE_JIT_MAX_SLOTS];
     double lo_cv[WHALE_JIT_MAX_SLOTS];
     int unreachable = 0;
+    int ret_is_bool = -1;
 
     if (b->func_kind != JS_FUNC_NORMAL)
         return 0;
@@ -65357,27 +65358,18 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
     /* pass 2: emit + abstract-interpret */
     whale_jit_src_len = 0;
     whale_emit("%s", whale_jit_preamble);
-    whale_emit("JSValue whale_jit_fn(JSContext *ctx, JSValue *args, JSValue *var_buf, int *deopt, JSValue whale_self, void *whale_entry, void *whale_var_refs)\n{\n");
-    whale_emit("    (void)ctx; (void)var_buf; (void)args; (void)deopt; (void)whale_self; (void)whale_entry; (void)whale_var_refs;\n");
-    whale_emit("    if (!whale_jit_stack_ok(ctx)) return JS_EXCEPTION;\n");
+    /* whale_jit_core works purely in doubles: every number is unboxed at the
+       boundary. Self-recursion calls it directly, so the recursive fast path
+       costs no boxing at all - only the engine entry does that. */
+    whale_emit("static double whale_jit_core(JSContext *ctx, JSValue *args, double *An, int *deopt)\n{\n");
+    whale_emit("    (void)ctx; (void)args; (void)An; (void)deopt;\n");
     for (i = 0; i < var_count; i++)
         whale_emit("    double L%d = 0;\n", i);
     for (i = 0; i < stack_size; i++)
         whale_emit("    double v%d = 0;\n", i);
     for (i = 0; i < arg_count; i++) {
         if (args_used[i])
-            whale_emit("    double A%d = 0;\n", i);
-    }
-    for (i = 0; i < arg_count; i++) {
-        if (!args_used[i])
-            continue;
-        whale_emit("    if (!whale_jit_unbox_num(ctx, args[%d], &A%d)) { *deopt = 1; return JS_EXCEPTION; }\n",
-                   i, i);
-    }
-    /* closure slots we use must be this function itself (checked once) */
-    for (i = 0; i < 4; i++) {
-        if (var_ref_used[i])
-            whale_emit("    if (!whale_jit_is_self(whale_var_refs, whale_self, %d)) { *deopt = 1; return JS_EXCEPTION; }\n", i);
+            whale_emit("    double A%d = An[%d];\n", i, i);
     }
 
     sp = 0;
@@ -65667,15 +65659,13 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
                     if (!whale_type_is_num(cur[var_count + sp - argc + k]))
                         goto out;
                 }
-                whale_emit("    { JSValue _argv[%d]; JSValue _r; double _d = 0; int _dd = 0;\n", argc > 0 ? argc : 1);
+                whale_emit("    { double _an[%d]; double _r = 0; int _dd = 0;\n", argc > 0 ? argc : 1);
                 for (k = 0; k < argc; k++)
-                    whale_emit("      _argv[%d] = whale_jit_box_num(ctx, v%d);\n", k, sp - argc + k);
-                whale_emit("      if (!whale_jit_stack_ok(ctx)) return JS_EXCEPTION;\n");
-                whale_emit("      _r = ((JSValue (*)(JSContext *, JSValue *, JSValue *, int *, JSValue, void *, void *))whale_entry)(ctx, _argv, NULL, &_dd, whale_self, whale_entry, whale_var_refs);\n");
-                whale_emit("      if (_dd) { *deopt = 1; return JS_EXCEPTION; }\n");
-                whale_emit("      if (JS_IsException(_r)) goto exc;\n");
-                whale_emit("      if (!whale_jit_unbox_num(ctx, _r, &_d)) { *deopt = 1; return JS_EXCEPTION; }\n");
-                whale_emit("      v%d = _d; }\n", func_slot);
+                    whale_emit("      _an[%d] = v%d;\n", k, sp - argc + k);
+                whale_emit("      if (!whale_jit_stack_ok(ctx)) { *deopt = 1; return 0; }\n");
+                whale_emit("      _r = whale_jit_core(ctx, args, _an, &_dd);\n");
+                whale_emit("      if (_dd) { *deopt = 1; return 0; }\n");
+                whale_emit("      v%d = _r; }\n", func_slot);
                 cur[var_count + func_slot] = WHALE_T_NUM;
                 sp = func_slot + 1;
             }
@@ -65795,12 +65785,13 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
             break;
         case OP_return:
             t = cur[var_count + sp - 1];
-            if (t == WHALE_T_BOOL)
-                whale_emit("    return JS_NewBool(ctx, v%d != 0);\n", sp - 1);
-            else if (t == WHALE_T_NUM)
-                whale_emit("    return whale_jit_box_num(ctx, v%d);\n", sp - 1);
-            else
+            if (t != WHALE_T_BOOL && t != WHALE_T_NUM)
                 goto out;
+            if (ret_is_bool == -1)
+                ret_is_bool = (t == WHALE_T_BOOL);
+            else if (ret_is_bool != (t == WHALE_T_BOOL))
+                goto out; /* mixed number/boolean returns: not our shape */
+            whale_emit("    return v%d;\n", sp - 1);
             unreachable = 1;
             break;
         default:
@@ -65809,8 +65800,31 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
         pos += sz;
     }
 
-    whale_emit("    return JS_UNDEFINED;\n");
-    whale_emit("  exc:\n    return JS_EXCEPTION;\n}\n");
+    whale_emit("    *deopt = 1;\n    return 0;\n");
+    whale_emit("}\n");
+    /* engine entry: unbox the arguments once, run core, box the result */
+    whale_emit("JSValue whale_jit_fn(JSContext *ctx, JSValue *args, JSValue *var_buf, int *deopt, JSValue whale_self, void *whale_entry, void *whale_var_refs)\n{\n");
+    whale_emit("    double An[%d]; double _r;\n", arg_count > 0 ? arg_count : 1);
+    whale_emit("    (void)ctx; (void)var_buf; (void)args; (void)deopt; (void)whale_self; (void)whale_entry; (void)whale_var_refs;\n");
+    whale_emit("    if (!whale_jit_stack_ok(ctx)) return JS_EXCEPTION;\n");
+    for (i = 0; i < arg_count; i++) {
+        if (!args_used[i])
+            continue;
+        whale_emit("    if (!whale_jit_unbox_num(ctx, args[%d], &An[%d])) { *deopt = 1; return JS_EXCEPTION; }\n", i, i);
+    }
+    /* closure slots we rely on must be this very function (once per entry;
+       the closure cannot change during the call, so recursion need not re-check) */
+    for (i = 0; i < 4; i++) {
+        if (var_ref_used[i])
+            whale_emit("    if (!whale_jit_is_self(whale_var_refs, whale_self, %d)) { *deopt = 1; return JS_EXCEPTION; }\n", i);
+    }
+    whale_emit("    _r = whale_jit_core(ctx, args, An, deopt);\n");
+    whale_emit("    if (*deopt) return JS_EXCEPTION;\n");
+    if (ret_is_bool == 1)
+        whale_emit("    return JS_NewBool(ctx, _r != 0);\n");
+    else
+        whale_emit("    return whale_jit_box_num(ctx, _r);\n");
+    whale_emit("}\n");
     ret = 1; /* every opcode lowered successfully */
   out:
     if (!ret && getenv("WHALE_JIT_DUMP"))
