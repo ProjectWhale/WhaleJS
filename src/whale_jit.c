@@ -19,6 +19,7 @@
 
 /* implemented inside the TinyCC translation unit (src/tcc/whale_tcc_iface.c) */
 int JS_WhaleTccProbe(void);
+void JS_WhaleTokPush(int t, double val);
 
 /* Opcode ids and sizes, taken from the same quickjs-opcode.h the interpreter
    uses. The enum mirrors OPCodeEnum in quickjs.c: the DEF entries first, then
@@ -93,6 +94,7 @@ static uint32_t whale_get_u16(const uint8_t *p)
 
 /* implemented inside the TinyCC translation unit (src/tcc/whale_tcc_iface.c) */
 int JS_WhaleTccProbe(void);
+void JS_WhaleTokPush(int t, double val);
 
 #ifndef WHALE_JIT_TCC_DIR
 #define WHALE_JIT_TCC_DIR "thirdparty/tcc-runtime"
@@ -115,6 +117,38 @@ enum {
 static char whale_jit_src[WHALE_JIT_SRC_MAX];
 static size_t whale_jit_src_len;
 
+/* ------------------------------------------------------------------------
+ * Token emitters.
+ *
+ * The generator pushes tokens straight into TinyCC's parser - there is no text
+ * stage and therefore no lexer, no keyword table and no literal scanner. The
+ * keywords are compile-time constants here (TOK_DOUBLE, TOK_RETURN, ...), so
+ * nothing can be mistaken for an identifier or collide with a TinyCC keyword.
+ * ---------------------------------------------------------------------- */
+static void wt(int t)
+{
+    JS_WhaleTokChar(t);          /* punctuation / single-character operators */
+}
+
+static void wt_id(const char *name)
+{
+    JS_WhaleTokIdent2(name);
+}
+
+static void wt_slot(const char *prefix, int n)
+{
+    JS_WhaleTokSlot(prefix, n);  /* L0 / v3 / A2 */
+}
+
+static void wt_int(int v)
+{
+    JS_WhaleTokInt(v);
+}
+
+static void wt_num(double v)
+{
+    JS_WhaleTokDouble(v);
+}
 static void whale_emit(const char *fmt, ...)
 {
     va_list ap;
