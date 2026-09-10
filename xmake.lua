@@ -1,13 +1,16 @@
 -- WhaleJS build (xmake)
--- src/        我们的 QuickJS 改造源码（基于 QuickJS-ng）
--- thirdparty/ 依赖源码（TinyCC 等）
--- temp/       临时数据（下载物、baseline 构建目录），不入 git
+-- src/                    我们的 QuickJS 改造源码（基于 QuickJS-ng）
+-- thirdparty/tinycc      TinyCC 源码（JIT 代码生成后端；ONE_SOURCE 单文件编译）
+-- thirdparty/tcc-runtime TCC 运行时支持（config.h / include / libtcc1-64.a / *.def）
+-- temp/                   临时数据（下载物、baseline 构建目录），不入 git
 set_project("WhaleJS")
 set_version("0.0.1")
 set_languages("c11", "c++14")
 add_rules("mode.debug", "mode.release")
 
 local SRC = "src"
+local TCC = "thirdparty/tinycc"
+local TCC_RT = "thirdparty/tcc-runtime"
 
 -- MinGW 会被 xmake 识别成独立平台 (mingw)，同样走 Windows 链接分支
 local function is_win()
@@ -35,20 +38,33 @@ local function link_whale()
     end
 end
 
+-- TinyCC：JIT 运行期把生成的 C 源码编成机器码。
+-- tcc.h 里 ONE_SOURCE 默认 1，所以整个 libtcc 只有 libtcc.c 一个翻译单元。
+-- config.h 放在 tcc-runtime/（TinyCC 上游 .gitignore 会吃掉 tinycc/config*.h）。
+target("libtcc")
+    set_kind("static")
+    add_files(TCC .. "/libtcc.c")
+    add_includedirs(TCC, TCC_RT)
+    add_defines("TCC_TARGET_PE", "TCC_TARGET_X86_64")
+
 -- qjs CLI（对照与手工验证用）
 target("qjs")
     set_kind("binary")
+    set_rundir("$(projectdir)")
+    add_deps("libtcc")
     add_files(engine_sources)
     add_files(SRC .. "/qjs.c", SRC .. "/gen/repl.c", SRC .. "/gen/standalone.c")
-    add_includedirs(SRC)
+    add_includedirs(SRC, TCC)
     add_defines(qjs_defines)
     link_whale()
 
 -- WhaleJS 单元测试：xmake run whale_test
 target("whale_test")
     set_kind("binary")
+    set_rundir("$(projectdir)")
+    add_deps("libtcc")
     add_files(engine_sources)
     add_files("tests/whale/*.c")
-    add_includedirs(SRC)
+    add_includedirs(SRC, TCC)
     add_defines(qjs_defines)
     link_whale()

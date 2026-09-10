@@ -8,6 +8,7 @@
 
 #include "quickjs.h"
 #include "whalejs.h"
+#include "libtcc.h"
 
 static int failures;
 
@@ -47,6 +48,57 @@ static double eval_number(JSContext *ctx, const char *src)
 #define SRC_FIB  "function fib(n){return n<2?n:fib(n-1)+fib(n-2)} fib(20)"
 #define SRC_LOOP "var s=0; for (var i=0;i<1000;i++) s+=i; s"
 #define SRC_STR  "('a'+'b'+[1,2,3].join('-')).length"
+
+/* TCC 运行时支持目录（相对项目根；xmake run 的 cwd 就是项目根） */
+#define WHALE_TCC_DIR "thirdparty/tcc-runtime"
+
+/*
+ * TCC 后端自检：证明 libtcc 已经链进来，且能在运行期把 C 源码编成机器码直接调用。
+ * 这是 JIT 的地基——真正的字节码→C 翻译还没接。
+ */
+static void check_tcc_backend(void)
+{
+    TCCState *s = tcc_new();
+    int (*add)(int, int);
+    int (*fib)(int);
+    int rc;
+
+    CHECK(s != NULL);
+    if (!s)
+        return;
+
+    /* 必须先设路径再定 output type：TCC 的 include/lib 搜索路径在初始化时就定了 */
+    tcc_set_lib_path(s, WHALE_TCC_DIR);
+    tcc_add_include_path(s, WHALE_TCC_DIR "/include");
+    tcc_add_library_path(s, WHALE_TCC_DIR "/lib");
+    tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
+
+    rc = tcc_compile_string(s,
+                            "int whale_add(int a, int b){ return a + b; }\n"
+                            "int whale_fib(int n){ return n < 2 ? n : whale_fib(n-1) + whale_fib(n-2); }\n");
+    CHECK(rc >= 0);
+    if (rc < 0) {
+        tcc_delete(s);
+        return;
+    }
+    rc = tcc_relocate(s, TCC_RELOCATE_AUTO);
+    CHECK(rc >= 0);
+    if (rc < 0) {
+        tcc_delete(s);
+        return;
+    }
+
+    add = (int (*)(int, int))tcc_get_symbol(s, "whale_add");
+    fib = (int (*)(int))tcc_get_symbol(s, "whale_fib");
+    CHECK(add != NULL);
+    CHECK(fib != NULL);
+    if (add)
+        CHECK(add(2, 3) == 5);
+    if (fib)
+        CHECK(fib(20) == 6765);
+
+    tcc_delete(s);
+}
 
 int main(void)
 {
@@ -121,6 +173,9 @@ int main(void)
     CHECK(JS_WhaleGetJitMode(NULL) == JS_JIT_OFF);
     JS_WhaleNoteJitRequest(NULL);
     JS_WhaleNoteJitResult(NULL, 1, 1);
+
+    /* 8. TCC 后端可用（JIT 地基） */
+    check_tcc_backend();
 
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);

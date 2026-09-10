@@ -12,6 +12,9 @@ build/
 *.dll
 *.pdb
 
+# TinyCC 运行时支持库必须进库（JIT 运行期要 libtcc1-64.a 和 *.def）
+!thirdparty/tcc-runtime/lib/*.a
+
 # 编辑器
 .vs/
 .vscode/
