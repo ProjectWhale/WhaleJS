@@ -28,4 +28,6 @@ The process of project: WhaleJS —— 基于 QuickJS-ng + TinyCC 实现带 JIT/
 
 <14>(SOLVED): Step 11 —— JIT/AOT 后端接口：`JSWhaleJitBackend { name, compile(ctx, src, &entry, &handle), release(handle) }`，当前唯一实现是 TCC；`whale_jit_backend` 指针就是 AOT 插入点（离线 gcc/clang + 磁盘缓存只需实现该结构体），不对"外部编译器"形成硬依赖。行为与性能不变（fibi 仍 9×）。commit 75cd7b6。见 current.md
 
-<15>(SOLVED): Step 12 —— 自查"JIT 没生效"：三个叠加原因（① opcode 覆盖太窄：用户用 `<=` 即 `lte`，而生成器只认 `lt`；② **正确性 bug**：跳转目标的栈深度用了线性扫描的 sp、死代码没回滚 → else 分支写错槽，`h(30)` 给 -29；③ **相对路径**：从 release 目录跑时 TCC 找不到 quickjs.h → 静默回退解释器）。另实现**数值直传**（`whale_jit_core` 全程 double + JSValue 包装层，自递归不再装箱/解箱）。结果：用户的 **fib(40) 17.5s → 2.12s（8.3×）**，递归 fib(24)×20 154→19ms，迭代 fibi 保持 9×。commit 005c615 + c994c44。见 current.md
+<15>(SOLVED): Step 12 —— 自查"JIT 没生效"：三个叠加原因（① opcode 覆盖太窄：用户用 `<=` 即 `lte`，而生成器只认 `lt`；② **正确性 bug**：跳转目标的栈深度用了线性扫描的 sp、死代码没回滚 → else 分支写错槽，`h(30)` 给 -29；③ **相对路径**：从 release 目录跑时 TCC 找不到 quickjs.h → 静默回退解释器）。另实现**数值直传**（`whale_jit_core` 全程 double + JSValue 包装层，自递归不再装箱/解箱）。结果：用户的 **fib(40) 17.5s → 2.12s（8.3×）**，递归 fib(24)×20 154→19ms，迭代 fibi 保持 9×。用户实测 1949ms。commit 005c615 + c994c44。见 current.md
+
+<16>(TIPS+SOLVED): Step 13 —— 方向：**直接生成 TCC 的 IR/AST**（用户确认 TCC 可随意改），额外好处是**不再需要 include quickjs.h → `.h` 路径问题从根上消失**，且跳过 C 解析、我们直接持有 IR 可做寄存器保留/窥孔/循环优化；落点 `tccgen.c` 的 vpushi/gen_op/g + SValue/vstack。构建：libtcc 现在**默认从源码编**，另有 `--libtcc_prebuilt=y` 走预编译 `libtcc.dll`（导入库由 dlltool 生成后入库，构建只 relink 0.8s）。commit ec7287f。见 current.md

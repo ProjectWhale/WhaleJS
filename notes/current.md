@@ -466,6 +466,34 @@ SOLVED
 2. 生成器静默放弃（`goto out`）这种设计很危险：语义永远对、性能悄悄归零 —— 必须有诊断出口。
 3. 相对路径写死在二进制里，会让同一个 exe 在不同 cwd 下行为不同。
 
+# <16>: Step 13 —— 改用 TCC 的 IR 是更优路线（附带干掉 .h 依赖）+ libtcc 两种链接方式
+TIPS（方向）+ SOLVED（构建）
+
+## 用户确认的方向：直接生成 TCC 的 opcode/AST，别经过 C 源码
+TCC 已停更、可以随意改，所以这条路可行。**额外好处（本轮确认）**：
+- **不再需要 include `quickjs.h`** → `<12>`/`<15>` 里那个"`.h` 找不到"的路径问题从根上消失
+  （问题本质是 TCC 要按 C 编译器的方式解析头文件；直接发 IR 就没有这个环节）。
+  注意 `libtcc1-64.a` 等运行期文件仍然需要路径，只是头文件依赖没了。
+- 跳过 C 解析/类型检查 → JIT 编译更快（现在单函数 ms 级，函数多了差距会放大）。
+- 我们直接持有 IR：寄存器保留、窥孔、循环优化都能在 IR 上做，
+  不必再靠"生成更友好的 C 源码"去猜 TCC 会怎么发码。
+- 落点：`tccgen.c` 的 `vpushi` / `gen_op` / `g()` 与 `SValue`/vstack。
+  建议第一步做"把一个数值基本块直接发成 TCC op"的最小闭环，接通后再扩展。
+
+## libtcc 现在两种链接方式（commit ec7287f）
+- **默认**：从 `thirdparty/tinycc/libtcc.c` 编成静态库（我们要魔改 TCC，所以默认走这条）。
+- **可选**：`xmake f -y -p mingw -m release --libtcc_prebuilt=y` → 链接预编译 `libtcc.dll`。
+  导入库 `liblibtcc.a` 用 `dlltool -d libtcc.def -l liblibtcc.a -D libtcc.dll` 生成后入库
+  （`thirdparty/tcc-runtime/lib/`，与 `libtcc1-64.a` 放一起）；构建只 relink（0.8s），
+  构建后把 dll 拷到二进制旁边。这条也满足 goal 里"优先预编译版本直接链接"。
+- `.gitignore` 加了 `!thirdparty/tcc-runtime/lib/*.dll`。
+- 验证：两种模式都 `fib(32)=2178309`（48ms / 51ms），源码模式 `whale api test: ok`。
+
+## 用户实测
+修完 `<=` 覆盖 + 跳转状态 + 路径之后，用户自己跑 fib(40)：**1949 ms**（我这边 2.12s，量级一致），
+相对原版 17.5s 约 9 倍。
+
+
 
 
 
