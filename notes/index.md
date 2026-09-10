@@ -13,3 +13,5 @@ The process of project: WhaleJS —— 基于 QuickJS-ng + TinyCC 实现带 JIT/
 <6>(SOLVED): Step 5 —— TinyCC 接入：config.h 手工落库（configure 需要 sh）、libtcc 单 TU 编译、tcc-runtime（include + libtcc1-64.a）落库、xmake 加 libtcc target；运行期编译已跑通（add/fib）。见 current.md
 
 <7>(SOLVED): Step 6 前哨 —— JIT 目标代码 ABI 原型跑通（TCC 编的 C 能操作真实 JSValue，`jit fibi(10)=55` 与解释器 MATCH）；两个坑：ng 版公开头没有 JS_Add/JS_Lt、PowerShell 里 `-Wl,--stack,` 要加引号；含第一版 opcode 子集与解释器语义清单。见 current.md
+
+<8>(SOLVED/UNRESOLVED 性能): Step 6 —— 第一版 JIT 跑通（字节码→C→TCC，原生 int 快路径 + 复用解释器 slow 路径；tests 断言 compiled>=1 且语义正确，commit 9581e82），但比解释器还慢（3000× fibi(30)：10ms vs 16ms）——TCC 不优化 + 值栈仍在内存。下一步优化路线（栈→寄存器提升、类型特化、递归展开、常量折叠、TCC 优化、编译缓存）已记入。见 current.md
