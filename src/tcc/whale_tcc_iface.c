@@ -34,6 +34,9 @@ int JS_WhaleTccProbe(void)
  *    ptrdiff_type, func_old_type). gen_op()/gv() consult those internally.
  * ---------------------------------------------------------------------- */
 
+/* define_stack snapshot for free_defines() at teardown (see tcc_compile()). */
+static Sym *whale_define_start;
+
 /* The framing shared by the emitters below. Returns 0 when the unit is open. */
 #define WHALE_IR_SETUP(s, tcc_dir, tag)                                     \
     do {                                                                    \
@@ -51,6 +54,7 @@ int JS_WhaleTccProbe(void)
         }                                                                   \
         (s)->nb_errors = 0;                                                 \
         (s)->error_set_jmp_enabled = 1;                                     \
+        whale_define_start = define_stack;                                 \
         tcc_open_bf((s), (tag), 0);                                         \
         tccelf_begin_file((s));                                             \
         preprocess_start((s), 0);                                           \
@@ -76,6 +80,10 @@ int JS_WhaleTccProbe(void)
 #define WHALE_IR_FINISH(s, name, out)                                       \
     do {                                                                    \
         preprocess_end((s));                                                \
+        free_inline_functions((s));                                         \
+        free_defines(whale_define_start);                                   \
+        sym_pop(&global_stack, NULL, 0);                                    \
+        sym_pop(&local_stack, NULL, 0);                                     \
         tccelf_end_file((s));                                               \
         tcc_close();                                                        \
         if (tcc_relocate((s), TCC_RELOCATE_AUTO) >= 0) {                    \
@@ -143,6 +151,7 @@ void *JS_WhaleIrCompileAdd2(const char *tcc_dir)
     if (getenv("WHALE_IR_DEBUG"))
         fprintf(stderr, "  ir2: before prolog: func.ref=%p retsym=%p retsym->next=%p pa=%p\n",
                 (void *)funcsym->type.ref, (void *)retsym, (void *)retsym->next, (void *)pa);
+    tcc_debug_funcstart(tcc_state, funcsym);
     sym_push2(&local_stack, SYM_FIELD, 0, 0);
     local_scope = 1;
     gfunc_prolog(&funcsym->type);
@@ -177,9 +186,15 @@ void *JS_WhaleIrCompileAdd2(const char *tcc_dir)
     gfunc_return(&func_vt);
 
     rsym = 0;
+    gsym(rsym);
     gfunc_epilog();
     cur_text_section->data_offset = ind;
+    label_pop(&global_label_stack, NULL, 0);
     elfsym(funcsym)->st_size = ind - func_ind;
+    tcc_debug_funcend(tcc_state, ind - func_ind);
+    func_vt.t = VT_VOID;
+    func_var = 0;
+    nocode_wanted = 0x80000000;
     check_vstack();
     if (getenv("WHALE_IR_DEBUG")) {
         int i, n = ind - func_ind;

@@ -783,3 +783,36 @@ c3                     ret
 ## 状态
 IR 调用已从 `whale_test` 摘除，回归保持绿：`whale api test: ok`、`fib(30)=832040`。
 `JS_WhaleIrCompileAdd2(tcc_dir)` 保留完整实现与分步打点（`WHALE_IR_DEBUG=1`）。
+# <24>: Step 21 —— IR 直出：机器码正确，调用仍崩；穷举后的剩余嫌疑
+PARTIAL
+
+## 本轮又排查掉的（都已补齐，仍崩）
+逐行对照 `gen_function`(tccgen.c:7054) 后补上的：
+- `tcc_debug_funcstart(tcc_state, sym)` / `tcc_debug_funcend(tcc_state, size)`（PE 下参与函数边界/展开信息）
+- `gsym(rsym)`、`label_pop(&global_label_stack, NULL, 0)`
+- 收尾完整照抄 `tcc_compile()`(libtcc.c:623)：`preprocess_end` → **`free_inline_functions`** →
+  **`free_defines(define_start)`** → `sym_pop(&global_stack)` → `sym_pop(&local_stack)` → `tccelf_end_file` → `tcc_close`
+  （`free_defines` 这一步先前漏了，导致 `sym_pop` 踩内存）
+- `VirtualProtect(PAGE_EXECUTE_READWRITE)` 显式加在入口页上（排除 DEP）
+- `sym_find(tok)` 取参数偏移（已验证 `a(r=0x132 c=16)`、`b(r=0x132 c=24)` 正确）
+
+## 现在的事实
+- **机器码完全正确**（反汇编验证，见 <23>）。
+- **入口地址正确**：`tcc_get_symbol` 与 `text_section->sh_addr` 一致。
+- **可执行权限已加**。
+- **调用仍然访问违例**（0xC0000005）。
+
+## 下一步：做一次真正的双路径对照（这是收敛最快的路）
+不要再逐条猜。在 `src/whale_jit.c` 里做一个临时对照：
+1. 用现有 C 源路径（`tcc_compile_string`）编译 **同一个签名** 的函数
+   `double whale_jit_fn(double a, double b) { return a + b; }`，relocate 后调用 —— 它**一定成功**。
+2. dump 它的函数字节（在 relocate **之前**读 `text_section->data`），与 IR 版逐字节比对。
+3. 差异点就是答案。重点看：
+   - 函数前后是否有额外数据（`.pdata` 展开记录、对齐填充、符号表项）；
+   - `pe_add_unwind_data` 写的东西在 C 路径和 IR 路径是否一致；
+   - `whale_tcc_compile` 在 relocate 后是否还有我们没做的调用（目前看没有，它只 `tcc_get_symbol` 然后 `tcc_delete`）。
+4. 如果字节一致而行为不同，那就是 **state 层面的差异**（临时文件、`s->runtime_mem`、函数表注册）。
+
+## 状态
+IR 调用已从 `whale_test` 摘除，回归保持绿：`whale api test: ok`、`fib(30)=832040`（无性能损失）。
+`JS_WhaleIrCompileAdd2(tcc_dir)` 保留完整实现 + 分步打点（`WHALE_IR_DEBUG=1`）。
