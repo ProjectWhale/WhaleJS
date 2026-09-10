@@ -489,3 +489,10 @@ void JS_WhaleTokChar(int ch)
 {
     JS_WhaleTokPush(ch, 0);
 }
+void JS_WhaleTokOp(int o)
+{
+    static const int optok[] = { '+', '-', '*', '/', TOK_LT, TOK_LE, TOK_GT, TOK_GE, TOK_EQ, TOK_NE };
+
+    if (o >= 0 && o < (int)(sizeof(optok) / sizeof(optok[0])))
+        JS_WhaleTokPush(optok[o], 0);
+}

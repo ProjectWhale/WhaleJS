@@ -46,6 +46,12 @@ enum {
     JS_WK_DEFAULT, JS_WK_SIZEOF, JS_WK_REGISTER, JS_WK_UNION, JS_WK_ENUM, JS_WK_SHORT,
 };
 
+/* operator ids for JS_WhaleTokOp (same idea as the keyword ids) */
+enum {
+    JS_OP_ADD = 0, JS_OP_SUB, JS_OP_MUL, JS_OP_DIV,
+    JS_OP_LT, JS_OP_LE, JS_OP_GT, JS_OP_GE, JS_OP_EQ, JS_OP_NE,
+};
+
 /* provided by src/tcc/whale_tcc_iface.c */
 void JS_WhaleTokKw(int w);
 void JS_WhaleTokIdent2(const char *name);
@@ -53,5 +59,6 @@ void JS_WhaleTokSlot(const char *prefix, int n);
 void JS_WhaleTokInt(int v);
 void JS_WhaleTokDouble(double v);
 void JS_WhaleTokChar(int ch);
+void JS_WhaleTokOp(int o);
 
 #endif /* WHALE_JIT_H */
