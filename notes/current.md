@@ -737,3 +737,49 @@ c3                     ret
 ## 状态
 IR 调用已从 `whale_test` 摘除（避免崩），打点与字节 dump 保留在 iface 里（`WHALE_IR_DEBUG=1`）。
 回归保持绿：`whale api test: ok`、`fib(30)=832040`。
+# <23>: Step 20 —— IR 直出：机器码**完全正确**，但还不能安全调用（PE 相关）
+PARTIAL（机器码正确，调用崩）
+
+## 铁证：生成的机器码是对的
+`double whale_ir_add(double a, double b) { return a + b; }` 经 IR 直出得到的字节：
+```
+55                     push rbp
+48 89 e5               mov rsp, rbp
+48 81 ec 00 00 00 00   sub rsp, 0
+66 0f d6 45 10         movq [rbp+16], xmm0     ← 存参数 a（PE/x64：参数在正偏移）
+66 0f d6 4d 18         movq [rbp+24], xmm1     ← 存参数 b
+f3 0f 7e 45 10         movq xmm0, [rbp+16]     ← 读 a
+f2 0f 58 45 18         addsd xmm0, [rbp+24]    ← xmm0 += b
+c9                     leave
+c3                     ret
+```
+参数符号也验证正确：`a(r=0x132 c=16)`、`b(r=0x132 c=24)`（`VT_LOCAL|VT_LVAL` + PE 正偏移）。
+
+## 本轮踩通的关键点（都是"没照抄解析器就不行"）
+1. **PE 与 ELF 是两套代码生成器**！`x86_64-gen.c` 里 `gfunc_prolog`/`gfunc_epilog` 各有两份：
+   **PE 版在 953/1021，ELF 版在 1435/1587**（后者在 `#ifndef PE` 里）。我们编 `TCC_TARGET_PE`，用的是 PE 版。
+   - PE 版参数：`addr = PTR_SIZE*2` 起递增，`sym_push(sym->v & ~SYM_FIELD, type, VT_LOCAL|VT_LVAL, addr)`
+     → **参数在正偏移 `[rbp+16]`、`[rbp+24]`**，`loc` 保持 0（我先前以为 loc 该是负数，是照 ELF 版想当然）。
+   - PE 版 epilog 自己回填 prolog（`ind = func_sub_sp_offset - FUNC_PROLOG_SIZE`）并调 `pe_add_unwind_data`。
+2. **`sym_push2` 不复制 `CType.ref`**（只有 `sym_push` 才 `s->type.ref = type->ref`）。
+   所以构造函数类型必须自己设 `funcsym->type.ref`。
+3. **`gfunc_prolog` 里参数是"新建"局部符号**，和我们手里的参数节点无关 —— 要用
+   `sym_find(tok)` 才能拿到它分配的偏移。这一条是参数访问的正确姿势。
+4. **必须装 `setjmp(s->error_jmp_buf)`**：`tcc_error()` 是 longjmp，没有跳转目标时任何报错都是直接崩。
+5. **不能调 `sym_pop(&local_stack)`**：它按解析器的形状释放符号链，我们的栈形状不同，会踩内存。
+6. **构建坑（重要）**：`whale_tcc_iface.c` 原来是"被 libtcc.c include"的，xmake 看不见这种依赖 ——
+   改它不会重编 libtcc。现在反过来：**`whale_tcc_iface.c` 是编译单元，它 `#include "libtcc.c"`**，
+   xmake 的 `add_files` 指向它，两个文件都被跟踪。
+
+## 现在唯一剩下的卡点
+机器码正确、入口地址正确（`tcc_get_symbol` 与段基址一致）、`VirtualProtect(PAGE_EXECUTE_READWRITE)`
+也加了 —— 调用仍然访问违例。因此剩下最可疑的是 **PE 侧的函数表/展开信息**：
+`pe_add_unwind_data` 写入的 `.pdata` 是否被正确 link，以及 `win64_add_function_table`
+（tccrun.c:305，只有 `tcc_run` 路径用 `RtlAddFunctionTable` 注册）在我们这条路径上没被调用。
+**下一步**：在 `tccrun.c` 找 `VirtualProtect`(284) 那段所在函数，看它是 `tcc_relocate_ex` 还是别的；
+确认 `_WIN64` 下我们是否需要显式注册函数表；再对比 `whale_tcc_compile`（C 源码路径，可正常调用+8×）
+在 relocate 之后比我们多做了什么 —— 这是最直接的对照实验。
+
+## 状态
+IR 调用已从 `whale_test` 摘除，回归保持绿：`whale api test: ok`、`fib(30)=832040`。
+`JS_WhaleIrCompileAdd2(tcc_dir)` 保留完整实现与分步打点（`WHALE_IR_DEBUG=1`）。

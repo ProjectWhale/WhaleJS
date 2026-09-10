@@ -1,145 +1,134 @@
-/* ------------------------------------------------------------------------
+#include "libtcc.c"
+
+/* ========================================================================
  * WhaleJS: TinyCC internal interface
  *
- * Compiled as part of the TinyCC translation unit (libtcc.c includes it at the
- * very end), so it can reach TinyCC's internals directly. First step of the
- * route in notes <16>: emit TinyCC IR / machine code straight from the JIT
- * generator instead of handing TinyCC C source to parse. That would
- *   - skip C parsing (faster JIT compiles),
- *   - remove the need to include quickjs.h at all (no header path dependency),
- *   - give us the IR to optimize on instead of guessing TinyCC's lowering.
+ * The whole TinyCC is included above, so this file is one translation unit that
+ * has both the compiler and our interface in scope. libtcc.c does not include
+ * this file the other way round: xmake cannot see #include dependencies, so the
+ * add_files() entry is the only file whose changes trigger a rebuild - and both
+ * files change often, so the entry has to be this one.
  *
- * For now: the plumbing (exported wrappers) plus a probe proving the linkage
- * works and internal state is reachable.
- * ------------------------------------------------------------------------ */
+ * This is the route from notes <16>: drive TinyCC's internals directly instead
+ * of handing it C source to parse. It skips C parsing and needs no include path
+ * at all (the quickjs.h header-path problem disappears), and it gives us the IR
+ * to optimise on later.
+ * ======================================================================== */
 
-/* Probe: 1 when TinyCC's current state is reachable, 0 otherwise. tcc_state and
-   the vstack/vtop pair are TinyCC internals declared in tcc.h, so reaching them
-   proves the interface file really is compiled inside TinyCC's translation unit
-   and that the JIT generator can drive TinyCC directly from here. */
+/* Probe: proves we really are compiled inside TinyCC's translation unit. */
 int JS_WhaleTccProbe(void)
 {
-    /* __vstack is TinyCC's value stack (tcc.h). Reading its capacity proves we
-       are compiled inside TinyCC's translation unit AND that the value is the
-       real one: VSTACK_SIZE is 256 in tcc.h. */
     return (int)(sizeof(__vstack) / sizeof(__vstack[0])) - 1;
 }
-/* ========================================================================
- * IR direct emission - first closed loop
+
+/* ------------------------------------------------------------------------
+ * One translation unit, opened and closed the way tcc_compile() does
+ * (libtcc.c:623): tcc_open_bf, tccelf_begin_file, preprocess_start, [emit],
+ * preprocess_end, tccelf_end_file, tcc_close, tcc_relocate.
  *
- * Instead of handing TinyCC C source to parse, drive its internals: build the
- * function symbol, emit the prologue, push operands on the value stack, lower
- * them with gen_op(), emit the epilogue, and let tcc_relocate() produce callable
- * machine code. This is the prerequisite for optimising on the IR (register
- * keeping, peepholes) and it drops the quickjs.h dependency entirely.
- *
- * First cut: a function with no parameters, so the parameter chain (the least
- * certain part of TinyCC's type model) is not involved yet.
- * ====================================================================== */
+ * Two things tcc_compile() does that must be reproduced:
+ *  - it installs s->error_jmp_buf. tcc_error() longjmps, so without a setjmp
+ *    target any reported error is an instant crash instead of a clean failure.
+ *  - it runs the prologue of tccgen_compile() (tccgen.c:235), which sets the
+ *    parser flags and the canonical global types (int_type, size_type,
+ *    ptrdiff_type, func_old_type). gen_op()/gv() consult those internally.
+ * ---------------------------------------------------------------------- */
 
+/* The framing shared by the emitters below. Returns 0 when the unit is open. */
+#define WHALE_IR_SETUP(s, tcc_dir, tag)                                     \
+    do {                                                                    \
+        char whale_lib[1024];                                               \
+        snprintf(whale_lib, sizeof(whale_lib), "%s/lib", (tcc_dir));        \
+        (s) = tcc_new();                                                    \
+        if (!(s))                                                           \
+            return NULL;                                                    \
+        tcc_set_lib_path((s), (tcc_dir));                                   \
+        tcc_add_library_path((s), whale_lib);                               \
+        tcc_set_output_type((s), TCC_OUTPUT_MEMORY);                        \
+        if (setjmp((s)->error_jmp_buf) != 0) {                              \
+            (s)->error_set_jmp_enabled = 0;                                 \
+            goto done;                                                      \
+        }                                                                   \
+        (s)->nb_errors = 0;                                                 \
+        (s)->error_set_jmp_enabled = 1;                                     \
+        tcc_open_bf((s), (tag), 0);                                         \
+        tccelf_begin_file((s));                                             \
+        preprocess_start((s), 0);                                           \
+        cur_text_section = NULL;                                            \
+        funcname = "";                                                      \
+        anon_sym = SYM_FIRST_ANOM;                                          \
+        section_sym = 0;                                                    \
+        const_wanted = 0;                                                   \
+        nocode_wanted = 0x80000000;                                         \
+        int_type.t = VT_INT;                                                \
+        char_pointer_type.t = VT_BYTE;                                      \
+        mk_pointer(&char_pointer_type);                                     \
+        size_type.t = VT_LLONG | VT_UNSIGNED;                               \
+        ptrdiff_type.t = VT_LLONG;                                          \
+        func_old_type.t = VT_FUNC;                                          \
+        func_old_type.ref = sym_push(SYM_FIELD, &int_type, 0, 0);           \
+        func_old_type.ref->f.func_call = FUNC_CDECL;                        \
+        func_old_type.ref->f.func_type = FUNC_OLD;                          \
+        tcc_debug_start((s));                                               \
+    } while (0)
 
-/* caller-facing op selector */
-#define WHALE_IR_ADD 0
-#define WHALE_IR_SUB 1
-#define WHALE_IR_MUL 2
-#define WHALE_IR_DIV 3
+/* Close it and turn the emitted code into a callable pointer. */
+#define WHALE_IR_FINISH(s, name, out)                                       \
+    do {                                                                    \
+        preprocess_end((s));                                                \
+        tccelf_end_file((s));                                               \
+        tcc_close();                                                        \
+        if (tcc_relocate((s), TCC_RELOCATE_AUTO) >= 0) {                    \
+            (out) = tcc_get_symbol((s), (name));                            \
+            if ((out)) {                                                    \
+                DWORD whale_old;                                            \
+                VirtualProtect((out), 4096, PAGE_EXECUTE_READWRITE, &whale_old); \
+            }                                                               \
+        }                                                                   \
+        (s)->error_set_jmp_enabled = 0;                                     \
+    } while (0)
 
-/* TinyCC names single-character operators by their character value (see the
-   many gen_op('+') calls in tccgen.c), so no token table is needed here. */
-static int whale_ir_token(int op)
+/* Emit `double whale_ir_add(double a, double b) { return a + b; }`.
+   The entry point of the whole route: with parameters there is no constant
+   pool involved, so this isolates "does IR emission produce callable code". */
+void *JS_WhaleIrCompileAdd2(const char *tcc_dir)
 {
-    switch (op) {
-    case WHALE_IR_ADD: return '+';
-    case WHALE_IR_SUB: return '-';
-    case WHALE_IR_MUL: return '*';
-    case WHALE_IR_DIV: return '/';
-    default: return 0;
-    }
-}
-
-/* Emit `double f(void) { return a <op> b; }` straight into IR.
-   Returns a callable function pointer, or NULL on failure.
-
-   TinyCC has exactly one global state (tcc_state and the rest), so this must not
-   be called while another compilation is live; it also has to open/close the
-   translation unit the way tcc_compile() does, because emitting by hand is not
-   something the parser is otherwise prepared for. */
-void *JS_WhaleIrCompileConst2(const char *tcc_dir, double a, double b, int op)
-{
-    char lib_dir[1024];
-    TCCState *s;
+    TCCState *s = NULL;
     CType ft, dt;
-    Sym *retsym, *funcsym;
+    Sym *retsym, *funcsym, *pa, *pb;
     CValue cval;
-    TokenSym *ts;
-    int tok = whale_ir_token(op);
-    void *fn = NULL;
+    TokenSym *ta, *tb, *tf;
+    void *volatile fn = NULL;
 
-#define IRSTEP(x) do { if (getenv("WHALE_IR_DEBUG")) fprintf(stderr, "  ir: %s\n", x); } while (0)
+    WHALE_IR_SETUP(s, tcc_dir, "<whale-ir>");
 
-    if (!tok)
-        return NULL;
-    snprintf(lib_dir, sizeof(lib_dir), "%s/lib", tcc_dir);
-
-    s = tcc_new();
-    IRSTEP("tcc_new");
-    if (!s)
-        return NULL;
-    tcc_set_lib_path(s, tcc_dir);
-    tcc_add_library_path(s, lib_dir);
-    tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
-    IRSTEP("paths");
-
-    tcc_open_bf(s, "<whale-ir>", 0);
-    tccelf_begin_file(s);
-    preprocess_start(s, 0);
-
-    /* The small prologue of tccgen_compile(): parser flags plus the global
-       canonical types (int_type, size_type, ptrdiff_type, func_old_type) that
-       gen_op()/gv() consult internally. Skipping this is what made gv crash -
-       it needs those types even though our own emit only uses double. */
-    cur_text_section = NULL;
-    funcname = "";
-    anon_sym = SYM_FIRST_ANOM;
-    section_sym = 0;
-    const_wanted = 0;
-    nocode_wanted = 0x80000000;
-    int_type.t = VT_INT;
-    char_pointer_type.t = VT_BYTE;
-    mk_pointer(&char_pointer_type);
-#if PTR_SIZE == 4
-    size_type.t = VT_INT | VT_UNSIGNED;
-    ptrdiff_type.t = VT_INT;
-#elif LONG_SIZE == 4
-    size_type.t = VT_LLONG | VT_UNSIGNED;
-    ptrdiff_type.t = VT_LLONG;
-#else
-    size_type.t = VT_LONG | VT_LLONG | VT_UNSIGNED;
-    ptrdiff_type.t = VT_LONG | VT_LLONG;
-#endif
-    func_old_type.t = VT_FUNC;
-    func_old_type.ref = sym_push(SYM_FIELD, &int_type, 0, 0);
-    func_old_type.ref->f.func_call = FUNC_CDECL;
-    func_old_type.ref->f.func_type = FUNC_OLD;
-    tcc_debug_start(s);
-    IRSTEP("canonical types");
-
-    ts = tok_alloc("whale_ir_fn", 11);
-    IRSTEP("tok_alloc");
-    if (!ts)
+    tf = tok_alloc("whale_ir_add", 12);
+    ta = tok_alloc("whale_a", 7);
+    tb = tok_alloc("whale_b", 7);
+    if (!tf || !ta || !tb)
         goto done;
+
+    /* the parameter chain hangs off the return-type symbol: retsym -> a -> b */
+    pb = sym_push2(&local_stack, tb->tok, VT_DOUBLE, 0);
+    pb->type.t = VT_DOUBLE;
+    pb->type.ref = NULL;
+    pb->next = NULL;
+
+    pa = sym_push2(&local_stack, ta->tok, VT_DOUBLE, 0);
+    pa->type.t = VT_DOUBLE;
+    pa->type.ref = NULL;
+    pa->next = pb;
 
     retsym = sym_push2(&local_stack, 0, VT_DOUBLE, 0);
     retsym->type.t = VT_DOUBLE;
     retsym->type.ref = NULL;
-    retsym->next = NULL;
+    retsym->next = pa;
 
     ft.t = VT_FUNC;
     ft.ref = retsym;
-    funcsym = sym_push2(&local_stack, ts->tok, VT_FUNC, 0);
+    funcsym = sym_push2(&local_stack, tf->tok, VT_FUNC, 0);
     funcsym->type = ft;
     funcsym->r = VT_CONST;
-    IRSTEP("symbols");
 
     cur_text_section = text_section;
     if (!cur_text_section)
@@ -151,66 +140,57 @@ void *JS_WhaleIrCompileConst2(const char *tcc_dir, double a, double b, int op)
     func_ind = ind;
     vla_sp_loc = -1;
     vla_sp_root_loc = -1;
+    if (getenv("WHALE_IR_DEBUG"))
+        fprintf(stderr, "  ir2: before prolog: func.ref=%p retsym=%p retsym->next=%p pa=%p\n",
+                (void *)funcsym->type.ref, (void *)retsym, (void *)retsym->next, (void *)pa);
     sym_push2(&local_stack, SYM_FIELD, 0, 0);
     local_scope = 1;
     gfunc_prolog(&funcsym->type);
     local_scope = 0;
-    IRSTEP("prolog");
+    if (getenv("WHALE_IR_DEBUG"))
+        fprintf(stderr, "  ir2: after prolog: loc=%d pa(r=%x c=%d) pb(r=%x c=%d)\n",
+                loc, pa->r, (int)pa->c, pb->r, (int)pb->c);
 
+    /* a and b are locals now; gfunc_prolog put their stack offsets in ->c */
+    if (getenv("WHALE_IR_DEBUG"))
+        fprintf(stderr, "  ir2: pa(r=%x c=%d) pb(r=%x c=%d) loc=%d\n",
+                pa->r, (int)pa->c, pb->r, (int)pb->c, loc);
     dt.t = VT_DOUBLE;
     dt.ref = NULL;
-    IRSTEP("body start");
-    cval.d = a;
-    vsetc(&dt, VT_CONST, &cval);
-    IRSTEP("push a");
-    cval.d = b;
-    vsetc(&dt, VT_CONST, &cval);
-    IRSTEP("push b");
-    gen_op(tok);
-    IRSTEP("gen_op");
-    /* no explicit gv() here: gfunc_return() fetches the value itself and knows
-       the right register class for the return type (guessing RC_FLOAT crashed) */
+    /* gfunc_prolog resolved the parameters by pushing fresh locals keyed on
+       their token - our own parameter nodes are untouched - so look them up by
+       token to get the stack offsets it assigned (PE/x86-64: positive offsets). */
+    pa = sym_find(ta->tok);
+    pb = sym_find(tb->tok);
+    if (getenv("WHALE_IR_DEBUG"))
+        fprintf(stderr, "  ir2: a(r=%x c=%d) b(r=%x c=%d) loc=%d\n",
+                pa ? pa->r : 0, pa ? (int)pa->c : -1,
+                pb ? pb->r : 0, pb ? (int)pb->c : -1, loc);
+    if (!pa || !pb)
+        goto done;
+    cval.i = pa->c;
+    vsetc(&dt, VT_LOCAL | VT_LVAL, &cval);
+    cval.i = pb->c;
+    vsetc(&dt, VT_LOCAL | VT_LVAL, &cval);
+    gen_op('+');
+    /* no explicit gv(): gfunc_return() fetches the value with the right class */
     gfunc_return(&func_vt);
-    IRSTEP("gfunc_return");
 
     rsym = 0;
     gfunc_epilog();
     cur_text_section->data_offset = ind;
     elfsym(funcsym)->st_size = ind - func_ind;
     check_vstack();
-    IRSTEP("epilog");
-
-    IRSTEP("unit closing");
-    preprocess_end(s);
-    sym_pop(&global_stack, NULL, 0);
-    sym_pop(&local_stack, NULL, 0);
-    tccelf_end_file(s);
-    tcc_close();
-    IRSTEP("unit closed");
-
-    if (tcc_relocate(s, TCC_RELOCATE_AUTO) >= 0) {
-        void *by_name = tcc_get_symbol(s, "whale_ir_fn");
-        void *by_off = (void *)(text_section->data + func_ind);
-        if (getenv("WHALE_IR_DEBUG"))
-            fprintf(stderr, "  ir: sym=%p off=%p base=%p\n", by_name, by_off,
-                    (void *)text_section->data);
-        fn = by_off;
-        if (getenv("WHALE_IR_DEBUG")) {
-            int i;
-            fprintf(stderr, "  ir: after relocate: sym=%p off=%p base=%p exec=%d\n",
-                    by_name, by_off, (void *)text_section->data,
-                    text_section->sh_addr ? 1 : 0);
-            fprintf(stderr, "  ir: bytes:");
-            for (i = 0; i < 40; i++)
-                fprintf(stderr, " %02x", ((unsigned char *)text_section->data)[i]);
-            fprintf(stderr, "\n");
-        }
-        IRSTEP("relocated");
-    } else {
-        IRSTEP("relocate FAILED");
+    if (getenv("WHALE_IR_DEBUG")) {
+        int i, n = ind - func_ind;
+        fprintf(stderr, "  ir2: code [%d,%d) %d bytes:", func_ind, ind, n);
+        for (i = func_ind; i < ind && i < func_ind + 56; i++)
+            fprintf(stderr, " %02x", text_section->data[i]);
+        fprintf(stderr, "\n");
     }
+
+    WHALE_IR_FINISH(s, "whale_ir_add", fn);
 
 done:
     return fn;
-#undef IRSTEP
 }

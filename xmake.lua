@@ -85,7 +85,7 @@ end
 if not libtcc_prebuilt then
     target("libtcc")
         set_kind("static")
-        add_files(TCC .. "/libtcc.c")
+        add_files(TCC .. "/whale_tcc_iface.c")
         add_includedirs(TCC, TCC_RT)
         add_defines("TCC_TARGET_PE", "TCC_TARGET_X86_64")
 end

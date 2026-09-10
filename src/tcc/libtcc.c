@@ -1980,5 +1980,3 @@ PUB_FUNC void tcc_print_stats(TCCState *s, unsigned total_time)
 #endif
 }
 
-/* WhaleJS: internal interface, compiled inside the TinyCC TU (see the file). */
-#include "whale_tcc_iface.c"
