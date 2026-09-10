@@ -657,3 +657,38 @@ PARTIAL
 调用点按实参类型分派到对应版本（配合守卫 + 单态内联缓存）。
 这与结论 1 天然吻合（一次编译 = 一个版本），应作为"扩大受益面"里**类型格与调用约定的基础设计**，
 也直接服务于"混合函数"和"外部调用"两块。
+# <21>: Step 18 —— IR 直出：崩点精确定位到 `gv(RC_FLOAT)`
+PARTIAL（定位完成，就差最后一步）
+
+## 采纳用户诊断：**不建第二个实例**
+用户指出"tcc 的初始化会动全局变量，第二次初始化就会混乱两个的内容；应该做侵入性修改，
+使**一个实例可以完成多个任务**，而不是建立两个实例"（并指出 TCC 没有实例下属的 ctx）。
+这完全正确，也修正了我 <20> 的表述：不是"不能并存"这种宿命，而是**不该新建实例**。
+本轮的改法：`JS_WhaleIrCompileConst2` 不再用 `tcc_compile_string` 当初始化（那会 `preprocess_end`
+把 token 环境拆掉，之后的 `tok_alloc` 往已释放内存写 → 堆损坏），改为照抄 `tcc_compile()`(libtcc.c:623) 的序列：
+
+```
+tcc_open_bf → tccelf_begin_file → preprocess_start → [我们发 IR] → preprocess_end
+→ sym_pop(global/local) → tccelf_end_file → tcc_close → tcc_relocate
+```
+
+## 打点结果（`WHALE_IR_DEBUG=1`）
+```
+ir: tcc_new  →  ir: paths  →  ir: unit opened  →  ir: tok_alloc  →  ir: symbols
+→  ir: prolog  →  ir: body start  →  ir: push a  →  ir: push b  →  ir: gen_op  →  ✗ 崩
+```
+**结论**：`gfunc_prolog`（建帧）✓、`vsetc` 压两个 double 常量 ✓、`gen_op('+')` ✓ 全部通过，
+**崩在 `gv(RC_FLOAT)`**（把 vtop 的值取到寄存器）—— 即"取值"这一步，不是建帧也不是降级。
+
+## 下一步（很窄了）
+看 `tccgen.c` 的 `gv()`(1253) 在 `RC_FLOAT` 路径上依赖什么我们没设的状态。候选：
+- `cur_func_sym` / `func_vt` / `func_var` 之外的"当前函数"全局；
+- `loc`/栈帧已分配但 **`gv` 需要的 `vtop->type.ref`**（double 的 `ref` 我设成 NULL 了，可能期望
+  `double_type` 那样的规范类型）；
+- `tcc_state->nosse` 等浮点策略标志；
+- `gv` 内部走 `load()` → `get_reg()`，而 `get_reg` 依赖"函数已经开始发码"的隐含状态。
+建议：在 `gv` 入口与 `load`/`get_reg` 里各加一行打点，几轮内能收敛。
+
+## 状态
+IR 调用已从 `whale_test` 摘除，回归保持绿：`whale api test: ok`、`fib(30)=832040`。
+打点保留在 iface 里（默认静默，`WHALE_IR_DEBUG=1` 才打印）。

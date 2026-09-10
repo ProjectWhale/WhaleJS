@@ -57,16 +57,16 @@ static int whale_ir_token(int op)
     }
 }
 
-/* Compile `double f(void) { return a <op> b; }` straight into IR.
+/* Emit `double f(void) { return a <op> b; }` straight into IR.
    Returns a callable function pointer, or NULL on failure.
-   NB: TinyCC has exactly one global state (tcc_state and friends), so this has
-   to hand it back before returning or it breaks every other user of it. */
+
+   TinyCC has exactly one global state (tcc_state and the rest), so this must not
+   be called while another compilation is live; it also has to open/close the
+   translation unit the way tcc_compile() does, because emitting by hand is not
+   something the parser is otherwise prepared for. */
 void *JS_WhaleIrCompileConst2(const char *tcc_dir, double a, double b, int op)
 {
-    TCCState *saved_state = tcc_state;
-    Section *saved_cur_text = cur_text_section;
-    Sym *saved_local = local_stack, *saved_global = global_stack;
-    char tcc_dir2[1024];
+    char lib_dir[1024];
     TCCState *s;
     CType ft, dt;
     Sym *retsym, *funcsym;
@@ -75,27 +75,31 @@ void *JS_WhaleIrCompileConst2(const char *tcc_dir, double a, double b, int op)
     int tok = whale_ir_token(op);
     void *fn = NULL;
 
+#define IRSTEP(x) do { if (getenv("WHALE_IR_DEBUG")) fprintf(stderr, "  ir: %s\n", x); } while (0)
+
     if (!tok)
         return NULL;
-    snprintf(tcc_dir2, sizeof(tcc_dir2), "%s/lib", tcc_dir);
+    snprintf(lib_dir, sizeof(lib_dir), "%s/lib", tcc_dir);
+
     s = tcc_new();
+    IRSTEP("tcc_new");
     if (!s)
         return NULL;
-    /* libtcc1-64.a is needed for the link step; the paths must be set before the
-       output type, because tcc_new() fixes them. Note that emitting IR still
-       needs NO include path - not parsing C is the whole point. */
     tcc_set_lib_path(s, tcc_dir);
-    tcc_add_library_path(s, tcc_dir2);
+    tcc_add_library_path(s, lib_dir);
     tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
-    /* tcc_new() builds the state but the sections/parser live in tcc_add_file,
-       so run a trivial compile to get a usable state. */
-    tcc_compile_string(s, "void whale_ir_init(void) {}");
+    IRSTEP("paths");
 
-    /* function type: return double, no parameters. ref -> return-type Sym,
-       whose ->next chain holds parameters (empty here). */
+    tcc_open_bf(s, "<whale-ir>", 0);
+    tccelf_begin_file(s);
+    preprocess_start(s, 0);
+    IRSTEP("unit opened");
+
     ts = tok_alloc("whale_ir_fn", 11);
+    IRSTEP("tok_alloc");
     if (!ts)
         goto done;
+
     retsym = sym_push2(&local_stack, 0, VT_DOUBLE, 0);
     retsym->type.t = VT_DOUBLE;
     retsym->type.ref = NULL;
@@ -106,8 +110,8 @@ void *JS_WhaleIrCompileConst2(const char *tcc_dir, double a, double b, int op)
     funcsym = sym_push2(&local_stack, ts->tok, VT_FUNC, 0);
     funcsym->type = ft;
     funcsym->r = VT_CONST;
+    IRSTEP("symbols");
 
-    /* the frame, same sequence gen_function() uses */
     cur_text_section = text_section;
     if (!cur_text_section)
         goto done;
@@ -122,34 +126,46 @@ void *JS_WhaleIrCompileConst2(const char *tcc_dir, double a, double b, int op)
     local_scope = 1;
     gfunc_prolog(&funcsym->type);
     local_scope = 0;
+    IRSTEP("prolog");
 
-    /* the body */
     dt.t = VT_DOUBLE;
     dt.ref = NULL;
+    IRSTEP("body start");
     cval.d = a;
     vsetc(&dt, VT_CONST, &cval);
+    IRSTEP("push a");
     cval.d = b;
     vsetc(&dt, VT_CONST, &cval);
+    IRSTEP("push b");
     gen_op(tok);
+    IRSTEP("gen_op");
     gv(RC_FLOAT);
+    IRSTEP("gv");
     gfunc_return(&func_vt);
+    IRSTEP("gfunc_return");
 
     rsym = 0;
     gfunc_epilog();
-    /* g() only advances ind; the section must be told where the code ends or
-       tcc_relocate() will not copy it into the executable buffer. */
     cur_text_section->data_offset = ind;
     elfsym(funcsym)->st_size = ind - func_ind;
     check_vstack();
+    IRSTEP("epilog");
 
-    if (tcc_relocate(s, TCC_RELOCATE_AUTO) >= 0)
+    preprocess_end(s);
+    sym_pop(&global_stack, NULL, 0);
+    sym_pop(&local_stack, NULL, 0);
+    tccelf_end_file(s);
+    tcc_close();
+    IRSTEP("unit closed");
+
+    if (tcc_relocate(s, TCC_RELOCATE_AUTO) >= 0) {
         fn = (void *)(cur_text_section->data + func_ind);
+        IRSTEP("relocated");
+    } else {
+        IRSTEP("relocate FAILED");
+    }
 
 done:
-    /* hand the single global state back to whoever had it */
-    tcc_state = saved_state;
-    cur_text_section = saved_cur_text;
-    local_stack = saved_local;
-    global_stack = saved_global;
     return fn;
+#undef IRSTEP
 }
