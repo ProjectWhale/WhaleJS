@@ -239,6 +239,51 @@ UNRESOLVED（性能）
 5. 保底路线：TCC 适合"快启动 JIT"，峰值性能交给 **AOT（离线 gcc -O3 编译成目标文件再加载）**——
    这也正好对上 goal 里"空闲时把纯 JS 函数 AOT 成机器码"的定位。
 
+# <10>: Step 7 —— 数值特化（int + double）已落地，JIT 从"慢一倍"追到"慢 12%"
+UNRESOLVED（性能，但大幅改善）
+
+## 设计（commit b6d8569）
+- 生成器里加了**抽象解释** pass，类型格 `{UNKNOWN, NUM, BOOL}`；走字节码时同步做类型传播，
+  跳转目标处比较"局部类型 + 栈类型 + sp"快照，不一致就放弃 JIT（回到纯解释器）。
+- 全程数值的函数 → 整个函数在 **C `double` 域**里跑：局部变量和栈槽都变成 `double` C 局部变量。
+  **为什么统一用 double**：JS 的 Number 本来就是 double，所以 `a+b` 在 double 域算就是规范行为，
+  int32 溢出会自然变成非整数并被装箱成 float —— 于是**不需要任何溢出检查**，只有"根本不是数值"才处理。
+- 装箱：数值返回时若落在 int32 且是整数值就 `JS_MKVAL(JS_TAG_INT, ...)`，否则 `JS_NewFloat64`；
+  BOOL 类型则 `JS_NewBool`。
+- 字面量：`push_const`/`push_const8` 里是 int 或 float64 的常量都支持（用 `%.17g` 打印 double 保精度）。
+- **guard 而不是假设**（JS 弱类型）：读参数时判 `JS_TAG_INT` / `JS_TAG_FLOAT64`，其它类型置 `*deopt`；
+  `JS_CallInternal` 收到 deopt 就清掉 `whale_jit_entry`、把栈帧恢复成当前帧，**用解释器重跑同一帧**。
+  重跑安全，因为被编译的子集无副作用（无 call、无属性访问、不写 `var_buf`；有 `var_ref` 的函数直接拒绝）。
+
+## 结果
+| 版本 | fibi(30) |
+|------|----------|
+| 原版 QuickJS-ng 解释器（gcc -O3） | **1600 ns/call** |
+| 未特化 JIT（通用 JSValue 域） | 3200 ns/call |
+| **数值特化 JIT（本版）** | **1800 ns/call** |
+正确性：400× `fibi(30)` 全对；浮点变体 `fsum(1000) = 249750` 300× 全对（double 路径确实被特化）。
+→ 特化把差距从"慢 100%"压到"慢 12%"，但**还没赢过解释器**。
+
+## 仍然没赢的根因
+TCC 基本不做优化：生成的 double 运算反复 load/store（没有有效的寄存器分配），
+每条语句都回到内存。我们生成的代码已经"算法级"更优（每次迭代约十条双精度运算 vs 解释器的
+opcode 分派），但被代码质量吃掉了。
+
+## 下一步（按收益排序）
+1. **寄存器形态生成**：现在的生成仍是"栈机形态"（`v0/v1` 槽 + 跳转）。改成把字节码还原成
+   结构化 C（`double a,b,i,n; while (i<n) {...}`，局部变量直接互算、无栈槽），TCC 至少能少几次内存往返。
+2. **AOT 路线**：热点函数离线用 gcc -O3 编成 .o/.dll 再加载，峰值性能靠它；TCC 只管"快启动 JIT"。
+3. **分支预测 / CPU 缓存优化**（用户提出，太复杂，先记着）：
+   - 分支：生成代码里对"类型 guard 通过"这种大概率分支加 `__builtin_expect`/布局提示；
+     循环回边对齐；把冷路径（deopt、异常）挪到函数尾部。
+   - I-cache：控制内联/展开规模，别让膨胀伤指令缓存；TCC `tcc_relocate` 出来的代码页尽量连续
+     （现在每个函数一个 TCCState，内存分散）；必要时按页对齐热函数。
+   - D-cache：JSValue 数组/对象的布局与访问顺序（SoA vs AoS）、局部变量尽量留在寄存器、
+     避免同一缓存行被多线程写。等有真实 profile 再做，别空优化。
+4. TCC 选项（`-O1` 之类）试一下；编译缓存 + `free_function_bytecode` 里 `tcc_delete`（老账）。
+5. 递归版 fib 仍走解释器（`call1` + `get_var_ref0` 不在支持面内）；支持 `call` 后才会覆盖 goal 要求的递归 fibonacci。
+
+
 
 
 
