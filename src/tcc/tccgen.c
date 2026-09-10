@@ -272,7 +272,12 @@ ST_FUNC int tccgen_compile(TCCState *s1)
 
     parse_flags = PARSE_FLAG_PREPROCESS | PARSE_FLAG_TOK_NUM | PARSE_FLAG_TOK_STR;
     next();
+    if (getenv("WHALE_IR_DEBUG"))
+        fprintf(stderr, "[cgen] before decl: tok=%d nocode=0x%x parse_flags=0x%x\n",
+                tok, nocode_wanted, parse_flags);
     decl(VT_CONST);
+    if (getenv("WHALE_IR_DEBUG"))
+        fprintf(stderr, "[cgen] decl returned\n");
     gen_inline_functions(s1);
     check_vstack();
     /* end of translation unit info */
@@ -4179,9 +4184,14 @@ static int parse_btype(CType *type, AttributeDef *ad)
                 sym_to_attr(ad, type1.ref);
             goto basic_type2;
         default:
+            if (getenv("WHALE_IR_DEBUG"))
+                fprintf(stderr, "[pb] tok=%d typespec_found=%d\n", tok, typespec_found);
             if (typespec_found)
                 goto the_end;
             s = sym_find(tok);
+            if (getenv("WHALE_IR_DEBUG"))
+                fprintf(stderr, "[pb] sym_find=%p vt_typedef=%d\n", (void *)s,
+                        s ? (s->type.t & VT_TYPEDEF) : -1);
             if (!s || !(s->type.t & VT_TYPEDEF))
                 goto the_end;
             t &= ~(VT_BTYPE|VT_LONG);

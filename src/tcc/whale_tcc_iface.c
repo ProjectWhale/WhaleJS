@@ -390,14 +390,27 @@ void *JS_WhaleTokCompileAdd2(const char *tcc_dir)
     tcc_add_library_path(s, lib_dir);
     tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
 
-    /* Need the token table: open the unit the normal way first, then let our
-       stream take over before any real parsing happens. */
-    tcc_open_bf(s, "<whale-tok>", 0);
+    /* Guard exactly like JS_WhaleCompileTokens: the lexer must be off before
+       anything defines a builtin macro, and any error must not leave it on. */
+    whale_tok_active = 0;
+    if (setjmp(s->error_jmp_buf) != 0) {
+        whale_tok_active = 0;
+        s->error_set_jmp_enabled = 0;
+        return NULL;
+    }
+    s->nb_errors = 0;
+    s->error_set_jmp_enabled = 1;
+
+    tcc_open_bf(s, "whale_tok.c", 1);
+    file->buffer[0] = 0;   /* empty unit, not garbage */
+    file->buf_ptr = file->buffer;
     tccelf_begin_file(s);
     preprocess_start(s, 0);
     tcc_debug_start(s);
 
     whale_tok_build_add2();
+    JS_WhaleTokReset();
+    whale_tok_pos = 0;
     whale_tok_active = 1;
 
     tccgen_compile(s);          /* the real parser, fed by our tokens */
@@ -425,16 +438,32 @@ int JS_WhaleCompileTokens(TCCState *s, void (*emit)(void *), void *emit_ctx)
 {
     if (!s)
         return 0;
+    /* the lexer must be off until we have tokens to give it: a previous run that
+       longjmp'ed out of here could have left it on, and preprocess_start() would
+       then consume our (empty) token stream */
+    whale_tok_active = 0;
+
     if (setjmp(s->error_jmp_buf) != 0) {
+        if (getenv("WHALE_IR_DEBUG"))
+            fprintf(stderr, "[tok] tcc_error raised, bailing out\n");
+        whale_tok_active = 0;
         s->error_set_jmp_enabled = 0;
         return 0;
     }
     s->nb_errors = 0;
     s->error_set_jmp_enabled = 1;
 
-    tcc_open_bf(s, "<whale-jit>", 0);
+    /* len only sizes the char buffer; we read no characters (tokens come from the hook),
+       but the buffer has to exist for preprocess_start/parser init. */
+    tcc_open_bf(s, "whale_jit.c", 1);
+    file->buffer[0] = 0;   /* an empty translation unit, not garbage */
+    file->buf_ptr = file->buffer;
     tccelf_begin_file(s);
+    if (getenv("WHALE_IR_DEBUG"))
+        fprintf(stderr, "[tok] pre  active=%d pos=%d len=%d\n", whale_tok_active, whale_tok_pos, whale_tok_len);
     preprocess_start(s, 0);
+    if (getenv("WHALE_IR_DEBUG"))
+        fprintf(stderr, "[tok] post active=%d pos=%d len=%d\n", whale_tok_active, whale_tok_pos, whale_tok_len);
     tcc_debug_start(s);
 
     /* tokens can only be created now: tok_alloc needs the unit */
@@ -511,6 +540,11 @@ void JS_WhaleTokOp(int o)
    the C it is supposed to be equivalent to. */
 void JS_WhaleTokDump(void)
 {
+    int kk;
+    fprintf(stderr, "[tokcount=%d] vals:", whale_tok_len);
+    for (kk = 0; kk < whale_tok_len && kk < 18; kk++)
+        fprintf(stderr, " %d", whale_tok_buf[kk]);
+    fprintf(stderr, "\n");
     int k;
 
     for (k = 0; k < whale_tok_len; k++) {

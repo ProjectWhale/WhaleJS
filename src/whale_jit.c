@@ -20,6 +20,7 @@
 /* implemented inside the TinyCC translation unit (src/tcc/whale_tcc_iface.c) */
 int JS_WhaleTccProbe(void);
 void JS_WhaleTokPush(int t, double val);
+extern int whale_tok_active;   /* owned by the TinyCC-side file */
 int JS_WhaleCompileTokens(struct TCCState *s, void (*emit)(void *), void *emit_ctx);
 
 /* Opcode ids and sizes, taken from the same quickjs-opcode.h the interpreter
@@ -96,6 +97,7 @@ static uint32_t whale_get_u16(const uint8_t *p)
 /* implemented inside the TinyCC translation unit (src/tcc/whale_tcc_iface.c) */
 int JS_WhaleTccProbe(void);
 void JS_WhaleTokPush(int t, double val);
+extern int whale_tok_active;   /* owned by the TinyCC-side file */
 int JS_WhaleCompileTokens(struct TCCState *s, void (*emit)(void *), void *emit_ctx);
 
 #ifndef WHALE_JIT_TCC_DIR
@@ -455,29 +457,28 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        quickjs JSValue), the one extern constant, and the entry points we call.
        No #include, so the compile needs no file on disk. */
     wk(JS_WK_TYPEDEF); wk(JS_WK_UNSIGNED); wk(JS_WK_LONG); wk(JS_WK_LONG); wt_id("JSValue"); wt(';');
-    wk(JS_WK_TYPEDEF); wk(JS_WK_VOID); wt_id("JSContext"); wt(';');
     wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_EXCEPTION"); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleVarRefIsSelf"); wt('(');
-        wt_id("JSContext"); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_VOID); wt('*'); wt('*');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_VOID); wt('*'); wt('*');
         wt_id("var_refs"); wt(','); wk(JS_WK_INT); wt_id("idx"); wt(',');
         wt_id("JSValue"); wt_id("self"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("whale_jit_box_num"); wt('(');
-        wt_id("JSContext"); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_DOUBLE); wt_id("d"); wt(')'); wt(';');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_DOUBLE); wt_id("d"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleCheckStack"); wt('(');
-        wt_id("JSContext"); wt('*'); wt_id("ctx"); wt(')'); wt(';');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("whale_jit_unbox_num"); wt('(');
-        wt_id("JSContext"); wt('*'); wt_id("ctx"); wt(','); wt_id("JSValue"); wt_id("v"); wt(',');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wt_id("JSValue"); wt_id("v"); wt(',');
         wk(JS_WK_DOUBLE); wt('*'); wt_id("dst"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_NewFloat64"); wt('(');
-        wt_id("JSContext"); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_DOUBLE); wt_id("d"); wt(')'); wt(';');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_DOUBLE); wt_id("d"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_NewBool"); wt('(');
-        wt_id("JSContext"); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("b"); wt(')'); wt(';');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("b"); wt(')'); wt(';');
 
     /* whale_jit_core works purely in doubles: every number is unboxed at the
        boundary. Self-recursion calls it directly, so the recursive fast path
        costs no boxing at all - only the engine entry does that. */
     wk(JS_WK_STATIC); wk(JS_WK_DOUBLE); wt_id("whale_jit_core"); wt('(');
-        wt_id("JSContext"); wt('*'); wt_id("ctx"); wt(',');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(',');
         wt_id("JSValue"); wt('*'); wt_id("args"); wt(',');
         wk(JS_WK_DOUBLE); wt('*'); wt_id("An"); wt(',');
         wk(JS_WK_INT); wt('*'); wt_id("deopt"); wt(')'); wt('{');
@@ -924,7 +925,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';');
     wt('}');
     /* engine entry: unbox the arguments once, run core, box the result */
-    wt_id("JSValue"); wt_id("whale_jit_fn"); wt('('); wt_id("JSContext"); wt('*'); wt_id("ctx"); wt(','); wt_id("JSValue"); wt('*'); wt_id("args"); wt(','); wt_id("JSValue"); wt('*'); wt_id("var_buf"); wt(','); wk(JS_WK_INT); wt('*'); wt_id("deopt"); wt(','); wt_id("JSValue"); wt_id("whale_self"); wt(','); wk(JS_WK_VOID); wt('*'); wt_id("whale_entry"); wt(','); wk(JS_WK_VOID); wt('*'); wt_id("whale_var_refs"); wt(')'); wt('{');
+    wt_id("JSValue"); wt_id("whale_jit_fn"); wt('('); wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wt_id("JSValue"); wt('*'); wt_id("args"); wt(','); wt_id("JSValue"); wt('*'); wt_id("var_buf"); wt(','); wk(JS_WK_INT); wt('*'); wt_id("deopt"); wt(','); wt_id("JSValue"); wt_id("whale_self"); wt(','); wk(JS_WK_VOID); wt('*'); wt_id("whale_entry"); wt(','); wk(JS_WK_VOID); wt('*'); wt_id("whale_var_refs"); wt(')'); wt('{');
     wk(JS_WK_DOUBLE); wt_id("An"); wt('['); wt_int(arg_count > 0 ? arg_count : 1); wt(']'); wt(';'); wk(JS_WK_DOUBLE); wt_id("_r"); wt(';');
     whale_emit("    (void)ctx; (void)var_buf; (void)args; (void)deopt; (void)whale_self; (void)whale_entry; (void)whale_var_refs;\n");
     wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleCheckStack"); wt('('); wt_id("ctx"); wt(')'); wt(')'); wk(JS_WK_RETURN); wt_id("JS_EXCEPTION"); wt(';');
@@ -1002,6 +1003,10 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
 
     if (getenv("WHALE_JIT_DUMP"))
         fprintf(stderr, "whale jit paths: src=%s rt=%s\n", WHALE_JIT_SRC_DIR, WHALE_JIT_TCC_DIR);
+
+    /* the lexer must be OFF before anything in TinyCC defines a builtin macro,
+       otherwise tcc_define_symbol() would read our (finished) token stream */
+    whale_tok_active = 0;
 
     s = tcc_new();
     if (!s)

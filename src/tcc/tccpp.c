@@ -2995,8 +2995,20 @@ extern void whale_next_token(void);
 ST_FUNC void next_nomacro(void)
 {
     if (whale_tok_active) {
+        static int dbg;
+        if (dbg < 6 && getenv("WHALE_IR_DEBUG")) {
+            dbg++;
+            fprintf(stderr, "[hook] serving token #%d\n", dbg);
+        }
         whale_next_token();
         return;
+    }
+    {
+        static int dbg2;
+        if (dbg2 < 30 && getenv("WHALE_IR_DEBUG")) {
+            dbg2++;
+            fprintf(stderr, "[hook] lexer path, active=%d\n", whale_tok_active);
+        }
     }
     do {
         next_nomacro_spc();

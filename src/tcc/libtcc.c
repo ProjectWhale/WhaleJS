@@ -681,6 +681,8 @@ LIBTCCAPI void tcc_define_symbol(TCCState *s1, const char *sym, const char *valu
         value = "1";
     len1 = strlen(sym);
     len2 = strlen(value);
+    if (getenv("WHALE_IR_DEBUG"))
+        fprintf(stderr, "[def] sym='%s' value='%s'\n", sym, value);
 
     /* init file structure */
     tcc_open_bf(s1, "<define>", len1 + len2 + 1);
