@@ -16,7 +16,7 @@ JIT 要求真编译成机器码（TinyCC 后端），不是把解释器循环包
 
 ## 构建
 ```powershell
-xmake f -y -m release
+xmake f -y -p mingw -m release   # 必须带 -p mingw：本机没有 MSVC，否则报 "toolchain not found!"
 xmake -y
 .\build\mingw\x86_64\release\qjs.exe -e "console.log(1+2)"
 ```

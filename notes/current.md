@@ -10,7 +10,7 @@ node 24。缺失：MSVC/clang/ninja/tcc/docker/cargo。本机 shell 是 PowerShe
   可用替代：`https://codeload.github.com/<owner>/<repo>/zip/refs/heads/<branch>` 直接下 zip 再 Expand-Archive。
 - TinyCC 官网 https://bellard.org/tcc/ 只给文档链接；实际二进制/源码在
   https://download.savannah.nongnu.org/releases/tinycc/ ，最新源码是 **0.9.27**（没有 0.9.28）。
-- 目录约定：第三方源码全部放 temp/，`.gitignore` 已排除 temp/ 与 build/。
+- 目录约定：`.gitignore` 已排除 temp/ 与 build/；第三方源码最终落 thirdparty/（见 <2>）。
 
 ## baseline 验证
 原版 QuickJS-ng 0.16.2 用 cmake + MinGW Makefiles 编译通过，`qjs.exe -e "console.log(...)"` 输出正常，
@@ -26,3 +26,20 @@ TIPS
   `ld.exe: cannot find -ldl`。修法：`is_win() = is_plat("windows") or is_plat("mingw")`，
   链接参数对齐 quickjs-ng cmake 的 MINGW 分支（`-static -static-libgcc -Wl,--stack,8388608 -lpthread`）。
 - 构建产物路径：`build/mingw/x86_64/release/qjs.exe`（平台名同样体现为 mingw）。
+- **构建已通过**：`xmake f -y -p mingw -m release` + `xmake -y` 成功；`qjs.exe -e` 输出正常。
+  不带 `-p mingw` 时 `xmake f` 会报 `target(qjs): toolchain not found!`（本机没装 VS）。
+- 性能基线（解释器，JIT 前的对照）：`fib(30) = 832040`，**253ms**。
+- src/ 精简：移除 test262/、.github/、docs/、run-test262.c、fuzz.c、qjs-wasi-reactor.c、
+  meson.build/meson_options.txt、unicode_download.sh、update-version.sh、.gitmodules；src 现 3.5MB。
+
+# <3>: 工具使用坑：对源码/构建文件落笔后，本回合 bash 会被拒
+TIPS
+
+- 宿主规则：一旦本回合用 file tool（write_file/edit_file）改过 `xmake.lua` 或源文件（如 `src/quickjs.c`），
+  本回合剩下来的 **bash 调用全部被拒**（提示 `bash cannot declare which files it changes while a
+  read-evidence requirement is outstanding: <path>`），连只读命令也拒；**下一个用户回合自动恢复**。
+  → 对策：验证性命令（编译、跑测试、git commit）安排在同一回合的**前半段**执行，文件落笔放后半段；
+  或者干脆下回合再验证。
+- bash 无法直接把多行内容写进源文件（会被上面这条拦），改源码只能走 `edit_file`，且**每次编辑前要重新
+  read 目标窗口**：同一回合内对同一文件连续两次 edit 会报 `file changed after read`/`missing lines a-b`。
+  实践节奏：read 窗口 → edit 一处 → read 窗口 → edit 下一处。

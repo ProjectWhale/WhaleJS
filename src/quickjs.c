@@ -47,6 +47,7 @@
 #include "quickjs.h"
 #include "libregexp.h"
 #include "dtoa.h"
+#include "whalejs.h"   /* WhaleJS: JIT/AOT 扩展接口 */
 
 #if defined(EMSCRIPTEN) || defined(_MSC_VER)
 #define DIRECT_DISPATCH  0
@@ -617,6 +618,9 @@ struct JSContext {
                              const char *input, size_t input_len,
                              const char *filename, int line, int flags, int scope_idx);
     void *user_opaque;
+
+    /* WhaleJS: embedded JIT/AOT state, see whalejs.h（零分配，随 context 释放） */
+    JSWhaleContext whale;
 };
 
 typedef union JSFloat64Union {
@@ -2900,6 +2904,7 @@ JSContext *JS_NewContext(JSRuntime *rt)
     ctx = JS_NewContextRaw(rt);
     if (!ctx)
         return NULL;
+    ctx->whale.jit_mode = JS_JIT_LAZY; /* WhaleJS: JIT on by default (lazy) */
 
     if (JS_AddIntrinsicBaseObjects(ctx) ||
         JS_AddIntrinsicDate(ctx) ||
@@ -2928,6 +2933,54 @@ void *JS_GetContextOpaque(JSContext *ctx)
 void JS_SetContextOpaque(JSContext *ctx, void *opaque)
 {
     ctx->user_opaque = opaque;
+}
+
+/* ===== WhaleJS: JIT/AOT public API (minimal implementation) ===== */
+
+void JS_WhaleSetJitMode(JSContext *ctx, JSJitMode mode)
+{
+    if (!ctx)
+        return;
+    if (mode < JS_JIT_OFF || mode > JS_JIT_AOT)
+        return;
+    ctx->whale.jit_mode = (int)mode;
+}
+
+JSJitMode JS_WhaleGetJitMode(JSContext *ctx)
+{
+    return ctx ? (JSJitMode)ctx->whale.jit_mode : JS_JIT_OFF;
+}
+
+void JS_WhaleGetJitStats(JSContext *ctx, JSWhaleJitStats *out)
+{
+    if (!out)
+        return;
+    if (!ctx) {
+        memset(out, 0, sizeof(*out));
+        return;
+    }
+    out->requests = ctx->whale.stat_requests;
+    out->compiled = ctx->whale.stat_compiled;
+    out->failed = ctx->whale.stat_failed;
+    out->code_bytes = ctx->whale.stat_code_bytes;
+}
+
+void JS_WhaleNoteJitRequest(JSContext *ctx)
+{
+    if (ctx)
+        ctx->whale.stat_requests++;
+}
+
+void JS_WhaleNoteJitResult(JSContext *ctx, int ok, uint64_t code_bytes)
+{
+    if (!ctx)
+        return;
+    if (ok) {
+        ctx->whale.stat_compiled++;
+        ctx->whale.stat_code_bytes += code_bytes;
+    } else {
+        ctx->whale.stat_failed++;
+    }
 }
 
 /* set the new value and free the old value after (freeing the value
