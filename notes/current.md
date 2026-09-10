@@ -493,6 +493,36 @@ TCC 已停更、可以随意改，所以这条路可行。**额外好处（本�
 修完 `<=` 覆盖 + 跳转状态 + 路径之后，用户自己跑 fib(40)：**1949 ms**（我这边 2.12s，量级一致），
 相对原版 17.5s 约 9 倍。
 
+# <17>: Step 14 —— 把 JIT 生成器拆成独立编译单元（src/whale_jit.c）
+SOLVED
+
+## 做了什么（commit 41fe765）
+- 生成器（~950 行）从 `quickjs.c` 搬到 `src/whale_jit.c`；引擎与它之间只通过结构体通信：
+  `JSWhaleFuncInfo { byte_code, byte_code_len, is_normal, arg/var/stack 计数, var_ref_count, cpool }`，
+  生成器**不碰 quickjs 内部结构**。
+- 生成器需要的三个内部服务由引擎以薄封装提供：
+  - `JS_WhaleVarRefIsSelf(ctx, var_refs, idx, self)` —— 证明"就是自己"（只编译直接自递归）
+  - `JS_WhaleCheckStack(ctx)` —— 栈溢出检查（同时抛 RangeError）
+  - `JS_WhaleOpSize(op)` —— **操作数长度直接问解释器**（`short_opcode_info`），不再自己维护表
+- 收益：**只改 JIT 生成器 → 增量重建 0.5 秒**（此前每改一处都要重编 6.5 万行的 quickjs.c，约 60 秒）。
+
+## 两个坑（都值得记住）
+1. **TinyCC 必须保持独立编译单元**。TCC 的 `tcctok.h` 和 quickjs 的 token 表**都用 `DEF()` 展开枚举**
+   （`TOK_VOID`/`TOK_IF`…）→ 把 `libtcc.c` include 进 `quickjs.c` 必然重定义。
+   要从生成器里用 TCC 内部 API，正确做法是**在 TCC 那一侧加导出薄封装**（libtcc API 本身就是这个套路），
+   而不是合并 TU。
+2. **自己生成 opcode size 表踩坑**：`quickjs-opcode.h` 第一次 include 就已经把 `DEF` 与 `def` 两类项都展开了
+   （`def` 默认落到 `DEF`），我 include 了两次 → 表翻倍、DEF 区之后的 size 全部错位 →
+   生成器在第一条 opcode 就"静默放弃"（诊断先是 `pos=0 op=215`，改对映射后暴露真凶 `get_var_ref0`）。
+   现在 size 一律由引擎提供，不可能再漂移。
+   （顺带确认过：两边枚举是一致的 —— `get_var_ref0=227 add=156 count=252 temp_start=185 temp_end=204`。）
+
+## 验证
+- `bad=0`（pristine 与 whalejs 在 h/fib/fibi 上完全一致）、`whale api test: ok`
+- 用户 fib.js：**2.22 s**（原版 17.5 s）
+- 只 touch `src/whale_jit.c`：`build ok, spent 0.5s`
+
+
 
 
 
