@@ -892,6 +892,10 @@ typedef struct JSFunctionBytecode {
     int pc2line_len;
     uint8_t *pc2line_buf;
     char *source;
+
+    /* WhaleJS: JIT/AOT 状态（零初始化，见 src/whalejs.h） */
+    uint32_t whale_call_count; /* 调用次数，用于热点判定 */
+    void *whale_jit_entry;     /* 非 NULL 表示已有机器码入口 */
 } JSFunctionBytecode;
 
 typedef struct JSBoundFunction {
@@ -2981,6 +2985,23 @@ void JS_WhaleNoteJitResult(JSContext *ctx, int ok, uint64_t code_bytes)
     } else {
         ctx->whale.stat_failed++;
     }
+}
+
+/* WhaleJS: JS_CallInternal 的热点入口。
+   当前只统计；TinyCC 编译接入后在这里产出机器码并填 b->whale_jit_entry。
+   注意：JIT=OFF 时必须零开销返回。 */
+static void whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
+{
+    JSWhaleContext *w = &ctx->whale;
+
+    if (w->jit_mode == JS_JIT_OFF)
+        return;
+
+    w->stat_requests++;
+    b->whale_call_count++;
+    if (b->whale_call_count < WHALE_JIT_HOT_THRESHOLD || b->whale_jit_entry)
+        return;
+    /* 热点已达阈值：下一步在这里调 TinyCC 把 b 编译成机器码 */
 }
 
 /* set the new value and free the old value after (freeing the value
@@ -18206,6 +18227,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     sf->prev_frame = rt->current_stack_frame;
     rt->current_stack_frame = sf;
     ctx = b->realm; /* set the current realm */
+
+    /* WhaleJS: 热点统计（JIT 代码生成接入前先只计数，见 src/whalejs.h） */
+    whale_on_call(ctx, b);
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
     if (check_dump_flag(ctx->rt, JS_DUMP_BYTECODE_STEP))

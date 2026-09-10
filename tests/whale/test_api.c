@@ -54,6 +54,7 @@ int main(void)
     JSContext *ctx = rt ? JS_NewContext(rt) : NULL;
     JSWhaleJitStats st;
     double fib_off, loop_off, str_off, fib_lazy, loop_lazy, str_lazy;
+    uint32_t req_before;
 
     CHECK(rt != NULL);
     CHECK(ctx != NULL);
@@ -88,23 +89,31 @@ int main(void)
     CHECK(st.failed == 1);
     CHECK(st.code_bytes == 128);
 
-    /* 5. JIT=OFF 语义正确 */
+    /* 5. JIT=OFF：语义正确，且不产生 JIT 请求 */
     JS_WhaleSetJitMode(ctx, JS_JIT_OFF);
+    JS_WhaleGetJitStats(ctx, &st);
+    req_before = st.requests;
     fib_off = eval_number(ctx, SRC_FIB);
     loop_off = eval_number(ctx, SRC_LOOP);
     str_off = eval_number(ctx, SRC_STR);
     CHECK(fib_off == 6765.0);   /* fib(20) */
     CHECK(loop_off == 499500.0);
     CHECK(str_off == 7.0);      /* "ab1-2-3".length */
+    JS_WhaleGetJitStats(ctx, &st);
+    CHECK(st.requests == req_before);   /* OFF 下热点统计纹丝不动 */
 
-    /* 6. JIT=LAZY 与 OFF 结果必须一致（JIT 上线后这条是真正的回归检查） */
+    /* 6. JIT=LAZY：结果与 OFF 一致，且热点统计在涨（JIT 上线后这条是真正的回归检查） */
     JS_WhaleSetJitMode(ctx, JS_JIT_LAZY);
+    JS_WhaleGetJitStats(ctx, &st);
+    req_before = st.requests;
     fib_lazy = eval_number(ctx, SRC_FIB);
     loop_lazy = eval_number(ctx, SRC_LOOP);
     str_lazy = eval_number(ctx, SRC_STR);
     CHECK(fib_lazy == fib_off);
     CHECK(loop_lazy == loop_off);
     CHECK(str_lazy == str_off);
+    JS_WhaleGetJitStats(ctx, &st);
+    CHECK(st.requests > req_before);
 
     /* 7. NULL 入参不得崩 */
     JS_WhaleSetJitMode(NULL, JS_JIT_OFF);

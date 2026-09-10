@@ -35,6 +35,11 @@ typedef struct JSWhaleContext {
     uint64_t stat_code_bytes;
 } JSWhaleContext;
 
+/* 热点阈值：函数累计调用达到该次数即进入 JIT 候选 */
+#ifndef WHALE_JIT_HOT_THRESHOLD
+#define WHALE_JIT_HOT_THRESHOLD 100
+#endif
+
 /* 公开 API */
 JS_EXTERN void      JS_WhaleSetJitMode(JSContext *ctx, JSJitMode mode);
 JS_EXTERN JSJitMode JS_WhaleGetJitMode(JSContext *ctx);
