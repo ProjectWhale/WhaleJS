@@ -24,3 +24,112 @@ int JS_WhaleTccProbe(void)
        real one: VSTACK_SIZE is 256 in tcc.h. */
     return (int)(sizeof(__vstack) / sizeof(__vstack[0])) - 1;
 }
+/* ========================================================================
+ * IR direct emission - first closed loop
+ *
+ * Instead of handing TinyCC C source to parse, drive its internals: build the
+ * function symbol, emit the prologue, push operands on the value stack, lower
+ * them with gen_op(), emit the epilogue, and let tcc_relocate() produce callable
+ * machine code. This is the prerequisite for optimising on the IR (register
+ * keeping, peepholes) and it drops the quickjs.h dependency entirely.
+ *
+ * First cut: a function with no parameters, so the parameter chain (the least
+ * certain part of TinyCC's type model) is not involved yet.
+ * ====================================================================== */
+
+
+/* caller-facing op selector */
+#define WHALE_IR_ADD 0
+#define WHALE_IR_SUB 1
+#define WHALE_IR_MUL 2
+#define WHALE_IR_DIV 3
+
+/* TinyCC names single-character operators by their character value (see the
+   many gen_op('+') calls in tccgen.c), so no token table is needed here. */
+static int whale_ir_token(int op)
+{
+    switch (op) {
+    case WHALE_IR_ADD: return '+';
+    case WHALE_IR_SUB: return '-';
+    case WHALE_IR_MUL: return '*';
+    case WHALE_IR_DIV: return '/';
+    default: return 0;
+    }
+}
+
+/* Compile `double f(void) { return a <op> b; }` straight into IR.
+   Returns a callable function pointer, or NULL on failure. */
+void *JS_WhaleIrCompileConst2(double a, double b, int op)
+{
+    TCCState *s;
+    CType ft, dt;
+    Sym *retsym, *funcsym, *dummy;
+    CValue cval;
+    int tok = whale_ir_token(op);
+    void *fn = NULL;
+
+    if (!tok)
+        return NULL;
+    s = tcc_new();
+    if (!s)
+        return NULL;
+    tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
+
+    /* function type: return double, no parameters.
+       TinyCC models it as CType.ref -> return-type Sym, whose ->next chain holds
+       the parameters (see gfunc_prolog). With no parameters that chain ends at
+       the return-type symbol. */
+    TokenSym *ts = tok_alloc("whale_ir_fn", 11);
+    retsym = sym_push2(&local_stack, 0, VT_DOUBLE, 0);
+    retsym->type.t = VT_DOUBLE;
+    retsym->type.ref = NULL;
+    retsym->next = NULL;
+
+    ft.t = VT_FUNC;
+    ft.ref = retsym;
+    funcsym = sym_push2(&local_stack, ts->tok, VT_FUNC, 0);
+    funcsym->type = ft;
+    funcsym->r = VT_CONST;
+
+    /* the frame: same sequence gen_function() uses */
+    cur_text_section = text_section;
+    if (!cur_text_section)
+        return NULL;
+    nocode_wanted = 0;
+    ind = cur_text_section->data_offset;
+    put_extern_sym(funcsym, cur_text_section, ind, 0);
+    funcname = "";
+    func_ind = ind;
+    vla_sp_loc = -1;
+    vla_sp_root_loc = -1;
+    dummy = sym_push2(&local_stack, SYM_FIELD, 0, 0);
+    (void)dummy;
+    local_scope = 1;
+    gfunc_prolog(&funcsym->type);
+    local_scope = 0;
+
+    /* the body */
+    dt.t = VT_DOUBLE;
+    dt.ref = NULL;
+    cval.d = a;
+    vsetc(&dt, VT_CONST, &cval);
+    cval.d = b;
+    vsetc(&dt, VT_CONST, &cval);
+    gen_op(tok);
+    gv(RC_FLOAT);
+    gfunc_return(&func_vt);
+
+    rsym = 0;
+    gsym_addr(0, ind);   /* no early returns to patch; keep the sequence */
+    gfunc_epilog();
+    elfsym(funcsym)->st_size = ind - func_ind;
+    check_vstack();
+
+    /* make it callable */
+    if (tcc_relocate(s, TCC_RELOCATE_AUTO) < 0) {
+        tcc_delete(s);
+        return NULL;
+    }
+    fn = tcc_get_symbol(s, "whale_ir_fn");
+    return fn;
+}
