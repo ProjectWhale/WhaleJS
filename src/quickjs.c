@@ -65072,8 +65072,73 @@ static int whale_type_is_num(int t)
     return t == WHALE_T_NUM || t == WHALE_T_BOOL;
 }
 
+/* load-like opcode -> C expression (identifier or literal). Returns 0 if the
+   opcode at that position is not a simple load. */
+static int whale_load_expr(const uint8_t *pc, int pos, const uint8_t *cur, int var_count,
+                           char *out, size_t out_size, int *len_out, int *type_out)
+{
+    int op = pc[pos];
+
+    *len_out = short_opcode_info(op).size;
+    *type_out = WHALE_T_NUM;
+    switch (op) {
+    case OP_push_minus1:
+        snprintf(out, out_size, "-1");
+        return 1;
+    case OP_push_0: case OP_push_1: case OP_push_2: case OP_push_3:
+    case OP_push_4: case OP_push_5: case OP_push_6: case OP_push_7:
+        snprintf(out, out_size, "%d", op - OP_push_0);
+        return 1;
+    case OP_push_i8:
+        snprintf(out, out_size, "%d", (int)(int8_t)pc[pos + 1]);
+        return 1;
+    case OP_push_i16:
+        snprintf(out, out_size, "%d", (int)(int16_t)get_u16(pc + pos + 1));
+        return 1;
+    case OP_push_i32:
+        snprintf(out, out_size, "%d", (int)(int32_t)get_u32(pc + pos + 1));
+        return 1;
+    case OP_push_true:
+        snprintf(out, out_size, "1");
+        *type_out = WHALE_T_BOOL;
+        return 1;
+    case OP_push_false:
+        snprintf(out, out_size, "0");
+        *type_out = WHALE_T_BOOL;
+        return 1;
+    case OP_get_loc0: case OP_get_loc1: case OP_get_loc2: case OP_get_loc3:
+    case OP_get_loc8:
+    case OP_get_loc:
+        {
+            int idx = (op == OP_get_loc8) ? (int)pc[pos + 1] :
+                      (op == OP_get_loc) ? (int)get_u16(pc + pos + 1) :
+                      op - OP_get_loc0;
+            int t = (idx >= 0 && idx < var_count) ? cur[idx] : WHALE_T_UNKNOWN;
+
+            if (t == WHALE_T_UNKNOWN)
+                return 0;
+            *type_out = t;
+            snprintf(out, out_size, "L%d", idx);
+            return 1;
+        }
+    case OP_get_arg0: case OP_get_arg1: case OP_get_arg2: case OP_get_arg3:
+    case OP_get_arg:
+        snprintf(out, out_size, "A%d",
+                 (op == OP_get_arg) ? (int)get_u16(pc + pos + 1) : op - OP_get_arg0);
+        return 1;
+    default:
+        return 0;
+    }
+}
 /* Generate + type-check in one pass. Returns 0 when the function is not a
-   candidate (unsupported opcode, unknown type, inconsistent jump target). */
+   candidate (unsupported opcode, unknown type, inconsistent jump target).
+
+   The emitter is deliberately "expression shaped" rather than "stack shaped":
+   a load-load-binop(-store) run collapses into a single C assignment, so TCC
+   sees `L3 = L0 + L1;` instead of two stack slots being filled and then read
+   back. That matters because TCC has no register allocator worth the name and
+   spills aggressively - the fewer distinct live variables it sees, the more
+   stays in registers. Constants folded at compile time disappear the same way. */
 static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
 {
     const uint8_t *pc = b->byte_code_buf;
@@ -65129,23 +65194,138 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
         whale_emit("    double L%d = 0;\n", i);
     for (i = 0; i < stack_size; i++)
         whale_emit("    double v%d = 0;\n", i);
+    for (i = 0; i < arg_count; i++) {
+        if (args_used[i])
+            whale_emit("    double A%d = 0;\n", i);
+    }
+    /* unbox the arguments once, guarded: only numbers may enter this code */
+    for (i = 0; i < arg_count; i++) {
+        if (!args_used[i])
+            continue;
+        whale_emit("    { JSValue _a = args[%d]; int _t = JS_VALUE_GET_TAG(_a); if (_t == JS_TAG_INT) A%d = (double)JS_VALUE_GET_INT(_a); else if (JS_TAG_IS_FLOAT64(_t)) A%d = (double)JS_VALUE_GET_FLOAT64(_a); else { *deopt = 1; return JS_EXCEPTION; } }\n",
+                   i, i, i);
+    }
 
     sp = 0;
     for (pos = 0; pos < len; ) {
         int op = pc[pos];
         int sz = short_opcode_info(op).size;
         int ta, tb, t;
+        char e1[32], e2[32];
+        int t1 = 0, t2 = 0;
+        int l1 = 0, l2 = 0, ok1, ok2 = 0, p2 = 0;
 
         cur[state_len - 1] = (uint8_t)sp;
         if (targets[pos]) {
             if (seen[pos]) {
-                if (memcmp(snap + (size_t)pos * state_len, cur, state_len) != 0)
-                    goto out; /* reached with a different slot/type state */
+                int k, differ = 0;
+
+                for (k = 0; k < state_len; k++) {
+                    uint8_t sv = snap[(size_t)pos * state_len + k];
+                    uint8_t cv = cur[k];
+
+                    if (sv == cv)
+                        continue;
+                    if (sv == WHALE_T_UNKNOWN) {
+                        snap[(size_t)pos * state_len + k] = cv; /* optimistic merge */
+                    } else if (cv != WHALE_T_UNKNOWN) {
+                        differ = 1;
+                        break;
+                    }
+                }
+                if (differ)
+                    goto out; /* real type conflict at the merge point */
             } else {
                 seen[pos] = 1;
                 memcpy(snap + (size_t)pos * state_len, cur, state_len);
             }
             whale_emit("  L%d:\n", pos);
+        }
+
+        /* --- peephole: <load> <load> <binop> [put_loc] -> one assignment --- */
+        ok1 = whale_load_expr(pc, pos, cur, var_count, e1, sizeof(e1), &l1, &t1);
+        if (ok1) {
+            p2 = pos + l1;
+            if (p2 < len)
+                ok2 = whale_load_expr(pc, p2, cur, var_count, e2, sizeof(e2), &l2, &t2);
+        } else if (op == OP_get_loc0_loc1 && var_count >= 2 &&
+                   cur[0] != WHALE_T_UNKNOWN && cur[1] != WHALE_T_UNKNOWN) {
+            snprintf(e1, sizeof(e1), "L0");
+            snprintf(e2, sizeof(e2), "L1");
+            t1 = cur[0];
+            t2 = cur[1];
+            l1 = 1;
+            l2 = 0;
+            p2 = pos + 1;
+            ok1 = ok2 = 1;
+        }
+        if (ok1 && ok2) {
+            int p3 = p2 + l2;
+            int op3 = (p3 < len) ? pc[p3] : 0;
+
+            if ((op3 == OP_add || op3 == OP_sub || op3 == OP_mul || op3 == OP_lt) &&
+                whale_type_is_num(t1) && whale_type_is_num(t2)) {
+                int l3 = short_opcode_info(op3).size;
+                int p4 = p3 + l3;
+                int dst = -1, l4 = 0;
+
+                if (p4 < len && pc[p4] >= OP_put_loc0 && pc[p4] <= OP_put_loc3) {
+                    dst = pc[p4] - OP_put_loc0;
+                    l4 = 1;
+                } else if (p4 < len && pc[p4] == OP_put_loc8) {
+                    dst = (int)pc[p4 + 1];
+                    l4 = 2;
+                } else if (p4 < len && pc[p4] == OP_put_loc) {
+                    dst = (int)get_u16(pc + p4 + 1);
+                    l4 = 3;
+                }
+
+                if (op3 == OP_lt) {
+                    if (dst >= 0) {
+                        whale_emit("    L%d = (%s < %s) ? 1 : 0;\n", dst, e1, e2);
+                        cur[dst] = WHALE_T_BOOL;
+                    } else {
+                        whale_emit("    v%d = (%s < %s) ? 1 : 0;\n", sp, e1, e2);
+                        cur[var_count + sp] = WHALE_T_BOOL;
+                        sp += 1;
+                    }
+                } else {
+                    if (dst >= 0) {
+                        whale_emit("    L%d = %s %c %s;\n", dst, e1,
+                                   op3 == OP_add ? '+' : op3 == OP_sub ? '-' : '*', e2);
+                        cur[dst] = WHALE_T_NUM;
+                    } else {
+                        whale_emit("    v%d = %s %c %s;\n", sp, e1,
+                                   op3 == OP_add ? '+' : op3 == OP_sub ? '-' : '*', e2);
+                        cur[var_count + sp] = WHALE_T_NUM;
+                        sp += 1;
+                    }
+                }
+                pos = p4 + l4;
+                continue;
+            }
+        }
+        /* --- peephole 2: <load> put_loc -> direct copy --- */
+        if (ok1 && whale_type_is_num(t1)) {
+            int pb = pos + l1;
+            int d2 = -1, l5 = 0;
+
+            if (pb < len && pc[pb] >= OP_put_loc0 && pc[pb] <= OP_put_loc3) {
+                d2 = pc[pb] - OP_put_loc0;
+                l5 = 1;
+            } else if (pb < len && pc[pb] == OP_put_loc8) {
+                d2 = (int)pc[pb + 1];
+                l5 = 2;
+            } else if (pb < len && pc[pb] == OP_put_loc) {
+                d2 = (int)get_u16(pc + pb + 1);
+                l5 = 3;
+            }
+            if (d2 >= 0 && d2 < var_count) {
+                whale_emit("    L%d = %s;\n", d2, e1);
+                cur[d2] = (uint8_t)t1;
+                pos = pb + l5;
+                continue;
+            }
         }
 
         switch (op) {
@@ -65251,9 +65431,7 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
 
                 if (idx < 0 || idx >= arg_count)
                     goto out;
-                /* guard: only numbers may enter the specialized code */
-                whale_emit("    { JSValue _a = args[%d]; int _t = JS_VALUE_GET_TAG(_a); if (_t == JS_TAG_INT) v%d = (double)JS_VALUE_GET_INT(_a); else if (JS_TAG_IS_FLOAT64(_t)) v%d = (double)JS_VALUE_GET_FLOAT64(_a); else { *deopt = 1; return JS_EXCEPTION; } }\n",
-                           idx, sp, sp);
+                whale_emit("    v%d = A%d;\n", sp, idx);
                 cur[var_count + sp] = WHALE_T_NUM;
                 sp++;
             }
@@ -65325,11 +65503,11 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
         }
         pos += sz;
     }
-    /* falling off the end would return undefined - not our shape */
-    goto out;
-
-    ret = 1;
+    whale_emit("    return JS_UNDEFINED;\n}\n");
+    ret = 1;   /* every opcode lowered successfully */
   out:
+    if (!ret && getenv("WHALE_JIT_DUMP"))
+        fprintf(stderr, "whale jit: gen gave up at pos=%d op=%d\n", pos, (pos < len) ? pc[pos] : -1);
     if (targets)
         js_free(ctx, targets);
     if (seen)
@@ -65342,7 +65520,6 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
         js_free(ctx, args_used);
     return ret;
 }
-
 /* Compile the emitted source with TCC and attach the entry to b. */
 static int whale_jit_compile(JSContext *ctx, JSFunctionBytecode *b)
 {
@@ -65363,6 +65540,9 @@ static int whale_jit_compile(JSContext *ctx, JSFunctionBytecode *b)
     tcc_add_library_path(s, WHALE_JIT_TCC_DIR "/lib");
     tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
     tcc_add_symbol(s, "JS_NewFloat64", (void *)JS_NewFloat64);
+
+    if (getenv("WHALE_JIT_DUMP"))
+        fprintf(stderr, "--- whale jit source ---\n%s--- end ---\n", whale_jit_src);
 
     if (tcc_compile_string(s, whale_jit_src) < 0)
         goto fail;
