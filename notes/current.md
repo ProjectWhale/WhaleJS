@@ -1070,3 +1070,33 @@ TIPS
 ## 状态
 回归坏于此轮末尾（`whale_test` 撞访问违例），**代码已回退到 f5e9667**（绿：`whale api test: ok`、
 `fib(32)=2178309`，8×）；本轮工作保留在 git `1bdeaae`（及 `5716d97`..`0bb5b25`）。
+# <32>: Step 29 —— 又一次自我纠正：**观测工具的故障被当成了被观察对象的故障**
+TIPS
+
+## 我错在哪
+上一个 <31> 里我断定"token 流只发到 `{ double v0 = ` 就断了"。**错了。**
+真相：`JS_WhaleTokDump()` 自己会崩 —— 它用 `get_tok_str(t, NULL)` 打印每个 token，
+而 `get_tok_str` 对 `TOK_CINT`/`TOK_CDOUBLE` 会按"标识符"去索引 token 表（越界）。
+dump 恰好停在 `v0 = ` 之后的**第一个数字字面量**（`wt_int(0)`）就是证据。
+
+**所以：dump 断了 ≠ token 流断了。** 我把自写工具的输出当成了判据，而那个工具本身有 bug。
+
+## 用什么方法纠正的（值得复用）
+**把 emit 代码逐行"手译"回等价的 C，再用 `gcc -fsyntax-only` 检查**：
+```
+temp/read_back.c:26:5: error: label 'L20' used but not defined   ← 唯一的错是我手写时编的标签
+```
+即：**我读出的序列语法完全正确**（`static double whale_jit_core(JSContext*, JSValue*, double*, int*) {...}`
+与 `JSValue whale_jit_fn(...) {...}` 全部合法）。gcc 接受、TCC 却报 `function pointer expected`
+→ 差别**不在 token 的合法性**上。
+
+## 结论与下一步
+- token 序列**语法正确**；TCC 仍报 `function pointer expected`（含义：`decl()` 遇到"非类型名的标识符 + `(`"）。
+- 问题方向已从"我的 token 发错了"转为 **"TCC 没把我们的类型名认出来"**：
+  查 `decl()` 里判断标识符是否为类型名走的是哪个函数（`sym_find` 一类），
+  以及我们经 `tok_alloc` 得到的 token 在它看来是否可见。**这仍是一次纯读代码的排查，不需要跑 WhaleJS。**
+
+## 教训（与 <31> 合并成一条）
+1. **先读代码**（rules-for-LLMs.md 里本来就有这条，我反复忘）；
+2. **不要依赖自写观测工具的输出**：先确认工具本身正确（`get_tok_str` 不能用于 CINT/CDOUBLE）；
+3. 观察与推理冲突时，**先怀疑观察**。
