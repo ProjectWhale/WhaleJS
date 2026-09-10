@@ -8,6 +8,16 @@ set_version("0.0.1")
 set_languages("c11", "c++14")
 add_rules("mode.debug", "mode.release")
 
+-- libtcc: compiled from thirdparty/tinycc by default (we intend to patch it),
+-- or linked from the prebuilt DLL+import lib with --libtcc_prebuilt=y.
+option("libtcc_prebuilt")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Link the prebuilt libtcc (DLL + import library) instead of compiling TinyCC from source")
+option_end()
+
+local libtcc_prebuilt = has_config("libtcc_prebuilt")
+
 local SRC = "src"
 local TCC = "thirdparty/tinycc"
 local TCC_RT = "thirdparty/tcc-runtime"
@@ -51,17 +61,32 @@ end
 -- TinyCC：JIT 运行期把生成的 C 源码编成机器码。
 -- tcc.h 里 ONE_SOURCE 默认 1，所以整个 libtcc 只有 libtcc.c 一个翻译单元。
 -- config.h 放在 tcc-runtime/（TinyCC 上游 .gitignore 会吃掉 tinycc/config*.h）。
-target("libtcc")
-    set_kind("static")
-    add_files(TCC .. "/libtcc.c")
-    add_includedirs(TCC, TCC_RT)
-    add_defines("TCC_TARGET_PE", "TCC_TARGET_X86_64")
+if not libtcc_prebuilt then
+    target("libtcc")
+        set_kind("static")
+        add_files(TCC .. "/libtcc.c")
+        add_includedirs(TCC, TCC_RT)
+        add_defines("TCC_TARGET_PE", "TCC_TARGET_X86_64")
+end
+
+-- put libtcc.dll next to the binary when the prebuilt path is used
+local function link_libtcc()
+    if libtcc_prebuilt then
+        add_linkdirs(TCC_RT .. "/lib")
+        add_links("libtcc")
+        after_build(function (target)
+            os.cp(TCC_RT .. "/lib/libtcc.dll", target:targetdir())
+        end)
+    else
+        add_deps("libtcc")
+    end
+end
 
 -- qjs CLI（对照与手工验证用）
 target("qjs")
     set_kind("binary")
     set_rundir("$(projectdir)")
-    add_deps("libtcc")
+    link_libtcc()
     add_files(engine_sources)
     add_files(SRC .. "/qjs.c", SRC .. "/gen/repl.c", SRC .. "/gen/standalone.c")
     add_includedirs(SRC, TCC)
@@ -72,7 +97,7 @@ target("qjs")
 target("whale_test")
     set_kind("binary")
     set_rundir("$(projectdir)")
-    add_deps("libtcc")
+    link_libtcc()
     add_files(engine_sources)
     add_files("tests/whale/*.c")
     add_includedirs(SRC, TCC)
