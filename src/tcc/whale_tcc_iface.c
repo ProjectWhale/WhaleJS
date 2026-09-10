@@ -419,7 +419,9 @@ void *JS_WhaleTokCompileAdd2(const char *tcc_dir)
  * next_nomacro() (decl/block/gen_function/gen_op) runs untouched, so parser
  * state is correct by construction. Returns 1 on success.
  * ---------------------------------------------------------------------- */
-int JS_WhaleCompileTokens(TCCState *s)
+void JS_WhaleTokDump(void);
+
+int JS_WhaleCompileTokens(TCCState *s, void (*emit)(void *), void *emit_ctx)
 {
     if (!s)
         return 0;
@@ -435,8 +437,16 @@ int JS_WhaleCompileTokens(TCCState *s)
     preprocess_start(s, 0);
     tcc_debug_start(s);
 
+    /* tokens can only be created now: tok_alloc needs the unit */
+    JS_WhaleTokReset();
+    if (emit)
+        emit(emit_ctx);
+
     whale_tok_pos = 0;
     whale_tok_active = 1;
+
+    if (getenv("WHALE_IR_DEBUG"))
+        JS_WhaleTokDump();
 
     tccgen_compile(s);
 
@@ -495,4 +505,27 @@ void JS_WhaleTokOp(int o)
 
     if (o >= 0 && o < (int)(sizeof(optok) / sizeof(optok[0])))
         JS_WhaleTokPush(optok[o], 0);
+}
+
+/* Diagnostics: reconstruct the token stream as text, so it can be compared with
+   the C it is supposed to be equivalent to. */
+void JS_WhaleTokDump(void)
+{
+    int k;
+
+    for (k = 0; k < whale_tok_len; k++) {
+        int t = whale_tok_buf[k];
+        const char *nm = get_tok_str(t, NULL);
+        if (t == TOK_CINT)
+            fprintf(stderr, "%d ", (int)whale_tok_num[k]);
+        else if (t == TOK_CDOUBLE)
+            fprintf(stderr, "%.17g ", whale_tok_num[k]);
+        else if (nm && t < 256)
+            fprintf(stderr, "%s ", nm);
+        else if (nm)
+            fprintf(stderr, "%s ", nm);
+        else
+            fprintf(stderr, "<?%d> ", t);
+    }
+    fprintf(stderr, "\n");
 }

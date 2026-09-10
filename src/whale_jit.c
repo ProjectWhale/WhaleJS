@@ -20,6 +20,7 @@
 /* implemented inside the TinyCC translation unit (src/tcc/whale_tcc_iface.c) */
 int JS_WhaleTccProbe(void);
 void JS_WhaleTokPush(int t, double val);
+int JS_WhaleCompileTokens(struct TCCState *s, void (*emit)(void *), void *emit_ctx);
 
 /* Opcode ids and sizes, taken from the same quickjs-opcode.h the interpreter
    uses. The enum mirrors OPCodeEnum in quickjs.c: the DEF entries first, then
@@ -95,6 +96,7 @@ static uint32_t whale_get_u16(const uint8_t *p)
 /* implemented inside the TinyCC translation unit (src/tcc/whale_tcc_iface.c) */
 int JS_WhaleTccProbe(void);
 void JS_WhaleTokPush(int t, double val);
+int JS_WhaleCompileTokens(struct TCCState *s, void (*emit)(void *), void *emit_ctx);
 
 #ifndef WHALE_JIT_TCC_DIR
 #define WHALE_JIT_TCC_DIR "thirdparty/tcc-runtime"
@@ -982,6 +984,17 @@ typedef struct JSWhaleJitBackend {
     void (*release)(void *handle);
 } JSWhaleJitBackend;
 
+/* The generator runs inside JS_WhaleCompileTokens(), after the translation unit
+   is open - before that tok_alloc() has no token table to allocate from. */
+static JSContext *whale_gen_ctx;
+static const JSWhaleFuncInfo *whale_gen_info;
+
+static void whale_gen_cb(void *unused)
+{
+    (void)unused;
+    whale_jit_gen(whale_gen_ctx, whale_gen_info);
+}
+
 static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, void **handle_out)
 {
     TCCState *s;
@@ -1005,7 +1018,10 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
     tcc_add_symbol(s, "whale_jit_unbox_num", (void *)whale_jit_unbox_num);
     tcc_add_symbol(s, "JS_NewFloat64", (void *)JS_NewFloat64);
 
-    if (tcc_compile_string(s, src) < 0)
+    /* Drive TinyCC's parser with the tokens the generator pushed: no source
+       text is parsed and no header is read. */
+    (void)src;
+    if (!JS_WhaleCompileTokens(s, whale_gen_cb, NULL))
         goto fail;
     if (tcc_relocate(s, TCC_RELOCATE_AUTO) < 0)
         goto fail;
@@ -1044,8 +1060,8 @@ int JS_WhaleJitCompileFunction(JSContext *ctx, const JSWhaleFuncInfo *info,
 
     if (!entry_out || !handle_out)
         return 0;
-    if (!whale_jit_gen(ctx, info))
-        return 0;
+    whale_gen_ctx = ctx;
+    whale_gen_info = info;
 
     if (getenv("WHALE_JIT_DUMP")) {
         fprintf(stderr, "--- whale jit source ---\n%s--- end ---\n", whale_jit_src);
