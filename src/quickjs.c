@@ -65738,15 +65738,28 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
     return ret;
 }
 
-/* Compile the emitted source with TCC and attach the entry to b. */
-static int whale_jit_compile(JSContext *ctx, JSFunctionBytecode *b)
+/* =========================================================================
+ * WhaleJS: JIT/AOT backend interface
+ *
+ * Everything above produces C source for a function; everything here turns that
+ * source into a callable entry point. Today the only backend is TinyCC, which
+ * compiles in-process into memory. A future AOT path (offline gcc/clang with an
+ * on-disk cache, per rules/goal.md) plugs in by implementing this struct and
+ * pointing whale_jit_backend at it - no other code has to change.
+ * ========================================================================= */
+
+typedef struct JSWhaleJitBackend {
+    const char *name;
+    /* Returns 1 on success and fills entry_out (the callable) plus handle_out
+       (an opaque object that must stay alive as long as the entry is used). */
+    int (*compile)(JSContext *ctx, const char *src, void **entry_out, void **handle_out);
+    void (*release)(void *handle);
+} JSWhaleJitBackend;
+
+static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, void **handle_out)
 {
     TCCState *s;
     void *fn;
-    int ok = 0;
-
-    if (!whale_jit_gen(ctx, b))
-        return 0;
 
     s = tcc_new();
     if (!s)
@@ -65763,10 +65776,7 @@ static int whale_jit_compile(JSContext *ctx, JSFunctionBytecode *b)
     tcc_add_symbol(s, "whale_jit_unbox_num", (void *)whale_jit_unbox_num);
     tcc_add_symbol(s, "JS_NewFloat64", (void *)JS_NewFloat64);
 
-    if (getenv("WHALE_JIT_DUMP"))
-        fprintf(stderr, "--- whale jit source ---\n%s--- end ---\n", whale_jit_src);
-
-    if (tcc_compile_string(s, whale_jit_src) < 0)
+    if (tcc_compile_string(s, src) < 0)
         goto fail;
     if (tcc_relocate(s, TCC_RELOCATE_AUTO) < 0)
         goto fail;
@@ -65774,13 +65784,47 @@ static int whale_jit_compile(JSContext *ctx, JSFunctionBytecode *b)
     if (!fn)
         goto fail;
 
-    b->whale_jit_entry = fn;
-    b->whale_jit_tcc = s;
-    /* ponytail: the TCCState (owning the machine code) is not freed with the
-       bytecode; one leaks per JIT-ed function until the cache work lands. */
-    ok = 1;
+    *entry_out = fn;
+    *handle_out = s;
+    return 1;
   fail:
-    if (!ok)
-        tcc_delete(s);
-    return ok;
+    tcc_delete(s);
+    return 0;
+}
+
+static void whale_tcc_release(void *handle)
+{
+    if (handle)
+        tcc_delete(handle);
+}
+
+static JSWhaleJitBackend whale_backend_tcc = {
+    "tcc",
+    whale_tcc_compile,
+    whale_tcc_release,
+};
+
+/* The active backend. Swapping this pointer is the AOT insertion point. */
+static JSWhaleJitBackend *whale_jit_backend = &whale_backend_tcc;
+
+/* Compile the emitted source and attach the entry to b. */
+static int whale_jit_compile(JSContext *ctx, JSFunctionBytecode *b)
+{
+    void *entry = NULL, *handle = NULL;
+
+    if (!whale_jit_gen(ctx, b))
+        return 0;
+
+    if (getenv("WHALE_JIT_DUMP"))
+        fprintf(stderr, "--- whale jit source ---\n%s--- end ---\n", whale_jit_src);
+
+    if (!whale_jit_backend->compile(ctx, whale_jit_src, &entry, &handle))
+        return 0;
+
+    b->whale_jit_entry = entry;
+    b->whale_jit_tcc = handle;
+    /* ponytail: the backend handle (owning the machine code) is not released
+       when the bytecode goes away; one leaks per JIT-ed function until the
+       cache work lands. A future AOT backend would release on its own terms. */
+    return 1;
 }
