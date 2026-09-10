@@ -778,13 +778,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     if (!whale_type_is_num(cur[var_count + sp - argc + k]))
                         goto out;
                 }
-                whale_emit("    { double _an[%d]; double _r = 0; int _dd = 0;\n", argc > 0 ? argc : 1);
+                wt('{'); wt(JS_WK_DOUBLE); wt_id("_an"); wt('['); wt_int(argc > 0 ? argc : 1); wt(']'); wt(';'); wt(JS_WK_DOUBLE); wt_id("_r"); wt('='); wt_int(0); wt(';'); wt(JS_WK_INT); wt_id("_dd"); wt('='); wt_int(0); wt(';');
                 for (k = 0; k < argc; k++)
-                    whale_emit("      _an[%d] = v%d;\n", k, sp - argc + k);
-                whale_emit("      if (!JS_WhaleCheckStack(ctx)) { *deopt = 1; return 0; }\n");
-                whale_emit("      _r = whale_jit_core(ctx, args, _an, &_dd);\n");
-                whale_emit("      if (_dd) { *deopt = 1; return 0; }\n");
-                whale_emit("      v%d = _r; }\n", func_slot);
+                    wt_id("_an"); wt('['); wt_int(k); wt(']'); wt('='); wt_slot("v", sp - argc + k); wt(';');
+                wt(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleCheckStack"); wt('('); wt_id("ctx"); wt(')'); wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wt(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                wt_id("_r"); wt('='); wt_id("whale_jit_core"); wt('('); wt_id("ctx"); wt(','); wt_id("args"); wt(','); wt_id("_an"); wt(','); wt('&'); wt_id("_dd"); wt(')'); wt(';');
+                wt(JS_WK_IF); wt('('); wt_id("_dd"); wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wt(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                wt_slot("v", func_slot); wt('='); wt_id("_r"); wt(';'); wt('}');
                 cur[var_count + func_slot] = WHALE_T_NUM;
                 sp = func_slot + 1;
             }
@@ -836,7 +836,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             if (!whale_type_is_num(cur[var_count + sp - 1]))
                 goto out;
             /* !x is true for 0 and for NaN */
-            whale_emit("    v%d = ((v%d != v%d) || (v%d == 0)) ? 1 : 0;\n", sp - 1, sp - 1, sp - 1, sp - 1);
+            wt_slot("v", sp - 1); wt('='); wt('('); wt('('); wt_slot("v", sp - 1); wt_op(JS_OP_NE); wt_slot("v", sp - 1); wt(')'); wt_op(JS_OP_OR); wt('('); wt_slot("v", sp - 1); wt_op(JS_OP_EQ); wt_int(0); wt(')'); wt(')'); wt('?'); wt_int(1); wt(':'); wt_int(0); wt(';');
             cur[var_count + sp - 1] = WHALE_T_BOOL;
             break;
         case OP_inc: case OP_dec:
@@ -878,7 +878,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 t = cur[var_count + sp - 1];
                 if (!whale_type_is_num(t))
                     goto out;
-                whale_emit("    if (v%d %s 0) goto L%d;\n", sp - 1, is_true ? "!=" : "==", tgt);
+                wt(JS_WK_IF); wt('('); wt_slot("v", sp - 1); wt_op(is_true ? JS_OP_NE : JS_OP_EQ); wt_int(0); wt(')'); wt(JS_WK_GOTO); wt_slot("L", tgt); wt(';');
                 sp--;
                 /* the edge leaving this jump defines the target state */
                 if ((tgt >= 0) && (tgt <= len) && (!seen[tgt])) {
@@ -893,7 +893,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int tgt = (op == OP_goto8) ? (pos + 1 + (int8_t)pc[pos + 1])
                                            : (pos + 1 + (int32_t)whale_get_u32(pc + pos + 1));
 
-                whale_emit("    goto L%d;\n", tgt);
+                wt(JS_WK_GOTO); wt_slot("L", tgt); wt(';');
                 unreachable = 1;
                 if ((tgt >= 0) && (tgt <= len) && (!seen[tgt])) {
                     cur[state_len - 1] = (uint8_t)sp;
@@ -910,7 +910,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 ret_is_bool = (t == WHALE_T_BOOL);
             else if (ret_is_bool != (t == WHALE_T_BOOL))
                 goto out; /* mixed number/boolean returns: not our shape */
-            whale_emit("    return v%d;\n", sp - 1);
+            wt(JS_WK_RETURN); wt_slot("v", sp - 1); wt(';');
             unreachable = 1;
             break;
         default:
@@ -919,31 +919,32 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         pos += sz;
     }
 
-    whale_emit("    *deopt = 1;\n    return 0;\n");
-    whale_emit("}\n");
+    wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wt(JS_WK_RETURN); wt_int(0); wt(';');
+    wt('}');
     /* engine entry: unbox the arguments once, run core, box the result */
-    whale_emit("JSValue whale_jit_fn(JSContext *ctx, JSValue *args, JSValue *var_buf, int *deopt, JSValue whale_self, void *whale_entry, void *whale_var_refs)\n{\n");
-    whale_emit("    double An[%d]; double _r;\n", arg_count > 0 ? arg_count : 1);
+    wt_id("JSValue"); wt_id("whale_jit_fn"); wt('('); wt_id("JSContext"); wt('*'); wt_id("ctx"); wt(','); wt_id("JSValue"); wt('*'); wt_id("args"); wt(','); wt_id("JSValue"); wt('*'); wt_id("var_buf"); wt(','); wt(JS_WK_INT); wt('*'); wt_id("deopt"); wt(','); wt_id("JSValue"); wt_id("whale_self"); wt(','); wt_id("void"); wt('*'); wt_id("whale_entry"); wt(','); wt_id("void"); wt('*'); wt_id("whale_var_refs"); wt(')'); wt('{');
+    wt(JS_WK_DOUBLE); wt_id("An"); wt('['); wt_int(arg_count > 0 ? arg_count : 1); wt(']'); wt(';'); wt(JS_WK_DOUBLE); wt_id("_r"); wt(';');
     whale_emit("    (void)ctx; (void)var_buf; (void)args; (void)deopt; (void)whale_self; (void)whale_entry; (void)whale_var_refs;\n");
-    whale_emit("    if (!JS_WhaleCheckStack(ctx)) return JS_EXCEPTION;\n");
+    wt(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleCheckStack"); wt('('); wt_id("ctx"); wt(')'); wt(')'); wt(JS_WK_RETURN); wt_id("JS_EXCEPTION"); wt(';');
     for (i = 0; i < arg_count; i++) {
         if (!args_used[i])
             continue;
-        whale_emit("    if (!whale_jit_unbox_num(ctx, args[%d], &An[%d])) { *deopt = 1; return JS_EXCEPTION; }\n", i, i);
+        wt(JS_WK_IF); wt('('); wt('!'); wt_id("whale_jit_unbox_num"); wt('('); wt_id("ctx"); wt(','); wt_id("args"); wt('['); wt_int(i); wt(']'); wt(','); wt('&'); wt_id("An"); wt('['); wt_int(i); wt(']'); wt(')'); wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wt(JS_WK_RETURN); wt_id("JS_EXCEPTION"); wt(';'); wt('}');
     }
     /* closure slots we rely on must be this very function (once per entry;
        the closure cannot change during the call, so recursion need not re-check) */
     for (i = 0; i < 4; i++) {
         if (var_ref_used[i])
-            whale_emit("    if (!JS_WhaleVarRefIsSelf(ctx, whale_var_refs, %d, whale_self)) { *deopt = 1; return JS_EXCEPTION; }\n", i);
+            wt(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleVarRefIsSelf"); wt('('); wt_id("ctx"); wt(','); wt_id("whale_var_refs"); wt(','); wt_int(i); wt(','); wt_id("whale_self"); wt(')'); wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wt(JS_WK_RETURN); wt_id("JS_EXCEPTION"); wt(';'); wt('}');
     }
-    whale_emit("    _r = whale_jit_core(ctx, args, An, deopt);\n");
-    whale_emit("    if (*deopt) return JS_EXCEPTION;\n");
-    if (ret_is_bool == 1)
-        whale_emit("    return JS_NewBool(ctx, _r != 0);\n");
-    else
-        whale_emit("    return whale_jit_box_num(ctx, _r);\n");
-    whale_emit("}\n");
+    wt_id("_r"); wt('='); wt_id("whale_jit_core"); wt('('); wt_id("ctx"); wt(','); wt_id("args"); wt(','); wt_id("An"); wt(','); wt_id("deopt"); wt(')'); wt(';');
+    wt(JS_WK_IF); wt('('); wt('*'); wt_id("deopt"); wt(')'); wt(JS_WK_RETURN); wt_id("JS_EXCEPTION"); wt(';');
+    if (ret_is_bool == 1) {
+        wt(JS_WK_RETURN); wt_id("JS_NewBool"); wt('('); wt_id("ctx"); wt(','); wt_id("_r"); wt_op(JS_OP_NE); wt_int(0); wt(')'); wt(';');
+    } else {
+        wt(JS_WK_RETURN); wt_id("whale_jit_box_num"); wt('('); wt_id("ctx"); wt(','); wt_id("_r"); wt(')'); wt(';');
+    }
+    wt('}');
     ret = 1; /* every opcode lowered successfully */
   out:
     if (!ret && getenv("WHALE_JIT_DUMP"))

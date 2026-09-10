@@ -50,6 +50,7 @@ enum {
 enum {
     JS_OP_ADD = 0, JS_OP_SUB, JS_OP_MUL, JS_OP_DIV,
     JS_OP_LT, JS_OP_LE, JS_OP_GT, JS_OP_GE, JS_OP_EQ, JS_OP_NE,
+    JS_OP_OR, JS_OP_AND,
 };
 
 /* provided by src/tcc/whale_tcc_iface.c */
