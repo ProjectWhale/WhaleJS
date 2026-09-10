@@ -535,3 +535,30 @@ SOLVED
 
 
 
+
+# <18>: Step 15 —— TinyCC 内部接口骨架（为"直接发 IR"铺路）
+SOLVED（骨架与链路）/ 待办（真正的 IR 通路）
+
+## 做了什么
+- 新增 `src/tcc/whale_tcc_iface.c`，由 `libtcc.c` **末尾 include** → 它编译在 TinyCC 自己的 TU 里，
+  因此能直接摸 TCC 内部（`tcc_state`、`vstack`/`vtop`，将来 `vpushi`/`gen_op`/`g`）。
+  这就是 <17> 那条结论的正解：**不合并 TU，而是在 TCC 一侧加导出封装**。
+- 探针 `JS_WhaleTccProbe()` 返回 `VSTACK_SIZE`（来自 tcc.h，256）→ 链路通且值可验证；
+  `WHALE_JIT_DUMP=1` 时 JIT 打印 `whale tcc internal probe: vstack cap=256`。
+- 生成器侧（`src/whale_jit.c`）在 `libtcc.h` 之后声明即可调用。
+
+## 改动点地图（优先级 2/3 与 IR 直发的落点）
+| 位置 | 行 | 作用 |
+|---|---|---|
+| `x86_64-gen.c` | 146 / 158 / 166 / 326 | `g()` 逐字节发码 / `o()` 发 32 位 / `gen_le16` / `gen_modrm` |
+| `tccgen.c` | 2154 / 3069 / 663 | `gen_op()`（op 归一化核心）/ `vstore()` / `vswap()` |
+| `tcc.h` | 424 / 1283 / 1305 | `SValue` / `vstack`+`vtop` 全局（容量 256）/ `check_vstack()` |
+
+- **发 IR** = 把生成器的 op 序列直接喂给 `vstack` + `gen_op`，跳过 `tccpp`/`tccgen` 的解析；
+  额外好处是**不再 include quickjs.h**（<16> 已提），`.h` 路径问题从根上消失。
+- **做窥孔** = 得在 `g()`/`o()` 外面加一层缓冲：TCC 现在是单遍流式发码，做跨语句优化前
+  必须先缓存整个函数的 `gen_op` 序列（temp/tcc_to_optimize.md 的架构分叉点）。
+
+## 验证
+- `whale api test: ok`；pristine 与 whalejs 在 fib/fibi 上 `bad=0`；用户 fib.js 2.2~2.6s（抖动区间内）。
+- 探针 256 == tcc.h 的 `VSTACK_SIZE`。
