@@ -65149,37 +65149,54 @@ static int whale_type_is_num(int t)
 
 /* load-like opcode -> C expression (identifier or literal), plus its type.
    Returns 0 if the opcode at that position is not a simple load. */
-static int whale_load_expr(const uint8_t *pc, int pos, const uint8_t *cur, int var_count,
-                           char *out, size_t out_size, int *len_out, int *type_out)
+static int whale_load_expr(JSFunctionBytecode *b, const uint8_t *pc, int pos, const uint8_t *cur, int var_count,
+                           const uint8_t *lo_c, const double *lo_cv,
+                           char *out, size_t out_size,
+                           int *len_out, int *type_out, int *const_out, double *cval_out)
 {
     int op = pc[pos];
 
     *len_out = short_opcode_info(op).size;
     *type_out = WHALE_T_NUM;
+    *const_out = 0;
+    *cval_out = 0;
     switch (op) {
     case OP_push_minus1:
         snprintf(out, out_size, "-1");
+        *const_out = 1;
+        *cval_out = -1;
         return 1;
     case OP_push_0: case OP_push_1: case OP_push_2: case OP_push_3:
     case OP_push_4: case OP_push_5: case OP_push_6: case OP_push_7:
         snprintf(out, out_size, "%d", op - OP_push_0);
+        *const_out = 1;
+        *cval_out = (double)(op - OP_push_0);
         return 1;
     case OP_push_i8:
         snprintf(out, out_size, "%d", (int)(int8_t)pc[pos + 1]);
+        *const_out = 1;
+        *cval_out = (double)(int)(int8_t)pc[pos + 1];
         return 1;
     case OP_push_i16:
         snprintf(out, out_size, "%d", (int)(int16_t)get_u16(pc + pos + 1));
+        *const_out = 1;
+        *cval_out = (double)(int)(int16_t)get_u16(pc + pos + 1);
         return 1;
     case OP_push_i32:
         snprintf(out, out_size, "%d", (int)(int32_t)get_u32(pc + pos + 1));
+        *const_out = 1;
+        *cval_out = (double)(int)(int32_t)get_u32(pc + pos + 1);
         return 1;
     case OP_push_true:
         snprintf(out, out_size, "1");
         *type_out = WHALE_T_BOOL;
+        *const_out = 1;
+        *cval_out = 1;
         return 1;
     case OP_push_false:
         snprintf(out, out_size, "0");
         *type_out = WHALE_T_BOOL;
+        *const_out = 1;
         return 1;
     case OP_get_loc0: case OP_get_loc1: case OP_get_loc2: case OP_get_loc3:
     case OP_get_loc8:
@@ -65188,13 +65205,46 @@ static int whale_load_expr(const uint8_t *pc, int pos, const uint8_t *cur, int v
             int idx = (op == OP_get_loc8) ? (int)pc[pos + 1] :
                       (op == OP_get_loc) ? (int)get_u16(pc + pos + 1) :
                       op - OP_get_loc0;
-            int t = (idx >= 0 && idx < var_count) ? cur[idx] : WHALE_T_UNKNOWN;
+            int tt = (idx >= 0 && idx < var_count) ? cur[idx] : WHALE_T_UNKNOWN;
 
-            if (t == WHALE_T_UNKNOWN)
+            if (tt == WHALE_T_UNKNOWN)
                 return 0;
-            *type_out = t;
-            snprintf(out, out_size, "L%d", idx);
+            *type_out = tt;
+            /* constant propagation: a local that is written exactly once with a
+               compile-time constant is that constant everywhere afterwards */
+            if (idx >= 0 && idx < var_count && lo_c && lo_c[idx]) {
+                snprintf(out, out_size, "%.17g", lo_cv[idx]);
+                *const_out = 1;
+                *cval_out = lo_cv[idx];
+            } else {
+                snprintf(out, out_size, "L%d", idx);
+            }
             return 1;
+        }
+    case OP_push_const:
+    case OP_push_const8:
+        {
+            int idx = (op == OP_push_const8) ? (int)pc[pos + 1] : (int)get_u32(pc + pos + 1);
+            JSValue c;
+            int ct;
+
+            if (!b || idx < 0 || idx >= b->cpool_count)
+                return 0;
+            c = b->cpool[idx];
+            ct = JS_VALUE_GET_TAG(c);
+            if (ct == JS_TAG_INT) {
+                snprintf(out, out_size, "%d", (int)JS_VALUE_GET_INT(c));
+                *const_out = 1;
+                *cval_out = (double)JS_VALUE_GET_INT(c);
+                return 1;
+            }
+            if (JS_TAG_IS_FLOAT64(ct)) {
+                snprintf(out, out_size, "%.17g", JS_VALUE_GET_FLOAT64(c));
+                *const_out = 1;
+                *cval_out = JS_VALUE_GET_FLOAT64(c);
+                return 1;
+            }
+            return 0; /* strings / bigints: not our shape */
         }
     case OP_get_arg0: case OP_get_arg1: case OP_get_arg2: case OP_get_arg3:
     case OP_get_arg:
@@ -65205,7 +65255,6 @@ static int whale_load_expr(const uint8_t *pc, int pos, const uint8_t *cur, int v
         return 0;
     }
 }
-
 /* Generate + type-check in one pass. Returns 0 when the function is not a
    candidate (unsupported opcode, unknown type, inconsistent jump target). */
 static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
@@ -65219,6 +65268,10 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
     int pos, i, sp, ret = 0;
     uint8_t *targets = NULL, *seen = NULL, *snap = NULL, *cur = NULL, *args_used = NULL;
     uint8_t var_ref_used[4] = { 0, 0, 0, 0 };
+    uint16_t *assign_cnt = NULL;
+    uint8_t lo_c[WHALE_JIT_MAX_SLOTS];
+    double lo_cv[WHALE_JIT_MAX_SLOTS];
+    int unreachable = 0;
 
     if (b->func_kind != JS_FUNC_NORMAL)
         return 0;
@@ -65232,8 +65285,11 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
     snap = js_mallocz(ctx, (size_t)(len + 1) * state_len);
     cur = js_mallocz(ctx, state_len);
     args_used = js_mallocz(ctx, arg_count > 0 ? arg_count : 1);
-    if (!targets || !seen || !snap || !cur || !args_used)
+    assign_cnt = js_mallocz(ctx, sizeof(uint16_t) * (var_count > 0 ? var_count : 1));
+    if (!targets || !seen || !snap || !cur || !args_used || !assign_cnt)
         goto out;
+    memset(lo_c, 0, sizeof(lo_c));
+    memset(lo_cv, 0, sizeof(lo_cv));
 
     /* pass 1: jump targets + which arguments are read */
     for (pos = 0; pos < len; ) {
@@ -65250,6 +65306,21 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
             int a = (int)get_u16(pc + pos + 1);
             if (a >= 0 && a < arg_count)
                 args_used[a] = 1;
+        } else if (op == OP_inc_loc || op == OP_dec_loc) {
+            {   /* these write a local too, so it is not a constant */
+                int a = (int)pc[pos + 1];
+                if (a < var_count)
+                    assign_cnt[a]++;
+            }
+        } else if (op >= OP_put_loc0 && op <= OP_put_loc3) {
+            assign_cnt[op - OP_put_loc0]++;
+        } else if (op == OP_put_loc8) {
+            if ((int)pc[pos + 1] < var_count)
+                assign_cnt[pc[pos + 1]]++;
+        } else if (op == OP_put_loc) {
+            int a = (int)get_u16(pc + pos + 1);
+            if (a < var_count)
+                assign_cnt[a]++;
         } else if (op >= OP_get_var_ref0 && op < OP_get_var_ref0 + 4) {
             var_ref_used[op - OP_get_var_ref0] = 1;
         } else if (op == OP_get_var_ref) {
@@ -65294,6 +65365,16 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
         char e1[32], e2[32];
         int l1 = 0, l2 = 0, ok1, ok2 = 0, p2 = 0;
         int t1 = 0, t2 = 0;
+        int c1 = 0, c2 = 0;
+        double cv1 = 0, cv2 = 0;
+
+        /* dead code after an unconditional return/goto is not emitted */
+        if (unreachable && !targets[pos]) {
+            pos += sz;
+            continue;
+        }
+        if (targets[pos])
+            unreachable = 0;
 
         cur[state_len - 1] = (uint8_t)sp;
         if (targets[pos]) {
@@ -65323,11 +65404,11 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
         }
 
         /* --- peephole 1: <load> <load> <binop> [put_loc] -> one assignment --- */
-        ok1 = whale_load_expr(pc, pos, cur, var_count, e1, sizeof(e1), &l1, &t1);
+        ok1 = whale_load_expr(b, pc, pos, cur, var_count, lo_c, lo_cv, e1, sizeof(e1), &l1, &t1, &c1, &cv1);
         if (ok1) {
             p2 = pos + l1;
             if (p2 < len)
-                ok2 = whale_load_expr(pc, p2, cur, var_count, e2, sizeof(e2), &l2, &t2);
+                ok2 = whale_load_expr(b, pc, p2, cur, var_count, lo_c, lo_cv, e2, sizeof(e2), &l2, &t2, &c2, &cv2);
         } else if (op == OP_get_loc0_loc1 && var_count >= 2 &&
                    cur[0] != WHALE_T_UNKNOWN && cur[1] != WHALE_T_UNKNOWN) {
             snprintf(e1, sizeof(e1), "L0");
@@ -65404,6 +65485,12 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
             if (d2 >= 0 && d2 < var_count) {
                 whale_emit("    L%d = %s;\n", d2, e1);
                 cur[d2] = (uint8_t)t1;
+                if (assign_cnt[d2] == 1 && c1) {
+                    lo_c[d2] = 1;
+                    lo_cv[d2] = cv1;
+                } else {
+                    lo_c[d2] = 0;
+                }
                 pos = pb + l5;
                 continue;
             }
@@ -65494,6 +65581,7 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
                     goto out;
                 whale_emit("    L%d = v%d;\n", idx, sp - 1);
                 cur[idx] = (uint8_t)t;
+                lo_c[idx] = 0;
                 sp--;
             }
             break;
@@ -65586,6 +65674,7 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
                     goto out;
                 whale_emit("    L%d = L%d + 1;\n", idx, idx);
                 cur[idx] = WHALE_T_NUM;
+                lo_c[idx] = 0;
             }
             break;
         case OP_drop:
@@ -65610,6 +65699,7 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
             break;
         case OP_goto8:
             whale_emit("    goto L%d;\n", pos + 1 + (int8_t)pc[pos + 1]);
+            unreachable = 1;
             break;
         case OP_return:
             t = cur[var_count + sp - 1];
@@ -65619,6 +65709,7 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
                 whale_emit("    return whale_jit_box_num(ctx, v%d);\n", sp - 1);
             else
                 goto out;
+            unreachable = 1;
             break;
         default:
             goto out; /* anything else: keep interpreting */
@@ -65642,6 +65733,8 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
         js_free(ctx, cur);
     if (args_used)
         js_free(ctx, args_used);
+    if (assign_cnt)
+        js_free(ctx, assign_cnt);
     return ret;
 }
 
