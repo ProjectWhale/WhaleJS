@@ -978,3 +978,36 @@ preamble 自包含（无 `#include`、无 `#define`、`<<`/`>>` 进运算符表�
 
 ## 状态
 工作区已回到 **f5e9667**：`whale api test: ok`、`fib(32)=2178309 44ms`（8× 仍在），无未跟踪文件。
+# <29>: Step 26 —— 用户点破：**"生成 C 再扫回 token"是自找麻烦**（已回退）
+PARTIAL / 方向修正
+
+## 用户的判断（正确）
+"你能生成 C 代码不就能自己生成 token 流吗" —— 我却一直走"生成 C 文本 → 复刻一个 C 词法器把它扫回 token"，
+而**麻烦全部来自复刻 TCC 的词法**：关键字表、字面量解析、多字符运算符。`out` 撞 asm 关键字（<28>）
+就是这个方案带来的 bug，而不是问题本身。
+
+## 正确的做法（下次直接这么做）
+`whale_emit(fmt, ...)` 那 55 个调用点**直接发射 token**，不要经过文本：
+
+```c
+whale_emit("    double v%d = 0;\n", i);
+   ↓
+wtok(TOK_DOUBLE); wtok_id("v"); wtok_int(i); wtok('='); wtok_int(0); wtok(';');
+```
+
+这样：
+- **不需要词法器**（不扫文本、不需要关键字表、不需要字面量解析）；
+- 关键字映射缩减到"emit 里真正出现的那几个"（`double`/`int`/`void`/`static`/`extern`/`return`/`if`/`goto`…），
+  且**只可能撞我知道的名字**，不会有 `out` 这类意外；
+- 本文的 `whale_tok_buf` / `whale_tok_push` / `whale_tok_active` / `next_nomacro` hook（都在 f5e9667 里）**可以原样复用** ——
+  它们是这次唯一站得住的部分。
+
+## 本轮试过并再次失败的
+按上面的思路做了"白名单 + 词法器 + JS_WhaleCompileTokens"，但：
+- 白名单里 `TOK_SIGNED`/`TOK_CONST`/`TOK_VOLATILE`/`TOK_INLINE` 在 TCC 里其实叫 `TOK_SIGNED2`/`TOK_CONST2`/…；
+- 大段文本替换在 PowerShell 里反复把文件搞坏（几次都是替换文本插错位置）。
+**这两条本身就是"这条路太绕"的证据。**
+
+## 状态
+工作区回到 **f5e9667**：`whale api test: ok`、`fib(32)=2178309 44ms`（8×），无未跟踪文件。
+下一步：改 `whale_emit` 的调用点为直接发 token（小步、可验证、不再写词法器）。
