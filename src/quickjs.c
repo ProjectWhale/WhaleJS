@@ -65147,6 +65147,27 @@ static int whale_type_is_num(int t)
     return t == WHALE_T_NUM || t == WHALE_T_BOOL;
 }
 
+/* numeric binary opcode -> C operator. Returns NULL when the opcode is not a
+   plain numeric binary op (the emitter then refuses to JIT the function).
+   `*is_cmp` tells the caller whether the result is a boolean. */
+static const char *whale_binop_c(int op, int *is_cmp)
+{
+    *is_cmp = 0;
+    switch (op) {
+    case OP_add: return "+";
+    case OP_sub: return "-";
+    case OP_mul: return "*";
+    case OP_div: return "/";
+    case OP_lt:  *is_cmp = 1; return "<";
+    case OP_lte: *is_cmp = 1; return "<=";
+    case OP_gt:  *is_cmp = 1; return ">";
+    case OP_gte: *is_cmp = 1; return ">=";
+    case OP_eq: case OP_strict_eq:   *is_cmp = 1; return "==";
+    case OP_neq: case OP_strict_neq: *is_cmp = 1; return "!=";
+    default: return NULL;
+    }
+}
+
 /* load-like opcode -> C expression (identifier or literal), plus its type.
    Returns 0 if the opcode at that position is not a simple load. */
 static int whale_load_expr(JSFunctionBytecode *b, const uint8_t *pc, int pos, const uint8_t *cur, int var_count,
@@ -65298,8 +65319,10 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
 
         if (sz <= 0 || pos + sz > len)
             goto out;
-        if (op == OP_goto8 || op == OP_if_false8) {
+        if (op == OP_goto8 || op == OP_if_false8 || op == OP_if_true8) {
             targets[pos + 1 + (int8_t)pc[pos + 1]] = 1;
+        } else if (op == OP_goto || op == OP_if_false || op == OP_if_true) {
+            targets[pos + 1 + (int32_t)get_u32(pc + pos + 1)] = 1;
         } else if (op >= OP_get_arg0 && op < OP_get_arg0 + 4) {
             args_used[op - OP_get_arg0] = 1;
         } else if (op == OP_get_arg) {
@@ -65379,16 +65402,19 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
         cur[state_len - 1] = (uint8_t)sp;
         if (targets[pos]) {
             if (seen[pos]) {
+                size_t base = (size_t)pos * state_len;
+                int snap_sp = snap[base + state_len - 1];
+                int live = var_count + ((snap_sp < sp) ? snap_sp : sp);
                 int k, differ = 0;
 
-                for (k = 0; k < state_len; k++) {
-                    uint8_t sv = snap[(size_t)pos * state_len + k];
+                for (k = 0; k < live; k++) {
+                    uint8_t sv = snap[base + k];
                     uint8_t cv = cur[k];
 
                     if (sv == cv)
                         continue;
                     if (sv == WHALE_T_UNKNOWN) {
-                        snap[(size_t)pos * state_len + k] = cv; /* optimistic merge */
+                        snap[base + k] = cv; /* optimistic merge */
                     } else if (cv != WHALE_T_UNKNOWN) {
                         differ = 1;
                         break;
@@ -65400,6 +65426,11 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
                 seen[pos] = 1;
                 memcpy(snap + (size_t)pos * state_len, cur, state_len);
             }
+            /* A jump target's state comes from the edges that reach it, not from the
+               linear scan: restoring the snapshot is what puts `sp` back after dead
+               code was skipped (e.g. an else-branch sitting right after the goto). */
+            memcpy(cur, snap + (size_t)pos * state_len, state_len);
+            sp = cur[state_len - 1];
             whale_emit("  L%d:\n", pos);
         }
 
@@ -65424,8 +65455,11 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
             int p3 = p2 + l2;
             int op3 = (p3 < len) ? pc[p3] : 0;
 
-            if ((op3 == OP_add || op3 == OP_sub || op3 == OP_mul || op3 == OP_lt) &&
-                whale_type_is_num(t1) && whale_type_is_num(t2)) {
+            {
+            int is_cmp = 0;
+            const char *cop = whale_binop_c(op3, &is_cmp);
+
+            if (cop && whale_type_is_num(t1) && whale_type_is_num(t2)) {
                 int l3 = short_opcode_info(op3).size;
                 int p4 = p3 + l3;
                 int dst = -1, l4 = 0;
@@ -65441,29 +65475,28 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
                     l4 = 3;
                 }
 
-                if (op3 == OP_lt) {
+                if (is_cmp) {
                     if (dst >= 0) {
-                        whale_emit("    L%d = (%s < %s) ? 1 : 0;\n", dst, e1, e2);
+                        whale_emit("    L%d = (%s %s %s) ? 1 : 0;\n", dst, e1, cop, e2);
                         cur[dst] = WHALE_T_BOOL;
                     } else {
-                        whale_emit("    v%d = (%s < %s) ? 1 : 0;\n", sp, e1, e2);
+                        whale_emit("    v%d = (%s %s %s) ? 1 : 0;\n", sp, e1, cop, e2);
                         cur[var_count + sp] = WHALE_T_BOOL;
                         sp += 1;
                     }
                 } else {
                     if (dst >= 0) {
-                        whale_emit("    L%d = %s %c %s;\n", dst, e1,
-                                   op3 == OP_add ? '+' : op3 == OP_sub ? '-' : '*', e2);
+                        whale_emit("    L%d = %s %s %s;\n", dst, e1, cop, e2);
                         cur[dst] = WHALE_T_NUM;
                     } else {
-                        whale_emit("    v%d = %s %c %s;\n", sp, e1,
-                                   op3 == OP_add ? '+' : op3 == OP_sub ? '-' : '*', e2);
+                        whale_emit("    v%d = %s %s %s;\n", sp, e1, cop, e2);
                         cur[var_count + sp] = WHALE_T_NUM;
                         sp += 1;
                     }
                 }
                 pos = p4 + l4;
                 continue;
+            }
             }
         }
 
@@ -65648,24 +65681,60 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
             }
             break;
 
-        case OP_add: case OP_sub: case OP_mul:
+        case OP_add: case OP_sub: case OP_mul: case OP_div:
+        case OP_lt: case OP_lte: case OP_gt: case OP_gte:
+        case OP_eq: case OP_neq: case OP_strict_eq: case OP_strict_neq:
+            {
+                int is_cmp = 0;
+                const char *cop = whale_binop_c(op, &is_cmp);
+
+                ta = cur[var_count + sp - 2];
+                tb = cur[var_count + sp - 1];
+                if (!cop || !whale_type_is_num(ta) || !whale_type_is_num(tb))
+                    goto out;
+                if (is_cmp) {
+                    whale_emit("    v%d = (v%d %s v%d) ? 1 : 0;\n", sp - 2, sp - 2, cop, sp - 1);
+                    cur[var_count + sp - 2] = WHALE_T_BOOL;
+                } else {
+                    whale_emit("    v%d = v%d %s v%d;\n", sp - 2, sp - 2, cop, sp - 1);
+                    cur[var_count + sp - 2] = WHALE_T_NUM;
+                }
+                sp--;
+            }
+            break;
+        case OP_mod:
             ta = cur[var_count + sp - 2];
             tb = cur[var_count + sp - 1];
             if (!whale_type_is_num(ta) || !whale_type_is_num(tb))
                 goto out;
-            whale_emit("    v%d = v%d %c v%d;\n", sp - 2, sp - 2,
-                       op == OP_add ? '+' : op == OP_sub ? '-' : '*', sp - 1);
+            whale_emit("    v%d = fmod(v%d, v%d);\n", sp - 2, sp - 2, sp - 1);
             cur[var_count + sp - 2] = WHALE_T_NUM;
             sp--;
             break;
-        case OP_lt:
-            ta = cur[var_count + sp - 2];
-            tb = cur[var_count + sp - 1];
-            if (!whale_type_is_num(ta) || !whale_type_is_num(tb))
+        case OP_neg:
+            if (!whale_type_is_num(cur[var_count + sp - 1]))
                 goto out;
-            whale_emit("    v%d = (v%d < v%d) ? 1 : 0;\n", sp - 2, sp - 2, sp - 1);
-            cur[var_count + sp - 2] = WHALE_T_BOOL;
-            sp--;
+            whale_emit("    v%d = -v%d;\n", sp - 1, sp - 1);
+            cur[var_count + sp - 1] = WHALE_T_NUM;
+            break;
+        case OP_plus:
+            /* +x on a number is the identity */
+            if (!whale_type_is_num(cur[var_count + sp - 1]))
+                goto out;
+            cur[var_count + sp - 1] = WHALE_T_NUM;
+            break;
+        case OP_not:
+            if (!whale_type_is_num(cur[var_count + sp - 1]))
+                goto out;
+            /* !x is true for 0 and for NaN */
+            whale_emit("    v%d = ((v%d != v%d) || (v%d == 0)) ? 1 : 0;\n", sp - 1, sp - 1, sp - 1, sp - 1);
+            cur[var_count + sp - 1] = WHALE_T_BOOL;
+            break;
+        case OP_inc: case OP_dec:
+            if (!whale_type_is_num(cur[var_count + sp - 1]))
+                goto out;
+            whale_emit("    v%d = v%d %c 1;\n", sp - 1, sp - 1, op == OP_inc ? '+' : '-');
+            cur[var_count + sp - 1] = WHALE_T_NUM;
             break;
         case OP_inc_loc:
             {
@@ -65690,16 +65759,39 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
             sp++;
             break;
 
-        case OP_if_false8:
-            t = cur[var_count + sp - 1];
-            if (!whale_type_is_num(t))
-                goto out;
-            whale_emit("    if (v%d == 0) goto L%d;\n", sp - 1, pos + 1 + (int8_t)pc[pos + 1]);
-            sp--;
+        case OP_if_false8: case OP_if_true8: case OP_if_false: case OP_if_true:
+            {
+                int is8 = (op == OP_if_false8 || op == OP_if_true8);
+                int is_true = (op == OP_if_true8 || op == OP_if_true);
+                int tgt = is8 ? (pos + 1 + (int8_t)pc[pos + 1])
+                              : (pos + 1 + (int32_t)get_u32(pc + pos + 1));
+
+                t = cur[var_count + sp - 1];
+                if (!whale_type_is_num(t))
+                    goto out;
+                whale_emit("    if (v%d %s 0) goto L%d;\n", sp - 1, is_true ? "!=" : "==", tgt);
+                sp--;
+                /* the edge leaving this jump defines the target state */
+                if ((tgt >= 0) && (tgt <= len) && (!seen[tgt])) {
+                    cur[state_len - 1] = (uint8_t)sp;
+                    seen[tgt] = 1;
+                    memcpy(snap + (size_t)tgt * state_len, cur, state_len);
+                }
+            }
             break;
-        case OP_goto8:
-            whale_emit("    goto L%d;\n", pos + 1 + (int8_t)pc[pos + 1]);
-            unreachable = 1;
+        case OP_goto8: case OP_goto:
+            {
+                int tgt = (op == OP_goto8) ? (pos + 1 + (int8_t)pc[pos + 1])
+                                           : (pos + 1 + (int32_t)get_u32(pc + pos + 1));
+
+                whale_emit("    goto L%d;\n", tgt);
+                unreachable = 1;
+                if ((tgt >= 0) && (tgt <= len) && (!seen[tgt])) {
+                    cur[state_len - 1] = (uint8_t)sp;
+                    seen[tgt] = 1;
+                    memcpy(snap + (size_t)tgt * state_len, cur, state_len);
+                }
+            }
             break;
         case OP_return:
             t = cur[var_count + sp - 1];
@@ -65760,6 +65852,9 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
 {
     TCCState *s;
     void *fn;
+
+    if (getenv("WHALE_JIT_DUMP"))
+        fprintf(stderr, "whale jit paths: src=%s rt=%s\n", WHALE_JIT_SRC_DIR, WHALE_JIT_TCC_DIR);
 
     s = tcc_new();
     if (!s)

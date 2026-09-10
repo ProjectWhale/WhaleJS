@@ -18,6 +18,16 @@ local function is_win()
 end
 
 local qjs_defines = { "_GNU_SOURCE" }
+
+-- The JIT backend runs at runtime and needs to find quickjs.h and the TCC
+-- runtime next to the sources, whatever the working directory is, so bake the
+-- absolute paths in at configure time.
+-- NB: backslashes would be eaten as escapes inside the C string literal
+local PROJ = string.gsub(os.projectdir(), "\\", "/")
+table.join2(qjs_defines, {
+    'WHALE_JIT_SRC_DIR="' .. PROJ .. '/src"',
+    'WHALE_JIT_TCC_DIR="' .. PROJ .. '/thirdparty/tcc-runtime"',
+})
 if is_win() then
     table.join2(qjs_defines, { "WIN32_LEAN_AND_MEAN", "_WIN32_WINNT=0x0601" })
 end

@@ -405,6 +405,21 @@ SOLVED
 3. **AOT 后端接口预留**（`compile(src)->entry` 抽象）。
 4. TCC 内部优化（优先级 2/3），工作量大，按需再做。
 
+# <14>: Step 11 —— JIT/AOT 后端接口（AOT 插入点）
+SOLVED
+
+- 把"C 源码 → 可调用入口"抽成结构体：
+  `JSWhaleJitBackend { name, compile(ctx, src, &entry, &handle), release(handle) }`。
+  当前唯一实现 `whale_backend_tcc`（`tcc_compile_string` + `tcc_relocate` + `tcc_get_symbol`，
+  运行时 helper 符号也在这里注册）。
+- `whale_jit_backend` 是**可替换的指针** —— 这就是 AOT 的插入点：将来用离线 gcc/clang + 磁盘缓存编热点函数，
+  只要实现同一个结构体、改这个指针，生成器与 `JS_CallInternal` 挂接都不用动，
+  也不会对"外部编译器"形成硬依赖（用户要求：先留接口，别硬依赖 gcc）。
+- 行为不变：`whale_jit_compile()` 仍是"生成源码 → 交给后端 → 把 entry/handle 挂到 bytecode"。
+  句柄释放仍是老账（代码里有 `ponytail:` 标注）。
+- 验证（commit 75cd7b6）：build ok、`whale api test: ok`、fibi(30) 仍 200 ns/call（9×）。
+
+
 
 
 
