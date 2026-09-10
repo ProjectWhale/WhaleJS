@@ -11,3 +11,5 @@ The process of project: WhaleJS —— 基于 QuickJS-ng + TinyCC 实现带 JIT/
 <5>(SOLVED): Step 4 —— JIT 挂接层：JS_CallInternal 调 whale_on_call 做热点计数，JSFunctionBytecode 加 whale_call_count/whale_jit_entry（js_mallocz 零初始化），hot 分支留待接 TinyCC（commit bdd65de）。见 current.md
 
 <6>(SOLVED): Step 5 —— TinyCC 接入：config.h 手工落库（configure 需要 sh）、libtcc 单 TU 编译、tcc-runtime（include + libtcc1-64.a）落库、xmake 加 libtcc target；运行期编译已跑通（add/fib）。见 current.md
+
+<7>(SOLVED): Step 6 前哨 —— JIT 目标代码 ABI 原型跑通（TCC 编的 C 能操作真实 JSValue，`jit fibi(10)=55` 与解释器 MATCH）；两个坑：ng 版公开头没有 JS_Add/JS_Lt、PowerShell 里 `-Wl,--stack,` 要加引号；含第一版 opcode 子集与解释器语义清单。见 current.md
