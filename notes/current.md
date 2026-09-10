@@ -622,3 +622,38 @@ PARTIAL / PLANNED
 ## 验证
 - 正常路径：`fib(30)=832040` 13ms、`whale api test: ok`。
 - IR 直出：`WHALE_IR_PROBE=1` 可复现崩溃（已知，未修）。
+# <20>: Step 17 —— IR 直出：两个架构结论 + 卡在访问违例
+PARTIAL
+
+## 结论 1（重要）：TinyCC 的编译**不能并存**
+`tcc_new()` 的语义是"初始化 TCC 的全局环境"，**不是**"创建可并存的实例" ——
+`tcc_state`、`sections`、`text_section`、`table_ident`、`sym_free_first`、`ind`/`loc`/`func_vt`
+全是**进程级全局**。实证：
+- 第一版探针放在 JIT 的 TCC 编译路径**内部** → 堆损坏（`0xC0000374`）；
+- 移到"无活跃编译"的时点、并把 `tcc_state`/`cur_text_section`/`local_stack`/`global_stack` 全都 save/restore
+  → 仍崩（`0xC0000005`）。说明**只要同一进程里先后有两次 TCC 生命周期，残留全局就会互踩**。
+→ **设计必须"一次编译一个版本"**：IR 通路与 C 源通路**不能并存**，用开关二选一。
+   这与"按参数类型签名分版本"的模板化思路天然同构（见下）。
+
+## 结论 2：IR 直出确实**不需要 include 路径**（<16> 的预测得到验证）
+中途报过 `library 'libtcc1-64.a' not found`（我漏了 `tcc_set_lib_path` + `tcc_add_library_path`），
+补齐即消失。也就是说 IR 通路只要**库路径**，**不需要** `quickjs.h` 的 include 路径 ——
+"`.h` 路径问题从根上消失"成立。
+
+## 现状
+`JS_WhaleIrCompileConst2(tcc_dir, a, b, op)` 已写完全套（建帧 → 发码 → relocate），能编过；
+在 `whale_test` 最前面（进程还没有任何 TCC 状态时）调用 → **立刻访问违例**，连 printf 都出不来。
+已从测试里摘除，回归保持绿：`whale api test: ok`、`fib(30)=832040 21ms`。
+
+## 下一步（定位方案）
+在 iface 里逐句 `fprintf` 打点，先分出崩在哪一段：
+① `tcc_new`/路径设置 ② `sym_push2` 建符号 ③ `gfunc_prolog` ④ `gen_op`/`gv` ⑤ `gfunc_epilog`/回填 ⑥ `tcc_relocate`。
+怀疑集中在 ②③：`sym_push2(&local_stack, …)` 依赖 `local_stack` 已由 `tccgen_init` 建好，
+而裸调可能走在解析器预期之外的状态里。
+
+## 用户指导（纳入设计）：动态类型要按**参数签名分版本**
+动态类型是 JIT 的大坑，**尤其传参**。方向：像 C++ template 实例化那样**按参数类型签名分版本** ——
+同一个 JS 函数遇到 `(double,double)` 编一版、`(int,int)` 编一版、`(string,*)` 回退解释器；
+调用点按实参类型分派到对应版本（配合守卫 + 单态内联缓存）。
+这与结论 1 天然吻合（一次编译 = 一个版本），应作为"扩大受益面"里**类型格与调用约定的基础设计**，
+也直接服务于"混合函数"和"外部调用"两块。

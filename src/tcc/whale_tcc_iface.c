@@ -58,28 +58,44 @@ static int whale_ir_token(int op)
 }
 
 /* Compile `double f(void) { return a <op> b; }` straight into IR.
-   Returns a callable function pointer, or NULL on failure. */
-void *JS_WhaleIrCompileConst2(double a, double b, int op)
+   Returns a callable function pointer, or NULL on failure.
+   NB: TinyCC has exactly one global state (tcc_state and friends), so this has
+   to hand it back before returning or it breaks every other user of it. */
+void *JS_WhaleIrCompileConst2(const char *tcc_dir, double a, double b, int op)
 {
+    TCCState *saved_state = tcc_state;
+    Section *saved_cur_text = cur_text_section;
+    Sym *saved_local = local_stack, *saved_global = global_stack;
+    char tcc_dir2[1024];
     TCCState *s;
     CType ft, dt;
-    Sym *retsym, *funcsym, *dummy;
+    Sym *retsym, *funcsym;
     CValue cval;
+    TokenSym *ts;
     int tok = whale_ir_token(op);
     void *fn = NULL;
 
     if (!tok)
         return NULL;
+    snprintf(tcc_dir2, sizeof(tcc_dir2), "%s/lib", tcc_dir);
     s = tcc_new();
     if (!s)
         return NULL;
+    /* libtcc1-64.a is needed for the link step; the paths must be set before the
+       output type, because tcc_new() fixes them. Note that emitting IR still
+       needs NO include path - not parsing C is the whole point. */
+    tcc_set_lib_path(s, tcc_dir);
+    tcc_add_library_path(s, tcc_dir2);
     tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
+    /* tcc_new() builds the state but the sections/parser live in tcc_add_file,
+       so run a trivial compile to get a usable state. */
+    tcc_compile_string(s, "void whale_ir_init(void) {}");
 
-    /* function type: return double, no parameters.
-       TinyCC models it as CType.ref -> return-type Sym, whose ->next chain holds
-       the parameters (see gfunc_prolog). With no parameters that chain ends at
-       the return-type symbol. */
-    TokenSym *ts = tok_alloc("whale_ir_fn", 11);
+    /* function type: return double, no parameters. ref -> return-type Sym,
+       whose ->next chain holds parameters (empty here). */
+    ts = tok_alloc("whale_ir_fn", 11);
+    if (!ts)
+        goto done;
     retsym = sym_push2(&local_stack, 0, VT_DOUBLE, 0);
     retsym->type.t = VT_DOUBLE;
     retsym->type.ref = NULL;
@@ -91,10 +107,10 @@ void *JS_WhaleIrCompileConst2(double a, double b, int op)
     funcsym->type = ft;
     funcsym->r = VT_CONST;
 
-    /* the frame: same sequence gen_function() uses */
+    /* the frame, same sequence gen_function() uses */
     cur_text_section = text_section;
     if (!cur_text_section)
-        return NULL;
+        goto done;
     nocode_wanted = 0;
     ind = cur_text_section->data_offset;
     put_extern_sym(funcsym, cur_text_section, ind, 0);
@@ -102,8 +118,7 @@ void *JS_WhaleIrCompileConst2(double a, double b, int op)
     func_ind = ind;
     vla_sp_loc = -1;
     vla_sp_root_loc = -1;
-    dummy = sym_push2(&local_stack, SYM_FIELD, 0, 0);
-    (void)dummy;
+    sym_push2(&local_stack, SYM_FIELD, 0, 0);
     local_scope = 1;
     gfunc_prolog(&funcsym->type);
     local_scope = 0;
@@ -120,16 +135,21 @@ void *JS_WhaleIrCompileConst2(double a, double b, int op)
     gfunc_return(&func_vt);
 
     rsym = 0;
-    gsym_addr(0, ind);   /* no early returns to patch; keep the sequence */
     gfunc_epilog();
+    /* g() only advances ind; the section must be told where the code ends or
+       tcc_relocate() will not copy it into the executable buffer. */
+    cur_text_section->data_offset = ind;
     elfsym(funcsym)->st_size = ind - func_ind;
     check_vstack();
 
-    /* make it callable */
-    if (tcc_relocate(s, TCC_RELOCATE_AUTO) < 0) {
-        tcc_delete(s);
-        return NULL;
-    }
-    fn = tcc_get_symbol(s, "whale_ir_fn");
+    if (tcc_relocate(s, TCC_RELOCATE_AUTO) >= 0)
+        fn = (void *)(cur_text_section->data + func_ind);
+
+done:
+    /* hand the single global state back to whoever had it */
+    tcc_state = saved_state;
+    cur_text_section = saved_cur_text;
+    local_stack = saved_local;
+    global_stack = saved_global;
     return fn;
 }

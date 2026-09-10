@@ -19,7 +19,6 @@
 
 /* implemented inside the TinyCC translation unit (src/tcc/whale_tcc_iface.c) */
 int JS_WhaleTccProbe(void);
-void *JS_WhaleIrCompileConst2(double a, double b, int op);
 
 /* Opcode ids and sizes, taken from the same quickjs-opcode.h the interpreter
    uses. The enum mirrors OPCodeEnum in quickjs.c: the DEF entries first, then
@@ -94,7 +93,6 @@ static uint32_t whale_get_u16(const uint8_t *p)
 
 /* implemented inside the TinyCC translation unit (src/tcc/whale_tcc_iface.c) */
 int JS_WhaleTccProbe(void);
-void *JS_WhaleIrCompileConst2(double a, double b, int op);
 
 #ifndef WHALE_JIT_TCC_DIR
 #define WHALE_JIT_TCC_DIR "thirdparty/tcc-runtime"
@@ -319,6 +317,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         static int once;
         if (!once && getenv("WHALE_JIT_DUMP")) {
             once = 1;
+
             fprintf(stderr, "whale jit op ids: get_var_ref0=%d add=%d invalid=%d count=%d temp_start=%d temp_end=%d\n",
                     OP_get_var_ref0, OP_add, OP_invalid, OP_COUNT, OP_TEMP_START, OP_TEMP_END);
         }
@@ -973,15 +972,7 @@ int JS_WhaleJitCompileFunction(JSContext *ctx, const JSWhaleFuncInfo *info,
     if (getenv("WHALE_JIT_DUMP")) {
         fprintf(stderr, "--- whale jit source ---\n%s--- end ---\n", whale_jit_src);
         fprintf(stderr, "whale tcc internal probe: vstack cap=%d\n", JS_WhaleTccProbe());
-        /* IR-direct emission is still being brought up: it builds the frame but
-           the first actual call crashes, so it stays behind its own switch. */
-        if (getenv("WHALE_IR_PROBE")) {
-            double (*irfn)(void) = (double (*)(void))JS_WhaleIrCompileConst2(2.5, 4.0, 0);
-            fprintf(stderr, "whale ir direct: add(2.5,4.0) -> %s", irfn ? "ok" : "NULL");
-            if (irfn)
-                fprintf(stderr, " result=%.2f", irfn());
-            fprintf(stderr, "\n");
-        }
+
     }
 
     if (!whale_jit_backend->compile(ctx, whale_jit_src, &entry, &handle))
