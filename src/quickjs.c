@@ -18243,23 +18243,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     /* WhaleJS: 热点统计（JIT 代码生成接入前先只计数，见 src/whalejs.h） */
     whale_on_call(ctx, b);
 
-    /* WhaleJS: native entry ready -> run it. On deopt fall through to the
-       interpreter with the same frame (nothing was written to var_buf). */
+    /* WhaleJS: native entry ready -> run it. The frame stays current while
+       the JIT code runs (it may re-enter the engine for self-recursion). On
+       deopt we fall through and interpret the same frame again. */
     if (b->whale_jit_entry) {
         int whale_deopt = 0;
         JSValue whale_ret;
-        rt->current_stack_frame = sf->prev_frame;
-        whale_ret = ((JSValue (*)(JSContext *, JSValue *, JSValue *, int *))b->whale_jit_entry)
-                        (ctx, arg_buf, var_buf, &whale_deopt);
+        whale_ret = ((JSValue (*)(JSContext *, JSValue *, JSValue *, int *, JSValue, void *, void *))b->whale_jit_entry)
+                        (ctx, arg_buf, var_buf, &whale_deopt, func_obj, (void *)b->whale_jit_entry, (void *)var_refs);
         if (unlikely(whale_deopt)) {
             b->whale_jit_entry = NULL;   /* give up and interpret this one */
             b->whale_jit_tried = 1;
-            rt->current_stack_frame = sf;
         } else {
             if (unlikely(sf->var_ref_count != 0))
                 close_var_refs(rt, sf);
             for (pval = local_buf; pval < stack_buf; pval++)
                 JS_FreeValue(ctx, *pval);
+            rt->current_stack_frame = sf->prev_frame;
             return whale_ret;
         }
     }
@@ -65008,24 +65008,30 @@ uintptr_t js_std_cmd(int cmd, ...) {
 /* =========================================================================
  * WhaleJS: JIT code generation (TinyCC backend)
  *
- * Shape compiled today: functions that are numeric end to end.
- * A small abstract interpreter walks the bytecode with the type lattice
- * {UNKNOWN, NUM, BOOL}. When every value reaching an arithmetic op, a local
- * read, or the return is NUM/BOOL, we emit code that runs the whole function in
- * the C `double` domain: locals and stack slots become `double` C locals, so the
+ * Shape compiled: functions that are numeric end to end, plus self-recursive
+ * ones. An abstract interpreter walks the bytecode with the type lattice
+ * {UNKNOWN, NUM, BOOL, SELF}; when every value reaching an arithmetic op, a
+ * local read, a call argument or the return is NUM/BOOL, the whole function runs
+ * in the C double domain (locals and stack slots become double C locals), so the
  * inner loop is a few machine instructions instead of a JSValue dance.
  *
- * Why double for everything numeric: a JS Number IS a double, so `a + b` in the
- * double domain is already the spec behaviour, including int32 overflow (which
- * simply produces a non-integral result and gets boxed as a float). No range
- * checks and no deoptimization for overflow are needed - only for types that are
- * not numbers at all.
+ * Why double for everything numeric: a JS Number IS a double, so arithmetic in
+ * the double domain is already spec behaviour, int32 overflow included. No range
+ * checks and no deopt are needed for overflow - only for non-numbers.
  *
- * JS is dynamically typed, so numeric-ness is never assumed - it is guarded:
- *   - reading an argument checks the tag (int or float64); anything else sets
- *     *deopt and JS_CallInternal re-runs the function on the interpreter.
- * Deoptimization is safe to re-run because the compiled subset has no side
- * effects: no calls, no property access, and var_buf is never written.
+ * Recursion: `call` is only accepted when the callee is *this* function
+ * (get_var_ref checked against the running function at run time). That keeps the
+ * compiled function side-effect free, which is what makes deoptimization safe to
+ * re-run: a mismatched type sets *deopt, JS_CallInternal drops the compiled entry
+ * and simply interprets the same frame again.
+ *
+ * Optimisation notes (see also temp/tcc_to_optimize.md): TCC has no register
+ * allocator worth the name and spills at every statement boundary, so the emitter
+ * works hard to keep the variable count and the stack-slot round trips low:
+ *   - <load> <load> <binop> [put_loc] folds into one assignment
+ *   - <load> put_loc folds into a direct copy
+ *   - arguments are unboxed once into A0..An
+ * That is also why constants fold for free: they never become variables.
  * ========================================================================= */
 
 #include "libtcc.h"
@@ -65045,6 +65051,7 @@ enum {
     WHALE_T_UNKNOWN = 0,
     WHALE_T_NUM = 1,  /* Number: held as double while specialized */
     WHALE_T_BOOL = 2, /* true / false, usable as 1 / 0 */
+    WHALE_T_SELF = 3, /* this function, usable only as a call target */
 };
 
 static char whale_jit_src[WHALE_JIT_SRC_MAX];
@@ -65065,15 +65072,83 @@ static void whale_emit(const char *fmt, ...)
         whale_jit_src_len += (size_t)n;
 }
 
-static const char *whale_jit_preamble = "#include \"quickjs.h\"\n";
+/* ---- helpers the generated code calls back into ---- */
+
+/* Is closure slot idx of the frame that is currently running equal to `self`?
+   Only true for a direct self-recursive reference, which is the single call
+   shape we compile. Borrowed reference: no dup/free needed. */
+static int whale_jit_is_self(void **var_refs, JSValue self, int idx)
+{
+    JSVarRef *vr;
+
+    if (!var_refs || idx < 0)
+        return 0;
+    vr = (JSVarRef *)var_refs[idx];
+    if (!vr || !vr->pvalue)
+        return 0;
+    return (JS_VALUE_GET_TAG(*vr->pvalue) == JS_VALUE_GET_TAG(self) &&
+            JS_VALUE_GET_PTR(*vr->pvalue) == JS_VALUE_GET_PTR(self));
+}
+
+/* Self-recursive call: go back through the engine so the callee gets a proper
+   frame. The callee is this same function object, so it re-enters this JIT
+   entry rather than the interpreter. */
+static JSValue whale_jit_call_self(JSContext *ctx, JSValue self, JSValue *argv, int argc)
+{
+    return JS_CallInternal(ctx, self, JS_UNDEFINED, JS_UNDEFINED, argc, argv, 0);
+}
+
+static int whale_jit_stack_ok(JSContext *ctx)
+{
+    if (js_check_stack_overflow(ctx->rt, 0)) {
+        JS_ThrowStackOverflow(ctx);
+        return 0;
+    }
+    return 1;
+}
+
+static JSValue whale_jit_box_num(JSContext *ctx, double d)
+{
+    if (d >= -2147483648.0 && d <= 2147483647.0) {
+        int i = (int)d;
+
+        if ((double)i == d)
+            return JS_MKVAL(JS_TAG_INT, i);
+    }
+    return JS_NewFloat64(ctx, d);
+}
+
+/* returns 1 and stores the value when v is a number */
+static int whale_jit_unbox_num(JSContext *ctx, JSValue v, double *out)
+{
+    int t = JS_VALUE_GET_TAG(v);
+
+    if (t == JS_TAG_INT) {
+        *out = (double)JS_VALUE_GET_INT(v);
+        return 1;
+    }
+    if (JS_TAG_IS_FLOAT64(t)) {
+        *out = (double)JS_VALUE_GET_FLOAT64(v);
+        return 1;
+    }
+    return 0;
+}
+
+static const char *whale_jit_preamble =
+    "#include \"quickjs.h\"\n"
+    "extern int whale_jit_is_self(void **var_refs, JSValue self, int idx);\n"
+    "extern JSValue whale_jit_call_self(JSContext *ctx, JSValue self, JSValue *argv, int argc);\n"
+    "extern JSValue whale_jit_box_num(JSContext *ctx, double d);\n"
+    "extern int whale_jit_stack_ok(JSContext *ctx);\n"
+    "extern int whale_jit_unbox_num(JSContext *ctx, JSValue v, double *out);\n";
 
 static int whale_type_is_num(int t)
 {
     return t == WHALE_T_NUM || t == WHALE_T_BOOL;
 }
 
-/* load-like opcode -> C expression (identifier or literal). Returns 0 if the
-   opcode at that position is not a simple load. */
+/* load-like opcode -> C expression (identifier or literal), plus its type.
+   Returns 0 if the opcode at that position is not a simple load. */
 static int whale_load_expr(const uint8_t *pc, int pos, const uint8_t *cur, int var_count,
                            char *out, size_t out_size, int *len_out, int *type_out)
 {
@@ -65130,15 +65205,9 @@ static int whale_load_expr(const uint8_t *pc, int pos, const uint8_t *cur, int v
         return 0;
     }
 }
-/* Generate + type-check in one pass. Returns 0 when the function is not a
-   candidate (unsupported opcode, unknown type, inconsistent jump target).
 
-   The emitter is deliberately "expression shaped" rather than "stack shaped":
-   a load-load-binop(-store) run collapses into a single C assignment, so TCC
-   sees `L3 = L0 + L1;` instead of two stack slots being filled and then read
-   back. That matters because TCC has no register allocator worth the name and
-   spills aggressively - the fewer distinct live variables it sees, the more
-   stays in registers. Constants folded at compile time disappear the same way. */
+/* Generate + type-check in one pass. Returns 0 when the function is not a
+   candidate (unsupported opcode, unknown type, inconsistent jump target). */
 static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
 {
     const uint8_t *pc = b->byte_code_buf;
@@ -65149,13 +65218,13 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
     int state_len = var_count + stack_size + 1; /* +1: sp */
     int pos, i, sp, ret = 0;
     uint8_t *targets = NULL, *seen = NULL, *snap = NULL, *cur = NULL, *args_used = NULL;
+    uint8_t var_ref_used[4] = { 0, 0, 0, 0 };
 
     if (b->func_kind != JS_FUNC_NORMAL)
         return 0;
     if (stack_size <= 0 || stack_size > WHALE_JIT_MAX_SLOTS)
         return 0;
-    /* a closure capturing our locals would make promotion to C locals wrong */
-    if (b->var_ref_count != 0)
+    if (b->var_ref_count > 4)
         return 0;
 
     targets = js_mallocz(ctx, len + 1);
@@ -65181,6 +65250,12 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
             int a = (int)get_u16(pc + pos + 1);
             if (a >= 0 && a < arg_count)
                 args_used[a] = 1;
+        } else if (op >= OP_get_var_ref0 && op < OP_get_var_ref0 + 4) {
+            var_ref_used[op - OP_get_var_ref0] = 1;
+        } else if (op == OP_get_var_ref) {
+            int a = (int)get_u16(pc + pos + 1);
+            if (a >= 0 && a < 4)
+                var_ref_used[a] = 1;
         }
         pos += sz;
     }
@@ -65188,8 +65263,9 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
     /* pass 2: emit + abstract-interpret */
     whale_jit_src_len = 0;
     whale_emit("%s", whale_jit_preamble);
-    whale_emit("JSValue whale_jit_fn(JSContext *ctx, JSValue *args, JSValue *var_buf, int *deopt)\n{\n");
-    whale_emit("    (void)ctx; (void)var_buf; (void)args; (void)deopt;\n");
+    whale_emit("JSValue whale_jit_fn(JSContext *ctx, JSValue *args, JSValue *var_buf, int *deopt, JSValue whale_self, void *whale_entry, void *whale_var_refs)\n{\n");
+    whale_emit("    (void)ctx; (void)var_buf; (void)args; (void)deopt; (void)whale_self; (void)whale_entry; (void)whale_var_refs;\n");
+    whale_emit("    if (!whale_jit_stack_ok(ctx)) return JS_EXCEPTION;\n");
     for (i = 0; i < var_count; i++)
         whale_emit("    double L%d = 0;\n", i);
     for (i = 0; i < stack_size; i++)
@@ -65198,12 +65274,16 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
         if (args_used[i])
             whale_emit("    double A%d = 0;\n", i);
     }
-    /* unbox the arguments once, guarded: only numbers may enter this code */
     for (i = 0; i < arg_count; i++) {
         if (!args_used[i])
             continue;
-        whale_emit("    { JSValue _a = args[%d]; int _t = JS_VALUE_GET_TAG(_a); if (_t == JS_TAG_INT) A%d = (double)JS_VALUE_GET_INT(_a); else if (JS_TAG_IS_FLOAT64(_t)) A%d = (double)JS_VALUE_GET_FLOAT64(_a); else { *deopt = 1; return JS_EXCEPTION; } }\n",
-                   i, i, i);
+        whale_emit("    if (!whale_jit_unbox_num(ctx, args[%d], &A%d)) { *deopt = 1; return JS_EXCEPTION; }\n",
+                   i, i);
+    }
+    /* closure slots we use must be this function itself (checked once) */
+    for (i = 0; i < 4; i++) {
+        if (var_ref_used[i])
+            whale_emit("    if (!whale_jit_is_self(whale_var_refs, whale_self, %d)) { *deopt = 1; return JS_EXCEPTION; }\n", i);
     }
 
     sp = 0;
@@ -65212,8 +65292,8 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
         int sz = short_opcode_info(op).size;
         int ta, tb, t;
         char e1[32], e2[32];
-        int t1 = 0, t2 = 0;
         int l1 = 0, l2 = 0, ok1, ok2 = 0, p2 = 0;
+        int t1 = 0, t2 = 0;
 
         cur[state_len - 1] = (uint8_t)sp;
         if (targets[pos]) {
@@ -65234,7 +65314,7 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
                     }
                 }
                 if (differ)
-                    goto out; /* real type conflict at the merge point */
+                    goto out;
             } else {
                 seen[pos] = 1;
                 memcpy(snap + (size_t)pos * state_len, cur, state_len);
@@ -65242,7 +65322,7 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
             whale_emit("  L%d:\n", pos);
         }
 
-        /* --- peephole: <load> <load> <binop> [put_loc] -> one assignment --- */
+        /* --- peephole 1: <load> <load> <binop> [put_loc] -> one assignment --- */
         ok1 = whale_load_expr(pc, pos, cur, var_count, e1, sizeof(e1), &l1, &t1);
         if (ok1) {
             p2 = pos + l1;
@@ -65305,6 +65385,7 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
                 continue;
             }
         }
+
         /* --- peephole 2: <load> put_loc -> direct copy --- */
         if (ok1 && whale_type_is_num(t1)) {
             int pb = pos + l1;
@@ -65437,6 +65518,48 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
             }
             break;
 
+        /* closure reference: accepted only when it turns out to be this very
+           function at run time, i.e. a direct self-recursive reference */
+        case OP_get_var_ref0: case OP_get_var_ref1: case OP_get_var_ref2: case OP_get_var_ref3:
+        case OP_get_var_ref:
+            {
+                int idx = (op == OP_get_var_ref) ? (int)get_u16(pc + pos + 1) : op - OP_get_var_ref0;
+
+                /* the closure check was hoisted to the entry */
+                (void)idx;
+                cur[var_count + sp] = WHALE_T_SELF;
+                sp++;
+            }
+            break;
+
+        /* self-recursive call */
+        case OP_call0: case OP_call1: case OP_call2: case OP_call3:
+        case OP_call:
+            {
+                int argc = (op == OP_call) ? (int)get_u16(pc + pos + 1) : op - OP_call0;
+                int func_slot = sp - 1 - argc;
+                int k;
+
+                if (func_slot < 0 || cur[var_count + func_slot] != WHALE_T_SELF)
+                    goto out;
+                for (k = 0; k < argc; k++) {
+                    if (!whale_type_is_num(cur[var_count + sp - argc + k]))
+                        goto out;
+                }
+                whale_emit("    { JSValue _argv[%d]; JSValue _r; double _d = 0; int _dd = 0;\n", argc > 0 ? argc : 1);
+                for (k = 0; k < argc; k++)
+                    whale_emit("      _argv[%d] = whale_jit_box_num(ctx, v%d);\n", k, sp - argc + k);
+                whale_emit("      if (!whale_jit_stack_ok(ctx)) return JS_EXCEPTION;\n");
+                whale_emit("      _r = ((JSValue (*)(JSContext *, JSValue *, JSValue *, int *, JSValue, void *, void *))whale_entry)(ctx, _argv, NULL, &_dd, whale_self, whale_entry, whale_var_refs);\n");
+                whale_emit("      if (_dd) { *deopt = 1; return JS_EXCEPTION; }\n");
+                whale_emit("      if (JS_IsException(_r)) goto exc;\n");
+                whale_emit("      if (!whale_jit_unbox_num(ctx, _r, &_d)) { *deopt = 1; return JS_EXCEPTION; }\n");
+                whale_emit("      v%d = _d; }\n", func_slot);
+                cur[var_count + func_slot] = WHALE_T_NUM;
+                sp = func_slot + 1;
+            }
+            break;
+
         case OP_add: case OP_sub: case OP_mul:
             ta = cur[var_count + sp - 2];
             tb = cur[var_count + sp - 1];
@@ -65490,21 +65613,22 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
             break;
         case OP_return:
             t = cur[var_count + sp - 1];
-            if (t == WHALE_T_BOOL) {
+            if (t == WHALE_T_BOOL)
                 whale_emit("    return JS_NewBool(ctx, v%d != 0);\n", sp - 1);
-            } else if (t == WHALE_T_NUM) {
-                whale_emit("    { double _d = v%d; if (_d >= -2147483648.0 && _d <= 2147483647.0) { int _i = (int)_d; if ((double)_i == _d) return JS_MKVAL(JS_TAG_INT, _i); } return JS_NewFloat64(ctx, _d); }\n", sp - 1);
-            } else {
+            else if (t == WHALE_T_NUM)
+                whale_emit("    return whale_jit_box_num(ctx, v%d);\n", sp - 1);
+            else
                 goto out;
-            }
             break;
         default:
             goto out; /* anything else: keep interpreting */
         }
         pos += sz;
     }
-    whale_emit("    return JS_UNDEFINED;\n}\n");
-    ret = 1;   /* every opcode lowered successfully */
+
+    whale_emit("    return JS_UNDEFINED;\n");
+    whale_emit("  exc:\n    return JS_EXCEPTION;\n}\n");
+    ret = 1; /* every opcode lowered successfully */
   out:
     if (!ret && getenv("WHALE_JIT_DUMP"))
         fprintf(stderr, "whale jit: gen gave up at pos=%d op=%d\n", pos, (pos < len) ? pc[pos] : -1);
@@ -65520,6 +65644,7 @@ static int whale_jit_gen(JSContext *ctx, JSFunctionBytecode *b)
         js_free(ctx, args_used);
     return ret;
 }
+
 /* Compile the emitted source with TCC and attach the entry to b. */
 static int whale_jit_compile(JSContext *ctx, JSFunctionBytecode *b)
 {
@@ -65539,6 +65664,10 @@ static int whale_jit_compile(JSContext *ctx, JSFunctionBytecode *b)
     tcc_add_include_path(s, WHALE_JIT_SRC_DIR);
     tcc_add_library_path(s, WHALE_JIT_TCC_DIR "/lib");
     tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
+    tcc_add_symbol(s, "whale_jit_is_self", (void *)whale_jit_is_self);
+    tcc_add_symbol(s, "whale_jit_stack_ok", (void *)whale_jit_stack_ok);
+    tcc_add_symbol(s, "whale_jit_box_num", (void *)whale_jit_box_num);
+    tcc_add_symbol(s, "whale_jit_unbox_num", (void *)whale_jit_unbox_num);
     tcc_add_symbol(s, "JS_NewFloat64", (void *)JS_NewFloat64);
 
     if (getenv("WHALE_JIT_DUMP"))
