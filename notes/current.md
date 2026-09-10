@@ -419,6 +419,54 @@ SOLVED
   句柄释放仍是老账（代码里有 `ponytail:` 标注）。
 - 验证（commit 75cd7b6）：build ok、`whale api test: ok`、fibi(30) 仍 200 ns/call（9×）。
 
+# <15>: Step 12 —— 自查：JIT 为什么"没生效" + 数值直传（fib(40) 18.6s → 2.12s）
+SOLVED
+
+## 用户报的现象
+他的 `fib.js`（`if (n <= 2) return 1; ... fib(40)`）用我们的 qjs 跑 17s，原版 16s，node 873ms。
+自查结论：**三个独立原因叠加**。跟"编译开销"和"生成 C"都没关系（TCC 的接口就是 C，这条路实测 9×）。
+
+### 原因 1：opcode 覆盖太窄
+生成器只认 `lt/add/sub/mul`。他写的是 `n <= 2` → 字节码用 **`lte`** → 生成器直接放弃 → 全程解释执行。
+修：`whale_binop_c()` 把数值二元运算映射成 C 运算符（`add sub mul div lt lte gt gte eq neq strict_eq strict_neq`），
+外加 `mod / neg / plus / not / inc / dec` 与 32 位跳转 `if_false / if_true / goto`、`if_true8`。
+（`not` 用 `(x != x) || (x == 0)`，这样 NaN 也是 falsy。）
+
+### 原因 2（正确性 bug）：跳转目标处的栈深度
+目标处的 `sp` 是**线性扫描**带过去的：`goto` 之后的死代码虽不生成，但扫过的字节码**没有回滚 sp**，
+于是 `else` 分支把结果写进错误的槽 —— `h(30)` 返回 `-29` 而不是 `0`。
+修：**在跳转指令处就用该边自己的 sp 登记目标状态**；进入目标时校验并**恢复快照**；
+比较时只看两条边上都活跃的槽（全部局部变量 + 栈 `min(sp)`）。
+
+### 原因 3（环境致命）：JIT 后端用了相对路径
+`WHALE_JIT_SRC_DIR "src"` / `"thirdparty/tcc-runtime"`。从 `build/mingw/x86_64/release` 跑 `qjs fib.js` 时 cwd 变了
+→ TCC 报 `include file 'quickjs.h' not found` → **静默回退解释器**（正是用户看到的现象）。
+修：xmake 在配置期注入**绝对路径**宏。坑：Windows 路径的反斜杠必须换成 `/`，
+否则 C 字符串字面量会把 `\a` 之类当转义吃掉（`'\a'` 是 BEL）。
+另外 `WHALE_JIT_DUMP=1` 时会打印实际使用的两个路径，方便排查。
+
+### 原定计划第 1 项：数值直传
+生成两个入口：
+- `whale_jit_core(ctx, args, double *An, int *deopt)` —— 全程 double，零装箱；
+- `whale_jit_fn(...)` —— 引擎调用的 JSValue 包装（入口解箱一次、出口装箱一次）。
+自递归**直接调 core** → 递归不再"装箱参数 → 重入引擎 → 解箱结果"。
+`is_self` 检查移到包装层（一次调用里闭包不会变，递归无需重复校验）。
+顺带：TCC **不能在生成代码里按值传递聚合类型**（`JSValue` 在某配置下是 union），所以 core 只收 `ctx/args/An/deopt`。
+
+## 结果
+| 用例 | 原版 | WhaleJS JIT |
+|------|------|-------------|
+| **用户 fib.js（fib(40)，从 release 目录）** | 17.5 s | **2.12 s（8.3×）** |
+| 递归 fib(24) ×20 | 154 ms | **19 ms（8.1×）** |
+| 迭代 fibi(30) | 2000 ns/call | **200 ns/call（9×）** |
+（node 跑同一个 fib(40) 是 873 ms，还差 2.4×；剩下的是 TCC 代码质量 + 我们不是真优化器。）
+
+## 教训
+1. **"没提速"先确认到底有没有走 JIT**：`WHALE_JIT_DUMP=1` 一次就能区分"生成器放弃 / 编译失败 / 没被调用"。
+2. 生成器静默放弃（`goto out`）这种设计很危险：语义永远对、性能悄悄归零 —— 必须有诊断出口。
+3. 相对路径写死在二进制里，会让同一个 exe 在不同 cwd 下行为不同。
+
+
 
 
 

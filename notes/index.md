@@ -27,3 +27,5 @@ The process of project: WhaleJS —— 基于 QuickJS-ng + TinyCC 实现带 JIT/
 <13>(SOLVED): Step 10 —— 常量传播 + 死代码消除（吃掉 temp/tcc_to_optimize.md 优先级 1，且不用动 TCC）：只写一次的常量局部变量在读取处替换成字面量（`push_const` 数值常量也参与折叠），return/goto 之后的不可达字节码不生成。踩坑：`inc_loc`/`dec_loc` 也是写操作，漏统计会让循环计数器被当成常量 → JIT 死循环（已修）。结果：cf(30) 1200→400 ns/call（3×），fibi 保持 9×，递归 fib 1.28×。commit 5182fd6。见 current.md
 
 <14>(SOLVED): Step 11 —— JIT/AOT 后端接口：`JSWhaleJitBackend { name, compile(ctx, src, &entry, &handle), release(handle) }`，当前唯一实现是 TCC；`whale_jit_backend` 指针就是 AOT 插入点（离线 gcc/clang + 磁盘缓存只需实现该结构体），不对"外部编译器"形成硬依赖。行为与性能不变（fibi 仍 9×）。commit 75cd7b6。见 current.md
+
+<15>(SOLVED): Step 12 —— 自查"JIT 没生效"：三个叠加原因（① opcode 覆盖太窄：用户用 `<=` 即 `lte`，而生成器只认 `lt`；② **正确性 bug**：跳转目标的栈深度用了线性扫描的 sp、死代码没回滚 → else 分支写错槽，`h(30)` 给 -29；③ **相对路径**：从 release 目录跑时 TCC 找不到 quickjs.h → 静默回退解释器）。另实现**数值直传**（`whale_jit_core` 全程 double + JSValue 包装层，自递归不再装箱/解箱）。结果：用户的 **fib(40) 17.5s → 2.12s（8.3×）**，递归 fib(24)×20 154→19ms，迭代 fibi 保持 9×。commit 005c615 + c994c44。见 current.md
