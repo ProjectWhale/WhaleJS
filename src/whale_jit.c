@@ -27,6 +27,7 @@ int  JS_WhaleTokSinkLen(void);
 void JS_WhaleTokCommit(int *tok, double *num, int n);
 extern int whale_tok_active;   /* owned by the TinyCC-side file */
 extern int whale_gen_ok;       /* set by whale_gen_cb, read by the interface */
+extern int whale_gen_pure;     /* 0 once a global read is emitted (no memoising) */
 int JS_WhaleCompileTokens(struct TCCState *s, void (*emit)(void *), void *emit_ctx);
 
 /* WhaleJS services implemented in quickjs.c. The generated code only *names*
@@ -1179,6 +1180,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int atom = (int)whale_get_u32(pc + pos + 1);
                 int fm = fold_mark();
 
+                /* Reading a global makes the result depend on something other
+                   than the arguments, so the engine must not memoise this
+                   function. */
+                whale_gen_pure = 0;
                 wk(JS_WK_IF); wt('('); wt('!');
                 wt_id("JS_WhaleGetGlobalNum"); wt('('); wt_id("ctx"); wt(','); wt_int(atom); wt(','); wt('&'); wt_slot("v", sp); wt(')');
                 wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');

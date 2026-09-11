@@ -899,6 +899,12 @@ typedef struct JSFunctionBytecode {
     void *whale_jit_entry;     /* 非 NULL 表示已有机器码入口 */
     uint8_t whale_jit_tried;   /* JIT compile already attempted */
     void *whale_jit_tcc;       /* owning TCCState (keeps the code alive) */
+    /* Memoisation: this function was JIT-compiled and never reads a global, so
+       its result depends only on its numeric arguments - repeated calls with
+       the same ones can reuse it. `whale_memo` is a small bounded table (see
+       WhaleMemo) and is dropped when the bytecode is freed. */
+    uint8_t whale_pure;
+    void *whale_memo;
 } JSFunctionBytecode;
 
 typedef struct JSBoundFunction {
@@ -3070,6 +3076,166 @@ int JS_WhaleToInt32(double d)
         return (int32_t)d;          /* truncation is exactly ToInt32 here */
     return whale_dtoi32_slow(d);
 }
+
+/* ---- memoisation ---------------------------------------------------------
+ * A pure function called again with the same numeric arguments returns the
+ * cached result instead of recomputing it. "Pure" means: the JIT compiled it
+ * (so every operand and the result is a number) and it never reads a global -
+ * therefore its result depends only on its arguments. For a recursive function
+ * like fib that is the difference between exponential and linear work.
+ *
+ * The table is bounded and self-tuning. Capacity starts small, grows while the
+ * function keeps being called, and stops at a ceiling; entries record the tick
+ * they were last hit, and a full table drops the colder ones. A single fixed
+ * cap would either waste memory on a large program or throttle a small one.
+ */
+#define WHALE_MEMO_MIN 8
+#define WHALE_MEMO_MAX 4096
+
+typedef struct WhaleMemoEntry {
+    uint32_t last_hit;
+    JSValue result;             /* always a number: the JIT only returns those */
+    JSValue args[1];            /* arg_count slots, trailing - always numbers */
+} WhaleMemoEntry;
+
+typedef struct WhaleMemo {
+    int count, cap, arg_count;
+    uint32_t tick;
+    WhaleMemoEntry **entries;
+} WhaleMemo;
+
+/* Same value, keeping -0 and +0 apart (JS distinguishes them in `1/x`) and
+   never matching NaN - a cached NaN could not be told from any other. */
+static int whale_same_number(JSValue a, JSValue b)
+{
+    int ta = JS_VALUE_GET_TAG(a), tb = JS_VALUE_GET_TAG(b);
+
+    if (ta != tb)
+        return 0;
+    if (ta == JS_TAG_INT)
+        return JS_VALUE_GET_INT(a) == JS_VALUE_GET_INT(b);
+    if (JS_TAG_IS_FLOAT64(ta)) {
+        double x = JS_VALUE_GET_FLOAT64(a), y = JS_VALUE_GET_FLOAT64(b);
+
+        if (x != y)                     /* this also rejects NaN */
+            return 0;
+        return (x != 0.0) || (1.0 / x == 1.0 / y);
+    }
+    return 0;
+}
+
+/* Returns 1 and stores a *new* reference when the call is already memoised. */
+static int whale_memo_lookup(WhaleMemo *m, int argc, const JSValue *argv, JSValue *out)
+{
+    int i, k;
+
+    if (argc != m->arg_count)
+        return 0;
+    for (k = 0; k < argc; k++) {
+        if (!JS_IsNumber(argv[k]))
+            return 0;                   /* anything else is not our business */
+    }
+    m->tick++;
+    for (i = 0; i < m->count; i++) {
+        WhaleMemoEntry *e = m->entries[i];
+        int hit = 1;
+
+        for (k = 0; k < argc; k++) {
+            if (!whale_same_number(e->args[k], argv[k])) {
+                hit = 0;
+                break;
+            }
+        }
+        if (!hit)
+            continue;
+        e->last_hit = m->tick;
+        *out = js_dup(e->result);
+        return 1;
+    }
+    return 0;
+}
+
+/* Drop what has not been used for a while. Entries are numeric, so there is
+   nothing to release - only the storage. */
+static void whale_memo_evict(JSContext *ctx, WhaleMemo *m)
+{
+    uint32_t cutoff = m->tick / 2;
+    int i, n = 0;
+
+    for (i = 0; i < m->count; i++) {
+        WhaleMemoEntry *e = m->entries[i];
+        if (e->last_hit >= cutoff)
+            m->entries[n++] = e;
+        else
+            js_free(ctx, e);
+    }
+    if (n == m->count) {
+        /* everything looked hot: fall back to dropping the older half */
+        int half = n / 2;
+
+        for (i = 0; i < half; i++)
+            js_free(ctx, m->entries[i]);
+        memmove(m->entries, m->entries + half, (n - half) * sizeof(*m->entries));
+        n -= half;
+    }
+    m->count = n;
+}
+
+static void whale_memo_insert(JSContext *ctx, WhaleMemo *m, int argc,
+                              const JSValue *argv, JSValue result)
+{
+    WhaleMemoEntry *e;
+    int k;
+
+    for (k = 0; k < argc; k++) {
+        if (!JS_IsNumber(argv[k]))
+            return;
+    }
+    if (m->count == m->cap) {
+        if (m->cap < WHALE_MEMO_MAX) {
+            int ncap = m->cap ? m->cap * 2 : WHALE_MEMO_MIN;
+
+            if (ncap > WHALE_MEMO_MAX)
+                ncap = WHALE_MEMO_MAX;
+            m->entries = js_realloc(ctx, m->entries, ncap * sizeof(*m->entries));
+            if (!m->entries)
+                return;
+            m->cap = ncap;
+        } else {
+            whale_memo_evict(ctx, m);
+            if (m->count == m->cap)     /* still full: give this one up */
+                return;
+        }
+    }
+    e = js_malloc(ctx, sizeof(*e) + (argc > 1 ? (argc - 1) : 0) * sizeof(JSValue));
+    if (!e)
+        return;
+    e->last_hit = ++m->tick;
+    e->result = result;
+    for (k = 0; k < argc; k++)
+        e->args[k] = argv[k];
+    m->entries[m->count++] = e;
+}
+
+static void whale_memo_discard(JSRuntime *rt, JSFunctionBytecode *b)
+{
+    WhaleMemo *m = b->whale_memo;
+    int i;
+
+    if (!m)
+        return;
+    for (i = 0; i < m->count; i++)
+        js_free_rt(rt, m->entries[i]);  /* entries hold numbers only */
+    js_free_rt(rt, m->entries);
+    js_free_rt(rt, m);
+    b->whale_memo = NULL;
+}
+
+/* Set by the generator: 1 when the function it just emitted never reads a
+   global, i.e. its result depends only on its arguments. Mirrors whale_gen_ok
+   (owned by src/tcc/whale_tcc_iface.c). */
+extern int whale_gen_pure;
+
 static void whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
 {
     JSWhaleContext *w = &ctx->whale;
@@ -3108,6 +3274,17 @@ static void whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
             b->whale_jit_entry = entry;
             b->whale_jit_tcc = handle;
             JS_WhaleNoteJitResult(ctx, 1, 0);
+            /* Memoise it only if the generator never had to read a global:
+               then the result is a function of the arguments alone. */
+            if (whale_gen_pure) {
+                WhaleMemo *m = js_mallocz(ctx, sizeof(*m));
+
+                if (m) {
+                    m->arg_count = b->arg_count;
+                    b->whale_memo = m;
+                    b->whale_pure = 1;
+                }
+            }
         } else {
             JS_WhaleNoteJitResult(ctx, 0, 0);
         }
@@ -18320,6 +18497,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     sf->cur_func = unsafe_unconst(func_obj);
     var_refs = p->u.func.var_refs;
 
+    /* Memoised call: the arguments are in hand and nothing has been allocated
+       yet, so a hit returns straight away. A missing/extra argument makes
+       argc differ from the memoised arity, which the lookup rejects. */
+    if (unlikely(b->whale_pure)) {
+        JSValue memo_ret;
+
+        if (whale_memo_lookup((WhaleMemo *)b->whale_memo, argc, argv, &memo_ret))
+            return memo_ret;
+    }
+
     local_buf = alloca(alloca_size);
     if (unlikely(arg_allocated_size)) {
         int n = min_int(argc, b->arg_count);
@@ -18371,6 +18558,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 close_var_refs(rt, sf);
             for (pval = local_buf; pval < stack_buf; pval++)
                 JS_FreeValue(ctx, *pval);
+            /* Remember the result, so the next call with the same arguments can
+               skip all of this. Only pure numeric functions get here. */
+            if (unlikely(b->whale_pure))
+                whale_memo_insert(ctx, (WhaleMemo *)b->whale_memo, argc, arg_buf,
+                                  js_dup(whale_ret));
             rt->current_stack_frame = sf->prev_frame;
             return whale_ret;
         }
@@ -37364,6 +37556,9 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
 static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
 {
     int i;
+
+    /* the memo table holds only numbers, so it is just storage to release */
+    whale_memo_discard(rt, b);
 
     if (b->byte_code_buf)
         free_bytecode_atoms(rt, b->byte_code_buf, b->byte_code_len, true);

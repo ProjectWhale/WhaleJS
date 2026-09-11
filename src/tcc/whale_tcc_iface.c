@@ -302,6 +302,10 @@ int whale_tok_active;
 /* Set by the generator callback: 0 means it bailed on an opcode it cannot lower,
    so the tokens emitted so far form a truncated function. */
 int whale_gen_ok = 1;
+/* Also set by the generator: 1 when the function it emitted never reads a
+   global. Such a function's result depends only on its arguments, which is what
+   lets the engine memoise it (see whale_memo in quickjs.c). */
+int whale_gen_pure = 1;
 static int whale_tok_buf[16384];
 static double whale_tok_num[16384];
 static int whale_tok_len;
@@ -527,6 +531,7 @@ int JS_WhaleCompileTokens(TCCState *s, void (*emit)(void *), void *emit_ctx)
     /* tokens can only be created now: tok_alloc needs the unit */
     JS_WhaleTokReset();
     whale_gen_ok = 1;
+    whale_gen_pure = 1;         /* pessimistic until the generator says otherwise */
     if (emit)
         emit(emit_ctx);
 
