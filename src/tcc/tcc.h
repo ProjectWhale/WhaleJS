@@ -805,7 +805,19 @@ struct TCCState {
     const char *runtime_main;
     void **runtime_mem;
     int nb_runtime_mem;
+    /* Number of symbols that already carry a section base from a previous
+       relocate. tcc_relocate_ex() can be called more than once on one state
+       (WhaleJS compiles several functions into a single state), and only the
+       symbols that existed then may have that base taken off again. */
+    int nb_relocated_syms;
 #endif
+    /* Symbols pe_build_imports() rebound to an import thunk: their st_shndx
+       stops being SHN_UNDEF, so a later link would not recognise them as
+       imports at all. They are put back before every link. Elements are symbol
+       indices stored as (void *)(intptr_t), which is what dynarray_add()
+       expects. */
+    void **pe_import_syms;
+    int nb_pe_import_syms;
 
     /* used by main and tcc_parse_args only */
     struct filespec **files; /* files seen on command line */
@@ -1462,6 +1474,12 @@ ST_FUNC unsigned create_plt_entry(TCCState *s1, unsigned got_offset, struct sym_
 ST_FUNC void relocate_init(Section *sr);
 ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr, addr_t addr, addr_t val);
 ST_FUNC void relocate_plt(TCCState *s1);
+
+/* Undo the relocations already applied to a section's data. A TCCState that is
+   relocated more than once (WhaleJS compiles several functions into one state
+   and runs each one) would otherwise have every relocation applied again on top
+   of the previous result, since relocate() adds into the section storage. */
+ST_FUNC void relocate_reset(TCCState *s1, Section *s);
 
 /* ------------ xxx-gen.c ------------ */
 

@@ -299,10 +299,52 @@ void JS_WhaleIrDumpText(TCCState *s, const char *tag)
  * ======================================================================== */
 
 int whale_tok_active;
+/* Set by the generator callback: 0 means it bailed on an opcode it cannot lower,
+   so the tokens emitted so far form a truncated function. */
+int whale_gen_ok = 1;
 static int whale_tok_buf[16384];
 static double whale_tok_num[16384];
 static int whale_tok_len;
 static int whale_tok_pos;
+
+/* ---- generator-owned token workspace ----------------------------------
+   The JIT generator folds stack-slot values into expressions before the final
+   token order is known, so it needs a workspace it can append to and then
+   linearise. The encoders below append there; JS_WhaleTokCommit() copies the
+   finished stream into the buffer the parser reads. Without a workspace
+   installed the encoders write the parser buffer directly, as before. */
+static int *whale_ws_tok;
+static double *whale_ws_num;
+static int whale_ws_cap;
+static int whale_ws_len;
+
+void JS_WhaleTokSink(int *tok, double *num, int cap)
+{
+    whale_ws_tok = tok;
+    whale_ws_num = num;
+    whale_ws_cap = cap;
+    whale_ws_len = 0;
+}
+
+int JS_WhaleTokSinkLen(void)
+{
+    return whale_ws_len;
+}
+
+/* Publish the first n workspace tokens as the stream the parser reads. */
+void JS_WhaleTokCommit(int *tok, double *num, int n)
+{
+    int i, cap = (int)(sizeof(whale_tok_buf) / sizeof(whale_tok_buf[0]));
+
+    if (n > cap)
+        n = cap;
+    for (i = 0; i < n; i++) {
+        whale_tok_num[i] = num[i];
+        whale_tok_buf[i] = tok[i];
+    }
+    whale_tok_len = n;
+    whale_tok_pos = 0;
+}
 
 static int whale_tok_ident(const char *name)
 {
@@ -326,6 +368,16 @@ void JS_WhaleTokReset(void)
 /* val is used only for TOK_CINT / TOK_CDOUBLE */
 void JS_WhaleTokPush(int t, double val)
 {
+    if (whale_ws_tok) {
+        /* The generator owns the stream while it folds expressions: it buffered
+           the whole function before the parser ever runs, so the encoders append
+           to its workspace and JS_WhaleTokCommit() publishes the result. */
+        if (whale_ws_len >= whale_ws_cap)
+            return;
+        whale_ws_num[whale_ws_len] = val;
+        whale_ws_tok[whale_ws_len++] = t;
+        return;
+    }
     if (whale_tok_len >= (int)(sizeof(whale_tok_buf) / sizeof(whale_tok_buf[0])))
         return;
     whale_tok_num[whale_tok_len] = val;
@@ -341,13 +393,13 @@ int JS_WhaleTokIdent(const char *name)
 void whale_next_token(void)
 {
     tok = (whale_tok_pos < whale_tok_len) ? whale_tok_buf[whale_tok_pos] : TOK_EOF;
+    tokc.i = 0;
+    tokc.d = 0;
     if (tok == TOK_CINT)
         tokc.i = (int)whale_tok_num[whale_tok_pos];
     else if (tok == TOK_CDOUBLE)
         tokc.d = whale_tok_num[whale_tok_pos];
     whale_tok_pos++;
-    tokc.i = 0;
-    tokc.d = 0;
     tok_flags = 0;
 }
 
@@ -408,9 +460,7 @@ void *JS_WhaleTokCompileAdd2(const char *tcc_dir)
     preprocess_start(s, 0);
     tcc_debug_start(s);
 
-    whale_tok_build_add2();
-    JS_WhaleTokReset();
-    whale_tok_pos = 0;
+    whale_tok_build_add2();      /* fills and resets the stream */
     whale_tok_active = 1;
 
     tccgen_compile(s);          /* the real parser, fed by our tokens */
@@ -443,10 +493,22 @@ int JS_WhaleCompileTokens(TCCState *s, void (*emit)(void *), void *emit_ctx)
        then consume our (empty) token stream */
     whale_tok_active = 0;
 
+    /* Snapshot the macro stack before setjmp: the error path below unwinds with
+       it, and it must never still hold a previous unit's value. */
+    whale_define_start = define_stack;
+
     if (setjmp(s->error_jmp_buf) != 0) {
-        if (getenv("WHALE_IR_DEBUG"))
-            fprintf(stderr, "[tok] tcc_error raised, bailing out\n");
+        /* tcc_error() longjmps straight here, so the teardown at the end of this
+           function never runs. Do the same unwinding on this path: otherwise the
+           symbol/label stacks keep this unit's entries and the next compile in
+           the process trips over them (label_pop() would then define labels
+           through put_extern_sym() against a symbol table that no longer exists). */
         whale_tok_active = 0;
+        free_defines(whale_define_start);
+        sym_pop(&global_stack, NULL, 0);
+        sym_pop(&local_stack, NULL, 0);
+        global_label_stack = NULL;
+        local_label_stack = NULL;
         s->error_set_jmp_enabled = 0;
         return 0;
     }
@@ -459,20 +521,34 @@ int JS_WhaleCompileTokens(TCCState *s, void (*emit)(void *), void *emit_ctx)
     file->buffer[0] = 0;   /* an empty translation unit, not garbage */
     file->buf_ptr = file->buffer;
     tccelf_begin_file(s);
-    if (getenv("WHALE_IR_DEBUG"))
-        fprintf(stderr, "[tok] pre  active=%d pos=%d len=%d\n", whale_tok_active, whale_tok_pos, whale_tok_len);
     preprocess_start(s, 0);
-    if (getenv("WHALE_IR_DEBUG"))
-        fprintf(stderr, "[tok] post active=%d pos=%d len=%d\n", whale_tok_active, whale_tok_pos, whale_tok_len);
     tcc_debug_start(s);
 
     /* tokens can only be created now: tok_alloc needs the unit */
     JS_WhaleTokReset();
+    whale_gen_ok = 1;
     if (emit)
         emit(emit_ctx);
 
     whale_tok_pos = 0;
     whale_tok_active = 1;
+
+    if (!whale_gen_ok) {
+        /* The generator bailed on an opcode it cannot lower, so what it pushed is
+           a truncated function. Parsing that would only produce a bogus syntax
+           error, so skip the parse and unwind as if the unit had ended. */
+        whale_tok_active = 0;
+        free_defines(whale_define_start);
+        sym_pop(&global_stack, NULL, 0);
+        sym_pop(&local_stack, NULL, 0);
+        global_label_stack = NULL;
+        local_label_stack = NULL;
+        preprocess_end(s);
+        tccelf_end_file(s);
+        tcc_close();
+        s->error_set_jmp_enabled = 0;
+        return 0;
+    }
 
     if (getenv("WHALE_IR_DEBUG"))
         JS_WhaleTokDump();
@@ -482,8 +558,28 @@ int JS_WhaleCompileTokens(TCCState *s, void (*emit)(void *), void *emit_ctx)
     whale_tok_active = 0;
     preprocess_end(s);
     free_inline_functions(s);
+    /* Unwind this unit the way tcc_compile() does, so the next compile in this
+       process starts from an empty symbol/macro stack. */
+    free_defines(whale_define_start);
+    sym_pop(&global_stack, NULL, 0);
+    sym_pop(&local_stack, NULL, 0);
+    /* Drop any labels left behind by a parse that bailed out early. label_pop()
+       would try to define their symbols through put_extern_sym() against a
+       symbol table that is already gone, and the next gen_function() pops
+       global_label_stack wholesale - so detach the chains here instead of
+       letting the stale entries crash a later compile. They are only freed with
+       the state at process exit. */
+    global_label_stack = NULL;
+    local_label_stack = NULL;
     tccelf_end_file(s);
     tcc_close();
+
+    /* pe_output_file() runs again on every relocate and records the PE entry
+       symbol in runtime_main. pe_add_runtime() reads that field to decide
+       whether to inject a start symbol, so once it is set a later relocate would
+       define `main`/`__runmain` as UNDEF and pe_check_symbols() would fail the
+       compile. WhaleJS never runs a program out of this state, so clear it. */
+    s->runtime_main = NULL;
 
     s->error_set_jmp_enabled = 0;
     return s->nb_errors == 0;
@@ -530,7 +626,8 @@ void JS_WhaleTokChar(int ch)
 }
 void JS_WhaleTokOp(int o)
 {
-    static const int optok[] = { '+', '-', '*', '/', TOK_LT, TOK_LE, TOK_GT, TOK_GE, TOK_EQ, TOK_NE, TOK_LOR, TOK_LAND };
+    static const int optok[] = { '+', '-', '*', '/', TOK_LT, TOK_LE, TOK_GT, TOK_GE, TOK_EQ, TOK_NE, TOK_LOR, TOK_LAND,
+                                 TOK_SHL, TOK_SAR, TOK_SHR };
 
     if (o >= 0 && o < (int)(sizeof(optok) / sizeof(optok[0])))
         JS_WhaleTokPush(optok[o], 0);
@@ -549,17 +646,19 @@ void JS_WhaleTokDump(void)
 
     for (k = 0; k < whale_tok_len; k++) {
         int t = whale_tok_buf[k];
-        const char *nm = get_tok_str(t, NULL);
+        fprintf(stderr, "%d:", k);
+        /* get_tok_str() is only valid for identifiers/keywords: for a plain
+           character token it would index past/to the wrong table entry. */
         if (t == TOK_CINT)
-            fprintf(stderr, "%d ", (int)whale_tok_num[k]);
+            fprintf(stderr, "INT %d\n", (int)whale_tok_num[k]);
         else if (t == TOK_CDOUBLE)
-            fprintf(stderr, "%.17g ", whale_tok_num[k]);
-        else if (nm && t < 256)
-            fprintf(stderr, "%s ", nm);
-        else if (nm)
-            fprintf(stderr, "%s ", nm);
-        else
-            fprintf(stderr, "<?%d> ", t);
+            fprintf(stderr, "DBL %.17g\n", whale_tok_num[k]);
+        else if (t > 0 && t < 256)
+            fprintf(stderr, "'%c' (%d)\n", (t >= 32 && t < 127) ? t : '?', t);
+        else if (t >= TOK_IDENT) {
+            const char *nm = get_tok_str(t, NULL);
+            fprintf(stderr, "%s (%d)\n", nm ? nm : "?", t);
+        } else
+            fprintf(stderr, "T%d\n", t);
     }
-    fprintf(stderr, "\n");
 }

@@ -3021,6 +3021,55 @@ int JS_WhaleCheckStack(JSContext *ctx)
     }
     return 1;
 }
+
+/* Read a global as a number for the JIT. `atom` is the atom index the bytecode
+   carries for OP_get_var. Returns 0 when the global is not a number, which
+   makes the compiled code deoptimise and let the interpreter run the frame -
+   so this must not raise. Self-contained on purpose: the JIT-side unbox helper
+   is static to whale_jit.c, and JS_GetGlobalVar is defined much later here. */
+static JSValue JS_GetGlobalVar(JSContext *ctx, JSAtom prop, bool throw_ref_error);
+
+int JS_WhaleGetGlobalNum(JSContext *ctx, int atom, double *out)
+{
+    JSValue v = JS_GetGlobalVar(ctx, atom, false);
+    int t, ok = 0;
+
+    if (JS_IsException(v))
+        return 0;
+    t = JS_VALUE_GET_TAG(v);
+    if (t == JS_TAG_INT) {
+        *out = (double)JS_VALUE_GET_INT(v);
+        ok = 1;
+    } else if (JS_TAG_IS_FLOAT64(t)) {
+        *out = JS_VALUE_GET_FLOAT64(v);
+        ok = 1;
+    }
+    JS_FreeValue(ctx, v);   /* no-op for numbers, but a global may be an object */
+    return ok;
+}
+
+/* ToInt32 for the JIT. The bitwise operators are defined on int32, so the
+   generated code cannot just cast a double: JS specifies a truncation towards
+   zero followed by a modulo-2^32 wrap (and 0 for the non-finite values).
+   
+   The wrap needs fmod(), which is a libm call - far too expensive for something
+   the generated code calls on every bitwise operand. Values in the int32 range
+   (by far the common case) only need a truncating cast, so that is the fast
+   path and fmod() is left for the cold one. */
+static int32_t whale_dtoi32_slow(double d)
+{
+    if (!isfinite(d))
+        return 0;
+    /* fmod keeps the sign, then the unsigned cast does the mod 2^32 */
+    return (int32_t)(uint32_t)fmod(d, 4294967296.0);
+}
+
+int JS_WhaleToInt32(double d)
+{
+    if (d >= -2147483648.0 && d <= 2147483647.0)
+        return (int32_t)d;          /* truncation is exactly ToInt32 here */
+    return whale_dtoi32_slow(d);
+}
 static void whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
 {
     JSWhaleContext *w = &ctx->whale;
@@ -3064,6 +3113,19 @@ static void whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
         }
     }   /* compile failed: stay interpreted */
     /* 热点已达阈值：下一步在这里调 TinyCC 把 b 编译成机器码 */
+}
+
+/* A loop back edge is heat exactly like a call is: a function that is entered
+   once and then loops a million times is as hot as one that is called a million
+   times, and without counting the back edge the JIT would never look at the
+   first kind at all. After the first attempt this is one load, because
+   whale_jit_tried short-circuits it. */
+static void whale_note_backedge(JSContext *ctx, JSFunctionBytecode *b)
+{
+    if (b->whale_jit_tried)     /* compiled, or tried and gave up */
+        return;
+    if (++b->whale_call_count >= WHALE_JIT_HOT_THRESHOLD)
+        whale_on_call(ctx, b);
 }
 
 /* set the new value and free the old value after (freeing the value
@@ -19300,19 +19362,34 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_goto):
-            pc += (int32_t)get_u32(pc);
-            if (unlikely(js_poll_interrupts(ctx)))
-                goto exception;
+            {
+                int32_t whale_d = (int32_t)get_u32(pc);
+                pc += whale_d;
+                if (whale_d < 0)            /* back edge: hot loop */
+                    whale_note_backedge(ctx, b);
+                if (unlikely(js_poll_interrupts(ctx)))
+                    goto exception;
+            }
             BREAK;
         CASE(OP_goto16):
-            pc += (int16_t)get_u16(pc);
-            if (unlikely(js_poll_interrupts(ctx)))
-                goto exception;
+            {
+                int32_t whale_d = (int16_t)get_u16(pc);
+                pc += whale_d;
+                if (whale_d < 0)
+                    whale_note_backedge(ctx, b);
+                if (unlikely(js_poll_interrupts(ctx)))
+                    goto exception;
+            }
             BREAK;
         CASE(OP_goto8):
-            pc += (int8_t)pc[0];
-            if (unlikely(js_poll_interrupts(ctx)))
-                goto exception;
+            {
+                int32_t whale_d = (int8_t)pc[0];
+                pc += whale_d;
+                if (whale_d < 0)
+                    whale_note_backedge(ctx, b);
+                if (unlikely(js_poll_interrupts(ctx)))
+                    goto exception;
+            }
             BREAK;
         CASE(OP_if_true):
             {

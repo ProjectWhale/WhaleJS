@@ -51,6 +51,10 @@ enum {
     JS_OP_ADD = 0, JS_OP_SUB, JS_OP_MUL, JS_OP_DIV,
     JS_OP_LT, JS_OP_LE, JS_OP_GT, JS_OP_GE, JS_OP_EQ, JS_OP_NE,
     JS_OP_OR, JS_OP_AND,
+    /* These are single tokens in C, not two characters: the parser never sees
+       a lexer, so `wt('<'); wt('<')` would arrive as two `<` and fail with
+       "')' expected (got \"<\")". */
+    JS_OP_SHL, JS_OP_SAR, JS_OP_SHR,
 };
 
 /* provided by src/tcc/whale_tcc_iface.c */

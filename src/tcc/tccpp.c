@@ -2967,6 +2967,14 @@ keep_tok_flags:
 #endif
 }
 
+/* WhaleJS: when the JIT drives the compiler, tokens come from our own stream
+   instead of the lexer - that is what removes the C-source/header dependency.
+   The hook replaces only the real-lexer call, so a macro string left behind by
+   unget_tok() (used by is_label() and friends) still gets consumed first:
+   otherwise the pushed-back token would be dropped and the stream would slip. */
+extern int whale_tok_active;
+extern void whale_next_token(void);
+
 /* return next token without macro substitution. Can read input from
    macro_ptr buffer */
 static void next_nomacro_spc(void)
@@ -2981,35 +2989,16 @@ static void next_nomacro_spc(void)
                 goto redo;
             }
         }
+    } else if (whale_tok_active) {
+        whale_next_token();
     } else {
         next_nomacro1();
     }
     //printf("token = %s\n", get_tok_str(tok, &tokc));
 }
 
-/* WhaleJS: when the JIT drives the compiler, tokens come from our own stream
-   instead of the lexer - that is what removes the C-source/header dependency. */
-extern int whale_tok_active;
-extern void whale_next_token(void);
-
 ST_FUNC void next_nomacro(void)
 {
-    if (whale_tok_active) {
-        static int dbg;
-        if (dbg < 6 && getenv("WHALE_IR_DEBUG")) {
-            dbg++;
-            fprintf(stderr, "[hook] serving token #%d\n", dbg);
-        }
-        whale_next_token();
-        return;
-    }
-    {
-        static int dbg2;
-        if (dbg2 < 30 && getenv("WHALE_IR_DEBUG")) {
-            dbg2++;
-            fprintf(stderr, "[hook] lexer path, active=%d\n", whale_tok_active);
-        }
-    }
     do {
         next_nomacro_spc();
     } while (tok < 256 && (isidnum_table[tok - CH_EOF] & IS_SPC));

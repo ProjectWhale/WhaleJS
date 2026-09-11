@@ -676,13 +676,16 @@ LIBTCCAPI int tcc_compile_string(TCCState *s, const char *str)
 LIBTCCAPI void tcc_define_symbol(TCCState *s1, const char *sym, const char *value)
 {
     int len1, len2;
+    /* Defining a macro must never read the JIT's token stream (it calls
+       next_nomacro() directly, bypassing tcc_compile). */
+    extern int whale_tok_active;
+    int whale_saved_active = whale_tok_active;
+    whale_tok_active = 0;
     /* default value */
     if (!value)
         value = "1";
     len1 = strlen(sym);
     len2 = strlen(value);
-    if (getenv("WHALE_IR_DEBUG"))
-        fprintf(stderr, "[def] sym='%s' value='%s'\n", sym, value);
 
     /* init file structure */
     tcc_open_bf(s1, "<define>", len1 + len2 + 1);
@@ -694,6 +697,7 @@ LIBTCCAPI void tcc_define_symbol(TCCState *s1, const char *sym, const char *valu
     next_nomacro();
     parse_define();
     tcc_close();
+    whale_tok_active = whale_saved_active;
 }
 
 /* undefine a preprocessor symbol */

@@ -20,8 +20,20 @@
 /* implemented inside the TinyCC translation unit (src/tcc/whale_tcc_iface.c) */
 int JS_WhaleTccProbe(void);
 void JS_WhaleTokPush(int t, double val);
+/* the generator folds expressions in a workspace it owns and then hands the
+   linearised token stream to the parser through Commit() */
+void JS_WhaleTokSink(int *tok, double *num, int cap);
+int  JS_WhaleTokSinkLen(void);
+void JS_WhaleTokCommit(int *tok, double *num, int n);
 extern int whale_tok_active;   /* owned by the TinyCC-side file */
+extern int whale_gen_ok;       /* set by whale_gen_cb, read by the interface */
 int JS_WhaleCompileTokens(struct TCCState *s, void (*emit)(void *), void *emit_ctx);
+
+/* WhaleJS services implemented in quickjs.c. The generated code only *names*
+   the runtime helpers (they are emitted as tokens), but tcc_add_symbol() below
+   takes their real addresses, so these need declarations. */
+int JS_WhaleToInt32(double d);
+int JS_WhaleGetGlobalNum(JSContext *ctx, int atom, double *out);
 
 /* Opcode ids and sizes, taken from the same quickjs-opcode.h the interpreter
    uses. The enum mirrors OPCodeEnum in quickjs.c: the DEF entries first, then
@@ -107,7 +119,6 @@ int JS_WhaleCompileTokens(struct TCCState *s, void (*emit)(void *), void *emit_c
 #define WHALE_JIT_SRC_DIR "src"
 #endif
 
-#define WHALE_JIT_SRC_MAX 65536
 #define WHALE_JIT_MAX_SLOTS 64
 
 /* type lattice for the specialization pass */
@@ -117,9 +128,6 @@ enum {
     WHALE_T_BOOL = 2, /* true / false, usable as 1 / 0 */
     WHALE_T_SELF = 3, /* this function, usable only as a call target */
 };
-
-static char whale_jit_src[WHALE_JIT_SRC_MAX];
-static size_t whale_jit_src_len;
 
 /* ------------------------------------------------------------------------
  * Token emitters.
@@ -164,20 +172,6 @@ static void wt_num(double v)
 {
     JS_WhaleTokDouble(v);
 }
-static void whale_emit(const char *fmt, ...)
-{
-    va_list ap;
-    int n;
-
-    if (whale_jit_src_len + 1 >= WHALE_JIT_SRC_MAX)
-        return;
-    va_start(ap, fmt);
-    n = vsnprintf(whale_jit_src + whale_jit_src_len,
-                  WHALE_JIT_SRC_MAX - whale_jit_src_len, fmt, ap);
-    va_end(ap);
-    if (n > 0)
-        whale_jit_src_len += (size_t)n;
-}
 
 /* ---- helpers the generated code calls back into ---- */
 
@@ -188,6 +182,15 @@ static void whale_emit(const char *fmt, ...)
 /* Self-recursive call: go back through the engine so the callee gets a proper
    frame. The callee is this same function object, so it re-enters this JIT
    entry rather than the interpreter. */
+
+/* The process-wide TCCState plus the per-compile function names. The state is
+   created on the first compile and lives until process exit; every later compile
+   is another file inside it, so the generated names carry a counter to stay
+   unique while earlier functions' code remains live. */
+static TCCState *whale_jit_state;
+static unsigned whale_jit_seq;
+static char whale_core_name[40];
+static char whale_entry_name[40];
 
 
 static JSValue whale_jit_box_num(JSContext *ctx, double d)
@@ -216,13 +219,6 @@ static int whale_jit_unbox_num(JSContext *ctx, JSValue v, double *out)
     }
     return 0;
 }
-
-static const char *whale_jit_preamble =
-    "#include \"quickjs.h\"\n"
-    "extern int JS_WhaleVarRefIsSelf(JSContext *ctx, void **var_refs, int idx, JSValue self);\n"
-    "extern JSValue whale_jit_box_num(JSContext *ctx, double d);\n"
-    "extern int JS_WhaleCheckStack(JSContext *ctx);\n"
-    "extern int whale_jit_unbox_num(JSContext *ctx, JSValue v, double *out);\n";
 
 static int whale_type_is_num(int t)
 {
@@ -336,6 +332,11 @@ static int whale_load_analyze(const JSWhaleFuncInfo *info, const uint8_t *pc, in
             }
             if (JS_TAG_IS_FLOAT64(ct)) {
                 *cval_out = JS_VALUE_GET_FLOAT64(c);
+                /* must say WLD_REAL: the default kind is WLD_INT, and
+                   whale_load_emit() would then truncate the literal to int
+                   (1.5 -> 1) and every float constant in the function would be
+                   silently wrong. */
+                *kind_out = WLD_REAL;
                 return 1;
             }
             return 0; /* strings / bigints: not our shape */
@@ -361,6 +362,204 @@ static void whale_load_emit(int kind, int idx, double cval)
     }
 }
 
+/* Opcode name for diagnostics, built from the same table the enum uses so it
+   can never drift from the interpreter's numbering (the temp opcodes are named
+   too, shifted by OP_TEMP_START as the enum does). */
+static const char *whale_op_name(int op)
+{
+    static const char *def_names[] = {
+#define FMT(f)
+#define DEF(id, size, n_pop, n_push, f) #id,
+#define def(id, size, n_pop, n_push, f)
+#include "quickjs-opcode.h"
+#undef def
+#undef DEF
+#undef FMT
+    };
+    static const char *tmp_names[] = {
+#define FMT(f)
+#define DEF(id, size, n_pop, n_push, f)
+#define def(id, size, n_pop, n_push, f) #id,
+#include "quickjs-opcode.h"
+#undef def
+#undef DEF
+#undef FMT
+    };
+
+    if (op >= 0 && op < OP_COUNT)
+        return def_names[op];
+    if (op >= OP_TEMP_START && op <= OP_TEMP_END)
+        return tmp_names[op - OP_TEMP_START];
+    return "?";
+}
+
+/* =====================================================================
+ * Expression folding
+ *
+ * A stack slot is not written into a C variable until something forces it to
+ * be. The generator instead keeps the token sequence that produces the value,
+ * so a chain like
+ *     s = s * c + k;
+ * comes out as one C statement instead of four. That is worth a lot here:
+ * TinyCC has no register allocator and spills at every statement boundary.
+ *
+ * Two buffers, both owned by this file:
+ *   gw_*   append-only workspace - every encoder call lands here. A value
+ *          expression is a [off,len) range into it, and because it only ever
+ *          grows those ranges stay valid, so a value can be inlined again.
+ *   go_*   the finished stream in final order. A statement is committed by
+ *          copying its token range here; JS_WhaleTokCommit() then hands go_*
+ *          to the parser.
+ *
+ * A statement's tokens are contiguous in gw_* (its inline copies are appended
+ * as it is emitted), so committing is one copy of [mark, now).
+ * ===================================================================== */
+#define WHALE_TOK_MAX 32768
+
+static int    gw_tok[WHALE_TOK_MAX];
+static double gw_num[WHALE_TOK_MAX];
+static int    go_tok[WHALE_TOK_MAX];
+static double go_num[WHALE_TOK_MAX];
+static int    go_len;
+
+typedef struct { int off, len; } WhaleVExpr;
+
+static WhaleVExpr *whale_vexpr;   /* the pending expression of each stack slot */
+static uint8_t    *whale_vmat;    /* 1 = already forced into `v<n>` */
+
+/* Everything encoded from now on goes into the workspace. */
+static void fold_begin(void)
+{
+    JS_WhaleTokSink(gw_tok, gw_num, WHALE_TOK_MAX);
+    go_len = 0;
+}
+
+static int fold_mark(void)
+{
+    return JS_WhaleTokSinkLen();
+}
+
+/* A value whose expression grows past this many tokens is materialised right
+   away. Without a ceiling, inlining a value used many times (a comparison
+   inlined three times, say) could grow the function exponentially. */
+#define WHALE_EXPR_MAX 24
+
+static void fold_materialize(int k);
+
+/* Record [mark, now) as the value of stack slot k. */
+static void fold_set(int k, int mark)
+{
+    whale_vexpr[k].off = mark;
+    whale_vexpr[k].len = JS_WhaleTokSinkLen() - mark;
+    whale_vmat[k] = 0;
+    if (whale_vexpr[k].len > WHALE_EXPR_MAX)
+        fold_materialize(k);
+}
+
+/* Append the value of slot k to what is being built right now. */
+static void fold_inline(int k)
+{
+    int i;
+
+    if (whale_vmat[k]) {
+        wt_slot("v", k);            /* already a real variable */
+        return;
+    }
+    /* Always parenthesise. A folded value can be a comparison or a `?:`
+       expression, and precedence then matters: `if (x < y ? 1 : 0 == 0)` parses
+       as `x < y ? 1 : (0 == 0)`, i.e. always true, so the loop never runs.
+       Wrapping is cheap and keeps every use site correct. */
+    wt('(');
+    for (i = 0; i < whale_vexpr[k].len; i++)
+        JS_WhaleTokPush(gw_tok[whale_vexpr[k].off + i],
+                        gw_num[whale_vexpr[k].off + i]);
+    wt(')');
+}
+
+/* Emit ToInt32 of slot k. The helper is only needed for the modulo-2^32 wrap:
+   a value already in the int32 range just needs a truncating cast, and that is
+   the common case here (loop counters, small integers). So the range test is
+   inlined and the call stays on the cold branch.
+   
+   Repeating the operand is what makes this pay: it is done only when the value
+   is a plain variable or a short expression, which is exactly the shape the
+   bitwise operators see. Without this, every bitwise operand paid a helper
+   call whose fmod() dominated the loop. */
+static void fold_toint32(int k)
+{
+    int repeat = whale_vmat[k] || whale_vexpr[k].len <= 8;
+
+    if (!repeat) {
+        wt_id("JS_WhaleToInt32"); wt('('); fold_inline(k); wt(')');
+        return;
+    }
+    wt('(');
+    wt('('); fold_inline(k); wt_op(JS_OP_GE); wt_num(-2147483648.0); wt(')');
+    wt_op(JS_OP_AND);
+    wt('('); fold_inline(k); wt_op(JS_OP_LE); wt_num(2147483647.0); wt(')');
+    wt('?'); wt('('); wk(JS_WK_INT); wt(')'); fold_inline(k);
+    wt(':'); wt_id("JS_WhaleToInt32"); wt('('); fold_inline(k); wt(')');
+    wt(')');
+}
+
+/* Emit `a % b`. fmod() is a libm call and the operands here are usually small
+   positive integers, where the C remainder is exactly the same value, so test
+   that first and keep fmod() on the cold branch.
+   
+   Only strictly positive integers take the fast path. Zero and -0 are left to
+   fmod() on purpose: a truncating cast turns -0 into +0, and `fmod(-0, n)` is
+   -0 while `1/x` downstream would notice the difference. */
+static void fold_mod(int ka, int kb)
+{
+    int repeat = (whale_vmat[ka] || whale_vexpr[ka].len <= 8) &&
+                 (whale_vmat[kb] || whale_vexpr[kb].len <= 8);
+
+    if (!repeat) {
+        wt_id("fmod"); wt('('); fold_inline(ka); wt(','); fold_inline(kb); wt(')');
+        return;
+    }
+    wt('(');
+    /* cheap range tests first, the integrality test last */
+    wt('('); fold_inline(ka); wt_op(JS_OP_GT); wt_int(0); wt(')'); wt_op(JS_OP_AND);
+    wt('('); fold_inline(kb); wt_op(JS_OP_GT); wt_int(0); wt(')'); wt_op(JS_OP_AND);
+    wt('('); fold_inline(ka); wt_op(JS_OP_LE); wt_num(2147483647.0); wt(')'); wt_op(JS_OP_AND);
+    wt('('); fold_inline(kb); wt_op(JS_OP_LE); wt_num(2147483647.0); wt(')'); wt_op(JS_OP_AND);
+    wt('('); fold_inline(ka); wt_op(JS_OP_EQ); wt('('); wk(JS_WK_INT); wt(')'); fold_inline(ka); wt(')'); wt_op(JS_OP_AND);
+    wt('('); fold_inline(kb); wt_op(JS_OP_EQ); wt('('); wk(JS_WK_INT); wt(')'); fold_inline(kb); wt(')');
+    wt('?'); wt('('); wk(JS_WK_DOUBLE); wt(')'); wt('(');
+    wt('('); wk(JS_WK_INT); wt(')'); fold_inline(ka); wt('%'); wt('('); wk(JS_WK_INT); wt(')'); fold_inline(kb);
+    wt(')');
+    wt(':'); wt_id("fmod"); wt('('); fold_inline(ka); wt(','); fold_inline(kb); wt(')');
+    wt(')');
+}
+
+/* Copy the token range [mark, now) to the finished stream. */
+static void fold_commit(int mark)
+{
+    int i, n = JS_WhaleTokSinkLen();
+
+    for (i = mark; i < n && go_len < WHALE_TOK_MAX; i++) {
+        go_num[go_len] = gw_num[i];
+        go_tok[go_len++] = gw_tok[i];
+    }
+}
+
+/* Force slot k into a variable (`v<k> = <expr>;`) and commit it. Only needed
+   where a value has to survive a basic-block boundary or a jump. */
+static void fold_materialize(int k)
+{
+    int mark;
+
+    if (whale_vmat[k])
+        return;
+    mark = fold_mark();
+    wt_slot("v", k); wt('=');
+    fold_inline(k);
+    wt(';');
+    fold_commit(mark);
+    whale_vmat[k] = 1;
+}
+
 /* Generate + type-check in one pass. Returns 0 when the function is not a
    candidate (unsupported opcode, unknown type, inconsistent jump target). */
 static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
@@ -380,7 +579,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     int stack_size = info->stack_size;
     int arg_count = info->arg_count;
     int state_len = var_count + stack_size + 1; /* +1: sp */
-    int pos, i, sp, ret = 0;
+    int pos, i, sp, ret = 0, tail_mark;
     uint8_t *targets = NULL, *seen = NULL, *snap = NULL, *cur = NULL, *args_used = NULL;
     uint8_t var_ref_used[4] = { 0, 0, 0, 0 };
     uint16_t *assign_cnt = NULL;
@@ -402,7 +601,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     cur = calloc(1, state_len);
     args_used = calloc(1, arg_count > 0 ? arg_count : 1);
     assign_cnt = calloc(var_count > 0 ? var_count : 1, sizeof(uint16_t));
-    if (!targets || !seen || !snap || !cur || !args_used || !assign_cnt)
+    whale_vexpr = calloc(stack_size, sizeof(WhaleVExpr));
+    whale_vmat = calloc(1, stack_size);
+    if (!targets || !seen || !snap || !cur || !args_used || !assign_cnt ||
+        !whale_vexpr || !whale_vmat)
         goto out;
     memset(lo_c, 0, sizeof(lo_c));
     memset(lo_cv, 0, sizeof(lo_cv));
@@ -453,11 +655,25 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        tokens into TinyCC's parser directly, so there is no lexer and no
        keyword table, and keywords are compile-time constants. */
 
-    /* preamble: types only (JSValue is 8 bytes by value, ABI-identical to a
-       quickjs JSValue), the one extern constant, and the entry points we call.
-       No #include, so the compile needs no file on disk. */
-    wk(JS_WK_TYPEDEF); wk(JS_WK_UNSIGNED); wk(JS_WK_LONG); wk(JS_WK_LONG); wt_id("JSValue"); wt(';');
-    wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_EXCEPTION"); wt(';');
+    /* preamble: types only. JSValue must match quickjs.h exactly, because it is
+       passed *by value* across the JIT/host boundary (function arguments and
+       return values). quickjs.h uses the {union, int64_t tag} form on 64-bit,
+       i.e. 16 bytes - NOT the 8-byte NAN-boxed uint64_t. Getting this wrong
+       makes every JSValue argument/return garbage on the host side.
+
+       From here the encoders write into the folding workspace; the preamble and
+       the declarations below are structural, so they are committed as one
+       block before the bytecode loop starts. */
+    fold_begin();
+    wk(JS_WK_TYPEDEF); wk(JS_WK_UNION); wt('{');
+        wk(JS_WK_INT); wt_id("int32"); wt(';');
+        wk(JS_WK_DOUBLE); wt_id("float64"); wt(';');
+        wk(JS_WK_VOID); wt('*'); wt_id("ptr"); wt(';');
+    wt('}'); wt_id("JSValueUnion"); wt(';');
+    wk(JS_WK_TYPEDEF); wk(JS_WK_STRUCT); wt('{');
+        wt_id("JSValueUnion"); wt_id("u"); wt(';');
+        wk(JS_WK_LONG); wk(JS_WK_LONG); wt_id("tag"); wt(';');
+    wt('}'); wt_id("JSValue"); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleVarRefIsSelf"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_VOID); wt('*'); wt('*');
         wt_id("var_refs"); wt(','); wk(JS_WK_INT); wt_id("idx"); wt(',');
@@ -473,11 +689,23 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_DOUBLE); wt_id("d"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_NewBool"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("b"); wt(')'); wt(';');
+    /* `%` lowers to fmod(). It has to be declared: without this TinyCC falls
+       back to the C89 implicit declaration, takes the int return value from rax
+       while the real result is in xmm0, and every `%` silently yields 0. */
+    wk(JS_WK_EXTERN); wk(JS_WK_DOUBLE); wt_id("fmod"); wt('(');
+        wk(JS_WK_DOUBLE); wt_id("x"); wt(','); wk(JS_WK_DOUBLE); wt_id("y"); wt(')'); wt(';');
+    /* the bitwise operators need JS ToInt32 semantics, not a C cast */
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleToInt32"); wt('(');
+        wk(JS_WK_DOUBLE); wt_id("d"); wt(')'); wt(';');
+    /* reading a global (`get_var`); returns 0 when it is not a number */
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleGetGlobalNum"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("atom"); wt(',');
+        wk(JS_WK_DOUBLE); wt('*'); wt_id("out"); wt(')'); wt(';');
 
-    /* whale_jit_core works purely in doubles: every number is unboxed at the
+    /* whale_jit_core_<n> works purely in doubles: every number is unboxed at the
        boundary. Self-recursion calls it directly, so the recursive fast path
        costs no boxing at all - only the engine entry does that. */
-    wk(JS_WK_STATIC); wk(JS_WK_DOUBLE); wt_id("whale_jit_core"); wt('(');
+    wk(JS_WK_STATIC); wk(JS_WK_DOUBLE); wt_id(whale_core_name); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(',');
         wt_id("JSValue"); wt('*'); wt_id("args"); wt(',');
         wk(JS_WK_DOUBLE); wt('*'); wt_id("An"); wt(',');
@@ -493,6 +721,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             wk(JS_WK_DOUBLE); wt_slot("A", i); wt('='); wt_id("An"); wt('['); wt_int(i); wt(']'); wt(';');
         }
     }
+    fold_commit(0);     /* the whole implicit prologue is structural */
 
     sp = 0;
     for (pos = 0; pos < len; ) {
@@ -545,7 +774,21 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                code was skipped (e.g. an else-branch sitting right after the goto). */
             memcpy(cur, snap + (size_t)pos * state_len, state_len);
             sp = cur[state_len - 1];
-            wt_slot("L", pos); wt(':');
+            /* A basic-block boundary: every live stack slot has to become a real
+               variable again, because the expressions that produced them belong
+               to the block that just ended. */
+            {
+                int k;
+
+                for (k = 0; k < sp; k++)
+                    fold_materialize(k);
+            }
+            {
+                int fm = fold_mark();
+
+                wt_slot("L", pos); wt(':');
+                fold_commit(fm);
+            }
         }
 
         /* --- peephole 1: <load> <load> <binop> [put_loc] -> one assignment --- */
@@ -589,21 +832,75 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     l4 = 3;
                 }
 
+                /* Algebraic identities that remove the operation entirely, and
+                   with it a whole statement: x*1, 1*x, x/1 and x-0 are all just
+                   x. Deliberately NOT here: x+0 and 0+x (-0 + 0 is +0, so the
+                   sign changes) and x*0 (NaN * 0 is NaN, not 0). */
+                {
+                    int id_keep = -1;    /* 0 = keep the left operand, 1 = right */
+
+                    if (op3 == OP_mul) {
+                        if ((k2 == WLD_INT || k2 == WLD_REAL) && cv2 == 1.0)
+                            id_keep = 0;
+                        else if ((k1 == WLD_INT || k1 == WLD_REAL) && cv1 == 1.0)
+                            id_keep = 1;
+                    } else if (op3 == OP_div) {
+                        if ((k2 == WLD_INT || k2 == WLD_REAL) && cv2 == 1.0)
+                            id_keep = 0;
+                    } else if (op3 == OP_sub) {
+                        /* x-0 keeps x, including -0 - 0 == -0 */
+                        if ((k2 == WLD_INT || k2 == WLD_REAL) && cv2 == 0.0)
+                            id_keep = 0;
+                    }
+                    if (id_keep >= 0) {
+                        int fm = fold_mark();
+
+                        if (dst >= 0) {
+                            wt_slot("L", dst); wt('=');
+                            if (id_keep == 0) whale_load_emit(k1, i1, cv1);
+                            else whale_load_emit(k2, i2, cv2);
+                            wt(';');
+                            fold_commit(fm);
+                            cur[dst] = (uint8_t)(id_keep == 0 ? t1 : t2);
+                        } else {
+                            if (id_keep == 0) whale_load_emit(k1, i1, cv1);
+                            else whale_load_emit(k2, i2, cv2);
+                            fold_set(sp, fm);
+                            cur[var_count + sp] = (uint8_t)(id_keep == 0 ? t1 : t2);
+                            sp += 1;
+                        }
+                        pos = p4 + l4;
+                        continue;
+                    }
+                }
+
                 if (is_cmp) {
                     if (dst >= 0) {
+                        int fm = fold_mark();
+
                         wt_slot("L", dst); wt('='); wt('('); whale_load_emit(k1, i1, cv1); wt_op(opid); whale_load_emit(k2, i2, cv2); wt(')'); wt('?'); wt_int(1); wt(':'); wt_int(0); wt(';');
+                        fold_commit(fm);
                         cur[dst] = WHALE_T_BOOL;
                     } else {
-                        wt_slot("v", sp); wt('='); wt('('); whale_load_emit(k1, i1, cv1); wt_op(opid); whale_load_emit(k2, i2, cv2); wt(')'); wt('?'); wt_int(1); wt(':'); wt_int(0); wt(';');
+                        int fm = fold_mark();
+
+                        wt('('); whale_load_emit(k1, i1, cv1); wt_op(opid); whale_load_emit(k2, i2, cv2); wt(')'); wt('?'); wt_int(1); wt(':'); wt_int(0);
+                        fold_set(sp, fm);
                         cur[var_count + sp] = WHALE_T_BOOL;
                         sp += 1;
                     }
                 } else {
                     if (dst >= 0) {
+                        int fm = fold_mark();
+
                         wt_slot("L", dst); wt('='); whale_load_emit(k1, i1, cv1); wt_op(opid); whale_load_emit(k2, i2, cv2); wt(';');
+                        fold_commit(fm);
                         cur[dst] = WHALE_T_NUM;
                     } else {
-                        wt_slot("v", sp); wt('='); whale_load_emit(k1, i1, cv1); wt_op(opid); whale_load_emit(k2, i2, cv2); wt(';');
+                        int fm = fold_mark();
+
+                        whale_load_emit(k1, i1, cv1); wt_op(opid); whale_load_emit(k2, i2, cv2);
+                        fold_set(sp, fm);
                         cur[var_count + sp] = WHALE_T_NUM;
                         sp += 1;
                     }
@@ -630,7 +927,16 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 l5 = 3;
             }
             if (d2 >= 0 && d2 < var_count) {
-                wt_slot("L", d2); wt('='); whale_load_emit(k1, i1, cv1); wt(';');
+                /* `L = L` is a leftover worth dropping, not emitting: the
+                   QuickJS parser already folds things like `x * 1` into a
+                   plain copy, and a store that changes nothing is pure
+                   overhead in a loop body. Type bookkeeping below still runs. */
+                if (!(k1 == WLD_SLOT && i1 == d2)) {
+                    int fm = fold_mark();
+
+                    wt_slot("L", d2); wt('='); whale_load_emit(k1, i1, cv1); wt(';');
+                    fold_commit(fm);
+                }
                 cur[d2] = (uint8_t)t1;
                 if (assign_cnt[d2] == 1 && c1) {
                     lo_c[d2] = 1;
@@ -647,58 +953,87 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         case OP_push_minus1:
         case OP_push_0: case OP_push_1: case OP_push_2: case OP_push_3:
         case OP_push_4: case OP_push_5: case OP_push_6: case OP_push_7:
-            wt_slot("v", sp); wt('='); wt_int(op == OP_push_minus1 ? -1 : op - OP_push_0); wt(';');
-            cur[var_count + sp] = WHALE_T_NUM;
-            sp++;
+            {
+                int fm = fold_mark();
+
+                wt_int(op == OP_push_minus1 ? -1 : op - OP_push_0);
+                fold_set(sp, fm);
+                cur[var_count + sp] = WHALE_T_NUM;
+                sp++;
+            }
             break;
         case OP_push_i8:
-            wt_slot("v", sp); wt('='); wt_int((int)(int8_t)pc[pos + 1]); wt(';');
-            cur[var_count + sp] = WHALE_T_NUM;
-            sp++;
+            {
+                int fm = fold_mark();
+
+                wt_int((int)(int8_t)pc[pos + 1]);
+                fold_set(sp, fm);
+                cur[var_count + sp] = WHALE_T_NUM;
+                sp++;
+            }
             break;
         case OP_push_i16:
-            wt_slot("v", sp); wt('='); wt_int((int)(int16_t)whale_get_u16(pc + pos + 1)); wt(';');
-            cur[var_count + sp] = WHALE_T_NUM;
-            sp++;
+            {
+                int fm = fold_mark();
+
+                wt_int((int)(int16_t)whale_get_u16(pc + pos + 1));
+                fold_set(sp, fm);
+                cur[var_count + sp] = WHALE_T_NUM;
+                sp++;
+            }
             break;
         case OP_push_i32:
-            wt_slot("v", sp); wt('='); wt_int((int)(int32_t)whale_get_u32(pc + pos + 1)); wt(';');
-            cur[var_count + sp] = WHALE_T_NUM;
-            sp++;
+            {
+                int fm = fold_mark();
+
+                wt_int((int)(int32_t)whale_get_u32(pc + pos + 1));
+                fold_set(sp, fm);
+                cur[var_count + sp] = WHALE_T_NUM;
+                sp++;
+            }
             break;
         case OP_push_const:
         case OP_push_const8:
             {
                 int idx = (op == OP_push_const8) ? (int)pc[pos + 1] : (int)whale_get_u32(pc + pos + 1);
                 JSValue c;
-                int ct;
+                int ct, fm;
 
                 if (idx < 0 || idx >= info->cpool_count)
                     goto out;
                 c = info->cpool[idx];
                 ct = JS_VALUE_GET_TAG(c);
-                if (ct == JS_TAG_INT) {
-                    wt_slot("v", sp); wt('='); wt_int((int)JS_VALUE_GET_INT(c)); wt(';');
-                    cur[var_count + sp] = WHALE_T_NUM;
-                    sp++;
-                } else if (JS_TAG_IS_FLOAT64(ct)) {
-                    wt_slot("v", sp); wt('='); wt_num(JS_VALUE_GET_FLOAT64(c)); wt(';');
-                    cur[var_count + sp] = WHALE_T_NUM;
-                    sp++;
-                } else {
+                if (ct != JS_TAG_INT && !JS_TAG_IS_FLOAT64(ct))
                     goto out; /* strings / bigints / objects: not our shape */
-                }
+                fm = fold_mark();
+                if (ct == JS_TAG_INT)
+                    wt_int((int)JS_VALUE_GET_INT(c));
+                else
+                    wt_num(JS_VALUE_GET_FLOAT64(c));
+                fold_set(sp, fm);
+                cur[var_count + sp] = WHALE_T_NUM;
+                sp++;
             }
             break;
         case OP_push_true:
-            wt_slot("v", sp); wt('='); wt_int(1); wt(';');
-            cur[var_count + sp] = WHALE_T_BOOL;
-            sp++;
+            {
+                int fm = fold_mark();
+
+                wt_int(1);
+                fold_set(sp, fm);
+                cur[var_count + sp] = WHALE_T_BOOL;
+                sp++;
+            }
             break;
         case OP_push_false:
-            wt_slot("v", sp); wt('='); wt_int(0); wt(';');
-            cur[var_count + sp] = WHALE_T_BOOL;
-            sp++;
+            {
+                int fm = fold_mark();
+
+                wt_int(0);
+                fold_set(sp, fm);
+                cur[var_count + sp] = WHALE_T_BOOL;
+                sp++;
+            }
             break;
 
         case OP_get_loc0: case OP_get_loc1: case OP_get_loc2: case OP_get_loc3:
@@ -711,7 +1046,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 t = (idx >= 0 && idx < var_count) ? cur[idx] : WHALE_T_UNKNOWN;
                 if (t == WHALE_T_UNKNOWN)
                     goto out;
-                wt_slot("v", sp); wt('='); wt_slot("L", idx); wt(';');
+                {
+                    int fm = fold_mark();
+
+                    wt_slot("L", idx);
+                    fold_set(sp, fm);
+                }
                 cur[var_count + sp] = (uint8_t)t;
                 sp++;
             }
@@ -723,11 +1063,57 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int idx = (op == OP_put_loc8) ? (int)pc[pos + 1] :
                           (op == OP_put_loc) ? (int)whale_get_u16(pc + pos + 1) :
                           op - OP_put_loc0;
+                int fm;
+
                 t = cur[var_count + sp - 1];
                 if (t == WHALE_T_UNKNOWN || idx < 0 || idx >= var_count)
                     goto out;
-                wt_slot("L", idx); wt('='); wt_slot("v", sp - 1); wt(';');
+                fm = fold_mark();
+                wt_slot("L", idx); wt('='); fold_inline(sp - 1); wt(';');
+                fold_commit(fm);
                 cur[idx] = (uint8_t)t;
+                lo_c[idx] = 0;
+                sp--;
+            }
+            break;
+        /* set_loc* is put_loc with n_push=1: the value is stored *and* left on
+           the stack, so `sp` deliberately does not move. */
+        case OP_set_loc0: case OP_set_loc1: case OP_set_loc2: case OP_set_loc3:
+        case OP_set_loc8:
+        case OP_set_loc:
+            {
+                int idx = (op == OP_set_loc8) ? (int)pc[pos + 1] :
+                          (op == OP_set_loc) ? (int)whale_get_u16(pc + pos + 1) :
+                          op - OP_set_loc0;
+                int fm;
+
+                t = cur[var_count + sp - 1];
+                if (t == WHALE_T_UNKNOWN || idx < 0 || idx >= var_count)
+                    goto out;
+                fm = fold_mark();
+                wt_slot("L", idx); wt('='); fold_inline(sp - 1); wt(';');
+                fold_commit(fm);
+                cur[idx] = (uint8_t)t;
+                lo_c[idx] = 0;
+                /* sp unchanged */
+            }
+            break;
+        /* add_loc is the fused `L += x` the parser emits for compound
+           assignment to a local. */
+        case OP_add_loc:
+            {
+                int idx = (int)pc[pos + 1];
+                int fm;
+
+                t = cur[var_count + sp - 1];
+                if (t == WHALE_T_UNKNOWN || idx < 0 || idx >= var_count)
+                    goto out;
+                if (!whale_type_is_num(cur[idx]) || !whale_type_is_num(t))
+                    goto out;
+                fm = fold_mark();
+                wt_slot("L", idx); wt('='); wt_slot("L", idx); wt('+'); fold_inline(sp - 1); wt(';');
+                fold_commit(fm);
+                cur[idx] = WHALE_T_NUM;
                 lo_c[idx] = 0;
                 sp--;
             }
@@ -735,7 +1121,15 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         case OP_get_loc0_loc1:
             if (var_count < 2 || cur[0] == WHALE_T_UNKNOWN || cur[1] == WHALE_T_UNKNOWN)
                 goto out;
-            wt_slot("v", sp); wt('='); wt_slot("L", 0); wt(';'); wt_slot("v", sp + 1); wt('='); wt_slot("L", 1); wt(';');
+            {
+                int fm = fold_mark();
+
+                wt_slot("L", 0);
+                fold_set(sp, fm);
+                fm = fold_mark();
+                wt_slot("L", 1);
+                fold_set(sp + 1, fm);
+            }
             cur[var_count + sp] = cur[0];
             cur[var_count + sp + 1] = cur[1];
             sp += 2;
@@ -744,10 +1138,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         case OP_get_arg:
             {
                 int idx = (op == OP_get_arg) ? (int)whale_get_u16(pc + pos + 1) : op - OP_get_arg0;
+                int fm;
 
                 if (idx < 0 || idx >= arg_count)
                     goto out;
-                wt_slot("v", sp); wt('='); wt_slot("A", idx); wt(';');
+                fm = fold_mark();
+                wt_slot("A", idx);
+                fold_set(sp, fm);
                 cur[var_count + sp] = WHALE_T_NUM;
                 sp++;
             }
@@ -763,6 +1160,33 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 /* the closure check was hoisted to the entry */
                 (void)idx;
                 cur[var_count + sp] = WHALE_T_SELF;
+                /* SELF has no value expression: mark the slot materialised so
+                   a later use can never inline whatever was recorded there
+                   before (the slot is only ever consumed as a call target). */
+                whale_vmat[sp] = 1;
+                sp++;
+            }
+            break;
+
+        /* A global read. The value is fetched through a helper that also checks
+           it is a number, because the generated code cannot deal with anything
+           else - a non-number bails out (deopt) and the interpreter runs the
+           frame instead, which is exactly what the entry unboxing does for
+           arguments. */
+        case OP_get_var:
+        case OP_get_var_undef:
+            {
+                int atom = (int)whale_get_u32(pc + pos + 1);
+                int fm = fold_mark();
+
+                wk(JS_WK_IF); wt('('); wt('!');
+                wt_id("JS_WhaleGetGlobalNum"); wt('('); wt_id("ctx"); wt(','); wt_int(atom); wt(','); wt('&'); wt_slot("v", sp); wt(')');
+                wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                fold_commit(fm);
+                /* the helper wrote straight into the slot, so it is a real
+                   variable now rather than a folded expression */
+                whale_vmat[sp] = 1;
+                cur[var_count + sp] = WHALE_T_NUM;
                 sp++;
             }
             break;
@@ -773,7 +1197,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             {
                 int argc = (op == OP_call) ? (int)whale_get_u16(pc + pos + 1) : op - OP_call0;
                 int func_slot = sp - 1 - argc;
-                int k;
+                int k, fm;
 
                 if (func_slot < 0 || cur[var_count + func_slot] != WHALE_T_SELF)
                     goto out;
@@ -781,13 +1205,22 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     if (!whale_type_is_num(cur[var_count + sp - argc + k]))
                         goto out;
                 }
+                fm = fold_mark();
                 wt('{'); wk(JS_WK_DOUBLE); wt_id("_an"); wt('['); wt_int(argc > 0 ? argc : 1); wt(']'); wt(';'); wk(JS_WK_DOUBLE); wt_id("_r"); wt('='); wt_int(0); wt(';'); wk(JS_WK_INT); wt_id("_dd"); wt('='); wt_int(0); wt(';');
-                for (k = 0; k < argc; k++)
-                    wt_id("_an"); wt('['); wt_int(k); wt(']'); wt('='); wt_slot("v", sp - argc + k); wt(';');
+                for (k = 0; k < argc; k++) {
+                    wt_id("_an"); wt('['); wt_int(k); wt(']'); wt('='); fold_inline(sp - argc + k); wt(';');
+                }
                 wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleCheckStack"); wt('('); wt_id("ctx"); wt(')'); wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
-                wt_id("_r"); wt('='); wt_id("whale_jit_core"); wt('('); wt_id("ctx"); wt(','); wt_id("args"); wt(','); wt_id("_an"); wt(','); wt('&'); wt_id("_dd"); wt(')'); wt(';');
+                wt_id("_r"); wt('='); wt_id(whale_core_name); wt('('); wt_id("ctx"); wt(','); wt_id("args"); wt(','); wt_id("_an"); wt(','); wt('&'); wt_id("_dd"); wt(')'); wt(';');
                 wk(JS_WK_IF); wt('('); wt_id("_dd"); wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
                 wt_slot("v", func_slot); wt('='); wt_id("_r"); wt(';'); wt('}');
+                fold_commit(fm);
+                /* The result is in v<func_slot> now, which is a real variable.
+                   Marking it materialised is what makes later uses refer to it:
+                   without this the slot still held the expression of some
+                   earlier value (a call argument, say) and would be inlined as
+                   that instead of as the call result. */
+                whale_vmat[func_slot] = 1;
                 cur[var_count + func_slot] = WHALE_T_NUM;
                 sp = func_slot + 1;
             }
@@ -805,10 +1238,16 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 if (opid < 0 || !whale_type_is_num(ta) || !whale_type_is_num(tb))
                     goto out;
                 if (is_cmp) {
-                    wt_slot("v", sp - 2); wt('='); wt('('); wt_slot("v", sp - 2); wt_op(opid); wt_slot("v", sp - 1); wt(')'); wt('?'); wt_int(1); wt(':'); wt_int(0); wt(';');
+                    int fm = fold_mark();
+
+                    wt('('); fold_inline(sp - 2); wt_op(opid); fold_inline(sp - 1); wt(')'); wt('?'); wt_int(1); wt(':'); wt_int(0);
+                    fold_set(sp - 2, fm);
                     cur[var_count + sp - 2] = WHALE_T_BOOL;
                 } else {
-                    wt_slot("v", sp - 2); wt('='); wt_slot("v", sp - 2); wt_op(opid); wt_slot("v", sp - 1); wt(';');
+                    int fm = fold_mark();
+
+                    fold_inline(sp - 2); wt_op(opid); fold_inline(sp - 1);
+                    fold_set(sp - 2, fm);
                     cur[var_count + sp - 2] = WHALE_T_NUM;
                 }
                 sp--;
@@ -819,14 +1258,66 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             tb = cur[var_count + sp - 1];
             if (!whale_type_is_num(ta) || !whale_type_is_num(tb))
                 goto out;
-            wt_slot("v", sp - 2); wt('='); wt_id("fmod"); wt('('); wt_slot("v", sp - 2); wt(','); wt_slot("v", sp - 1); wt(')'); wt(';');
+            {
+                int fm = fold_mark();
+
+                fold_mod(sp - 2, sp - 1);
+                fold_set(sp - 2, fm);
+            }
+            cur[var_count + sp - 2] = WHALE_T_NUM;
+            sp--;
+            break;
+        /* Bitwise operators are defined on int32, so both operands go through
+           ToInt32 and the result comes back into the double domain. The shift
+           counts are taken mod 32, as JS specifies (a plain C shift by >= 32
+           is undefined). */
+        case OP_and: case OP_or: case OP_xor:
+            ta = cur[var_count + sp - 2];
+            tb = cur[var_count + sp - 1];
+            if (!whale_type_is_num(ta) || !whale_type_is_num(tb))
+                goto out;
+            {
+                int fm = fold_mark();
+
+                wt('('); wk(JS_WK_DOUBLE); wt(')'); wt('(');
+                fold_toint32(sp - 2);
+                wt(op == OP_and ? '&' : op == OP_or ? '|' : '^');
+                fold_toint32(sp - 1);
+                wt(')');
+                fold_set(sp - 2, fm);
+            }
+            cur[var_count + sp - 2] = WHALE_T_NUM;
+            sp--;
+            break;
+        case OP_shl: case OP_shr: case OP_sar:
+            ta = cur[var_count + sp - 2];
+            tb = cur[var_count + sp - 1];
+            if (!whale_type_is_num(ta) || !whale_type_is_num(tb))
+                goto out;
+            {
+                int fm = fold_mark();
+
+                wt('('); wk(JS_WK_DOUBLE); wt(')'); wt('(');
+                if (op == OP_shr) { wk(JS_WK_UNSIGNED); wk(JS_WK_INT); wt(')'); }   /* >>> is logical */
+                fold_toint32(sp - 2);
+                /* one token, not two '<' - there is no lexer to join them */
+                wt_op(op == OP_shl ? JS_OP_SHL : JS_OP_SAR);
+                wt('('); fold_toint32(sp - 1); wt('&'); wt_int(31); wt(')');
+                wt(')');
+                fold_set(sp - 2, fm);
+            }
             cur[var_count + sp - 2] = WHALE_T_NUM;
             sp--;
             break;
         case OP_neg:
             if (!whale_type_is_num(cur[var_count + sp - 1]))
                 goto out;
-            wt_slot("v", sp - 1); wt('='); wt('-'); wt_slot("v", sp - 1); wt(';');
+            {
+                int fm = fold_mark();
+
+                wt('-'); fold_inline(sp - 1);
+                fold_set(sp - 1, fm);
+            }
             cur[var_count + sp - 1] = WHALE_T_NUM;
             break;
         case OP_plus:
@@ -835,25 +1326,55 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 goto out;
             cur[var_count + sp - 1] = WHALE_T_NUM;
             break;
+        /* QuickJS has two different operators here: `lnot` is the logical
+           `!x`, while `not` is the bitwise `~x`. Treating `not` as `!x` made
+           every `~x` in a JIT'd function return 0 or 1. */
+        case OP_lnot:
+            if (!whale_type_is_num(cur[var_count + sp - 1]))
+                goto out;
+            {
+                int fm = fold_mark();
+
+                /* !x is true for 0 and for NaN */
+                wt('('); wt('('); fold_inline(sp - 1); wt_op(JS_OP_NE); fold_inline(sp - 1); wt(')');
+                wt_op(JS_OP_OR); wt('('); fold_inline(sp - 1); wt_op(JS_OP_EQ); wt_int(0); wt(')'); wt(')');
+                wt('?'); wt_int(1); wt(':'); wt_int(0);
+                fold_set(sp - 1, fm);
+            }
+            cur[var_count + sp - 1] = WHALE_T_BOOL;
+            break;
         case OP_not:
             if (!whale_type_is_num(cur[var_count + sp - 1]))
                 goto out;
-            /* !x is true for 0 and for NaN */
-            wt_slot("v", sp - 1); wt('='); wt('('); wt('('); wt_slot("v", sp - 1); wt_op(JS_OP_NE); wt_slot("v", sp - 1); wt(')'); wt_op(JS_OP_OR); wt('('); wt_slot("v", sp - 1); wt_op(JS_OP_EQ); wt_int(0); wt(')'); wt(')'); wt('?'); wt_int(1); wt(':'); wt_int(0); wt(';');
-            cur[var_count + sp - 1] = WHALE_T_BOOL;
+            {
+                int fm = fold_mark();
+
+                wt('('); wk(JS_WK_DOUBLE); wt(')'); wt('~'); fold_toint32(sp - 1);
+                fold_set(sp - 1, fm);
+            }
+            cur[var_count + sp - 1] = WHALE_T_NUM;
             break;
         case OP_inc: case OP_dec:
             if (!whale_type_is_num(cur[var_count + sp - 1]))
                 goto out;
-            wt_slot("v", sp - 1); wt('='); wt_slot("v", sp - 1); wt(op == OP_inc ? '+' : '-'); wt_int(1); wt(';');
+            {
+                int fm = fold_mark();
+
+                fold_inline(sp - 1); wt(op == OP_inc ? '+' : '-'); wt_int(1);
+                fold_set(sp - 1, fm);
+            }
             cur[var_count + sp - 1] = WHALE_T_NUM;
             break;
         case OP_inc_loc:
             {
                 int idx = (int)pc[pos + 1];
+                int fm;
+
                 if (idx < 0 || idx >= var_count || !whale_type_is_num(cur[idx]))
                     goto out;
+                fm = fold_mark();
                 wt_slot("L", idx); wt('='); wt_slot("L", idx); wt('+'); wt_int(1); wt(';');
+                fold_commit(fm);
                 cur[idx] = WHALE_T_NUM;
                 lo_c[idx] = 0;
             }
@@ -861,12 +1382,17 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         case OP_drop:
             if (sp <= 0)
                 goto out;
+            /* the value just disappears; its expression is never inlined and
+               the slot is overwritten by the next push */
             sp--;
             break;
         case OP_dup:
             if (sp <= 0)
                 goto out;
-            wt_slot("v", sp); wt('='); wt_slot("v", sp - 1); wt(';');
+            /* both slots share the expression. It has no side effects, so
+               inlining it twice is fine. */
+            whale_vexpr[sp] = whale_vexpr[sp - 1];
+            whale_vmat[sp] = whale_vmat[sp - 1];
             cur[var_count + sp] = cur[var_count + sp - 1];
             sp++;
             break;
@@ -877,11 +1403,14 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int is_true = (op == OP_if_true8 || op == OP_if_true);
                 int tgt = is8 ? (pos + 1 + (int8_t)pc[pos + 1])
                               : (pos + 1 + (int32_t)whale_get_u32(pc + pos + 1));
+                int fm;
 
                 t = cur[var_count + sp - 1];
                 if (!whale_type_is_num(t))
                     goto out;
-                wk(JS_WK_IF); wt('('); wt_slot("v", sp - 1); wt_op(is_true ? JS_OP_NE : JS_OP_EQ); wt_int(0); wt(')'); wk(JS_WK_GOTO); wt_slot("L", tgt); wt(';');
+                fm = fold_mark();
+                wk(JS_WK_IF); wt('('); fold_inline(sp - 1); wt_op(is_true ? JS_OP_NE : JS_OP_EQ); wt_int(0); wt(')'); wk(JS_WK_GOTO); wt_slot("L", tgt); wt(';');
+                fold_commit(fm);
                 sp--;
                 /* the edge leaving this jump defines the target state */
                 if ((tgt >= 0) && (tgt <= len) && (!seen[tgt])) {
@@ -895,8 +1424,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             {
                 int tgt = (op == OP_goto8) ? (pos + 1 + (int8_t)pc[pos + 1])
                                            : (pos + 1 + (int32_t)whale_get_u32(pc + pos + 1));
+                int fm = fold_mark();
 
                 wk(JS_WK_GOTO); wt_slot("L", tgt); wt(';');
+                fold_commit(fm);
                 unreachable = 1;
                 if ((tgt >= 0) && (tgt <= len) && (!seen[tgt])) {
                     cur[state_len - 1] = (uint8_t)sp;
@@ -906,15 +1437,21 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             }
             break;
         case OP_return:
-            t = cur[var_count + sp - 1];
-            if (t != WHALE_T_BOOL && t != WHALE_T_NUM)
-                goto out;
-            if (ret_is_bool == -1)
-                ret_is_bool = (t == WHALE_T_BOOL);
-            else if (ret_is_bool != (t == WHALE_T_BOOL))
-                goto out; /* mixed number/boolean returns: not our shape */
-            wk(JS_WK_RETURN); wt_slot("v", sp - 1); wt(';');
-            unreachable = 1;
+            {
+                int fm;
+
+                t = cur[var_count + sp - 1];
+                if (t != WHALE_T_BOOL && t != WHALE_T_NUM)
+                    goto out;
+                if (ret_is_bool == -1)
+                    ret_is_bool = (t == WHALE_T_BOOL);
+                else if (ret_is_bool != (t == WHALE_T_BOOL))
+                    goto out; /* mixed number/boolean returns: not our shape */
+                fm = fold_mark();
+                wk(JS_WK_RETURN); fold_inline(sp - 1); wt(';');
+                fold_commit(fm);
+                unreachable = 1;
+            }
             break;
         default:
             goto out; /* anything else: keep interpreting */
@@ -922,36 +1459,50 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         pos += sz;
     }
 
+    /* The epilogue and the whole engine entry are structural, so they are
+       committed as one block rather than folded. */
+    tail_mark = fold_mark();
     wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';');
     wt('}');
     /* engine entry: unbox the arguments once, run core, box the result */
-    wt_id("JSValue"); wt_id("whale_jit_fn"); wt('('); wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wt_id("JSValue"); wt('*'); wt_id("args"); wt(','); wt_id("JSValue"); wt('*'); wt_id("var_buf"); wt(','); wk(JS_WK_INT); wt('*'); wt_id("deopt"); wt(','); wt_id("JSValue"); wt_id("whale_self"); wt(','); wk(JS_WK_VOID); wt('*'); wt_id("whale_entry"); wt(','); wk(JS_WK_VOID); wt('*'); wt_id("whale_var_refs"); wt(')'); wt('{');
+    wt_id("JSValue"); wt_id(whale_entry_name); wt('('); wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wt_id("JSValue"); wt('*'); wt_id("args"); wt(','); wt_id("JSValue"); wt('*'); wt_id("var_buf"); wt(','); wk(JS_WK_INT); wt('*'); wt_id("deopt"); wt(','); wt_id("JSValue"); wt_id("whale_self"); wt(','); wk(JS_WK_VOID); wt('*'); wt_id("whale_entry"); wt(','); wk(JS_WK_VOID); wt('*'); wt_id("whale_var_refs"); wt(')'); wt('{');
     wk(JS_WK_DOUBLE); wt_id("An"); wt('['); wt_int(arg_count > 0 ? arg_count : 1); wt(']'); wt(';'); wk(JS_WK_DOUBLE); wt_id("_r"); wt(';');
-    whale_emit("    (void)ctx; (void)var_buf; (void)args; (void)deopt; (void)whale_self; (void)whale_entry; (void)whale_var_refs;\n");
-    wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleCheckStack"); wt('('); wt_id("ctx"); wt(')'); wt(')'); wk(JS_WK_RETURN); wt_id("JS_EXCEPTION"); wt(';');
+    /* On any failure set *deopt and return 0: the caller checks the flag first
+       and interprets the frame itself, so the returned JSValue is discarded.
+       That keeps JS_EXCEPTION (a macro with no linkable address) out of the
+       generated code entirely. */
+    wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleCheckStack"); wt('('); wt_id("ctx"); wt(')'); wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_id("whale_jit_box_num"); wt('('); wt_id("ctx"); wt(','); wt_int(0); wt(')'); wt(';'); wt('}');
     for (i = 0; i < arg_count; i++) {
         if (!args_used[i])
             continue;
-        wk(JS_WK_IF); wt('('); wt('!'); wt_id("whale_jit_unbox_num"); wt('('); wt_id("ctx"); wt(','); wt_id("args"); wt('['); wt_int(i); wt(']'); wt(','); wt('&'); wt_id("An"); wt('['); wt_int(i); wt(']'); wt(')'); wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_id("JS_EXCEPTION"); wt(';'); wt('}');
+        wk(JS_WK_IF); wt('('); wt('!'); wt_id("whale_jit_unbox_num"); wt('('); wt_id("ctx"); wt(','); wt_id("args"); wt('['); wt_int(i); wt(']'); wt(','); wt('&'); wt_id("An"); wt('['); wt_int(i); wt(']'); wt(')'); wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_id("whale_jit_box_num"); wt('('); wt_id("ctx"); wt(','); wt_int(0); wt(')'); wt(';'); wt('}');
     }
     /* closure slots we rely on must be this very function (once per entry;
        the closure cannot change during the call, so recursion need not re-check) */
     for (i = 0; i < 4; i++) {
-        if (var_ref_used[i])
-            wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleVarRefIsSelf"); wt('('); wt_id("ctx"); wt(','); wt_id("whale_var_refs"); wt(','); wt_int(i); wt(','); wt_id("whale_self"); wt(')'); wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_id("JS_EXCEPTION"); wt(';'); wt('}');
+        if (var_ref_used[i]) {
+            wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleVarRefIsSelf"); wt('('); wt_id("ctx"); wt(','); wt_id("whale_var_refs"); wt(','); wt_int(i); wt(','); wt_id("whale_self"); wt(')'); wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_id("whale_jit_box_num"); wt('('); wt_id("ctx"); wt(','); wt_int(0); wt(')'); wt(';'); wt('}');
+        }
     }
-    wt_id("_r"); wt('='); wt_id("whale_jit_core"); wt('('); wt_id("ctx"); wt(','); wt_id("args"); wt(','); wt_id("An"); wt(','); wt_id("deopt"); wt(')'); wt(';');
-    wk(JS_WK_IF); wt('('); wt('*'); wt_id("deopt"); wt(')'); wk(JS_WK_RETURN); wt_id("JS_EXCEPTION"); wt(';');
+    wt_id("_r"); wt('='); wt_id(whale_core_name); wt('('); wt_id("ctx"); wt(','); wt_id("args"); wt(','); wt_id("An"); wt(','); wt_id("deopt"); wt(')'); wt(';');
+    wk(JS_WK_IF); wt('('); wt('*'); wt_id("deopt"); wt(')'); wk(JS_WK_RETURN); wt_id("whale_jit_box_num"); wt('('); wt_id("ctx"); wt(','); wt_int(0); wt(')'); wt(';');
     if (ret_is_bool == 1) {
         wk(JS_WK_RETURN); wt_id("JS_NewBool"); wt('('); wt_id("ctx"); wt(','); wt_id("_r"); wt_op(JS_OP_NE); wt_int(0); wt(')'); wt(';');
     } else {
         wk(JS_WK_RETURN); wt_id("whale_jit_box_num"); wt('('); wt_id("ctx"); wt(','); wt_id("_r"); wt(')'); wt(';');
     }
     wt('}');
+    fold_commit(tail_mark);
+    /* hand the linearised stream to the parser */
+    JS_WhaleTokCommit(go_tok, go_num, go_len);
     ret = 1; /* every opcode lowered successfully */
   out:
-    if (!ret && getenv("WHALE_JIT_DUMP"))
-        fprintf(stderr, "whale jit: gen gave up at pos=%d op=%d\n", pos, (pos < len) ? pc[pos] : -1);
+    if (!ret && getenv("WHALE_JIT_DUMP")) {
+        int bad = (pos < len) ? pc[pos] : -1;
+
+        fprintf(stderr, "whale jit: gen gave up at pos=%d op=%d (%s)\n",
+                pos, bad, whale_op_name(bad));
+    }
     if (targets)
         free(targets);
     if (seen)
@@ -964,6 +1515,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         free(args_used);
     if (assign_cnt)
         free(assign_cnt);
+    if (whale_vexpr)
+        free(whale_vexpr);
+    if (whale_vmat)
+        free(whale_vmat);
+    whale_vexpr = NULL;
+    whale_vmat = NULL;
     return ret;
 }
 
@@ -993,7 +1550,11 @@ static const JSWhaleFuncInfo *whale_gen_info;
 static void whale_gen_cb(void *unused)
 {
     (void)unused;
-    whale_jit_gen(whale_gen_ctx, whale_gen_info);
+    /* Tell the interface whether the generator produced a complete stream. When
+       it bails on an opcode it cannot lower, the tokens emitted so far are a
+       truncated function; letting TinyCC parse them would report a bogus syntax
+       error, so the interface skips the parse instead. */
+    whale_gen_ok = whale_jit_gen(whale_gen_ctx, whale_gen_info);
 }
 
 static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, void **handle_out)
@@ -1008,20 +1569,37 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
        otherwise tcc_define_symbol() would read our (finished) token stream */
     whale_tok_active = 0;
 
-    s = tcc_new();
-    if (!s)
-        return 0;
+    /* One TCCState for the whole process. tcc_new() rebuilds global compiler
+       state (it releases sym_pools, which every state shares) and there is
+       nothing to gain from paying for that per compile: the state is created
+       once, every later compile is just another file inside it, and it lives
+       until process exit. The generated names carry a counter because the code
+       accumulates in this one state. */
+    if (!whale_jit_state) {
+        s = tcc_new();
+        if (!s)
+            return 0;
 
-    tcc_set_lib_path(s, WHALE_JIT_TCC_DIR);
-    tcc_add_include_path(s, WHALE_JIT_TCC_DIR "/include");
-    tcc_add_include_path(s, WHALE_JIT_SRC_DIR);
-    tcc_add_library_path(s, WHALE_JIT_TCC_DIR "/lib");
-    tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
-    tcc_add_symbol(s, "JS_WhaleVarRefIsSelf", (void *)JS_WhaleVarRefIsSelf);
-    tcc_add_symbol(s, "JS_WhaleCheckStack", (void *)JS_WhaleCheckStack);
-    tcc_add_symbol(s, "whale_jit_box_num", (void *)whale_jit_box_num);
-    tcc_add_symbol(s, "whale_jit_unbox_num", (void *)whale_jit_unbox_num);
-    tcc_add_symbol(s, "JS_NewFloat64", (void *)JS_NewFloat64);
+        tcc_set_lib_path(s, WHALE_JIT_TCC_DIR);
+        tcc_add_include_path(s, WHALE_JIT_TCC_DIR "/include");
+        tcc_add_include_path(s, WHALE_JIT_SRC_DIR);
+        tcc_add_library_path(s, WHALE_JIT_TCC_DIR "/lib");
+        tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
+        tcc_add_symbol(s, "JS_WhaleVarRefIsSelf", (void *)JS_WhaleVarRefIsSelf);
+        tcc_add_symbol(s, "JS_WhaleCheckStack", (void *)JS_WhaleCheckStack);
+        tcc_add_symbol(s, "whale_jit_box_num", (void *)whale_jit_box_num);
+        tcc_add_symbol(s, "whale_jit_unbox_num", (void *)whale_jit_unbox_num);
+        tcc_add_symbol(s, "JS_NewFloat64", (void *)JS_NewFloat64);
+        tcc_add_symbol(s, "JS_NewBool", (void *)JS_NewBool);
+        tcc_add_symbol(s, "JS_WhaleToInt32", (void *)JS_WhaleToInt32);
+        tcc_add_symbol(s, "JS_WhaleGetGlobalNum", (void *)JS_WhaleGetGlobalNum);
+        whale_jit_state = s;
+    }
+    s = whale_jit_state;
+
+    /* fresh names per compile: the code accumulates in this one state */
+    snprintf(whale_core_name, sizeof(whale_core_name), "whale_jit_core_%u", ++whale_jit_seq);
+    snprintf(whale_entry_name, sizeof(whale_entry_name), "whale_jit_fn_%u", whale_jit_seq);
 
     /* Drive TinyCC's parser with the tokens the generator pushed: no source
        text is parsed and no header is read. */
@@ -1030,22 +1608,27 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
         goto fail;
     if (tcc_relocate(s, TCC_RELOCATE_AUTO) < 0)
         goto fail;
-    fn = tcc_get_symbol(s, "whale_jit_fn");
+    fn = tcc_get_symbol(s, whale_entry_name);
     if (!fn)
         goto fail;
+
+    if (getenv("WHALE_JIT_DUMP"))
+        fprintf(stderr, "whale jit: %s -> %p\n", whale_entry_name, fn);
 
     *entry_out = fn;
     *handle_out = s;
     return 1;
   fail:
-    tcc_delete(s);
+    /* keep the state: it owns every previously compiled function's code, and
+       tcc_delete() would release the global symbol pools they share */
     return 0;
 }
 
 static void whale_tcc_release(void *handle)
 {
-    if (handle)
-        tcc_delete(handle);
+    /* the single TCCState is process-wide and must outlive the functions it
+       hosts, so dropping one function's handle must not tear it down */
+    (void)handle;
 }
 
 static JSWhaleJitBackend whale_backend_tcc = {
@@ -1069,12 +1652,13 @@ int JS_WhaleJitCompileFunction(JSContext *ctx, const JSWhaleFuncInfo *info,
     whale_gen_info = info;
 
     if (getenv("WHALE_JIT_DUMP")) {
-        fprintf(stderr, "--- whale jit source ---\n%s--- end ---\n", whale_jit_src);
+        /* there is no source text any more: the generator emits tokens straight
+           into TinyCC. The probe only shows that we really are inside the
+           TinyCC translation unit. */
         fprintf(stderr, "whale tcc internal probe: vstack cap=%d\n", JS_WhaleTccProbe());
-
     }
 
-    if (!whale_jit_backend->compile(ctx, whale_jit_src, &entry, &handle))
+    if (!whale_jit_backend->compile(ctx, NULL, &entry, &handle))
         return 0;
 
     *entry_out = entry;

@@ -163,6 +163,39 @@ ST_FUNC void relocate_plt(TCCState *s1)
     }
 }
 
+/* Reset the storage that relocate() writes into (it uses add32le/add64le, so a
+   second pass would add on top of the first). x86_64 uses RELA, i.e. the addend
+   lives in the relocation entry and the code generator leaves these bytes at
+   zero - so zeroing the targets restores exactly the pre-relocation state. */
+ST_FUNC void relocate_reset(TCCState *s1, Section *s)
+{
+    Section *sr = s->reloc;
+    ElfW_Rel *rel;
+
+    (void)s1;
+    if (!sr || !s->data)
+        return;
+    for_each_elem(sr, 0, rel, ElfW_Rel) {
+        unsigned char *ptr = s->data + rel->r_offset;
+        switch (ELFW(R_TYPE)(rel->r_info)) {
+        /* the eight-byte targets: relocate() adds a 64-bit value into them */
+        case R_X86_64_64:
+        case R_X86_64_PC64:
+        case R_X86_64_GOTPC64:
+        case R_X86_64_GOT64:
+        case R_X86_64_GOTOFF64:
+        case R_X86_64_PLTOFF64:
+            write64le(ptr, 0);
+            break;
+        default:
+            /* everything else writes a 32-bit field (PC32 / PLT32 / 32 / 32S,
+               the GOTPCREL family, GOT32, ...) */
+            write32le(ptr, 0);
+            break;
+        }
+    }
+}
+
 static ElfW_Rel *qrel; /* ptr to next reloc entry reused */
 
 void relocate_init(Section *sr)
@@ -230,6 +263,13 @@ void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr, addr_t 
             long long diff;
             diff = (long long)val - addr;
             if (diff < -2147483648LL || diff > 2147483647LL) {
+                if (getenv("WHALE_JIT_DUMP")) {
+                    ElfW(Sym) *ws = (ElfW(Sym) *)s1->symtab->data + sym_index;
+                    fprintf(stderr, "[reloc] %s: val=%llx addr=%llx diff=%lld st_shndx=%d st_value=%llx\n",
+                            (char *)s1->symtab->link->data + ws->st_name,
+                            (unsigned long long)val, (unsigned long long)addr, diff,
+                            (int)ws->st_shndx, (unsigned long long)ws->st_value);
+                }
                 tcc_error("internal error: relocation failed");
             }
             add32le(ptr, diff);

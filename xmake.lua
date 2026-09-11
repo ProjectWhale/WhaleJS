@@ -90,8 +90,8 @@ if not libtcc_prebuilt then
         add_defines("TCC_TARGET_PE", "TCC_TARGET_X86_64")
 end
 
--- qjs CLI（对照与手工验证用）
-target("qjs")
+-- whalejs CLI（对照与手工验证用）
+target("whalejs")
     set_kind("binary")
     set_rundir("$(projectdir)")
     link_libtcc()

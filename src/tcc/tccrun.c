@@ -183,8 +183,49 @@ static int tcc_relocate_ex(TCCState *s1, void *ptr, addr_t ptr_diff)
     addr_t mem;
 
     if (NULL == ptr) {
+        /* A state can be relocated more than once (WhaleJS drives several JIT
+           compiles through one TCCState). relocate_syms() below adds each
+           symbol's section base with '+=', so the base from the previous
+           relocate has to come off first - and it must happen here, while
+           sh_addr still holds the old value that the loop below clears. */
+        if (s1->nb_runtime_mem) {
+            /* Only the symbols that were already there at the previous relocate
+               carry a section base; the ones a compile added since are still
+               section-relative and must be left alone (taking a base off one of
+               those pushes it negative). */
+            ElfW(Sym) *sym = (ElfW(Sym) *)s1->symtab->data;
+            int nsym = s1->symtab->data_offset / sizeof(ElfW(Sym));
+            int limit = s1->nb_relocated_syms;
+            int i;
+
+            if (limit > nsym)
+                limit = nsym;
+            for (i = 1; i < limit; i++) {
+                int n = sym[i].st_shndx;
+                if (n > 0 && n < SHN_LORESERVE && s1->sections[n]->sh_addr)
+                    sym[i].st_value -= s1->sections[n]->sh_addr;
+            }
+            /* relocate() writes into the section storage with add32le/add64le,
+               so the bytes it patched last time have to go back to zero before
+               they are patched again - otherwise every pass adds on top of the
+               previous one and the machine code comes out corrupted. */
+#ifdef TCC_TARGET_X86_64
+            {
+                int i;
+                for (i = 1; i < s1->nb_sections; i++) {
+                    Section *sec = s1->sections[i];
+                    if (sec->reloc && (sec->sh_flags & SHF_ALLOC) && !getenv("WHALE_NO_RESET"))
+                        relocate_reset(s1, sec);
+                }
+            }
+#endif
+        }
         s1->nb_errors = 0;
 #ifdef TCC_TARGET_PE
+        /* This has to run on every relocate, not just the first: it binds the
+           import symbols to their thunks using the addresses of this pass, and
+           the storage it appends to is what the freshly compiled code calls
+           into. Skipping it leaves the new code with unbound imports. */
         pe_output_file(s1, NULL);
 #else
         tcc_add_runtime(s1);
@@ -241,6 +282,10 @@ static int tcc_relocate_ex(TCCState *s1, void *ptr, addr_t ptr_diff)
 #ifdef TCC_TARGET_PE
     s1->pe_imagebase = mem;
 #endif
+
+    /* relocate_syms() has now given every symbol a section base; remember how
+       many there were, so a later relocate only takes the base off those. */
+    s1->nb_relocated_syms = s1->symtab->data_offset / sizeof(ElfW(Sym));
 
     /* relocate each section */
     for(i = 1; i < s1->nb_sections; i++) {

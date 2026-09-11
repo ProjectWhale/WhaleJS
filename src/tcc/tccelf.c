@@ -1210,24 +1210,34 @@ ST_FUNC void tcc_add_runtime(TCCState *s1)
 /* add various standard linker symbols (must be done after the
    sections are filled (for example after allocating common
    symbols)) */
+static void tcc_set_linker_sym(Section *sec, addr_t value, const char *name)
+{
+    /* Idempotent: the same state may be relocated more than once (WhaleJS drives
+       several compiles through one TCCState), and by then these symbols already
+       exist with an older value. Re-defining them through set_elf_sym() would be
+       reported as "defined twice", so update the existing entry in place. */
+    int sym_index = find_elf_sym(symtab_section, name);
+
+    if (sym_index) {
+        ElfW(Sym) *esym = &((ElfW(Sym) *)symtab_section->data)[sym_index];
+        esym->st_value = value;
+        esym->st_shndx = sec->sh_num;
+        return;
+    }
+    set_elf_sym(symtab_section, value, 0,
+                ELFW(ST_INFO)(STB_GLOBAL, STT_NOTYPE), 0,
+                sec->sh_num, name);
+}
+
 static void tcc_add_linker_symbols(TCCState *s1)
 {
     char buf[1024];
     int i;
     Section *s;
 
-    set_elf_sym(symtab_section,
-                text_section->data_offset, 0,
-                ELFW(ST_INFO)(STB_GLOBAL, STT_NOTYPE), 0,
-                text_section->sh_num, "_etext");
-    set_elf_sym(symtab_section,
-                data_section->data_offset, 0,
-                ELFW(ST_INFO)(STB_GLOBAL, STT_NOTYPE), 0,
-                data_section->sh_num, "_edata");
-    set_elf_sym(symtab_section,
-                bss_section->data_offset, 0,
-                ELFW(ST_INFO)(STB_GLOBAL, STT_NOTYPE), 0,
-                bss_section->sh_num, "_end");
+    tcc_set_linker_sym(text_section, text_section->data_offset, "_etext");
+    tcc_set_linker_sym(data_section, data_section->data_offset, "_edata");
+    tcc_set_linker_sym(bss_section, bss_section->data_offset, "_end");
 #ifndef TCC_TARGET_PE
     /* horrible new standard ldscript defines */
     add_init_array_defines(s1, ".preinit_array");

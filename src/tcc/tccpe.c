@@ -789,6 +789,11 @@ static void pe_build_imports(struct pe_info *pe)
     for (sym_cnt = i = 0; i < ndlls; ++i)
         sym_cnt += pe->imp_info[i]->sym_count;
 
+    if (getenv("WHALE_JIT_DUMP"))
+        fprintf(stderr, "[pe] build_imports: ndlls=%d sym_cnt=%d data_offset=%u sh_addr=%p imagebase=%p\n",
+                ndlls, sym_cnt, (unsigned)pe->thunk->data_offset,
+                (void*)pe->thunk->sh_addr, (void*)pe->imagebase);
+
     if (0 == sym_cnt)
         return;
 
@@ -1217,6 +1222,10 @@ static int pe_check_symbols(struct pe_info *pe)
             int imp_sym = pe_find_import(pe->s1, sym);
             struct import_symbol *is;
 
+            if (getenv("WHALE_JIT_DUMP"))
+                fprintf(stderr, "[pe] undef '%s' type=%u other=0x%x -> imp_sym=%d\n",
+                        name, type, (unsigned)sym->st_other, imp_sym);
+
             if (imp_sym <= 0)
                 goto not_found;
 
@@ -1229,6 +1238,13 @@ static int pe_check_symbols(struct pe_info *pe)
             }
 
             is = pe_add_import(pe, imp_sym);
+            /* Remember the symbol so a later link into the same state can put
+               it back to SHN_UNDEF. Linking rebinds imports, and that is what
+               stops them looking like imports - the next pe_check_symbols()
+               would then find none at all. Restoring them (pe_restore_imports)
+               is what makes a second link work. */
+            dynarray_add(&pe->s1->pe_import_syms, &pe->s1->nb_pe_import_syms,
+                         (void *)(intptr_t)sym_index);
 
             if (type == STT_FUNC) {
                 unsigned long offset = is->thk_offset;
@@ -1938,6 +1954,25 @@ static void pe_set_options(TCCState * s1, struct pe_info *pe)
         pe->imagebase = s1->text_addr;
 }
 
+/* Give back the symbols that a previous pe_build_imports() rebound to their
+   import thunks. It set st_shndx to the thunk's section so that relocations
+   resolve to the thunk, which also means the symbol no longer looks undefined -
+   and pe_check_symbols() only collects SHN_UNDEF symbols as imports. Without
+   this the second link into one state finds no imports at all. */
+static void pe_restore_imports(TCCState *s1)
+{
+    int i;
+
+    for (i = 0; i < s1->nb_pe_import_syms; i++) {
+        int sym_index = (int)(intptr_t)s1->pe_import_syms[i];
+        ElfW(Sym) *sym = (ElfW(Sym) *)symtab_section->data + sym_index;
+
+        sym->st_shndx = SHN_UNDEF;
+        sym->st_value = 0;
+    }
+    s1->nb_pe_import_syms = 0;
+}
+
 ST_FUNC int pe_output_file(TCCState *s1, const char *filename)
 {
     int ret;
@@ -1947,6 +1982,8 @@ ST_FUNC int pe_output_file(TCCState *s1, const char *filename)
     memset(&pe, 0, sizeof pe);
     pe.filename = filename;
     pe.s1 = s1;
+
+    pe_restore_imports(s1);
 
     tcc_add_bcheck(s1);
     pe_add_runtime(s1, &pe);
