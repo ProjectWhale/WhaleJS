@@ -59,3 +59,8 @@ The process of project: WhaleJS —— 基于 QuickJS-ng + TinyCC 实现带 JIT/
 <37>(TIPS+PLAN): **perftest 设施** —— `perftest/` 下 15 个场景（递归/算术/局部/混合/深表达式/整数循环/分支/嵌套归约/浮点字面量/位运算/代数恒等/数组/字符串/筛法/对象），每个自包含、输出统一行 `WHALE_BENCH <name> ms=<n> check=<v>`；`perftest/main.js` 用 **PATH 命令名**（`node`/`qjs`/`whalejs`）跑，探测不到就跳过，并做跨引擎 `check` 一致性校验。xmake 目标已从 `qjs` 改名 **`whalejs`**，产物名正好就是 perftest 要的命令名。**它抓到的三个静默 bug**（都是"算错但不报错"）：浮点字面量被截断成 int（`OP_push_const` 的 float64 分支没覆盖默认 `WLD_INT`）、`fmod` 未声明导致 TCC 按 int 取返回值 → `%` 恒 0、`OP_not` 被当成逻辑非（QuickJS 里 `!x` 是 `lnot`、`~x` 才是 `not`）。**未完成、待续**：`get_var`（全局数值变量，让 `sieve` 类能进 JIT）、循环不变量外提（LICM）。
 
 <38>(PLAN, 后端方向): **后端指令集扩展方案**已单独记录 —— init 时 CPUID 检测、SSE4.2/AVX2 各做一份替换方案、按支持情况插拔、baseline 只到 SSE2、SIMD 同理。**AOT 路径用户已确认搁置**（当前优化收益已超预期，无实现必要）。见 notes/backend-isa-extensions.md
+
+<39>(TIPS, 待办/用户提醒): **结果缓存（memoization）的容量策略** —— 用户提醒：缓存不能无限增长，而每个程序的规模又不一样，所以将来做结果缓存时要有一个**按轮次定期清理不常用条目**的机制（而不是只设一个固定上限）。**用户明确说"先不急"，所以只是记录，实现结果缓存时必须一起做掉。**
+
+<40>(TIPS, 回滚基准的坑): **`Remove-Item build\.objs` 不足以强制重编** —— xmake 会从自己的缓存恢复对象，"构建成功"却给回**上一个版本的二进制**（实测：旧 tag 只花 2.5s 构建，跑出的数字与新版本几乎相同）。两个正确做法：① `xmake clean -a` 才真正强制全量重编；② 但删掉 `build` 目录会**同时丢掉平台配置**，之后 `xmake -y` 报 `toolchain not found`，必须显式 `xmake f -y -p mingw -m release`。另外还有一个更隐蔽的坑：`jit-opt-0` 那个 revisions 的 target 还叫 **`qjs`** 而不是 `whalejs`，所以脚本必须在构建后把**实际产物**（`whalejs.exe` 或 `qjs.exe`）发布成 `whalejs` 到独立 staging 目录，并每次清空该目录 —— 否则测到的是 PATH 里残留的旧二进制。
+
