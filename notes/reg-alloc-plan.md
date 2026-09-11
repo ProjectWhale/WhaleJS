@@ -77,3 +77,35 @@ TCC 侧已落地（commit `eb890d5`：`whale_pin_alloc` + `get_reg` 保留 + `gv
 ## 另一条已被否掉的路
 
 在 TCC 单遍流式发码的现状下做**循环级**优化（把归纳变量固定在寄存器）**必须能看到控制流**。notes `<19>` 的结论是"必须 IR 直出通了才动得了"—— 但 `<34>` 之后走的是 **token 通路**（生成器发 token 给 TCC parser），IR 直出并没做。所以循环优化仍然只能在 `whale_jit.c` 侧做（它有完整的循环体），**而"固定寄存器"是 TCC 侧唯一缺的那块**，这正是本方案要补的。
+
+## 第三次尝试（gv 的类检查修复）—— arith 修好了，locals 还不行
+
+**真 bug 找到了**：`gv()` 会被用**特定寄存器**调用 —— 返回值的 `RC_IRET`/`RC_FRET` 要求值落在返回寄存器里。原来的 pin 分支**无条件**返回 pin 寄存器，跳过了 `reg_classes[pr] & rc` 的类检查，于是 `return s` 读到的是一个值从未在其中的寄存器 —— 这就是"`arith` 返回循环计数"的全部原因。修法是：类匹配就直接用，不匹配就 **`get_reg(rc)` + `move_reg`** 把值搬出来（**不能走 `load`**：pin 变量从不存内存）。
+
+修完后：
+
+| 测试 | 结果 |
+|---|---|
+| `c=2,k=3,n=20` | **3145725 ✓** |
+| `c=3,n=5` | **243 ✓** |
+| `arith` perftest | **check=727740513040600.2 ✓，111ms → 62ms** |
+| `locals` perftest | **仍错**：`13333337`（node 是 `Infinity`） |
+
+**`locals` 的最小复现**：`function r(n){var a=1,b=2,c=3; for(var i=0;i<n;i++){var t=a+b; a=b+1; b=c+1; c=t;} return a+b+c;}` —— `r(20)` 给 **17**，node 给 **3388**。
+
+**生成的代码完全正确**（`register double L0..L4`，5 个变量分到 xmm5..xmm1）：
+```c
+L0 = 1; L1 = 2; L2 = 3; L3 = 0;
+L8:  if (!(L3 < A0)) goto L32;
+     L4 = L0 + L1;   L0 = L1 + 1;   L1 = L2 + 1;   L2 = L4;   L3 = L3 + 1;
+     goto L8;
+L32: return ((L0 + L1) + L2);
+```
+
+**所以这一次的 bug 与 pin 的*数量*相关**：`arith` pin 2 个变量（xmm5/xmm4）正确，`locals` pin 5 个（xmm5..xmm1）错误。而 `whale_pin_alloc` 从高往低取，特意留下 xmm0 给 TCC 自用，5 个也还在 6 个浮点寄存器的池内。
+
+**下次先做的实验**（每次构建 ~17s，很便宜）：
+1. **pin 数量二分**：只对 `i < 3` / `i < 4` 发 `TOK_REGISTER`，找出从几个开始错。若 4 个就错，问题在"多于池子的安全余量"，而不是分配去重。
+2. **怀疑 `get_reg(rc)` 在 `gv` 里的副作用** —— 它自己的注释就写着 "NOTE: get_reg can modify vstack[]"，而对于一个 pin 变量我是在 `gv` 中途调用它的。
+3. **怀疑 `gen_op` 的就地修改**：`gen_op` 会把结果算进**左操作数**的寄存器（`dst = vtop[-1].r`），而 pin 变量正好常做左操作数 → 它的寄存器被就地改写。逐条看时每一步都"马上会被覆盖"所以没错，但多变量交织时未必。
+4. `move_reg` 里 `save_reg(r)` 依赖我让 `save_reg_upstack` 跳过 pin 寄存器；确认它没有在别处被绕开。

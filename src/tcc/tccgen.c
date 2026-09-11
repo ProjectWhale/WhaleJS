@@ -1371,12 +1371,22 @@ ST_FUNC int gv(int rc)
                 if ((vtop->r & VT_VALMASK) == VT_LOCAL) {
                     int pr = vtop->sym->pin_reg - 1;
 
+
                     /* Swap only the location bits. Every other flag the value
                        carries (VT_SYM, VT_MUSTBOUND, VT_MUSTCAST) still applies
                        to it, and dropping them is one of the reasons the first
                        attempt computed the wrong answer. */
-                    vtop->r = (vtop->r & ~(VT_VALMASK | VT_LVAL)) | pr;
-                    return pr;
+                    if ((reg_classes[pr] & rc) != 0) {
+                        vtop->r = (vtop->r & ~(VT_VALMASK | VT_LVAL)) | pr;
+                        return pr;
+                    }
+                    {
+                        int nr = get_reg(rc);
+
+                        move_reg(nr, pr, vtop->type.t);
+                        vtop->r = (vtop->r & ~(VT_VALMASK | VT_LVAL)) | nr;
+                        return nr;
+                    }
                 }
             }
         }
