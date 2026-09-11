@@ -28,6 +28,7 @@ void JS_WhaleTokCommit(int *tok, double *num, int n);
 extern int whale_tok_active;   /* owned by the TinyCC-side file */
 extern int whale_gen_ok;       /* set by whale_gen_cb, read by the interface */
 extern int whale_gen_pure;     /* 0 once a global read is emitted (no memoising) */
+extern int whale_gen_objs;     /* object slots the emitted function uses (0 = none) */
 int JS_WhaleCompileTokens(struct TCCState *s, void (*emit)(void *), void *emit_ctx);
 
 /* WhaleJS services implemented in quickjs.c. The generated code only *names*
@@ -2039,6 +2040,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     /* hand the linearised stream to the parser */
     JS_WhaleTokCommit(go_tok, go_num, go_len);
     ret = 1; /* every opcode lowered successfully */
+    whale_gen_objs = whale_objs;
   out:
     if (!ret && getenv("WHALE_JIT_DUMP")) {
         int bad = (pos < len) ? pc[pos] : -1;

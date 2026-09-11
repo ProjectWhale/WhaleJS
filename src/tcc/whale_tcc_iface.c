@@ -306,6 +306,11 @@ int whale_gen_ok = 1;
    global. Such a function's result depends only on its arguments, which is what
    lets the engine memoise it (see whale_memo in quickjs.c). */
 int whale_gen_pure = 1;
+/* Also set by the generator: how many frame object slots the emitted function
+   uses. The engine only has to initialise and release those slots when this is
+   non-zero, which keeps plain numeric functions (fib, arith, ...) from paying
+   for machinery they never touch. */
+int whale_gen_objs = 0;
 static int whale_tok_buf[16384];
 static double whale_tok_num[16384];
 static int whale_tok_len;
@@ -532,6 +537,7 @@ int JS_WhaleCompileTokens(TCCState *s, void (*emit)(void *), void *emit_ctx)
     JS_WhaleTokReset();
     whale_gen_ok = 1;
     whale_gen_pure = 1;         /* pessimistic until the generator says otherwise */
+    whale_gen_objs = 0;
     if (emit)
         emit(emit_ctx);
 

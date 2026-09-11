@@ -905,6 +905,11 @@ typedef struct JSFunctionBytecode {
        WhaleMemo) and is dropped when the bytecode is freed. */
     uint8_t whale_pure;
     void *whale_memo;
+    /* Set when the compiled code uses frame object slots (typed arrays). The
+       slots have to be initialised before the call and released after, so a
+       function that does not use them must not pay for that - it is per call,
+       and fib-style recursion notices. */
+    uint8_t whale_needs_obj;
 } JSFunctionBytecode;
 
 typedef struct JSBoundFunction {
@@ -3491,6 +3496,7 @@ static void whale_memo_discard(JSRuntime *rt, JSFunctionBytecode *b)
    global, i.e. its result depends only on its arguments. Mirrors whale_gen_ok
    (owned by src/tcc/whale_tcc_iface.c). */
 extern int whale_gen_pure;
+extern int whale_gen_objs;
 
 static void whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
 {
@@ -3529,6 +3535,7 @@ static void whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
         if (JS_WhaleJitCompileFunction(ctx, &info, &entry, &handle)) {
             b->whale_jit_entry = entry;
             b->whale_jit_tcc = handle;
+            b->whale_needs_obj = whale_gen_objs > 0;
             JS_WhaleNoteJitResult(ctx, 1, 0);
             /* Memoise it only if the generator never had to read a global:
                then the result is a function of the arguments alone. */
@@ -18666,6 +18673,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int opcode, arg_allocated_size, i;
     JSValue *local_buf, *stack_buf, *var_buf, *arg_buf, *sp, ret_val, *pval;
     JSValue *obj_slots;
+    int whale_obj_n;         /* object slots reserved for this frame */
     JSVarRef **var_refs;
     size_t alloca_size;
 
@@ -18745,9 +18753,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        var_refs, so a JIT-compiled function has somewhere GC-visible to keep an
        object. The JIT's own generated code holds everything in C doubles and
        never touches the JS operand stack, so loaning it those slots costs
-       nothing at run time. See whale_obj_slots() below. */
+       nothing at run time. Reserve them only for a function whose code can
+       actually park an object: for anything else this is 64 bytes of stack per
+       call, which a recursive function pays on every level. */
+    whale_obj_n = b->whale_needs_obj ? WHALE_OBJ_SLOTS : 0;
     alloca_size = sizeof(JSValue) * (arg_allocated_size + b->var_count +
-                                     b->stack_size + WHALE_OBJ_SLOTS) +
+                                     b->stack_size + whale_obj_n) +
         sizeof(JSVarRef *) * b->var_ref_count;
     if (js_check_stack_overflow(rt, alloca_size))
         return JS_ThrowStackOverflow(caller_ctx);
@@ -18796,9 +18807,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        them: the JIT holds all its intermediate values in C doubles and never
        touches the JS operand stack. */
     obj_slots = stack_buf + b->stack_size;
-    for(i = 0; i < WHALE_OBJ_SLOTS; i++)
-        obj_slots[i] = JS_UNDEFINED;
-    sf->var_refs = (JSVarRef **)(obj_slots + WHALE_OBJ_SLOTS);
+    /* Only initialise the slots when this function's compiled code can use them.
+       It is per call, so eight stores here (plus as many frees on the way out)
+       show up as soon as the function recurses. */
+    if (b->whale_needs_obj) {
+        for(i = 0; i < WHALE_OBJ_SLOTS; i++)
+            obj_slots[i] = JS_UNDEFINED;
+    }
+    sf->var_refs = (JSVarRef **)(obj_slots + whale_obj_n);
     sf->var_ref_count = b->var_ref_count;
     for(i = 0; i < b->var_ref_count; i++)
         sf->var_refs[i] = NULL;
@@ -18825,16 +18841,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
            over them. While the generated code runs, sf->cur_sp is NULL - that is
            how the interpreter says "this frame is executing" - and GC only marks
            arg_buf .. cur_sp, so without this the slots would be invisible and an
-           object parked in one could be collected underneath the JIT. */
-        sf->cur_sp = obj_slots + WHALE_OBJ_SLOTS;
+           object parked in one could be collected underneath the JIT.
+           A function whose code never parks an object has nothing to protect, so
+           it skips all of this - the frame stays exactly as the interpreter
+           would have left it. */
+        if (b->whale_needs_obj)
+            sf->cur_sp = obj_slots + WHALE_OBJ_SLOTS;
         whale_ret = ((JSValue (*)(JSContext *, JSValue *, JSValue *, int *, JSValue, void *, void *))b->whale_jit_entry)
                         (ctx, arg_buf, var_buf, &whale_deopt, func_obj, (void *)b->whale_jit_entry, (void *)var_refs);
-        sf->cur_sp = NULL;
-        /* drop whatever the JIT parked, on both the deopt and the normal path:
-           the slots are only borrowed for the duration of this call */
-        for (pval = obj_slots; pval < obj_slots + WHALE_OBJ_SLOTS; pval++) {
-            JS_FreeValue(ctx, *pval);
-            *pval = JS_UNDEFINED;
+        if (b->whale_needs_obj) {
+            sf->cur_sp = NULL;
+            /* drop whatever the JIT parked, on both the deopt and the normal
+               path: the slots are only borrowed for the duration of this call */
+            for (pval = obj_slots; pval < obj_slots + WHALE_OBJ_SLOTS; pval++) {
+                JS_FreeValue(ctx, *pval);
+                *pval = JS_UNDEFINED;
+            }
         }
         if (unlikely(whale_deopt)) {
             if (getenv("WHALE_JIT_DUMP"))
