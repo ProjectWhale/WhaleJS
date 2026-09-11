@@ -555,8 +555,14 @@ int JS_WhaleCompileTokens(TCCState *s, void (*emit)(void *), void *emit_ctx)
         return 0;
     }
 
-    if (getenv("WHALE_IR_DEBUG"))
+    if (getenv("WHALE_IR_DEBUG")) {
+        fprintf(stderr, "[isa] bits=0x%x sse2=%d sse4.2=%d avx2=%d (override with WHALE_ISA)\n",
+                s->isa_bits,
+                !!(s->isa_bits & WHALE_ISA_SSE2),
+                !!(s->isa_bits & WHALE_ISA_SSE42),
+                !!(s->isa_bits & WHALE_ISA_AVX2));
         JS_WhaleTokDump();
+    }
 
     tccgen_compile(s);
 

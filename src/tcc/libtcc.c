@@ -750,6 +750,27 @@ LIBTCCAPI TCCState *tcc_new(void)
 #ifdef TCC_TARGET_I386
     s->seg_size = 32;
 #endif
+#ifdef TCC_TARGET_X86_64
+    /* Probe the instruction-set extensions available here. The backend does not
+       consult this yet - it still emits the SSE2 baseline - so this is a no-op
+       until instruction selection is made capability-driven. */
+    s->isa_bits = whale_isa_detect();
+    {
+        /* WHALE_ISA=<list> pins the extensions the backend may use, so a build
+           can be exercised against a lower baseline regardless of the host CPU
+           (or the reverse, to test a capability layer). An unset, empty or
+           unparsable value leaves the probe result in place. */
+        const char *isa = getenv("WHALE_ISA");
+
+        if (isa && *isa) {
+            int ok = 0;
+            unsigned int forced = whale_isa_parse(isa, &ok);
+
+            if (ok)
+                s->isa_bits = forced;
+        }
+    }
+#endif
     /* enable this if you want symbols with leading underscore on windows: */
 #if 0 /* def TCC_TARGET_PE */
     s->leading_underscore = 1;

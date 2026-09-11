@@ -697,7 +697,28 @@ struct TCCState {
 #endif
 #ifdef TCC_TARGET_X86_64
     int nosse; /* For -mno-sse support. */
+    /* Which instruction-set extensions the generated code is allowed to use.
+
+       SSE2 is the baseline that every x86-64 CPU has, so it is always set.
+       Above it there are exactly two layers: SSE4.2 and AVX2 - the latter
+       implies AVX, and SSE4.2 implies SSE4.1, so keeping the intermediate
+       levels would only add branches without adding capability. This is probed
+       with CPUID once, at tcc_new() time, and can be overridden with WHALE_ISA
+       for testing. Nothing consults it yet: the backend still emits the SSE2
+       baseline unconditionally. It exists so instruction selection can be made
+       capability-driven without changing behaviour first. */
+    unsigned int isa_bits;
 #endif
+
+/* ISA capability bits (x86-64).  SSE2 is the floor of the architecture, so it
+   is reported present without probing.  The two layers above it are the ones the
+   backend is going to have distinct code for: SSE4.2 and AVX2.  Code generation
+   may only use an instruction if the matching bit is set. */
+#define WHALE_ISA_SSE2  (1u << 0)   /* baseline, always on */
+#define WHALE_ISA_SSE42 (1u << 1)   /* implies SSE4.1 */
+#define WHALE_ISA_AVX2  (1u << 2)   /* implies AVX */
+
+#define WHALE_ISA_KNOWN (WHALE_ISA_SSE2 | WHALE_ISA_SSE42 | WHALE_ISA_AVX2)
 
     /* array of all loaded dlls (including those referenced by loaded dlls) */
     DLLReference **loaded_dlls;

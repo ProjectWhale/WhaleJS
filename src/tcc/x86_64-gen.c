@@ -142,6 +142,113 @@ ST_DATA const int reg_classes[NB_REGS] = {
 static unsigned long func_sub_sp_offset;
 static int func_ret_sub;
 
+/* ---- ISA capability probe -------------------------------------------------
+ *
+ * SSE2 is the floor of the x86-64 architecture, so it needs no probing and is
+ * always reported. Above it there are exactly two layers the backend will have
+ * distinct code for: SSE4.2 and AVX2. AVX2 implies AVX, and SSE4.2 implies
+ * SSE4.1, so the intermediate levels would only add branches without adding
+ * capability.
+ *
+ * AVX2 needs more than CPU support: the OS has to have enabled the wider
+ * register state, or executing those instructions faults. CPUID advertises AVX
+ * via CPUID.1:ECX.AVX, but that only means the CPU can do it - the OS half is
+ * OSXSAVE plus the XCR0 bits for XMM and YMM. Checking both is what the XGETBV
+ * below is for; skipping it is the classic way to crash on a CPU that reports
+ * AVX under a kernel that did not turn it on.
+ */
+ST_FUNC unsigned int whale_isa_detect(void)
+{
+    unsigned int bits = WHALE_ISA_SSE2;
+#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
+    unsigned int a, b, c, d;
+
+    a = 0; b = 0; c = 0; d = 0;
+#if defined(_MSC_VER)
+    {
+        int r[4];
+        __cpuidex(r, 0, 0);
+        a = (unsigned)r[0];
+    }
+#elif defined(__GNUC__) || defined(__TINYC__)
+    __asm__ __volatile__("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0u), "c"(0u));
+#endif
+    if (a < 1)
+        return bits;   /* CPUID leaf 1 unavailable: stay on the baseline */
+
+    a = 0; b = 0; c = 0; d = 0;
+#if defined(_MSC_VER)
+    {
+        int r[4];
+        __cpuidex(r, 1, 0);
+        a = (unsigned)r[0]; b = (unsigned)r[1]; c = (unsigned)r[2]; d = (unsigned)r[3];
+    }
+#elif defined(__GNUC__) || defined(__TINYC__)
+    __asm__ __volatile__("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1u), "c"(0u));
+#endif
+    if (c & (1u << 20))
+        bits |= WHALE_ISA_SSE42;
+
+    /* Only believe AVX2 if the OS has also enabled the state save. */
+    if ((c & (1u << 27)) && (c & (1u << 28))) {
+        unsigned long long xcr0 = 0;
+#if defined(_MSC_VER)
+        xcr0 = _xgetbv(0);
+#elif defined(__GNUC__) || defined(__TINYC__)
+        {
+            unsigned int lo, hi;
+            __asm__ __volatile__("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0u));
+            xcr0 = ((unsigned long long)hi << 32) | lo;
+        }
+#endif
+        if ((xcr0 & 0x6) == 0x6) {   /* XMM and YMM state both saved */
+            a = 0; b = 0; c = 0; d = 0;
+#if defined(_MSC_VER)
+            {
+                int r[4];
+                __cpuidex(r, 7, 0);
+                a = (unsigned)r[0]; b = (unsigned)r[1]; c = (unsigned)r[2]; d = (unsigned)r[3];
+            }
+#elif defined(__GNUC__) || defined(__TINYC__)
+            __asm__ __volatile__("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(7u), "c"(0u));
+#endif
+            if (b & (1u << 5))
+                bits |= WHALE_ISA_AVX2;
+        }
+    }
+#endif
+    return bits;
+}
+
+/* Parse a WHALE_ISA value: "native", or a comma-separated list of sse2, sse4.2
+   and avx2. SSE2 is always included - there is no way to ask for less than the
+   architecture baseline. */
+ST_FUNC unsigned int whale_isa_parse(const char *spec, int *ok)
+{
+    unsigned int bits;
+
+    *ok = 1;
+    if (!spec || !*spec) {
+        *ok = 0;
+        return 0;
+    }
+    if (!strcmp(spec, "native"))
+        return whale_isa_detect() & WHALE_ISA_KNOWN;
+
+    bits = WHALE_ISA_SSE2;   /* baseline is always kept */
+    for (;;) {
+        if (!strncmp(spec, "sse2", 4))        { bits |= WHALE_ISA_SSE2; spec += 4; }
+        else if (!strncmp(spec, "sse4.2", 6)) { bits |= WHALE_ISA_SSE42; spec += 6; }
+        else if (!strncmp(spec, "avx2", 4))   { bits |= WHALE_ISA_AVX2; spec += 4; }
+        else { *ok = 0; return 0; }
+        if (!*spec)
+            break;
+        if (*spec != ',') { *ok = 0; return 0; }
+        spec++;
+    }
+    return bits & WHALE_ISA_KNOWN;
+}
+
 /* XXX: make it faster ? */
 ST_FUNC void g(int c)
 {
