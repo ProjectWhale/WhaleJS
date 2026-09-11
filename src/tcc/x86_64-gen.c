@@ -1973,6 +1973,47 @@ void gen_opl(int op)
     gen_opi(op);
 }
 
+/* ---- scalar SSE encoding -------------------------------------------------
+ *
+ * Every scalar SSE2 instruction the backend emits goes through here. Today they
+ * are just the SSE2 byte sequences, but the same operations have a VEX-encoded
+ * three-operand form under AVX2: `vaddsd xmm0, xmm1, xmm2` instead of
+ * `addsd xmm1, xmm2`, which removes a move whenever the destination differs from
+ * the first source. That is a different encoding, not a different opcode byte,
+ * and it changes the operand form - so the decision has to live here rather than
+ * being absorbed into each call site.
+ *
+ * `ext` is the opcode extension following the 0F prefix: 0x58 add, 0x59 mul,
+ * 0x5c sub, 0x5e div, 0x2e ucomisd, 0x2f comisd. Arithmetic takes an F2 (double)
+ * or F3 (single) prefix; the compare and convert forms take 66 for double and
+ * have no prefix for single.
+ */
+static void gen_sse_prefix(int ext, int is_double, int is_arith)
+{
+    int pf;
+
+    pf = is_arith ? (is_double ? 0xf2 : 0xf3) : (is_double ? 0x66 : 0x00);
+    if (pf)
+        o(pf);
+    o(0x0f);
+    o(ext);
+}
+
+/* The ModRM byte, plus any displacement, for `reg` against a memory or
+   register operand.
+
+   `rmem` is the operand that decides the addressing mode and, in the register
+   case, supplies the field; `r_mem` is what gen_modrm() actually addresses.
+   They are the same register except when the value had to be reloaded out of a
+   saved lvalue first, which is why they are two parameters rather than one. */
+static void gen_sse_modrm(int reg, int rmem, int r_mem, Sym *sym, int fc)
+{
+    if (rmem & VT_LVAL)
+        gen_modrm(reg, r_mem, sym, fc);
+    else
+        o(0xc0 + REG_VALUE(rmem) + REG_VALUE(reg) * 8);
+}
+
 /* generate a floating point operation 'v = t1 op t2' instruction. The
    two operands are guaranteed to have the same floating point type */
 /* XXX: need to use ST1 too */
@@ -1981,7 +2022,6 @@ void gen_opf(int op)
     int a, ft, fc, swapped, r;
     int float_type =
         (vtop->type.t & VT_BTYPE) == VT_LDOUBLE ? RC_ST0 : RC_FLOAT;
-
     /* convert constants to memory references */
     if ((vtop[-1].r & (VT_VALMASK | VT_LVAL)) == VT_CONST) {
         vswap();
@@ -2101,18 +2141,9 @@ void gen_opf(int op)
             }
             assert(!(vtop[-1].r & VT_LVAL));
             
-            if ((vtop->type.t & VT_BTYPE) == VT_DOUBLE)
-                o(0x66);
-            if (op == TOK_EQ || op == TOK_NE)
-                o(0x2e0f); /* ucomisd */
-            else
-                o(0x2f0f); /* comisd */
-
-            if (vtop->r & VT_LVAL) {
-                gen_modrm(vtop[-1].r, r, vtop->sym, fc);
-            } else {
-                o(0xc0 + REG_VALUE(vtop[0].r) + REG_VALUE(vtop[-1].r)*8);
-            }
+            gen_sse_prefix(op == TOK_EQ || op == TOK_NE ? 0x2e : 0x2f,
+                           (vtop->type.t & VT_BTYPE) == VT_DOUBLE, 0);
+            gen_sse_modrm(vtop[-1].r, vtop->r, r, vtop->sym, fc);
 
             vtop--;
             vtop->r = VT_CMP;
@@ -2157,19 +2188,8 @@ void gen_opf(int op)
                 vswap();
             }
             
-            if ((ft & VT_BTYPE) == VT_DOUBLE) {
-                o(0xf2);
-            } else {
-                o(0xf3);
-            }
-            o(0x0f);
-            o(0x58 + a);
-            
-            if (vtop->r & VT_LVAL) {
-                gen_modrm(vtop[-1].r, r, vtop->sym, fc);
-            } else {
-                o(0xc0 + REG_VALUE(vtop[0].r) + REG_VALUE(vtop[-1].r)*8);
-            }
+            gen_sse_prefix(0x58 + a, (ft & VT_BTYPE) == VT_DOUBLE, 1);
+            gen_sse_modrm(vtop[-1].r, vtop->r, r, vtop->sym, fc);
 
             vtop--;
         }
