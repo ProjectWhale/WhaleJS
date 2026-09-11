@@ -3129,6 +3129,144 @@ int JS_WhaleGetGlobalNum(JSContext *ctx, int atom, double *out)
     return ok;
 }
 
+/* ---- typed-array support for the JIT ---------------------------------------
+ *
+ * The generated code has no JSValue domain: every value it holds is a C double.
+ * A typed array therefore cannot travel in a register - it lives in one of the
+ * frame's object slots (see WHALE_OBJ_SLOTS) and is referred to by its slot
+ * number, which is a compile-time constant in the generated code. These helpers
+ * do the object work; the JIT only ever passes slot numbers and numbers.
+ *
+ * Each returns 1 for "carry on" and 0 for "the generated code must deopt and
+ * let the interpreter run this frame". None of them may raise.
+ */
+
+/* Resolve a global. Writes *num and returns 1 when it is a number. When it is
+   not, parks the value in object slot `slot` and returns 2 - that is the
+   `new Uint8Array(...)` constructor case, where the JIT wants to keep the
+   function object rather than reject the whole compilation. Returns 0 on an
+   exception or when the slot already holds something. */
+int JS_WhaleGetGlobalAny(JSContext *ctx, int atom, int slot, double *num)
+{
+    JSValue v = JS_GetGlobalVar(ctx, atom, false);
+    int t;
+
+    if (JS_IsException(v))
+        return 0;
+    t = JS_VALUE_GET_TAG(v);
+    if (t == JS_TAG_INT) {
+        *num = (double)JS_VALUE_GET_INT(v);
+        JS_FreeValue(ctx, v);
+        return 1;
+    }
+    if (JS_TAG_IS_FLOAT64(t)) {
+        *num = JS_VALUE_GET_FLOAT64(v);
+        JS_FreeValue(ctx, v);
+        return 1;
+    }
+    JS_WhaleObjSlot(ctx, slot, v);   /* takes over the reference */
+    return 2;
+}
+
+/* Is `v` the global Uint8Array constructor? Compared against the global rather
+   than by name or class id: a user function called Uint8Array must not be
+   assumed to build a real typed array. */
+static int whale_is_global_u8ctor(JSContext *ctx, JSValueConst v)
+{
+    JSAtom a = JS_NewAtom(ctx, "Uint8Array");
+    JSValue g;
+    int same;
+
+    if (a == JS_ATOM_NULL)
+        return 0;
+    g = JS_GetGlobalVar(ctx, a, false);
+    JS_FreeAtom(ctx, a);
+    if (JS_IsException(g))
+        return 0;
+    same = JS_IsStrictEqual(ctx, v, g);
+    JS_FreeValue(ctx, g);
+    return same;
+}
+
+/* `new Uint8Array(n)` against the constructor parked in ctor_slot, putting the
+   result in out_slot. Anything but the global Uint8Array with an in-range
+   numeric length deopts. Construction goes through the real constructor, so the
+   result is an ordinary typed array with a proper ArrayBuffer behind it and the
+   JIT never sees the difference. */
+int JS_WhaleNewU8Array(JSContext *ctx, int ctor_slot, double n, int out_slot)
+{
+    JSValue ctor, arg, arr;
+
+    if (!(n >= 0 && n <= 2147483647.0))
+        return 0;
+    ctor = JS_WhaleObjGet(ctx, ctor_slot);
+    if (!whale_is_global_u8ctor(ctx, ctor)) {
+        JS_FreeValue(ctx, ctor);
+        return 0;
+    }
+    arg = JS_NewInt32(ctx, (int32_t)n);
+    arr = JS_CallConstructor(ctx, ctor, 1, &arg);
+    JS_FreeValue(ctx, ctor);
+    if (JS_IsException(arr))
+        return 0;
+    JS_WhaleObjSlot(ctx, out_slot, arr);
+    return 1;
+}
+
+/* arr[idx] where arr lives in `slot`. Returns 1 and writes *out for an in-range
+   Uint8Array element. Out of range deopts: reading past the end is an ordinary
+   JS undefined, which the JIT cannot represent, and deopting is always safe. */
+int JS_WhaleTAU8Get(JSContext *ctx, int slot, double idx, double *out)
+{
+    JSValue arr;
+    uint8_t *p;
+    size_t size;
+    uint32_t i;
+
+    if (!(idx >= 0 && idx <= 4294967295.0))
+        return 0;
+    i = (uint32_t)idx;
+    arr = JS_WhaleObjGet(ctx, slot);
+    if (JS_GetTypedArrayType(arr) != JS_CLASS_UINT8_ARRAY) {
+        JS_FreeValue(ctx, arr);
+        return 0;
+    }
+    p = JS_GetUint8Array(ctx, &size, arr);
+    if (!p || i >= (uint32_t)size) {
+        JS_FreeValue(ctx, arr);
+        return 0;
+    }
+    *out = (double)p[i];
+    JS_FreeValue(ctx, arr);
+    return 1;
+}
+
+/* arr[idx] = v for a Uint8Array in `slot`. 1 on success, 0 to deopt. */
+int JS_WhaleTAU8Set(JSContext *ctx, int slot, double idx, double v)
+{
+    JSValue arr;
+    uint8_t *p;
+    size_t size;
+    uint32_t i;
+
+    if (!(idx >= 0 && idx <= 4294967295.0) || !(v >= 0 && v <= 255.0))
+        return 0;
+    i = (uint32_t)idx;
+    arr = JS_WhaleObjGet(ctx, slot);
+    if (JS_GetTypedArrayType(arr) != JS_CLASS_UINT8_ARRAY) {
+        JS_FreeValue(ctx, arr);
+        return 0;
+    }
+    p = JS_GetUint8Array(ctx, &size, arr);
+    if (!p || i >= (uint32_t)size) {
+        JS_FreeValue(ctx, arr);
+        return 0;
+    }
+    p[i] = (uint8_t)v;
+    JS_FreeValue(ctx, arr);
+    return 1;
+}
+
 /* ToInt32 for the JIT. The bitwise operators are defined on int32, so the
    generated code cannot just cast a double: JS specifies a truncation towards
    zero followed by a modulo-2^32 wrap (and 0 for the non-finite values).
