@@ -70,4 +70,7 @@ The process of project: WhaleJS —— 基于 QuickJS-ng + TinyCC 实现带 JIT/
 
 <43>(TIPS, 速查): **JIT 调试与用法速查**已单独记录 —— 全部环境变量的作用域与语义（尤其 **`WHALE_JIT_DUMP` 查“为什么没 JIT”、`WHALE_IR_DEBUG` 只在成功时 dump token** 这对最容易搞混的开关）、“JIT 没生效”的三步诊断、性能测量的注意事项（`--repeat=N` 取最小、跑基准前要确认没有构建在跑，否则 node 那侧数字虚高）、以及生成器的三层缓冲（token sink → `whale_vexpr[k]` → 输出流）与加 opcode 的检查清单。见 notes/jit-debugging.md
 
+<44>(PLAN, 寄存器改造): 方案已单独记录 → notes/reg-alloc-plan.md。要点：**复用 `register` 关键字**（`TOK_REGISTER` 存在且 `whale_tcc_iface.c:610` 白名单已收，但 `tccgen.c:4121` 目前完全忽略它）—— 这是现成的接口。**8 处改动跨 `tccgen.c`/`tcc.h`/`whale_jit.c`，必须一次做完**（只做“分配保留寄存器”而不做 `gv`/`vstore` 特判，会生成错误代码而非只是没收益）。关键约束：**函数调用会破坏寄存器**，所以初版只对函数体内无 `call` 的函数启用（`whale_jit.c` 侧可判定，且它已有完整的循环体缓冲）。验证要**先用 C 源路径隔离**（手写 `register double` 的小 C，不依赖 `whale_jit.c`）。另记：`SValue.r` 是 `unsigned short` 且 `0x0100`–`0x8000` 全被占满，**别指望在 `r` 里腾新标志位**。**工具坑**：`Get-ChildItem -Include` 不带 `-Recurse` 是**假阴性**（我据此误判成“TCC 没有 `TOK_REGISTER`”并写进了结论，后已复核更正）。
+
+
 
