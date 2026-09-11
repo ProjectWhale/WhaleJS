@@ -824,6 +824,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     int unreachable = 0;
     int ret_is_bool = -1;
     int whale_objs = 0;   /* object slots handed out; each new object takes one */
+    int whale_has_call = 0; /* a call clobbers registers, so no pinning then */
+    int whale_nloops = 0;   /* backward jumps; more than one means nesting */
 
     if (!info->is_normal)
         return 0;
@@ -890,6 +892,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             int a = (int)whale_get_u16(pc + pos + 1);
             if (a < var_count)
                 assign_cnt[a]++;
+        } else if (op == OP_call || (op >= OP_call0 && op <= OP_call3)) {
+            whale_has_call = 1;
         } else if (op >= OP_get_var_ref0 && op < OP_get_var_ref0 + 4) {
             var_ref_used[op - OP_get_var_ref0] = 1;
         } else if (op == OP_get_var_ref) {
@@ -898,6 +902,19 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 var_ref_used[a] = 1;
         }
         pos += sz;
+    }
+
+    {
+        /* Count the back edges. A nested loop needs more live registers than a
+           flat one, and pinning its counters is what made minmax spin for ever:
+           with both induction variables pinned TinyCC has nowhere left to put a
+           temporary. */
+        int k, nloops = 0;
+
+        for (k = 0; k < len; k++)
+            if (loop_back[k])
+                nloops++;
+        whale_nloops = nloops;
     }
 
     /* pass 2: emit tokens. Nothing here builds text - the generator pushes
@@ -985,6 +1002,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wk(JS_WK_DOUBLE); wt('*'); wt_id("An"); wt(',');
         wk(JS_WK_INT); wt('*'); wt_id("deopt"); wt(')'); wt('{');
     for (i = 0; i < var_count; i++) {
+        if (!whale_has_call && whale_nloops <= 1)
+            wk(JS_WK_REGISTER);
         wk(JS_WK_DOUBLE); wt_slot("L", i); wt('='); wt_int(0); wt(';');
     }
     /* stack_size vars for the slots themselves plus WHALE_VSER_MAX spare names
@@ -2201,6 +2220,7 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
 
     if (getenv("WHALE_JIT_DUMP"))
         fprintf(stderr, "whale jit: %s -> %p\n", whale_entry_name, fn);
+
 
     *entry_out = fn;
     *handle_out = s;

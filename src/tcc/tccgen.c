@@ -973,8 +973,13 @@ static int whale_pin_alloc(int t)
 
     if (!is_float(t))
         return -1;
-    /* highest first: get_reg() scans upwards, so this stays out of its way */
-    for (r = NB_REGS - 1; r >= 0; r--) {
+    /* Highest first: get_reg() scans upwards, so this stays out of its way.
+       Stop at 18 to leave xmm0/xmm1 free - TinyCC needs somewhere to put
+       constants and intermediate results, and pinning away every float
+       register leaves get_reg() with nothing to spill and returns -1, which
+       is how minmax (five locals, two nested loops) ended up looping for
+       ever with the counter never advancing. */
+    for (r = NB_REGS - 1; r >= 18; r--) {
         if ((reg_classes[r] & RC_FLOAT) != 0) {
             if ((whale_pinned_regs & (1u << r)) == 0) {
                 whale_pinned_regs |= 1u << r;
@@ -2248,6 +2253,25 @@ ST_FUNC void gen_op(int op)
 {
     int u, t1, t2, bt1, bt2, t;
     CType type1;
+
+    /* WhaleJS: a pinned local's value lives in its register, not in its frame
+       slot, so it must never be taken as a memory reference. gen_opf() and
+       gen_opi() decide that from VT_LVAL, and the operand still looks like an
+       lvalue here - taking it as one makes the load read the frame slot the
+       value was never written to (`return a + b` then read a stale `b`). Say
+       what gv() would have said: both operands are in their registers. */
+    {
+        int wi;
+
+        for (wi = -1; wi <= 0; wi++) {
+            if ((vtop[wi].r & VT_VALMASK) == VT_LOCAL) {
+                int wp = whale_pin_find((int)vtop[wi].c.i);
+
+                if (wp >= 0)
+                    vtop[wi].r = (vtop[wi].r & ~(VT_VALMASK | VT_LVAL)) | wp;
+            }
+        }
+    }
 
 redo:
     t1 = vtop[-1].type.t;
