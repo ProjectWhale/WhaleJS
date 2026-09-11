@@ -18409,6 +18409,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     uint8_t *pc;
     int opcode, arg_allocated_size, i;
     JSValue *local_buf, *stack_buf, *var_buf, *arg_buf, *sp, ret_val, *pval;
+    JSValue *obj_slots;
     JSVarRef **var_refs;
     size_t alloca_size;
 
@@ -18484,8 +18485,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         arg_allocated_size = 0;
     }
 
+    /* WHALE_OBJ_SLOTS spare JSValue slots sit between the operand stack and the
+       var_refs, so a JIT-compiled function has somewhere GC-visible to keep an
+       object. The JIT's own generated code holds everything in C doubles and
+       never touches the JS operand stack, so loaning it those slots costs
+       nothing at run time. See whale_obj_slots() below. */
     alloca_size = sizeof(JSValue) * (arg_allocated_size + b->var_count +
-                                     b->stack_size) +
+                                     b->stack_size + WHALE_OBJ_SLOTS) +
         sizeof(JSVarRef *) * b->var_ref_count;
     if (js_check_stack_overflow(rt, alloca_size))
         return JS_ThrowStackOverflow(caller_ctx);
@@ -18525,7 +18531,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         var_buf[i] = JS_UNDEFINED;
 
     stack_buf = var_buf + b->var_count;
-    sf->var_refs = (JSVarRef **)(stack_buf + b->stack_size);
+    /* Spare slots for a JIT-compiled function to park objects in.
+       They sit between the operand stack and the var_refs on purpose: that puts
+       them inside the range GC walks (arg_buf .. cur_sp), which is the only
+       reason a JIT frame can hold an object at all. The generated code is a
+       plain C function, so its own locals are invisible to GC - anything it
+       keeps across a helper call has to live in one of these. Nothing else uses
+       them: the JIT holds all its intermediate values in C doubles and never
+       touches the JS operand stack. */
+    obj_slots = stack_buf + b->stack_size;
+    for(i = 0; i < WHALE_OBJ_SLOTS; i++)
+        obj_slots[i] = JS_UNDEFINED;
+    sf->var_refs = (JSVarRef **)(obj_slots + WHALE_OBJ_SLOTS);
     sf->var_ref_count = b->var_ref_count;
     for(i = 0; i < b->var_ref_count; i++)
         sf->var_refs[i] = NULL;
@@ -18548,8 +18565,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     if (b->whale_jit_entry) {
         int whale_deopt = 0;
         JSValue whale_ret;
+        /* Loan the object slots to the JIT by extending the frame's live range
+           over them. While the generated code runs, sf->cur_sp is NULL - that is
+           how the interpreter says "this frame is executing" - and GC only marks
+           arg_buf .. cur_sp, so without this the slots would be invisible and an
+           object parked in one could be collected underneath the JIT. */
+        sf->cur_sp = obj_slots + WHALE_OBJ_SLOTS;
         whale_ret = ((JSValue (*)(JSContext *, JSValue *, JSValue *, int *, JSValue, void *, void *))b->whale_jit_entry)
                         (ctx, arg_buf, var_buf, &whale_deopt, func_obj, (void *)b->whale_jit_entry, (void *)var_refs);
+        sf->cur_sp = NULL;
+        /* drop whatever the JIT parked, on both the deopt and the normal path:
+           the slots are only borrowed for the duration of this call */
+        for (pval = obj_slots; pval < obj_slots + WHALE_OBJ_SLOTS; pval++) {
+            JS_FreeValue(ctx, *pval);
+            *pval = JS_UNDEFINED;
+        }
         if (unlikely(whale_deopt)) {
             b->whale_jit_entry = NULL;   /* give up and interpret this one */
             b->whale_jit_tried = 1;

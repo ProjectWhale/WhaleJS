@@ -24,6 +24,22 @@ typedef struct JSWhaleFuncInfo {
     const JSValue *cpool;
 } JSWhaleFuncInfo;
 
+/* Number of JSValue slots the engine lends to a JIT-compiled function so it has
+   somewhere GC can see an object it is holding across a helper call.
+
+   This is not an optimisation, it is what makes objects possible in JIT code at
+   all. The generated function is a plain C function: it has no JSStackFrame, GC
+   does not scan the C stack, and so a `void *` in a C local is invisible to the
+   collector - the object would be freed underneath it. The engine therefore
+   reserves this many slots immediately after the JS operand stack, walks them
+   as part of the frame, and hands the address to the JIT. The JIT puts object
+   number k in slot k.
+
+   Borrowing them costs nothing at run time: the JIT keeps every intermediate
+   value in C doubles and never uses the JS operand stack, which is the region
+   these slots sit right behind. */
+#define WHALE_OBJ_SLOTS 8
+
 /* Compile one function. Returns 1 and fills entry_out/handle_out on success;
    the caller owns both, and releases the handle with JS_WhaleJitRelease(). */
 int  JS_WhaleJitCompileFunction(JSContext *ctx, const JSWhaleFuncInfo *info,
