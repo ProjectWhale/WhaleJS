@@ -131,6 +131,8 @@ enum {
     WHALE_T_SELF = 3, /* this function, usable only as a call target */
     WHALE_T_OBJ = 4,  /* a JS object (typed array). Only the typed-array helpers
                          may touch it; anything else deopts. */
+    WHALE_T_I32 = 5,  /* a number already known to be an in-range int32, so ToInt32
+                         on it is just a cast. Bitwise results always are. */
 };
 
 /* The object slot a type carries, packed into the same byte as the type.
@@ -238,7 +240,9 @@ static int whale_jit_unbox_num(JSContext *ctx, JSValue v, double *out)
 
 static int whale_type_is_num(int t)
 {
-    return t == WHALE_T_NUM || t == WHALE_T_BOOL;
+    /* WHALE_T_I32 counts as a number: it only adds the knowledge that the value
+       is already an in-range int32. */
+    return t == WHALE_T_NUM || t == WHALE_T_BOOL || t == WHALE_T_I32;
 }
 
 /* numeric binary opcode -> C operator. Returns NULL when the opcode is not a
@@ -570,9 +574,19 @@ static void fold_inline(int k)
    is a plain variable or a short expression, which is exactly the shape the
    bitwise operators see. Without this, every bitwise operand paid a helper
    call whose fmod() dominated the loop. */
-static void fold_toint32(int k)
+static void fold_toint32(int k, int is_i32)
 {
-    int repeat = whale_vmat[k] || whale_vexpr[k].len <= 8;
+    int repeat;
+
+    /* Already an in-range int32: the range test and the helper call both fall
+       away, leaving a plain cast. Only when the operand is already a variable -
+       inlining an un-materialised operand copies a whole pending expression,
+       which measured slower than the helper it replaced. */
+    if (is_i32 && whale_vmat[k]) {
+        wt('('); wk(JS_WK_INT); wt(')'); wt('('); fold_inline(k); wt(')');
+        return;
+    }
+    repeat = whale_vmat[k] || whale_vexpr[k].len <= 8;
 
     if (!repeat) {
         wt_id("JS_WhaleToInt32"); wt('('); fold_inline(k); wt(')');
@@ -1037,6 +1051,17 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                     if (sv == cv)
                         continue;
+                    /* WHALE_T_I32 is an optimisation hint, not a value: an I32 on
+                       one edge and a plain number on the other are the same thing
+                       here, so merge them down to the plain number. Treating the
+                       difference as a conflict refused to compile the whole
+                       function - which is how `acc` (NUM down one branch of an
+                       `if`, I32 down the other) lost bitops to the interpreter. */
+                    if ((sv == WHALE_T_I32 && whale_type_is_num(cv)) ||
+                        (cv == WHALE_T_I32 && whale_type_is_num(sv))) {
+                        snap[base + k] = WHALE_T_NUM;
+                        continue;
+                    }
                     if (sv == WHALE_T_UNKNOWN) {
                         snap[base + k] = cv; /* optimistic merge */
                     } else if (cv != WHALE_T_UNKNOWN) {
@@ -1794,13 +1819,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int fm = fold_mark();
 
                 wt('('); wk(JS_WK_DOUBLE); wt(')'); wt('(');
-                fold_toint32(sp - 2);
+                fold_toint32(sp - 2, cur[var_count + sp - 2] == WHALE_T_I32);
                 wt(op == OP_and ? '&' : op == OP_or ? '|' : '^');
-                fold_toint32(sp - 1);
+                fold_toint32(sp - 1, cur[var_count + sp - 1] == WHALE_T_I32);
                 wt(')');
                 fold_set(sp - 2, fm);
             }
-            cur[var_count + sp - 2] = WHALE_T_NUM;
+            cur[var_count + sp - 2] = WHALE_T_I32;   /* & | ^ are int32 by definition */
             sp--;
             break;
         case OP_shl: case OP_shr: case OP_sar:
@@ -1813,14 +1838,15 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                 wt('('); wk(JS_WK_DOUBLE); wt(')'); wt('(');
                 if (op == OP_shr) { wk(JS_WK_UNSIGNED); wk(JS_WK_INT); wt(')'); }   /* >>> is logical */
-                fold_toint32(sp - 2);
+                fold_toint32(sp - 2, cur[var_count + sp - 2] == WHALE_T_I32);
                 /* one token, not two '<' - there is no lexer to join them */
                 wt_op(op == OP_shl ? JS_OP_SHL : JS_OP_SAR);
-                wt('('); fold_toint32(sp - 1); wt('&'); wt_int(31); wt(')');
+                wt('('); fold_toint32(sp - 1, cur[var_count + sp - 1] == WHALE_T_I32); wt('&'); wt_int(31); wt(')');
                 wt(')');
                 fold_set(sp - 2, fm);
             }
-            cur[var_count + sp - 2] = WHALE_T_NUM;
+            /* >>> is unsigned, so its result can exceed int32; << and >> cannot */
+            cur[var_count + sp - 2] = (op == OP_shr) ? WHALE_T_NUM : WHALE_T_I32;
             sp--;
             break;
         case OP_neg:
@@ -1863,10 +1889,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             {
                 int fm = fold_mark();
 
-                wt('('); wk(JS_WK_DOUBLE); wt(')'); wt('~'); fold_toint32(sp - 1);
+                wt('('); wk(JS_WK_DOUBLE); wt(')'); wt('~'); fold_toint32(sp - 1, cur[var_count + sp - 1] == WHALE_T_I32);
                 fold_set(sp - 1, fm);
             }
-            cur[var_count + sp - 1] = WHALE_T_NUM;
+            cur[var_count + sp - 1] = WHALE_T_I32;
             break;
         case OP_inc: case OP_dec:
             if (!whale_type_is_num(cur[var_count + sp - 1]))
@@ -1958,7 +1984,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int fm;
 
                 t = cur[var_count + sp - 1];
-                if (t != WHALE_T_BOOL && t != WHALE_T_NUM)
+                if (!whale_type_is_num(t))
                     goto out;
                 if (ret_is_bool == -1)
                     ret_is_bool = (t == WHALE_T_BOOL);
