@@ -1369,8 +1369,14 @@ ST_FUNC int gv(int rc)
         if (vtop->sym) {
             if (vtop->sym->pin_reg != 0) {
                 if ((vtop->r & VT_VALMASK) == VT_LOCAL) {
-                    vtop->r = vtop->sym->pin_reg - 1;
-                    return vtop->r;
+                    int pr = vtop->sym->pin_reg - 1;
+
+                    /* Swap only the location bits. Every other flag the value
+                       carries (VT_SYM, VT_MUSTBOUND, VT_MUSTCAST) still applies
+                       to it, and dropping them is one of the reasons the first
+                       attempt computed the wrong answer. */
+                    vtop->r = (vtop->r & ~(VT_VALMASK | VT_LVAL)) | pr;
+                    return pr;
                 }
             }
         }
@@ -3260,7 +3266,8 @@ ST_FUNC void vstore(void)
                     move_reg(pr, r, vtop->type.t);
                 vswap();
                 vtop--;
-                vtop->r = (vtop->r & ~VT_VALMASK) | pr;
+                /* the value is in a register now, so VT_LVAL has to go too */
+                vtop->r = (vtop->r & ~(VT_VALMASK | VT_LVAL)) | pr;
                 vtop->r |= delayed_cast;
                 return;
             }

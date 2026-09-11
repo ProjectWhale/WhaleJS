@@ -48,7 +48,19 @@ TCC 侧已落地（commit `eb890d5`：`whale_pin_alloc` + `get_reg` 保留 + `gv
 
 **快了 ~45–50%，正是 `<19>` 预估的上限**，方向没问题 —— 但 `arith` 算错，且某个 case（`bitops` 之后）**挂住**。
 
-**下次的排查线索**（按可能性排序）：
+**第二次尝试（已修标志位）—— 错误不变**，所以 bug 不在标志位。但拿到了关键诊断：
+
+- 生成代码是 `register double L0 = 0; register double L1 = 0;` 然后 `L4: if (i < n) … L0 = ((L0 * A1) + A2); L1 = (L1 + 1); goto L4; return L0;` —— **看起来完全正确，且 `L0`/`L1` 全内联（没有 `v<n>` 物化），这解释了 45% 的提速**。
+- **`arith` 的结果是 `20000000`，而 `n = 20000000`** —— 正确的是 `7.27e14`。返回值等于循环次数，**意味着 `return L0` 拿到的是 `i` 的值** → **`L0` 和 `L1` 落到了同一个物理寄存器**（`L1` 覆盖了 `L0`）。
+- `loop_sum`（`s += i` 之类）反而是对的，`arith`（`s = s * c + k`）错 —— 差别在算术复杂度，不在有无 pin。
+
+**因此下次的第一嫌疑改为：`whale_pin_alloc()` 的分配去重没生效。** 具体要查：
+- `whale_pinned_regs` 是否真的在两次分配之间**保持**（它是 `static`，但 `tcc_new` 会不会重置、或者每次编译是否要清零？**没清零** → 多轮编译会累积，但一轮内应该正常）；
+- `reg_classes[r] & RC_FLOAT` 对 22/23（xmm6/xmm7，**明确不含 `RC_FLOAT`**）应被跳过，21/20 应依次返回；
+- **`sym->pin_reg = pr + 1` 写进的是不是 `gv()` 后来看到的那个 `Sym`** —— 在 `decl()` 里 `sym_push` 之后写，但 `unary()` 求值标识符时挂到 `vtop->sym` 的可能是**另一个** `Sym`（`sym_push` 会同时挂进 `local_stack` 和 token 表）。
+- 最快的二分：**只 pin 一个变量**（例如只对 `L1` 发 `TOK_REGISTER`）。若结果正确，问题就在"两个变量拿到同一寄存器"。
+
+**下次的排查线索**（其余，按可能性排序）：
 1. **`gv()` 的 pin 分支直接 `vtop->r = pin_reg; return;`** 是**整体赋值**，把 `vtop->r` 上所有别的标志位一起清掉了（`VT_SYM`、`VT_MUSTBOUND`、`VT_MUSTCAST` …）。该保留它们、只换位置位：`vtop->r = (vtop->r & ~(VT_VALMASK | VT_LVAL)) | pr;`
 2. **`vtop->sym` 对局部变量求值未必非 NULL、也未必是*那个*符号** —— 其语义是 "if (VT_SYM | VT_CONST), or if result of unary() for an identifier"。若指向别的 `Sym`，pin 就用错寄存器。**先验证**（在 `gv` 里打印 `vtop->sym->v` 与 `pin_reg`）。
 3. **`vstore()` 的 pin 分支手写 `vswap(); vtop--;`** 模仿正常收尾，但正常路径还带 `delayed_cast` 与 `vtop->r |= ...`；且 `gv(rc)` 可能因 `vtop->r` 恰好等于 `pr` 而**误判"值已在 pr"**（类匹配只看 `reg_classes[r] & rc`）→ 根本不 load，值就是陈的。
