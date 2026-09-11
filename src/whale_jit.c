@@ -923,6 +923,22 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_DOUBLE); wt_id("d"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_NewBool"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("b"); wt(')'); wt(';');
+    /* typed-array helpers (WHALE_T_OBJ). Declared like everything else: with no
+       prototype TinyCC applies the C89 implicit declaration, a `double` argument
+       then goes to the wrong register, and every call silently turns into a
+       deopt. */
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleGetGlobalObj"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("atom"); wt(',');
+        wk(JS_WK_INT); wt_id("slot"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleNewU8Array"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("ctor_slot"); wt(',');
+        wk(JS_WK_DOUBLE); wt_id("n"); wt(','); wk(JS_WK_INT); wt_id("out_slot"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleTAU8Get"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(',');
+        wk(JS_WK_DOUBLE); wt_id("idx"); wt(','); wk(JS_WK_DOUBLE); wt('*'); wt_id("out"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleTAU8Set"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(',');
+        wk(JS_WK_DOUBLE); wt_id("idx"); wt(','); wk(JS_WK_DOUBLE); wt_id("v"); wt(')'); wt(';');
     /* object-slot test hook (WHALE_OBJ_TEST). Declared like the rest: without a
        prototype TinyCC applies the C89 implicit declaration, and while the int
        return happens to land correctly in eax here, relying on that is the same
@@ -1307,6 +1323,140 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             }
             break;
 
+        /* Property-key conversion. The JIT only holds numbers, so a value here is
+           already its own property key and this is the identity. Checked rather
+           than assumed: a non-number would mean something else got this far and
+           must deopt. */
+        case OP_to_propkey:
+        case OP_to_propkey2:
+            if (!whale_type_is_num(cur[var_count + sp - 1]))
+                goto out;
+            break;
+
+        /* Is the value undefined or null? Every value the JIT can hold is a
+           number, a boolean, this function or an object - never undefined and
+           never null - so the answer is always false. Nothing can reach here
+           holding one: OP_undefined has no case and get_var_undef deopts when
+           the global is missing. */
+        case OP_is_undefined_or_null:
+            {
+                int fm = fold_mark();
+
+                wt_int(0);
+                fold_set(sp - 1, fm);
+                cur[var_count + sp - 1] = WHALE_T_BOOL;
+            }
+            break;
+
+        /* Exchange the top two values. Materialising both first reduces this to
+           a swap of the two stack slots' bookkeeping - including the object slot
+           number, which rides in the type byte, so it needs nothing extra. */
+        case OP_swap:
+            {
+                int a = sp - 2, b = sp - 1;
+                WhaleVExpr ve;
+                uint8_t tb;
+                int tn;
+
+                fold_materialize(a);
+                fold_materialize(b);
+                ve = whale_vexpr[a]; whale_vexpr[a] = whale_vexpr[b]; whale_vexpr[b] = ve;
+                tb = whale_vmat[a];  whale_vmat[a]  = whale_vmat[b];  whale_vmat[b]  = tb;
+                tn = whale_vname[a]; whale_vname[a] = whale_vname[b]; whale_vname[b] = tn;
+                tb = cur[var_count + a];
+                cur[var_count + a] = cur[var_count + b];
+                cur[var_count + b] = tb;
+            }
+            break;
+
+        /* `new Uint8Array(n)`. Stack is [ctor, new.target, args...]; only the
+           one-argument typed-array form is lowered, everything else deopts. */
+        case OP_call_constructor:
+            {
+                int argc = (int)whale_get_u16(pc + pos + 1);
+                int fslot = sp - argc - 2;
+                int out;
+
+                if (argc != 1 || fslot < 0)
+                    goto out;
+                /* new.target is deliberately not checked: for `new Uint8Array(n)`
+                   the bytecode passes the constructor itself as the target, and a
+                   target that is some other function cannot change what this
+                   construction makes. */
+                if (!WHALE_IS_OBJ(cur[var_count + fslot]) ||
+                    !whale_type_is_num(cur[var_count + sp - 1]))
+                    goto out;
+                out = whale_objs++;
+                if (out >= WHALE_OBJ_SLOTS)
+                    goto out;
+                {
+                    int fm = fold_mark();
+
+                    wk(JS_WK_IF); wt('('); wt('!');
+                    wt_id("JS_WhaleNewU8Array"); wt('('); wt_id("ctx"); wt(',');
+                    wt_int(WHALE_OBJ_SLOT(cur[var_count + fslot])); wt(',');
+                    fold_inline(sp - 1); wt(','); wt_int(out); wt(')');
+                    wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    fold_commit(fm);
+                }
+                sp = fslot;
+                cur[var_count + sp] = WHALE_OBJ_T(out);
+                sp++;
+            }
+            break;
+
+        /* arr[idx] on a typed array. The array is a slot number, so only the
+           index needs a value. */
+        case OP_get_array_el:
+            {
+                int ta = cur[var_count + sp - 2];
+                int tb = cur[var_count + sp - 1];
+                int nm;
+
+                if (!WHALE_IS_OBJ(ta) || !whale_type_is_num(tb))
+                    goto out;
+                nm = whale_vserial++;
+                {
+                    int fm = fold_mark();
+
+                    wk(JS_WK_IF); wt('('); wt('!');
+                    wt_id("JS_WhaleTAU8Get"); wt('('); wt_id("ctx"); wt(',');
+                    wt_int(WHALE_OBJ_SLOT(ta)); wt(',');
+                    fold_inline(sp - 1); wt(','); wt('&'); wt_slot("v", nm); wt(')');
+                    wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    fold_commit(fm);
+                    whale_vname[sp - 2] = nm;
+                    whale_vmat[sp - 2] = 1;
+                }
+                cur[var_count + sp - 2] = WHALE_T_NUM;
+                sp--;
+            }
+            break;
+
+        /* arr[idx] = v on a typed array */
+        case OP_put_array_el:
+            {
+                int ta = cur[var_count + sp - 3];
+                int tb = cur[var_count + sp - 2];
+                int tc = cur[var_count + sp - 1];
+
+                if (!WHALE_IS_OBJ(ta) || !whale_type_is_num(tb) ||
+                    !whale_type_is_num(tc))
+                    goto out;
+                {
+                    int fm = fold_mark();
+
+                    wk(JS_WK_IF); wt('('); wt('!');
+                    wt_id("JS_WhaleTAU8Set"); wt('('); wt_id("ctx"); wt(',');
+                    wt_int(WHALE_OBJ_SLOT(ta)); wt(',');
+                    fold_inline(sp - 2); wt(','); fold_inline(sp - 1); wt(')');
+                    wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    fold_commit(fm);
+                }
+                sp -= 3;
+            }
+            break;
+
         case OP_get_loc0: case OP_get_loc1: case OP_get_loc2: case OP_get_loc3:
         case OP_get_loc8:
         case OP_get_loc:
@@ -1317,6 +1467,14 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 t = (idx >= 0 && idx < var_count) ? cur[idx] : WHALE_T_UNKNOWN;
                 if (t == WHALE_T_UNKNOWN)
                     goto out;
+                if (WHALE_IS_OBJ(t)) {
+                    /* An object is its slot number, which the type already
+                       carries - nothing to emit, the value is the same in every
+                       copy. Only the value path needs folding. */
+                    cur[var_count + sp] = (uint8_t)t;
+                    sp++;
+                    break;
+                }
                 {
                     int fm = fold_mark();
 
@@ -1339,6 +1497,16 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 t = cur[var_count + sp - 1];
                 if (t == WHALE_T_UNKNOWN || idx < 0 || idx >= var_count)
                     goto out;
+                if (WHALE_IS_OBJ(t)) {
+                    /* Same reasoning as get_loc: the value *is* the slot number,
+                       so this store is a type change and nothing else - no
+                       deferred store and no fold slot. */
+                    local_forget(idx);
+                    cur[idx] = (uint8_t)t;
+                    lo_c[idx] = 0;
+                    sp--;
+                    break;
+                }
                 /* Defer the store: the value stays an expression until it is
                    read, or until the basic block ends. */
                 local_forget(idx);

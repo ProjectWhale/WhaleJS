@@ -620,7 +620,7 @@ struct JSContext {
                              const char *filename, int line, int flags, int scope_idx);
     void *user_opaque;
 
-    /* WhaleJS: embedded JIT/AOT state, see whalejs.h（零分配，随 context 释放） */
+    /* WhaleJS: embedded JIT/AOT state, see whalejs.h（零分配，随 context 释放�?*/
     JSWhaleContext whale;
 };
 
@@ -894,9 +894,9 @@ typedef struct JSFunctionBytecode {
     uint8_t *pc2line_buf;
     char *source;
 
-    /* WhaleJS: JIT/AOT 状态（零初始化，见 src/whalejs.h） */
-    uint32_t whale_call_count; /* 调用次数，用于热点判定 */
-    void *whale_jit_entry;     /* 非 NULL 表示已有机器码入口 */
+    /* WhaleJS: JIT/AOT 状��（零初始化，�?? src/whalejs.h�?*/
+    uint32_t whale_call_count; /* 调用次数，用于热点判�?*/
+    void *whale_jit_entry;     /* �?NULL 表示已有机器码入�?*/
     uint8_t whale_jit_tried;   /* JIT compile already attempted */
     void *whale_jit_tcc;       /* owning TCCState (keeps the code alive) */
     /* Memoisation: this function was JIT-compiled and never reads a global, so
@@ -2996,9 +2996,7 @@ void JS_WhaleNoteJitResult(JSContext *ctx, int ok, uint64_t code_bytes)
     }
 }
 
-/* WhaleJS: JS_CallInternal 的热点入口。
-   当前只统计；TinyCC 编译接入后在这里产出机器码并填 b->whale_jit_entry。
-   注意：JIT=OFF 时必须零开销返回。 */
+/* WhaleJS: JS_CallInternal 的热点入口��?   当前�??��计；TinyCC 编译接入后在这里产出机器码并�?b->whale_jit_entry�?   注意：JIT=OFF 时必须零弢�锢�返回�?*/
 /* ---- services the JIT codegen module (src/whale_jit.c) needs from us ---- */
 
 /* Is closure slot idx of the running frame this very function? The generator
@@ -3125,6 +3123,7 @@ int JS_WhaleGetGlobalNum(JSContext *ctx, int atom, double *out)
         *out = JS_VALUE_GET_FLOAT64(v);
         ok = 1;
     }
+
     JS_FreeValue(ctx, v);   /* no-op for numbers, but a global may be an object */
     return ok;
 }
@@ -3154,13 +3153,18 @@ int JS_WhaleGetGlobalObj(JSContext *ctx, int atom, int slot)
 
     if (JS_IsException(v))
         return 0;
+
     JS_WhaleObjSlot(ctx, slot, v);   /* takes over the reference */
     return 1;
 }
 
 /* Is `v` the global Uint8Array constructor? Compared against the global rather
    than by name or class id: a user function called Uint8Array must not be
-   assumed to build a real typed array. */
+   assumed to build a real typed array.
+
+   Both sides must be functions. Without that check a lookup that yields
+   undefined on both sides compares equal and the answer is a false positive -
+   which is exactly how this was first written. */
 static int whale_is_global_u8ctor(JSContext *ctx, JSValueConst v)
 {
     JSAtom a = JS_NewAtom(ctx, "Uint8Array");
@@ -3169,10 +3173,16 @@ static int whale_is_global_u8ctor(JSContext *ctx, JSValueConst v)
 
     if (a == JS_ATOM_NULL)
         return 0;
+    if (!JS_IsFunction(ctx, v)) {
+        JS_FreeAtom(ctx, a);
+        return 0;
+    }
     g = JS_GetGlobalVar(ctx, a, false);
     JS_FreeAtom(ctx, a);
-    if (JS_IsException(g))
+    if (JS_IsException(g) || !JS_IsFunction(ctx, g)) {
+        JS_FreeValue(ctx, g);
         return 0;
+    }
     same = JS_IsStrictEqual(ctx, v, g);
     JS_FreeValue(ctx, g);
     return same;
@@ -3193,6 +3203,11 @@ int JS_WhaleGlobalIsU8Ctor(JSContext *ctx, int atom)
 
     if (JS_IsException(v))
         return 0;
+    if (getenv("WHALE_JIT_DUMP"))
+        fprintf(stderr, "[isu8] ctx=%p global=%p var=%p tag=%d\n",
+                (void *)ctx, (void *)JS_VALUE_GET_PTR(ctx->global_obj),
+                (void *)JS_VALUE_GET_PTR(ctx->global_var_obj),
+                JS_VALUE_GET_TAG(v));
     r = whale_is_global_u8ctor(ctx, v);
     JS_FreeValue(ctx, v);
     return r;
@@ -3207,6 +3222,7 @@ int JS_WhaleNewU8Array(JSContext *ctx, int ctor_slot, double n, int out_slot)
 {
     JSValue ctor, arg, arr;
 
+
     if (!(n >= 0 && n <= 2147483647.0))
         return 0;
     ctor = JS_WhaleObjGet(ctx, ctor_slot);
@@ -3220,6 +3236,7 @@ int JS_WhaleNewU8Array(JSContext *ctx, int ctor_slot, double n, int out_slot)
     if (JS_IsException(arr))
         return 0;
     JS_WhaleObjSlot(ctx, out_slot, arr);
+
     return 1;
 }
 
@@ -3229,51 +3246,43 @@ int JS_WhaleNewU8Array(JSContext *ctx, int ctor_slot, double n, int out_slot)
 int JS_WhaleTAU8Get(JSContext *ctx, int slot, double idx, double *out)
 {
     JSValue arr;
-    uint8_t *p;
-    size_t size;
+    JSObject *p;
     uint32_t i;
 
     if (!(idx >= 0 && idx <= 4294967295.0))
         return 0;
     i = (uint32_t)idx;
-    arr = JS_WhaleObjGet(ctx, slot);
-    if (JS_GetTypedArrayType(arr) != JS_CLASS_UINT8_ARRAY) {
-        JS_FreeValue(ctx, arr);
+    arr = whale_frame_obj_slots(ctx)[slot];   /* borrowed: nothing is freed */
+    if (JS_VALUE_GET_TAG(arr) != JS_TAG_OBJECT)
         return 0;
-    }
-    p = JS_GetUint8Array(ctx, &size, arr);
-    if (!p || i >= (uint32_t)size) {
-        JS_FreeValue(ctx, arr);
+    p = JS_VALUE_GET_OBJ(arr);
+    if (p->class_id != JS_CLASS_UINT8_ARRAY || typed_array_is_oob(p) ||
+        i >= (uint32_t)p->u.array.count)
         return 0;
-    }
-    *out = (double)p[i];
-    JS_FreeValue(ctx, arr);
+    *out = (double)p->u.array.u.uint8_ptr[i];
     return 1;
 }
 
-/* arr[idx] = v for a Uint8Array in `slot`. 1 on success, 0 to deopt. */
+/* arr[idx] = v for a Uint8Array in `slot`. 1 on success, 0 to deopt.
+
+   Same inline object access as JS_WhaleTAU8Get, and for the same reason. */
 int JS_WhaleTAU8Set(JSContext *ctx, int slot, double idx, double v)
 {
     JSValue arr;
-    uint8_t *p;
-    size_t size;
+    JSObject *p;
     uint32_t i;
 
     if (!(idx >= 0 && idx <= 4294967295.0) || !(v >= 0 && v <= 255.0))
         return 0;
     i = (uint32_t)idx;
-    arr = JS_WhaleObjGet(ctx, slot);
-    if (JS_GetTypedArrayType(arr) != JS_CLASS_UINT8_ARRAY) {
-        JS_FreeValue(ctx, arr);
+    arr = whale_frame_obj_slots(ctx)[slot];   /* borrowed: nothing is freed */
+    if (JS_VALUE_GET_TAG(arr) != JS_TAG_OBJECT)
         return 0;
-    }
-    p = JS_GetUint8Array(ctx, &size, arr);
-    if (!p || i >= (uint32_t)size) {
-        JS_FreeValue(ctx, arr);
+    p = JS_VALUE_GET_OBJ(arr);
+    if (p->class_id != JS_CLASS_UINT8_ARRAY || typed_array_is_oob(p) ||
+        i >= (uint32_t)p->u.array.count)
         return 0;
-    }
-    p[i] = (uint8_t)v;
-    JS_FreeValue(ctx, arr);
+    p->u.array.u.uint8_ptr[i] = (uint8_t)v;
     return 1;
 }
 
@@ -3512,7 +3521,7 @@ static void whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
             JS_WhaleNoteJitResult(ctx, 0, 0);
         }
     }   /* compile failed: stay interpreted */
-    /* 热点已达阈值：下一步在这里调 TinyCC 把 b 编译成机器码 */
+    /* �??��已达阈��：下一步在这里�?TinyCC �?b 编译成机器码 */
 }
 
 /* A loop back edge is heat exactly like a call is: a function that is entered
@@ -18779,7 +18788,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     rt->current_stack_frame = sf;
     ctx = b->realm; /* set the current realm */
 
-    /* WhaleJS: 热点统计（JIT 代码生成接入前先只计数，见 src/whalejs.h） */
+    /* WhaleJS: �??��统�??（JIT 代码生成接入前先�????数，�?src/whalejs.h�?*/
     whale_on_call(ctx, b);
 
     /* WhaleJS: native entry ready -> run it. The frame stays current while
@@ -18804,6 +18813,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             *pval = JS_UNDEFINED;
         }
         if (unlikely(whale_deopt)) {
+            if (getenv("WHALE_JIT_DUMP"))
+                fprintf(stderr, "whale jit: deopt, back to the interpreter\n");
             b->whale_jit_entry = NULL;   /* give up and interpret this one */
             b->whale_jit_tried = 1;
         } else {
