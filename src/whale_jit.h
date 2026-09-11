@@ -60,10 +60,15 @@ JSValue JS_WhaleObjGet(JSContext *ctx, int k);            /* read it back */
 /* Typed-array support. The generated code has no JSValue domain, so an array
    travels as an object slot number - a compile-time constant - and these do the
    object work. Each returns 0 to mean "deopt", and none may raise. */
-int JS_WhaleGetGlobalAny(JSContext *ctx, int atom, int slot, double *num);
+int JS_WhaleGetGlobalObj(JSContext *ctx, int atom, int slot);
 int JS_WhaleNewU8Array(JSContext *ctx, int ctor_slot, double n, int out_slot);
 int JS_WhaleTAU8Get(JSContext *ctx, int slot, double idx, double *out);
 int JS_WhaleTAU8Set(JSContext *ctx, int slot, double idx, double v);
+
+/* Compile-time only - never called by generated code. Does global `atom` name
+   the Uint8Array constructor? Asking while emitting is what keeps each stack
+   slot's held type a single compile-time fact. */
+int JS_WhaleGlobalIsU8Ctor(JSContext *ctx, int atom);
 
 /* Test hook: force a GC, then report the .length of whatever is in slot k, or -1
    if the slot does not hold an object. It exists to prove the slots survive a

@@ -3141,31 +3141,21 @@ int JS_WhaleGetGlobalNum(JSContext *ctx, int atom, double *out)
  * let the interpreter run this frame". None of them may raise.
  */
 
-/* Resolve a global. Writes *num and returns 1 when it is a number. When it is
-   not, parks the value in object slot `slot` and returns 2 - that is the
-   `new Uint8Array(...)` constructor case, where the JIT wants to keep the
-   function object rather than reject the whole compilation. Returns 0 on an
-   exception or when the slot already holds something. */
-int JS_WhaleGetGlobalAny(JSContext *ctx, int atom, int slot, double *num)
+/* Resolve a global the generator has decided is an object: park it in object
+   slot `slot`. Returns 1, or 0 to deopt (exception).
+
+   There is deliberately no "is it a number" variant. The generator asks
+   JS_WhaleGlobalIsU8Ctor while emitting, so it already knows which path this
+   global takes; a runtime answer here would give one stack slot two possible
+   identities, which the single-path generated code cannot express. */
+int JS_WhaleGetGlobalObj(JSContext *ctx, int atom, int slot)
 {
     JSValue v = JS_GetGlobalVar(ctx, atom, false);
-    int t;
 
     if (JS_IsException(v))
         return 0;
-    t = JS_VALUE_GET_TAG(v);
-    if (t == JS_TAG_INT) {
-        *num = (double)JS_VALUE_GET_INT(v);
-        JS_FreeValue(ctx, v);
-        return 1;
-    }
-    if (JS_TAG_IS_FLOAT64(t)) {
-        *num = JS_VALUE_GET_FLOAT64(v);
-        JS_FreeValue(ctx, v);
-        return 1;
-    }
     JS_WhaleObjSlot(ctx, slot, v);   /* takes over the reference */
-    return 2;
+    return 1;
 }
 
 /* Is `v` the global Uint8Array constructor? Compared against the global rather
