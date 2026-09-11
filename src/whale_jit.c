@@ -582,11 +582,11 @@ static void fold_toint32(int k, int is_i32)
        away, leaving a plain cast. Only when the operand is already a variable -
        inlining an un-materialised operand copies a whole pending expression,
        which measured slower than the helper it replaced. */
-    if (is_i32 && whale_vmat[k]) {
+    repeat = whale_vmat[k] || whale_vexpr[k].len <= 8;
+    if (is_i32 && repeat) {
         wt('('); wk(JS_WK_INT); wt(')'); wt('('); fold_inline(k); wt(')');
         return;
     }
-    repeat = whale_vmat[k] || whale_vexpr[k].len <= 8;
 
     if (!repeat) {
         wt_id("JS_WhaleToInt32"); wt('('); fold_inline(k); wt(')');
