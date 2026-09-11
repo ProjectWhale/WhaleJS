@@ -908,6 +908,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_DOUBLE); wt_id("d"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_NewBool"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("b"); wt(')'); wt(';');
+    /* object-slot test hook (WHALE_OBJ_TEST). Declared like the rest: without a
+       prototype TinyCC applies the C89 implicit declaration, and while the int
+       return happens to land correctly in eax here, relying on that is the same
+       mistake that made every `%` return 0 (see the fmod note below). */
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleObjProbeFrom"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wt_id("JSValue"); wt_id("v"); wt(')'); wt(';');
     /* `%` lowers to fmod(). It has to be declared: without this TinyCC falls
        back to the C89 implicit declaration, takes the int return value from rax
        while the real result is in xmm0, and every `%` silently yields 0. */
@@ -1755,6 +1761,23 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        That keeps JS_EXCEPTION (a macro with no linkable address) out of the
        generated code entirely. */
     wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleCheckStack"); wt('('); wt_id("ctx"); wt(')'); wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_id("whale_jit_box_num"); wt('('); wt_id("ctx"); wt(','); wt_int(0); wt(')'); wt(';'); wt('}');
+    {
+        /* ---- object-slot self test (WHALE_OBJ_TEST=<arg index>) -----------
+           Park the argument in a JIT object slot, force a full GC, and return
+           its .length. This exists to prove the slot mechanism: if the frame's
+           live range did not really cover the slots, the collection below frees
+           the array and this reads freed memory instead of a length. Only built
+           when the variable is set, so normal code is untouched. */
+        const char *ots = getenv("WHALE_OBJ_TEST");
+        int oti = ots ? atoi(ots) : -1;
+
+        if (oti >= 0 && oti < arg_count) {
+            wk(JS_WK_RETURN); wt_id("whale_jit_box_num"); wt('('); wt_id("ctx"); wt(',');
+            wt('('); wk(JS_WK_DOUBLE); wt(')'); wt_id("JS_WhaleObjProbeFrom"); wt('(');
+            wt_id("ctx"); wt(','); wt_id("args"); wt('['); wt_int(oti); wt(']'); wt(')');
+            wt(')'); wt(';');
+        }
+    }
     for (i = 0; i < arg_count; i++) {
         if (!args_used[i])
             continue;
@@ -1881,6 +1904,11 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
         tcc_add_symbol(s, "JS_NewBool", (void *)JS_NewBool);
         tcc_add_symbol(s, "JS_WhaleToInt32", (void *)JS_WhaleToInt32);
         tcc_add_symbol(s, "JS_WhaleGetGlobalNum", (void *)JS_WhaleGetGlobalNum);
+        /* object slots: the GC-visible place to keep an object across a call */
+        tcc_add_symbol(s, "JS_WhaleObjSlot", (void *)JS_WhaleObjSlot);
+        tcc_add_symbol(s, "JS_WhaleObjGet", (void *)JS_WhaleObjGet);
+        tcc_add_symbol(s, "JS_WhaleObjProbe", (void *)JS_WhaleObjProbe);
+        tcc_add_symbol(s, "JS_WhaleObjProbeFrom", (void *)JS_WhaleObjProbeFrom);
         whale_jit_state = s;
     }
     s = whale_jit_state;

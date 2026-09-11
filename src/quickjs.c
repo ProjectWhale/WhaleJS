@@ -3028,6 +3028,81 @@ int JS_WhaleCheckStack(JSContext *ctx)
     return 1;
 }
 
+/* ---- JIT object slots -----------------------------------------------------
+ *
+ * The generated code is an ordinary C function: no JSStackFrame, and GC does
+ * not scan the C stack. To hold an object it therefore has to store it where
+ * the collector looks. JS_CallInternal reserves WHALE_OBJ_SLOTS JSValue slots
+ * for exactly that, right after the JS operand stack and immediately before the
+ * var_refs - so the slots are the WHALE_OBJ_SLOTS entries ending at sf->var_refs,
+ * which is where these helpers find them. The frame's live range is extended
+ * over the slots while the JIT runs, otherwise GC would not walk them at all.
+ *
+ * A slot lives only as long as the call. This is not a second value stack: only
+ * an object the JIT is actively using between helper calls belongs here.
+ */
+static JSValue *whale_frame_obj_slots(JSContext *ctx)
+{
+    JSStackFrame *sf = ctx->rt->current_stack_frame;
+
+    return (JSValue *)sf->var_refs - WHALE_OBJ_SLOTS;
+}
+
+/* Park `v` in slot k, taking over the caller's reference. */
+void JS_WhaleObjSlot(JSContext *ctx, int k, JSValue v)
+{
+    JSValue *slots;
+
+    if (k < 0 || k >= WHALE_OBJ_SLOTS) {
+        JS_FreeValue(ctx, v);
+        return;
+    }
+    slots = whale_frame_obj_slots(ctx);
+    JS_FreeValue(ctx, slots[k]);   /* drop whatever was parked there */
+    slots[k] = v;
+}
+
+/* Read slot k back, adding a reference for the caller. */
+JSValue JS_WhaleObjGet(JSContext *ctx, int k)
+{
+    if (k < 0 || k >= WHALE_OBJ_SLOTS)
+        return JS_UNDEFINED;
+    return js_dup(whale_frame_obj_slots(ctx)[k]);
+}
+
+/* Collect, then report the .length of the object in slot k (-1 if none).
+   This is the test that the slots actually pin their object: if the frame's
+   live range did not cover them, the collection here would free the array and
+   the read afterwards would be a use-after-free. Nothing else calls it. */
+int JS_WhaleObjProbe(JSContext *ctx, int k)
+{
+    JSValue v, len;
+    int32_t n;
+
+    if (k < 0 || k >= WHALE_OBJ_SLOTS)
+        return -1;
+    JS_RunGC(ctx->rt);
+    v = whale_frame_obj_slots(ctx)[k];
+    if (!JS_IsObject(v))
+        return -1;
+    len = JS_GetPropertyStr(ctx, v, "length");
+    if (JS_IsException(len))
+        return -1;
+    n = (int32_t)JS_VALUE_GET_INT(len);
+    JS_FreeValue(ctx, len);
+    return (int)n;
+}
+
+/* Park a copy of `v` in slot 0, collect, then report its .length (-1 if v is not
+   an object). One call so the generated code does not need js_dup, which is a
+   static helper it cannot see. This is the slot test in one place: the
+   collection happens while the object is held only by the slot. */
+int JS_WhaleObjProbeFrom(JSContext *ctx, JSValue v)
+{
+    JS_WhaleObjSlot(ctx, 0, js_dup(v));
+    return JS_WhaleObjProbe(ctx, 0);
+}
+
 /* Read a global as a number for the JIT. `atom` is the atom index the bytecode
    carries for OP_get_var. Returns 0 when the global is not a number, which
    makes the compiled code deoptimise and let the interpreter run the frame -

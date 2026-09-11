@@ -51,6 +51,22 @@ int JS_WhaleVarRefIsSelf(JSContext *ctx, void **var_refs, int idx, JSValue self)
 int JS_WhaleCheckStack(JSContext *ctx);
 int JS_WhaleOpSize(int op);   /* bytecode operand size, from the interpreter table */
 
+/* Object slots: the GC-visible place for the JIT to keep an object across a
+   helper call (see WHALE_OBJ_SLOTS above). The engine implements these against
+   the calling frame, so the generated code does not have to pass an address. */
+void JS_WhaleObjSlot(JSContext *ctx, int k, JSValue v);   /* park object in slot k */
+JSValue JS_WhaleObjGet(JSContext *ctx, int k);            /* read it back */
+
+/* Test hook: force a GC, then report the .length of whatever is in slot k, or -1
+   if the slot does not hold an object. It exists to prove the slots survive a
+   collection, which is otherwise unobservable from JS. */
+int JS_WhaleObjProbe(JSContext *ctx, int k);
+
+/* Park a copy of v in slot 0, collect, then report its .length (-1 if v is not an
+   object). Combined into one call so generated code never has to reference
+   js_dup, which is static to the engine. */
+int JS_WhaleObjProbeFrom(JSContext *ctx, JSValue v);
+
 /* Keyword ids for the token emitters. The generator names a keyword; the
    TinyCC-side file maps it to its own TOK_*. ORDER MUST MATCH kwtok[] in
    src/tcc/whale_tcc_iface.c. */
