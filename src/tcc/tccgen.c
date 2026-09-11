@@ -985,6 +985,26 @@ static int whale_pin_alloc(int t)
     return -1;
 }
 
+/* Stack offset -> pinned register. A read has to recognise a pinned local
+   without looking at SValue.sym: unary() sets sym when an identifier is read,
+   but the initialiser of a declaration does not, and that mismatch had the
+   initialiser writing the frame slot while gv() later read the register - the
+   register then held whatever was left there. The map is per function and
+   reset by gen_function(). */
+static int whale_pin_loc[16];
+static int whale_pin_reg[16];
+static int whale_pin_n;
+
+static int whale_pin_find(int loc)
+{
+    int i;
+
+    for (i = 0; i < whale_pin_n; i++)
+        if (whale_pin_loc[i] == loc)
+            return whale_pin_reg[i];
+    return -1;
+}
+
 /* save registers up to (vtop - n) stack entry */
 ST_FUNC void save_regs(int n)
 {
@@ -1366,10 +1386,12 @@ ST_FUNC int gv(int rc)
         /* WhaleJS: a `register` local already owns its register, so there is
            nothing to reload and no class to satisfy - the value is where it
            belongs. Without this the pin did nothing but waste a register. */
-        if (vtop->sym) {
-            if (vtop->sym->pin_reg != 0) {
-                if ((vtop->r & VT_VALMASK) == VT_LOCAL) {
-                    int pr = vtop->sym->pin_reg - 1;
+        if ((vtop->r & VT_VALMASK) == VT_LOCAL) {
+            {
+                int pr = whale_pin_find((int)vtop->c.i);
+                if (pr >= 0) {
+
+
 
 
                     /* Swap only the location bits. Every other flag the value
@@ -3268,18 +3290,19 @@ ST_FUNC void vstore(void)
                below mirrors the store path: vswap() brings the value down over
                the destination, and the register field is rewritten so later
                reads know where the value actually lives. */
-            if (vtop[-1].sym && vtop[-1].sym->pin_reg != 0
-                && (vtop[-1].r & VT_VALMASK) == VT_LOCAL) {
-                int pr = vtop[-1].sym->pin_reg - 1;
+            if ((vtop[-1].r & VT_VALMASK) == VT_LOCAL) {
+                int pr = whale_pin_find((int)vtop[-1].c.i);
 
-                if (r != pr)
-                    move_reg(pr, r, vtop->type.t);
-                vswap();
-                vtop--;
-                /* the value is in a register now, so VT_LVAL has to go too */
-                vtop->r = (vtop->r & ~(VT_VALMASK | VT_LVAL)) | pr;
-                vtop->r |= delayed_cast;
-                return;
+                if (pr >= 0) {
+                    if (r != pr)
+                        move_reg(pr, r, vtop->type.t);
+                    vswap();
+                    vtop--;
+                    /* the value is in a register now, so VT_LVAL has to go too */
+                    vtop->r = (vtop->r & ~(VT_VALMASK | VT_LVAL)) | pr;
+                    vtop->r |= delayed_cast;
+                    return;
+                }
             }
             /* if lvalue was saved on stack, must read it */
             if ((vtop[-1].r & VT_VALMASK) == VT_LLOCAL) {
@@ -7030,8 +7053,14 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
             sym->a = ad->a;
             if (whale_pin_next) {
                 int pr = whale_pin_alloc(type->t);
-                if (pr >= 0)
+                if (pr >= 0) {
                     sym->pin_reg = pr + 1;
+                    if (whale_pin_n < 16) {
+                        whale_pin_loc[whale_pin_n] = addr;
+                        whale_pin_reg[whale_pin_n] = pr;
+                        whale_pin_n++;
+                    }
+                }
                 whale_pin_next = 0;
             }
         } else {
@@ -7154,6 +7183,11 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
    'cur_text_section' */
 static void gen_function(Sym *sym)
 {
+    /* WhaleJS: pinned registers belong to one function. A new one starts with
+       none, and the previous function's offset -> register map would otherwise
+       match a local of this one. */
+    whale_pinned_regs = 0;
+    whale_pin_n = 0;
     nocode_wanted = 0;
     ind = cur_text_section->data_offset;
     /* NOTE: we patch the symbol size later */
