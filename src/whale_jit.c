@@ -423,6 +423,33 @@ static int    go_tok[WHALE_TOK_MAX];
 static double go_num[WHALE_TOK_MAX];
 static int    go_len;
 
+/* Where committed statements land. Normally the finished stream; while a loop
+   body is being buffered it points at that loop's own buffer instead, so the
+   whole body can be worked on before it is handed on. */
+static int    *whale_out_tok = go_tok;
+static double *whale_out_num = go_num;
+static int    *whale_out_len = &go_len;
+
+/* ---- loop buffering ------------------------------------------------------
+ * A loop body is built in its own buffer and emitted in one go. Nothing is
+ * optimised here yet - this is the plumbing that makes it possible, because
+ * hoisting a loop invariant or unrolling both need to rearrange code that has
+ * not been handed on already. Nesting uses a small stack.
+ */
+#define WHALE_LOOP_MAX 4
+#define WHALE_LOOP_BUF 4096
+
+typedef struct WhaleLoop {
+    int     tok[WHALE_LOOP_BUF];
+    double  num[WHALE_LOOP_BUF];
+    int     len;
+    int     head_pos;       /* bytecode offset of the loop head */
+    int     back_pos;       /* ...of the backward jump that closes the body */
+} WhaleLoop;
+
+static WhaleLoop whale_loops[WHALE_LOOP_MAX];
+static int whale_loop_depth;
+
 typedef struct { int off, len; } WhaleVExpr;
 
 static WhaleVExpr *whale_vexpr;   /* the pending expression of each stack slot */
@@ -433,6 +460,11 @@ static void fold_begin(void)
 {
     JS_WhaleTokSink(gw_tok, gw_num, WHALE_TOK_MAX);
     go_len = 0;
+    /* start a compile with no loop open and the output going to the stream */
+    whale_loop_depth = 0;
+    whale_out_tok = go_tok;
+    whale_out_num = go_num;
+    whale_out_len = &go_len;
 }
 
 static int fold_mark(void)
@@ -534,14 +566,65 @@ static void fold_mod(int ka, int kb)
     wt(')');
 }
 
-/* Copy the token range [mark, now) to the finished stream. */
+/* Copy the token range [mark, now) to the current output. */
 static void fold_commit(int mark)
 {
     int i, n = JS_WhaleTokSinkLen();
 
-    for (i = mark; i < n && go_len < WHALE_TOK_MAX; i++) {
-        go_num[go_len] = gw_num[i];
-        go_tok[go_len++] = gw_tok[i];
+    for (i = mark; i < n && *whale_out_len < WHALE_TOK_MAX; i++) {
+        whale_out_num[*whale_out_len] = gw_num[i];
+        whale_out_tok[(*whale_out_len)++] = gw_tok[i];
+    }
+}
+
+/* Start buffering a loop body. Returns 0 when the stack is full, in which case
+   the body is emitted straight through as before. */
+static int loop_begin(int head_pos, int back_pos)
+{
+    WhaleLoop *l;
+
+    if (whale_loop_depth >= WHALE_LOOP_MAX)
+        return 0;
+    l = &whale_loops[whale_loop_depth];
+    l->len = 0;
+    l->head_pos = head_pos;
+    l->back_pos = back_pos;
+    whale_out_tok = l->tok;
+    whale_out_num = l->num;
+    whale_out_len = &l->len;
+    whale_loop_depth++;
+    return 1;
+}
+
+/* Finish the innermost loop and hand its body on. This is where a loop-level
+   optimisation would run - it gets the complete body at once. */
+static void loop_end(void)
+{
+    WhaleLoop *l, *p;
+    int i, n;
+
+    if (whale_loop_depth <= 0)
+        return;
+    whale_loop_depth--;
+    l = &whale_loops[whale_loop_depth];
+
+    /* switch back to the enclosing output target first, then append the body */
+    if (whale_loop_depth == 0) {
+        whale_out_tok = go_tok;
+        whale_out_num = go_num;
+        whale_out_len = &go_len;
+    } else {
+        p = &whale_loops[whale_loop_depth - 1];
+        whale_out_tok = p->tok;
+        whale_out_num = p->num;
+        whale_out_len = &p->len;
+    }
+    n = l->len;
+    if (n > WHALE_LOOP_BUF)
+        n = WHALE_LOOP_BUF;
+    for (i = 0; i < n && *whale_out_len < WHALE_TOK_MAX; i++) {
+        whale_out_num[*whale_out_len] = l->num[i];
+        whale_out_tok[(*whale_out_len)++] = l->tok[i];
     }
 }
 
@@ -582,6 +665,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     int state_len = var_count + stack_size + 1; /* +1: sp */
     int pos, i, sp, ret = 0, tail_mark;
     uint8_t *targets = NULL, *seen = NULL, *snap = NULL, *cur = NULL, *args_used = NULL;
+    int *loop_back = NULL;      /* per position: the backward jump that closes it */
     uint8_t var_ref_used[4] = { 0, 0, 0, 0 };
     uint16_t *assign_cnt = NULL;
     uint8_t lo_c[WHALE_JIT_MAX_SLOTS];
@@ -604,9 +688,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     assign_cnt = calloc(var_count > 0 ? var_count : 1, sizeof(uint16_t));
     whale_vexpr = calloc(stack_size, sizeof(WhaleVExpr));
     whale_vmat = calloc(1, stack_size);
+    loop_back = malloc((len + 1) * sizeof(*loop_back));
     if (!targets || !seen || !snap || !cur || !args_used || !assign_cnt ||
-        !whale_vexpr || !whale_vmat)
+        !whale_vexpr || !whale_vmat || !loop_back)
         goto out;
+    for (i = 0; i <= len; i++)
+        loop_back[i] = -1;
     memset(lo_c, 0, sizeof(lo_c));
     memset(lo_cv, 0, sizeof(lo_cv));
 
@@ -618,9 +705,17 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         if (sz <= 0 || pos + sz > len)
             goto out;
         if (op == OP_goto8 || op == OP_if_false8 || op == OP_if_true8) {
-            targets[pos + 1 + (int8_t)pc[pos + 1]] = 1;
+            int tgt = pos + 1 + (int8_t)pc[pos + 1];
+
+            targets[tgt] = 1;
+            if (tgt < pos)              /* backward jump: a loop back edge */
+                loop_back[tgt] = pos;
         } else if (op == OP_goto || op == OP_if_false || op == OP_if_true) {
-            targets[pos + 1 + (int32_t)whale_get_u32(pc + pos + 1)] = 1;
+            int tgt = pos + 1 + (int32_t)whale_get_u32(pc + pos + 1);
+
+            targets[tgt] = 1;
+            if (tgt < pos)
+                loop_back[tgt] = pos;
         } else if (op >= OP_get_arg0 && op < OP_get_arg0 + 4) {
             args_used[op - OP_get_arg0] = 1;
         } else if (op == OP_get_arg) {
@@ -734,6 +829,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         int t1 = 0, t2 = 0;
         int c1 = 0, c2 = 0;
         double cv1 = 0, cv2 = 0;
+
+        /* A loop head opens a buffer for its body; the back edge closes it.
+           The head label goes inside the buffer, because that is where the back
+           edge jumps to. Nesting uses the loop stack. */
+        if (loop_back[pos] >= 0)
+            loop_begin(pos, loop_back[pos]);
 
         /* dead code after an unconditional return/goto is not emitted */
         if (unreachable && !targets[pos]) {
@@ -1462,7 +1563,17 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             goto out; /* anything else: keep interpreting */
         }
         pos += sz;
+
+        /* the back edge of the innermost open loop closes its buffer */
+        if (whale_loop_depth > 0 &&
+            pos == whale_loops[whale_loop_depth - 1].back_pos)
+            loop_end();
     }
+
+    /* a loop without a back edge (a `for(;;)` whose exit is a throw, say) would
+       leave its buffer open - flush whatever is left before committing */
+    while (whale_loop_depth > 0)
+        loop_end();
 
     /* The epilogue and the whole engine entry are structural, so they are
        committed as one block rather than folded. */
@@ -1518,6 +1629,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         free(cur);
     if (args_used)
         free(args_used);
+    if (loop_back)
+        free(loop_back);
     if (assign_cnt)
         free(assign_cnt);
     if (whale_vexpr)
