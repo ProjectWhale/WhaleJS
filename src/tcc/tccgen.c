@@ -950,6 +950,41 @@ ST_FUNC void vpush_global_sym(CType *type, int v)
     vpushsym(type, external_global_sym(v, type, 0));
 }
 
+/* ---- WhaleJS: honouring `register` on a local ----------------------------
+ *
+ * TinyCC has no register allocator to speak of: every read of a local goes
+ * through gv() with VT_LVAL set, so it always loads, and every write goes
+ * through vstore(). A loop counter therefore crosses the memory bus on every
+ * iteration. The generator, which sees a whole loop body at once (loop_begin in
+ * whale_jit.c), can say which variables deserve better - and it says it with
+ * `register`, which the parser used to throw away.
+ *
+ * Only the float pool is used. RC_FLOAT covers xmm0-xmm5, so pinning one of
+ * them needs no change to reg_classes[]; the integer pool would (r8-r11 carry
+ * no RC_INT, and gv() reloads anything whose class does not match).
+ * whale_pinned_regs keeps a pinned register out of get_reg()'s hands.
+ */
+static int whale_pin_next;          /* set by the TOK_REGISTER case below */
+static unsigned whale_pinned_regs;  /* one bit per pinned register */
+
+static int whale_pin_alloc(int t)
+{
+    int r;
+
+    if (!is_float(t))
+        return -1;
+    /* highest first: get_reg() scans upwards, so this stays out of its way */
+    for (r = NB_REGS - 1; r >= 0; r--) {
+        if ((reg_classes[r] & RC_FLOAT) != 0) {
+            if ((whale_pinned_regs & (1u << r)) == 0) {
+                whale_pinned_regs |= 1u << r;
+                return r;
+            }
+        }
+    }
+    return -1;
+}
+
 /* save registers up to (vtop - n) stack entry */
 ST_FUNC void save_regs(int n)
 {
@@ -975,6 +1010,10 @@ ST_FUNC void save_reg_upstack(int r, int n)
     if ((r &= VT_VALMASK) >= VT_CONST)
         return;
     if (nocode_wanted)
+        return;
+    /* WhaleJS: a pinned register belongs to a `register` local, not to the value
+       stack, so nothing on the stack can force its value out. */
+    if (whale_pinned_regs & (1u << r))
         return;
 
     /* modify all stack values */
@@ -1042,6 +1081,8 @@ ST_FUNC int get_reg_ex(int rc, int rc2)
     SValue *p;
     
     for(r=0;r<NB_REGS;r++) {
+        if (whale_pinned_regs & (1u << r))
+            continue;
         if (reg_classes[r] & rc2) {
             int n;
             n=0;
@@ -1066,6 +1107,8 @@ ST_FUNC int get_reg(int rc)
 
     /* find a free register */
     for(r=0;r<NB_REGS;r++) {
+        if (whale_pinned_regs & (1u << r))
+            goto notfound;
         if (reg_classes[r] & rc) {
             if (nocode_wanted)
                 return r;
@@ -1088,7 +1131,8 @@ ST_FUNC int get_reg(int rc)
         if (r < VT_CONST && (reg_classes[r] & rc))
             goto save_found;
         r = p->r & VT_VALMASK;
-        if (r < VT_CONST && (reg_classes[r] & rc)) {
+        if (r < VT_CONST && (reg_classes[r] & rc)
+            && !(whale_pinned_regs & (1u << r))) {
         save_found:
             save_reg(r);
             return r;
@@ -1319,6 +1363,17 @@ ST_FUNC int gv(int rc)
             rc2 = RC_QRET;
 #endif
 #endif
+        /* WhaleJS: a `register` local already owns its register, so there is
+           nothing to reload and no class to satisfy - the value is where it
+           belongs. Without this the pin did nothing but waste a register. */
+        if (vtop->sym) {
+            if (vtop->sym->pin_reg != 0) {
+                if ((vtop->r & VT_VALMASK) == VT_LOCAL) {
+                    vtop->r = vtop->sym->pin_reg - 1;
+                    return vtop->r;
+                }
+            }
+        }
         /* need to reload if:
            - constant
            - lvalue (need to dereference pointer)
@@ -3192,6 +3247,23 @@ ST_FUNC void vstore(void)
 #endif
             }
             r = gv(rc);  /* generate value */
+            /* WhaleJS: a `register` destination keeps the value in its pinned
+               register instead of writing it back to the stack frame. The tail
+               below mirrors the store path: vswap() brings the value down over
+               the destination, and the register field is rewritten so later
+               reads know where the value actually lives. */
+            if (vtop[-1].sym && vtop[-1].sym->pin_reg != 0
+                && (vtop[-1].r & VT_VALMASK) == VT_LOCAL) {
+                int pr = vtop[-1].sym->pin_reg - 1;
+
+                if (r != pr)
+                    move_reg(pr, r, vtop->type.t);
+                vswap();
+                vtop--;
+                vtop->r = (vtop->r & ~VT_VALMASK) | pr;
+                vtop->r |= delayed_cast;
+                return;
+            }
             /* if lvalue was saved on stack, must read it */
             if ((vtop[-1].r & VT_VALMASK) == VT_LLOCAL) {
                 SValue sv;
@@ -4119,6 +4191,12 @@ static int parse_btype(CType *type, AttributeDef *ad)
             typespec_found = 1;
             break;
         case TOK_REGISTER:
+            /* WhaleJS: taken seriously rather than ignored. The next local
+               declared gets a register that get_reg() will not hand out and
+               that gv()/vstore() do not load and store through. */
+            whale_pin_next = 1;
+            next();
+            break;
         case TOK_AUTO:
         case TOK_RESTRICT1:
         case TOK_RESTRICT2:
@@ -6933,6 +7011,12 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
 #endif
             sym = sym_push(v, type, r, addr);
             sym->a = ad->a;
+            if (whale_pin_next) {
+                int pr = whale_pin_alloc(type->t);
+                if (pr >= 0)
+                    sym->pin_reg = pr + 1;
+                whale_pin_next = 0;
+            }
         } else {
             /* push local reference */
             vset(type, r, addr);
