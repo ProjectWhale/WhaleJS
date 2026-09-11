@@ -65,6 +65,11 @@ int JS_WhaleNewU8Array(JSContext *ctx, int ctor_slot, double n, int out_slot);
 int JS_WhaleTAU8Get(JSContext *ctx, int slot, double idx, double *out);
 int JS_WhaleTAU8Set(JSContext *ctx, int slot, double idx, double v);
 
+/* Buffer base + element count for a Uint8Array in `slot`, so generated code can
+   fetch both once and then index directly instead of calling an accessor per
+   element. NULL means deopt. */
+uint8_t *JS_WhaleTAU8Ptr(JSContext *ctx, int slot, double *len_out);
+
 /* Compile-time only - never called by generated code. Does global `atom` name
    the Uint8Array constructor? Asking while emitting is what keeps each stack
    slot's held type a single compile-time fact. */

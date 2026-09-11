@@ -3286,6 +3286,30 @@ int JS_WhaleTAU8Set(JSContext *ctx, int slot, double idx, double v)
     return 1;
 }
 
+/* Buffer base and element count for a Uint8Array in `slot`, so the generated
+   code can fetch both once and then index directly instead of calling an
+   accessor per element. Returns NULL to deopt.
+
+   Holding the raw pointer is safe because the array object stays reachable: the
+   object slot is a GC root (WHALE_OBJ_SLOTS), so nothing can collect the array
+   out from under it. What would invalidate the pointer is the buffer being
+   detached, and nothing running inside such a loop can do that - the JIT only
+   calls the accessors here, and they never call back into JS. The generated
+   code re-checks the cached count on every access anyway. */
+uint8_t *JS_WhaleTAU8Ptr(JSContext *ctx, int slot, double *len_out)
+{
+    JSValue arr = whale_frame_obj_slots(ctx)[slot];   /* borrowed: nothing is freed */
+    JSObject *p;
+
+    if (JS_VALUE_GET_TAG(arr) != JS_TAG_OBJECT)
+        return NULL;
+    p = JS_VALUE_GET_OBJ(arr);
+    if (p->class_id != JS_CLASS_UINT8_ARRAY || typed_array_is_oob(p))
+        return NULL;
+    *len_out = (double)p->u.array.count;
+    return p->u.array.u.uint8_ptr;
+}
+
 /* ToInt32 for the JIT. The bitwise operators are defined on int32, so the
    generated code cannot just cast a double: JS specifies a truncation towards
    zero followed by a modulo-2^32 wrap (and 0 for the non-finite values).
