@@ -34,6 +34,27 @@
 - `SValue.r` 是 `unsigned short` 且 0x0100–0x8000 全被 `VT_LVAL*`/`VT_SYM`/`VT_MUSTCAST`/`VT_MUSTBOUND`/`VT_BOUNDED` 占满 —— **不要指望在 `r` 里腾新标志位**。
 - x86_64 的 `NB_REGS = 25`（`NB_ASM_REGS = 16`），保留池要避开 `gen_opi()`/`gen_opf()` 内部会硬用的寄存器（`get_reg` 的注释特别提醒 spill 要从栈底开始，就是为了这个）。
 
+## 第一次尝试的结果（重要）
+
+TCC 侧已落地（commit `eb890d5`：`whale_pin_alloc` + `get_reg` 保留 + `gv`/`vstore`/`save_reg_upstack` 特判；无调用者，全量 0 mismatch）。
+
+生成器侧接上后（对 `!whale_has_call` 的函数，所有局部变量声明为 `register`）**收益确认，但正确性错了，已回退**：
+
+| case | 之前 | pin 后 | check |
+|---|---|---|---|
+| `arith` | 111ms | **65ms** | **错**：`727740513040600.2` → `20000000` |
+| `locals` | 101ms | **54ms** | 对（`Infinity`） |
+| `loop_sum` | 60ms | **57ms** | 对 |
+
+**快了 ~45–50%，正是 `<19>` 预估的上限**，方向没问题 —— 但 `arith` 算错，且某个 case（`bitops` 之后）**挂住**。
+
+**下次的排查线索**（按可能性排序）：
+1. **`gv()` 的 pin 分支直接 `vtop->r = pin_reg; return;`** 是**整体赋值**，把 `vtop->r` 上所有别的标志位一起清掉了（`VT_SYM`、`VT_MUSTBOUND`、`VT_MUSTCAST` …）。该保留它们、只换位置位：`vtop->r = (vtop->r & ~(VT_VALMASK | VT_LVAL)) | pr;`
+2. **`vtop->sym` 对局部变量求值未必非 NULL、也未必是*那个*符号** —— 其语义是 "if (VT_SYM | VT_CONST), or if result of unary() for an identifier"。若指向别的 `Sym`，pin 就用错寄存器。**先验证**（在 `gv` 里打印 `vtop->sym->v` 与 `pin_reg`）。
+3. **`vstore()` 的 pin 分支手写 `vswap(); vtop--;`** 模仿正常收尾，但正常路径还带 `delayed_cast` 与 `vtop->r |= ...`；且 `gv(rc)` 可能因 `vtop->r` 恰好等于 `pr` 而**误判"值已在 pr"**（类匹配只看 `reg_classes[r] & rc`）→ 根本不 load，值就是陈的。
+4. **`whale_has_call` 只认 `OP_call0..3`/`OP_call`** —— 若还有别的 opcode 间接调 JS（`OP_call_constructor` 已单独处理，`sieve` 走那条），要一并算 clobber。
+5. **初版很粗**：把**所有**局部变量都声明成 `register`（靠 `whale_pin_alloc` 的 `is_float` 挡非浮点、靠 6 个浮点寄存器上限挡超额）。更稳的是只 pin **真正的循环归纳变量** —— `loop_begin`/`loop_end` 能拿到完整循环体，本来就是为此准备的。
+
 ## 验证
 
 1. **先不用 JIT**：写一个 `register double` 的小 C 文件，走 `whale_tcc_compile` 的 C 源路径，确认语义正确（这是唯一不依赖 `whale_jit.c` 的隔离验证）。
