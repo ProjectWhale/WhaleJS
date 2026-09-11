@@ -128,7 +128,21 @@ enum {
     WHALE_T_NUM = 1,  /* Number: held as double while specialized */
     WHALE_T_BOOL = 2, /* true / false, usable as 1 / 0 */
     WHALE_T_SELF = 3, /* this function, usable only as a call target */
+    WHALE_T_OBJ = 4,  /* a JS object (typed array). Only the typed-array helpers
+                         may touch it; anything else deopts. */
 };
+
+/* The object slot a type carries, packed into the same byte as the type.
+
+   cur[] is uint8_t and is snapshotted at every jump target, so an object's slot
+   number has to travel with its type rather than in a parallel array that would
+   need its own snapshot handling. The low nibble holds the type, the high nibble
+   the slot + 1 - which caps WHALE_OBJ_SLOTS at 15 and costs nothing, because an
+   object's byte never equals WHALE_T_NUM/BOOL/SELF, so every existing type check
+   rejects it automatically. */
+#define WHALE_OBJ_T(slot)  ((uint8_t)(WHALE_T_OBJ | (((slot) + 1) << 4)))
+#define WHALE_IS_OBJ(t)    (((t) & 0x0f) == WHALE_T_OBJ)
+#define WHALE_OBJ_SLOT(t)  ((int)((t) >> 4) - 1)
 
 /* ------------------------------------------------------------------------
  * Token emitters.
@@ -794,6 +808,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     double lo_cv[WHALE_JIT_MAX_SLOTS];
     int unreachable = 0;
     int ret_is_bool = -1;
+    int whale_objs = 0;   /* object slots handed out; each new object takes one */
 
     if (!info->is_normal)
         return 0;
@@ -1447,6 +1462,26 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                    than the arguments, so the engine must not memoise this
                    function. */
                 whale_gen_pure = 0;
+                if (JS_WhaleGlobalIsU8Ctor(ctx, atom)) {
+                    /* `new Uint8Array(...)` needs the constructor itself kept.
+                       Judged here, while emitting, so the slot's identity is a
+                       single compile-time fact - see the WHALE_OBJ_T note. */
+                    int slot = whale_objs++;
+                    int nm;
+
+                    if (slot >= WHALE_OBJ_SLOTS)
+                        goto out;
+                    nm = whale_vserial++;
+                    wk(JS_WK_IF); wt('('); wt('!');
+                    wt_id("JS_WhaleGetGlobalObj"); wt('('); wt_id("ctx"); wt(','); wt_int(atom); wt(','); wt_int(slot); wt(')');
+                    wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    fold_commit(fm);
+                    whale_vname[sp] = nm;
+                    whale_vmat[sp] = 1;   /* marks the fold slot dead; unused for objects */
+                    cur[var_count + sp] = WHALE_OBJ_T(slot);
+                    sp++;
+                    break;
+                }
                 {
                     int nm = whale_vserial++;   /* fresh name, never reused */
                     wk(JS_WK_IF); wt('('); wt('!');
