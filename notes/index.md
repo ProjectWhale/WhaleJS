@@ -72,5 +72,8 @@ The process of project: WhaleJS —— 基于 QuickJS-ng + TinyCC 实现带 JIT/
 
 <44>(PLAN, 寄存器改造): 方案已单独记录 → notes/reg-alloc-plan.md。要点：**复用 `register` 关键字**（`TOK_REGISTER` 存在且 `whale_tcc_iface.c:610` 白名单已收，但 `tccgen.c:4121` 目前完全忽略它）—— 这是现成的接口。**8 处改动跨 `tccgen.c`/`tcc.h`/`whale_jit.c`，必须一次做完**（只做“分配保留寄存器”而不做 `gv`/`vstore` 特判，会生成错误代码而非只是没收益）。关键约束：**函数调用会破坏寄存器**，所以初版只对函数体内无 `call` 的函数启用（`whale_jit.c` 侧可判定，且它已有完整的循环体缓冲）。验证要**先用 C 源路径隔离**（手写 `register double` 的小 C，不依赖 `whale_jit.c`）。另记：`SValue.r` 是 `unsigned short` 且 `0x0100`–`0x8000` 全被占满，**别指望在 `r` 里腾新标志位**。**工具坑**：`Get-ChildItem -Include` 不带 `-Recurse` 是**假阴性**（我据此误判成“TCC 没有 `TOK_REGISTER`”并写进了结论，后已复核更正）。
 
+<45>(TODO, 用户点名要做 / 进度): **后端 ISA 分级（SSE2 baseline → SSE4.2 → AVX2）** —— 方案见 notes/backend-isa-extensions.md，**不要漏做**。**已完成的是骨架**（commit bed4f0d、7af225e）：`TCCState.isa_bits` + `WHALE_ISA_SSE2/SSE42/AVX2`（AVX2 蕴含 AVX、SSE4.2 蕴含 SSE4.1，故不留中间层）、`whale_isa_detect()`（CPUID + XGETBV 闸门，`tcc_new` 里调用）、`WHALE_ISA` env 覆盖、`gen_sse_prefix()`/`gen_sse_modrm()` 统一标量 SSE 发射。**待做的是第 3–5 步实际指令替换**，而它们目前**无收益**，原因是我们的 JIT 产物只有 `+ - * /`、比较和转换，**没有 `roundsd` 一类可替换目标**；AVX2 三操作数在 `gen_opf` 里因 `dst == src1` 而等价。**真正能吃下分级红利的是 SIMD 向量化**，而那需要"数组上独立迭代的循环"进 JIT —— 现在只有 `Uint8Array` 那条窄路径。所以顺序上它排在寄存器改造之后，和 `<38>`/`<44>` 是**两条独立的线**（后端 vs 生成器）。
+
+
 
 
