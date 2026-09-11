@@ -57,6 +57,14 @@ int JS_WhaleOpSize(int op);   /* bytecode operand size, from the interpreter tab
 void JS_WhaleObjSlot(JSContext *ctx, int k, JSValue v);   /* park object in slot k */
 JSValue JS_WhaleObjGet(JSContext *ctx, int k);            /* read it back */
 
+/* Typed-array support. The generated code has no JSValue domain, so an array
+   travels as an object slot number - a compile-time constant - and these do the
+   object work. Each returns 0 to mean "deopt", and none may raise. */
+int JS_WhaleGetGlobalAny(JSContext *ctx, int atom, int slot, double *num);
+int JS_WhaleNewU8Array(JSContext *ctx, int ctor_slot, double n, int out_slot);
+int JS_WhaleTAU8Get(JSContext *ctx, int slot, double idx, double *out);
+int JS_WhaleTAU8Set(JSContext *ctx, int slot, double idx, double v);
+
 /* Test hook: force a GC, then report the .length of whatever is in slot k, or -1
    if the slot does not hold an object. It exists to prove the slots survive a
    collection, which is otherwise unobservable from JS. */

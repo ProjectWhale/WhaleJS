@@ -3188,6 +3188,26 @@ static int whale_is_global_u8ctor(JSContext *ctx, JSValueConst v)
     return same;
 }
 
+/* Compile-time form: does global `atom` name the Uint8Array constructor?
+
+   This is what lets the choice of held type be a property of the stack slot at
+   generation time rather than a runtime branch. The generator runs inside the
+   engine's context, and the global's identity is fixed before the function is
+   ever called (a program cannot swap out Uint8Array between two calls of the
+   same bytecode and expect a different bytecode), so answering here is sound -
+   the generated code stays a single path. */
+int JS_WhaleGlobalIsU8Ctor(JSContext *ctx, int atom)
+{
+    JSValue v = JS_GetGlobalVar(ctx, (JSAtom)atom, false);
+    int r;
+
+    if (JS_IsException(v))
+        return 0;
+    r = whale_is_global_u8ctor(ctx, v);
+    JS_FreeValue(ctx, v);
+    return r;
+}
+
 /* `new Uint8Array(n)` against the constructor parked in ctor_slot, putting the
    result in out_slot. Anything but the global Uint8Array with an in-range
    numeric length deopts. Construction goes through the real constructor, so the

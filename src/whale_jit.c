@@ -1909,6 +1909,11 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
         tcc_add_symbol(s, "JS_WhaleObjGet", (void *)JS_WhaleObjGet);
         tcc_add_symbol(s, "JS_WhaleObjProbe", (void *)JS_WhaleObjProbe);
         tcc_add_symbol(s, "JS_WhaleObjProbeFrom", (void *)JS_WhaleObjProbeFrom);
+        /* typed arrays: the array travels as an object slot number */
+        tcc_add_symbol(s, "JS_WhaleGetGlobalAny", (void *)JS_WhaleGetGlobalAny);
+        tcc_add_symbol(s, "JS_WhaleNewU8Array", (void *)JS_WhaleNewU8Array);
+        tcc_add_symbol(s, "JS_WhaleTAU8Get", (void *)JS_WhaleTAU8Get);
+        tcc_add_symbol(s, "JS_WhaleTAU8Set", (void *)JS_WhaleTAU8Set);
         whale_jit_state = s;
     }
     s = whale_jit_state;
