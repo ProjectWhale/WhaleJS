@@ -181,3 +181,37 @@ L32: return ((L0 + L1) + L2);
 **`array` 属于同一族**（数组特化 + 长度缓存），但 `scan(a)` 的 `a` 是**参数**、形状不可静态确定，比 `object` 难。
 
 **建议顺序**：`object` → `array`。两者都远比"减少语句数"实在（那是 14× 和 10× 的缺口，而语句数方向已经被证明要靠引用分析才能再动）。
+## `object` 特化的设计（API 已探明，待实现）
+
+**接口用 shape 指针做内联缓存的键**，因为"属性值指针"只有在形状不变时才有效，而形状只在增删属性时变 —— 固定字段的循环每轮都相等。
+
+**引擎侧（第一段已落地，无调用者）**：
+- `JS_WhaleObjNew(ctx, slot)` —— `JS_NewObject` 后存进对象槽（`JS_WhaleObjSlot`，会接管引用）
+- `JS_WhaleObjShape(ctx, slot)` —— 返回 `JS_VALUE_GET_OBJ(o)->shape`，不透明键
+- `JS_WhaleObjFieldPtr(ctx, slot, atom, &shape)` —— 返回 `&pr->u.value`
+
+**QuickJS 内部用法的准确形态**（照着 `quickjs.c:8774` 的既有写法）：
+```c
+prs = find_own_property(&pr, p, atom);        /* 7491 处定义，static */
+if (!prs) return NULL;
+if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL) return NULL;   /* 访问器 */
+val = pr->u.value;
+```
+- 属性数组是 **`p->prop`**（`JSProperty *`，`quickjs.c:1163`），`find_own_property` 会一并给出下标正确的 `JSProperty *`
+- 形状是 **`p->shape`**；`JS_PROP_NORMAL` 是 `(0 << 4)`（`quickjs.h:415`）
+- `JSProperty` 的第一个成员就是 `JSValue value`，所以 `&pr->u.value` 可以直接给生成的代码解引用
+
+**数值域**：`JS_TAG_INT = 0`、`JS_TAG_FLOAT64 = 8`（**不是 NaN-boxing**），所以内联读是
+```c
+(fp->tag == 0) ? (double)fp->u.int32 : (fp->tag == 8) ? fp->u.float64 : <deopt>
+```
+写则是 `fp->tag = 8; fp->u.float64 = v;`。**任何别的 tag 都 deopt**，不要试图内联。
+
+**生成器侧（待做）**：
+- `OP_object`（`1,0,1,none`）—— 分配对象槽、发 `if (!JS_WhaleObjNew(ctx, S)) { *deopt = 1; return 0; }`，值就是槽号（同 `OP_get_var` 的 OBJ 分支，**不物化**）
+- `OP_define_field`（`5,2,1,atom`）/`OP_put_field`（`5,2,0,atom`）—— 栈上是 `[obj, value]`；**初始化那几个 `define_field` 只调用一次，用 helper 即可**（`JS_DefinePropertyValue`）
+- `OP_get_field`（`5,1,1,atom`）/`OP_get_field2`（`5,1,2,atom`）—— **必须在循环里内联**：为每个访问点声明一组 `_fpK`/`_fsK`，先比 shape，再直接读写
+- atom 用 `whale_get_u32(pc + pos + 1)` 取，**编译期就到手了**，正好当缓存键
+- 别忘了 `whale_load_analyze`/`whale_op_size_of` 那两处（`5` 字节）
+
+**顺序**：先 `object`，通了再照同一套做 `array`（`array_from`/`get_length`，但 `scan(a)` 的数组是参数、形状不可静态确定，更难）。

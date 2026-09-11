@@ -7490,6 +7490,65 @@ static inline JSShapeProperty *find_own_property(JSProperty **ppr,
     return NULL;
 }
 
+/* ---- WhaleJS: plain-object property access for the JIT --------------------
+ *
+ * An object literal the generator can see has a shape that does not change
+ * while a loop runs over its fields, so resolving a property once and caching
+ * the shape it was resolved against turns every later access into a pointer
+ * comparison plus a load - which is the only way this can beat the interpreter.
+ * A helper call per access is slower than the interpreter, as the typed-array
+ * work showed (18x slower before it was inlined).
+ */
+
+/* A fresh `{}` parked in object slot `slot`. The JIT only reaches this for a
+   local object literal, so nothing else shares the shape it ends up with. */
+int JS_WhaleObjNew(JSContext *ctx, int slot)
+{
+    JSValue o = JS_NewObject(ctx);
+
+    if (JS_IsException(o))
+        return 0;
+    JS_WhaleObjSlot(ctx, slot, o);
+    return 1;
+}
+
+/* The object's shape, as an opaque key for generated code to compare against
+   the one it cached. */
+void *JS_WhaleObjShape(JSContext *ctx, int slot)
+{
+    JSValue o = whale_frame_obj_slots(ctx)[slot];
+
+    if (JS_VALUE_GET_TAG(o) != JS_TAG_OBJECT)
+        return NULL;
+    return JS_VALUE_GET_OBJ(o)->shape;
+}
+
+/* Address of the value of property `atom` on the object in `slot`, or NULL to
+   deopt. It also hands back the shape the answer belongs to, which is what
+   makes the returned pointer safe to keep: a shape only changes when a
+   property is added or removed, so a loop over fixed fields compares equal
+   every iteration. */
+JSValue *JS_WhaleObjFieldPtr(JSContext *ctx, int slot, int atom, void **shape_io)
+{
+    JSValue o = whale_frame_obj_slots(ctx)[slot];
+    JSObject *p;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+
+    if (JS_VALUE_GET_TAG(o) != JS_TAG_OBJECT)
+        return NULL;
+    p = JS_VALUE_GET_OBJ(o);
+    if (p->class_id != JS_CLASS_OBJECT)
+        return NULL;                    /* arrays and the rest are other shapes */
+    *shape_io = p->shape;
+    prs = find_own_property(&pr, p, atom);
+    if (!prs)
+        return NULL;
+    if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+        return NULL;                    /* an accessor would have side effects */
+    return &pr->u.value;
+}
+
 /* Release a counted reference an open var_ref held on the coroutine
    (async function / generator / async generator) owning the frame it
    points into. */

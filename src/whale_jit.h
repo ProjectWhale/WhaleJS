@@ -70,6 +70,14 @@ int JS_WhaleTAU8Set(JSContext *ctx, int slot, double idx, double v);
    element. NULL means deopt. */
 uint8_t *JS_WhaleTAU8Ptr(JSContext *ctx, int slot, double *len_out);
 
+/* Plain-object fields, for the JIT's object-literal path. `JS_WhaleObjShape`
+   gives an opaque key the generated code caches; `JS_WhaleObjFieldPtr` resolves
+   a property against it and returns the address of its value, or NULL to deopt
+   (wrong shape, missing property, or an accessor). */
+int JS_WhaleObjNew(JSContext *ctx, int slot);
+void *JS_WhaleObjShape(JSContext *ctx, int slot);
+JSValue *JS_WhaleObjFieldPtr(JSContext *ctx, int slot, int atom, void **shape_io);
+
 /* Compile-time only - never called by generated code. Does global `atom` name
    the Uint8Array constructor? Asking while emitting is what keeps each stack
    slot's held type a single compile-time fact. */
