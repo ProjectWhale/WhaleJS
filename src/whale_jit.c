@@ -256,6 +256,20 @@ enum {
     WLD_REAL = 3,  /* floating constant in cval */
 };
 
+/* A token range in the folding workspace that produces one value. */
+typedef struct { int off, len; } WhaleVExpr;
+
+/* A local can be deferred like a stack slot (see the deferred-locals note next
+   to the helpers). Declared here because whale_load_analyze() below has to know
+   whether a local currently holds a pending expression rather than a value. */
+typedef struct WhaleLocal {
+    WhaleVExpr expr;
+    uint8_t    live;    /* 1 = pending expression, 0 = read the variable */
+    uint8_t    used;    /* the pending expression has been inlined once */
+} WhaleLocal;
+
+static WhaleLocal *whale_lmem;
+
 /* Decide what this load means. Returns 0 if it is not a simple load. */
 static int whale_load_analyze(const JSWhaleFuncInfo *info, const uint8_t *pc, int pos, const uint8_t *cur,
                               int var_count, const uint8_t *lo_c, const double *lo_cv,
@@ -303,6 +317,11 @@ static int whale_load_analyze(const JSWhaleFuncInfo *info, const uint8_t *pc, in
             int tt = (idx >= 0 && idx < var_count) ? cur[idx] : WHALE_T_UNKNOWN;
 
             if (tt == WHALE_T_UNKNOWN)
+                return 0;
+            /* A local whose value is still a pending expression must not be
+               read as `L<idx>` here - that would be the stale value. Refuse, so
+               the switch path goes through local_inline() instead. */
+            if (idx >= 0 && idx < var_count && whale_lmem && whale_lmem[idx].live)
                 return 0;
             *type_out = tt;
             /* constant propagation: a local written exactly once with a
@@ -450,10 +469,20 @@ typedef struct WhaleLoop {
 static WhaleLoop whale_loops[WHALE_LOOP_MAX];
 static int whale_loop_depth;
 
-typedef struct { int off, len; } WhaleVExpr;
-
 static WhaleVExpr *whale_vexpr;   /* the pending expression of each stack slot */
-static uint8_t    *whale_vmat;    /* 1 = already forced into `v<n>` */
+static uint8_t    *whale_vmat;    /* 1 = already forced into a variable */
+
+/* Which C variable a stack slot currently lives in.
+   
+   TinyCC has no register allocator, so a folded expression is spilled into a
+   named double. That name must not be reused once anything has inlined it: a
+   pending expression records the name as a token, so rewriting the variable
+   afterwards would change the value the pending expression reads. Each
+   materialisation therefore takes a fresh name, and `v<k>` is only ever the
+   *first* one. References go through whale_vname[k]. */
+#define WHALE_VSER_MAX 64
+static int whale_vname[WHALE_JIT_MAX_SLOTS];  /* slot -> name number */
+static int whale_vserial;                     /* next unused name number */
 
 /* Everything encoded from now on goes into the workspace. */
 static void fold_begin(void)
@@ -465,6 +494,9 @@ static void fold_begin(void)
     whale_out_tok = go_tok;
     whale_out_num = go_num;
     whale_out_len = &go_len;
+    /* fresh name space for this function's materialised slots */
+    whale_vserial = 0;
+    memset(whale_vname, 0, sizeof(whale_vname));
 }
 
 static int fold_mark(void)
@@ -489,24 +521,29 @@ static void fold_set(int k, int mark)
         fold_materialize(k);
 }
 
-/* Append the value of slot k to what is being built right now. */
-static void fold_inline(int k)
+/* Append an expression range to what is being built right now.
+
+   Always parenthesised: a folded value can be a comparison or a `?:`, and
+   precedence then matters - `if (x < y ? 1 : 0 == 0)` parses as
+   `x < y ? 1 : (0 == 0)`, i.e. always true, so the loop never runs. */
+static void fold_inline_expr(const WhaleVExpr *e)
 {
     int i;
 
+    wt('(');
+    for (i = 0; i < e->len; i++)
+        JS_WhaleTokPush(gw_tok[e->off + i], gw_num[e->off + i]);
+    wt(')');
+}
+
+/* Append the value of slot k to what is being built right now. */
+static void fold_inline(int k)
+{
     if (whale_vmat[k]) {
-        wt_slot("v", k);            /* already a real variable */
+        wt_slot("v", whale_vname[k]);   /* already a real variable */
         return;
     }
-    /* Always parenthesise. A folded value can be a comparison or a `?:`
-       expression, and precedence then matters: `if (x < y ? 1 : 0 == 0)` parses
-       as `x < y ? 1 : (0 == 0)`, i.e. always true, so the loop never runs.
-       Wrapping is cheap and keeps every use site correct. */
-    wt('(');
-    for (i = 0; i < whale_vexpr[k].len; i++)
-        JS_WhaleTokPush(gw_tok[whale_vexpr[k].off + i],
-                        gw_num[whale_vexpr[k].off + i]);
-    wt(')');
+    fold_inline_expr(&whale_vexpr[k]);
 }
 
 /* Emit ToInt32 of slot k. The helper is only needed for the modulo-2^32 wrap:
@@ -636,12 +673,97 @@ static void fold_materialize(int k)
 
     if (whale_vmat[k])
         return;
+    /* Take a fresh name: whatever inlined this slot beforehand recorded the old
+       name as a token, and rewriting that variable would silently change those
+       references. The prologue declares stack_size + WHALE_VSER_MAX variables,
+       so this cannot run out for any function seen so far. */
+    whale_vname[k] = whale_vserial++;
     mark = fold_mark();
-    wt_slot("v", k); wt('=');
+    wt_slot("v", whale_vname[k]); wt('=');
     fold_inline(k);
     wt(';');
     fold_commit(mark);
     whale_vmat[k] = 1;
+}
+
+/* ---- deferred locals -----------------------------------------------------
+ * A write to a local inside a basic block does not have to become a store right
+ * away. If the value is read once in the same block, keeping it in the
+ * expression chain removes a store/load pair; statement count is what dominates
+ * here, because TinyCC spills at every statement boundary. The second read, or
+ * the end of the block, materialises it into the real variable.
+ */
+
+/* Turn the pending expression of local d into a real store. */
+static void local_materialize(int d)
+{
+    WhaleLocal *m = &whale_lmem[d];
+    int mark;
+
+    if (!m->live)
+        return;
+    if (getenv("WHALE_MEM_TRACE"))
+        fprintf(stderr, "[mat] L%d off=%d len=%d\n", d, m->expr.off, m->expr.len);
+    mark = fold_mark();
+    wt_slot("L", d); wt('=');
+    fold_inline_expr(&m->expr);
+    wt(';');
+    fold_commit(mark);
+    m->live = 0;
+    m->used = 0;
+}
+
+/* Emit the value of local d: the pending expression if there is one, else the
+   variable.
+
+   Always inlines, even on a repeat read. Materialising here would be wrong when
+   it happens in the middle of building another expression: the store would be
+   emitted before the expression that consumes it, turning `a + b` into `a; b`.
+   Duplicating the expression is safe because it is pure, and the length ceiling
+   in local_set() keeps the duplication bounded. */
+static void local_inline(int d)
+{
+    if (getenv("WHALE_MEM_TRACE"))
+        fprintf(stderr, "[inl] L%d live=%d\n", d, whale_lmem[d].live);
+    if (!whale_lmem[d].live) {
+        wt_slot("L", d);
+        return;
+    }
+    fold_inline_expr(&whale_lmem[d].expr);
+}
+
+/* Forget any pending expression for d, without emitting it. Used when every
+   live local has to be written out (a basic-block boundary). */
+static void local_forget(int d)
+{
+    whale_lmem[d].live = 0;
+    whale_lmem[d].used = 0;
+}
+
+/* Record the expression just built in the workspace as the pending value of
+   local d. Falls back to storing it when it grew too long to duplicate. */
+static void local_set(int d, int mark)
+{
+    WhaleLocal *m = &whale_lmem[d];
+
+    m->expr.off = mark;
+    m->expr.len = JS_WhaleTokSinkLen() - mark;
+    m->live = 1;
+    m->used = 0;
+    if (getenv("WHALE_MEM_TRACE"))
+        fprintf(stderr, "[set] L%d off=%d len=%d\n", d, m->expr.off, m->expr.len);
+    if (m->expr.len > WHALE_EXPR_MAX)
+        local_materialize(d);
+}
+
+/* Materialise every deferred local. Called at a basic-block boundary, where the
+   values have to be readable from the variables again. */
+static void local_flush_all(int n)
+{
+    int d;
+
+    for (d = 0; d < n; d++)
+        local_materialize(d);
 }
 
 /* Generate + type-check in one pass. Returns 0 when the function is not a
@@ -688,9 +810,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     assign_cnt = calloc(var_count > 0 ? var_count : 1, sizeof(uint16_t));
     whale_vexpr = calloc(stack_size, sizeof(WhaleVExpr));
     whale_vmat = calloc(1, stack_size);
+    whale_lmem = calloc(var_count > 0 ? var_count : 1, sizeof(WhaleLocal));
     loop_back = malloc((len + 1) * sizeof(*loop_back));
     if (!targets || !seen || !snap || !cur || !args_used || !assign_cnt ||
-        !whale_vexpr || !whale_vmat || !loop_back)
+        !whale_vexpr || !whale_vmat || !whale_lmem || !loop_back)
         goto out;
     for (i = 0; i <= len; i++)
         loop_back[i] = -1;
@@ -809,7 +932,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     for (i = 0; i < var_count; i++) {
         wk(JS_WK_DOUBLE); wt_slot("L", i); wt('='); wt_int(0); wt(';');
     }
-    for (i = 0; i < stack_size; i++) {
+    /* stack_size vars for the slots themselves plus WHALE_VSER_MAX spare names
+       for the fresh names fold_materialize() hands out (see whale_vname) */
+    for (i = 0; i < stack_size + WHALE_VSER_MAX; i++) {
         wk(JS_WK_DOUBLE); wt_slot("v", i); wt('='); wt_int(0); wt(';');
     }
     for (i = 0; i < arg_count; i++) {
@@ -843,6 +968,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         }
         if (targets[pos])
             unreachable = 0;
+
+        /* A basic-block boundary: the value of every deferred local has to be in
+           its variable again, because the code that reaches this point may not
+           be the code that set the pending expression. */
+        if (targets[pos])
+            local_flush_all(var_count);
 
         cur[state_len - 1] = (uint8_t)sp;
         if (targets[pos]) {
@@ -958,6 +1089,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         int fm = fold_mark();
 
                         if (dst >= 0) {
+                            /* the variable is written here, so any pending
+                               expression for it must be dropped first */
+                            local_forget(dst);
                             wt_slot("L", dst); wt('=');
                             if (id_keep == 0) whale_load_emit(k1, i1, cv1);
                             else whale_load_emit(k2, i2, cv2);
@@ -980,6 +1114,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     if (dst >= 0) {
                         int fm = fold_mark();
 
+                        local_forget(dst);
                         wt_slot("L", dst); wt('='); wt('('); whale_load_emit(k1, i1, cv1); wt_op(opid); whale_load_emit(k2, i2, cv2); wt(')'); wt('?'); wt_int(1); wt(':'); wt_int(0); wt(';');
                         fold_commit(fm);
                         cur[dst] = WHALE_T_BOOL;
@@ -995,6 +1130,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     if (dst >= 0) {
                         int fm = fold_mark();
 
+                        local_forget(dst);
                         wt_slot("L", dst); wt('='); whale_load_emit(k1, i1, cv1); wt_op(opid); whale_load_emit(k2, i2, cv2); wt(';');
                         fold_commit(fm);
                         cur[dst] = WHALE_T_NUM;
@@ -1036,6 +1172,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 if (!(k1 == WLD_SLOT && i1 == d2)) {
                     int fm = fold_mark();
 
+                    local_forget(d2);
                     wt_slot("L", d2); wt('='); whale_load_emit(k1, i1, cv1); wt(';');
                     fold_commit(fm);
                 }
@@ -1050,6 +1187,17 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 continue;
             }
         }
+
+        /* Control flow is about to leave this position, and a pending local
+           expression is not yet stored anywhere at run time: it would only be
+           written where the value is next read, which the jump skips over. So
+           every deferred local has to be in its variable before the jump. This
+           is what a loop back edge needs - without it the loop counter is never
+           updated and the loop does not terminate. */
+        if (op == OP_goto || op == OP_goto8 || op == OP_goto16 ||
+            op == OP_if_false || op == OP_if_false8 ||
+            op == OP_if_true || op == OP_if_true8)
+            local_flush_all(var_count);
 
         switch (op) {
         case OP_push_minus1:
@@ -1151,7 +1299,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 {
                     int fm = fold_mark();
 
-                    wt_slot("L", idx);
+                    local_inline(idx);
                     fold_set(sp, fm);
                 }
                 cur[var_count + sp] = (uint8_t)t;
@@ -1170,9 +1318,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 t = cur[var_count + sp - 1];
                 if (t == WHALE_T_UNKNOWN || idx < 0 || idx >= var_count)
                     goto out;
+                /* Defer the store: the value stays an expression until it is
+                   read, or until the basic block ends. */
+                local_forget(idx);
                 fm = fold_mark();
-                wt_slot("L", idx); wt('='); fold_inline(sp - 1); wt(';');
-                fold_commit(fm);
+                fold_inline(sp - 1);
+                local_set(idx, fm);
                 cur[idx] = (uint8_t)t;
                 lo_c[idx] = 0;
                 sp--;
@@ -1192,9 +1343,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 t = cur[var_count + sp - 1];
                 if (t == WHALE_T_UNKNOWN || idx < 0 || idx >= var_count)
                     goto out;
+                local_forget(idx);
                 fm = fold_mark();
-                wt_slot("L", idx); wt('='); fold_inline(sp - 1); wt(';');
-                fold_commit(fm);
+                fold_inline(sp - 1);
+                local_set(idx, fm);
                 cur[idx] = (uint8_t)t;
                 lo_c[idx] = 0;
                 /* sp unchanged */
@@ -1212,9 +1364,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     goto out;
                 if (!whale_type_is_num(cur[idx]) || !whale_type_is_num(t))
                     goto out;
+                /* Folds to one expression as well. The left operand is the
+                   current value, which may itself still be pending, so that is
+                   written out first - before the new range is marked. */
+                local_materialize(idx);
                 fm = fold_mark();
-                wt_slot("L", idx); wt('='); wt_slot("L", idx); wt('+'); fold_inline(sp - 1); wt(';');
-                fold_commit(fm);
+                wt_slot("L", idx); wt('+'); fold_inline(sp - 1);
+                local_set(idx, fm);
                 cur[idx] = WHALE_T_NUM;
                 lo_c[idx] = 0;
                 sp--;
@@ -1226,10 +1382,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             {
                 int fm = fold_mark();
 
-                wt_slot("L", 0);
+                local_inline(0);
                 fold_set(sp, fm);
                 fm = fold_mark();
-                wt_slot("L", 1);
+                local_inline(1);
                 fold_set(sp + 1, fm);
             }
             cur[var_count + sp] = cur[0];
@@ -1285,13 +1441,17 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                    than the arguments, so the engine must not memoise this
                    function. */
                 whale_gen_pure = 0;
-                wk(JS_WK_IF); wt('('); wt('!');
-                wt_id("JS_WhaleGetGlobalNum"); wt('('); wt_id("ctx"); wt(','); wt_int(atom); wt(','); wt('&'); wt_slot("v", sp); wt(')');
-                wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
-                fold_commit(fm);
-                /* the helper wrote straight into the slot, so it is a real
-                   variable now rather than a folded expression */
-                whale_vmat[sp] = 1;
+                {
+                    int nm = whale_vserial++;   /* fresh name, never reused */
+                    wk(JS_WK_IF); wt('('); wt('!');
+                    wt_id("JS_WhaleGetGlobalNum"); wt('('); wt_id("ctx"); wt(','); wt_int(atom); wt(','); wt('&'); wt_slot("v", nm); wt(')');
+                    wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    fold_commit(fm);
+                    /* the helper wrote straight into the slot, so it is a real
+                       variable now rather than a folded expression */
+                    whale_vname[sp] = nm;
+                    whale_vmat[sp] = 1;
+                }
                 cur[var_count + sp] = WHALE_T_NUM;
                 sp++;
             }
@@ -1319,14 +1479,18 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleCheckStack"); wt('('); wt_id("ctx"); wt(')'); wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
                 wt_id("_r"); wt('='); wt_id(whale_core_name); wt('('); wt_id("ctx"); wt(','); wt_id("args"); wt(','); wt_id("_an"); wt(','); wt('&'); wt_id("_dd"); wt(')'); wt(';');
                 wk(JS_WK_IF); wt('('); wt_id("_dd"); wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
-                wt_slot("v", func_slot); wt('='); wt_id("_r"); wt(';'); wt('}');
-                fold_commit(fm);
-                /* The result is in v<func_slot> now, which is a real variable.
-                   Marking it materialised is what makes later uses refer to it:
-                   without this the slot still held the expression of some
-                   earlier value (a call argument, say) and would be inlined as
-                   that instead of as the call result. */
-                whale_vmat[func_slot] = 1;
+                {
+                    int nm = whale_vserial++;   /* fresh name, never reused */
+                    wt_slot("v", nm); wt('='); wt_id("_r"); wt(';'); wt('}');
+                    fold_commit(fm);
+                    /* The result is in that variable now. Marking it
+                       materialised is what makes later uses refer to it: without
+                       this the slot still held the expression of some earlier
+                       value (a call argument, say) and would be inlined as that
+                       instead of as the call result. */
+                    whale_vname[func_slot] = nm;
+                    whale_vmat[func_slot] = 1;
+                }
                 cur[var_count + func_slot] = WHALE_T_NUM;
                 sp = func_slot + 1;
             }
@@ -1478,9 +1642,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                 if (idx < 0 || idx >= var_count || !whale_type_is_num(cur[idx]))
                     goto out;
+                /* `L++` folds like add_loc: the current value may still be a
+                   pending expression, so it is written out first. */
+                local_materialize(idx);
                 fm = fold_mark();
-                wt_slot("L", idx); wt('='); wt_slot("L", idx); wt('+'); wt_int(1); wt(';');
-                fold_commit(fm);
+                wt_slot("L", idx); wt('+'); wt_int(1);
+                local_set(idx, fm);
                 cur[idx] = WHALE_T_NUM;
                 lo_c[idx] = 0;
             }
@@ -1637,8 +1804,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         free(whale_vexpr);
     if (whale_vmat)
         free(whale_vmat);
+    if (whale_lmem)
+        free(whale_lmem);
     whale_vexpr = NULL;
     whale_vmat = NULL;
+    whale_lmem = NULL;
     return ret;
 }
 
