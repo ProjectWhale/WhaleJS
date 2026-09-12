@@ -249,3 +249,44 @@ v0 = (_fp0->tag == 8) ? _fp0->u.float64 : (_fp0->tag == 0) ? (double)_fp0->u.int
 2. `_fp` 必须声明成 **`JSValue *`**，不能是 `void *`（内联读要 `->tag`）。
 3. **`v<n>` 在 prologue 已经声明过**，赋值不能写成 `double v<n> = ...`，否则 `redeclaration`。
 4. 替换代码块时 `old` 要覆盖**整个**要删的片段 —— 我少覆盖了三行，残留的 `JS_WhaleObjShape(...)` 生成了 `if (!_fs0) { JS_WhaleObjShape(ctx,0)) {`。
+## 前端框架方向：优化清单（用户要求列出，待实现）
+
+引擎可能用来跑前端框架，按**对框架的杠杆**排序。前三条是本方向的支柱。
+
+### 1. 小函数内联（最大杠杆）
+框架一次渲染会调用上千个小函数（组件的 `render`、`computed` 的求值、`createVNode`）。**每次调用都要建帧、装箱参数、查 memo、可能 deopt**。对"已知的、小的、无副作用的"被调者做内联，收益同时来自三处：省掉调用开销、让常量传播跨过函数边界、让死代码消除看见更多。这是清单里唯一"一条改动通吃所有框架场景"的项。
+
+### 2. Proxy 动态补丁穿透（框架核心）
+Vue 3 的响应式就是 `new Proxy(target, { get, set })` —— **每次属性访问都进 JS 陷阱**，那是它的主要开销。可行的做法是识别"单调陷阱"（`get` 只做 `track` + `Reflect.get`，`set` 只做 `trigger` + `Reflect.set`），把它特化成"直接访问 target + 内联 track/trigger"。**风险最高**（要推断用户代码语义），但收益最大，且和已经做好的 `get_field`/`put_field` 内联缓存是同一套机制 —— **target 的属性访问可以复用 `JS_WhaleObjFieldPtr` 那条路**。
+
+### 3. 参数类型特化（按签名分版本）
+`scan(a)` 这类"数组/对象作为参数"的通用函数现在整函数进不了 JIT —— 形状不可静态确定。按**调用点签名**分别编译几份（用户早前提过的 C++ template 式做法），每份按"这个参数是 packed array / 这个形状的对象"特化。**它同时解决 `array.js` 的 `scan` 和框架里绝大多数工具函数**（`patch`/`diff`/`normalize`）。
+
+### 4. `Array.prototype` 方法内联
+`map`/`filter`/`forEach`/`reduce`/`push`/`slice` 在框架里每帧调上千次。识别"packed array + 内置方法 + 单态回调"后，内联成循环（回调内联见第 1 条）。
+
+### 5. 循环不变量外提（LICM）—— 已有基础设施
+`loop_begin`/`loop_end` **已经能把整个循环体缓冲下来**（当初就是为此建的，至今没用）。框架的渲染循环里大量不变式（`list.length`、`props.x`、常量对象），每条外提一次就省一整轮。**这是清单里最容易摘的果子**，因为地基已经在了。
+
+### 6. 多态内联缓存（PIC）
+同一个函数被不同形状的对象调用时现在会 deopt。2–4 种形状各留一份缓存（`_fs`/`_fp` 再加一组），能覆盖框架里"同一 patch 函数处理几种 vnode 类型"的常见形态。
+
+### 7. 字符串拼接
+模板渲染大量 `a + b + c`。现在字符串上的 `+` 直接 deopt。可行的是识别"拼接链"并走一个 append-only 缓冲（Rust 式 `String`），而不是每步新建字符串。
+
+### 8. `Object.keys` / `for...in`
+框架遍历 props/slots。对**我们能证明形状固定**的对象（第 4 步那个判据已经能用）可以直接生成枚举。
+
+### 9. 闭包变量访问
+`get_var_ref` 现在只接受"闭包槽就是本函数自己"（自递归）。框架的响应式函数大量捕获外层变量 —— 放开到"闭包槽来自本函数可见的局部"会显著扩大覆盖。
+
+### 10. 循环交换 / 嵌套循环扁平化 + SIMD（用户点名）
+改善 CPU 缓存。**但它们的前提是数组访问进 JIT** —— 刚刚打好的 `_ap`/`_an` 缓存 + `get_array_el` 内联正是那个前提。做 2D 遍历（框架里 `matrix`/`table`、虚拟滚动的分块计算）时才划算，**顺序上排在 1–3 之后**：没有参数特化和内联，这些循环根本进不了 JIT。
+
+## `array` 的当前进展（未生效，但地基就绪）
+
+生成器侧已完成：`WHALE_T_ARR` 类型 + `WHALE_ARR_T`/`WHALE_IS_ARR` 宏、`array_from`（只支持空字面量 `[]`）、`get_length`、`get_array_el` 的 packed-array 内联读（元素也是 `JSValue`，同样 `tag == 8/0` 两分支 + 冷 deopt）、`put_array_el`（走 `JS_WhaleArrSetNum`，写后清 `_ai` 标志，因为扩容会移动 backing store）。引擎侧：`JS_WhaleArrPtr`（`fast_array` + `class_id` 检查）、`JS_WhaleArrNew`、`JS_WhaleArrSetNum`（追加走 `add_fast_array_element`，注意它成功接管值、失败时自己释放）。
+
+**但它现在没有收益**，`array.js` 的两个函数仍各自 bail：
+- `build(n)` 卡在 `return a` —— 返回数组需要让 `OP_return` 走一条"从对象槽取出引用"的路（`JS_WhaleObjGet` 已有），我加过一版但生成的 C 报 `identifier expected`，**已回退**（宁可干净地不支持，也不要生成有问题的代码）。下次从 dump 里那处 `return JS_WhaleObjGet(ctx, 0);` 入手查。
+- `scan(a)` 卡在 `get_length` —— 它的数组是**参数**，需要上面的第 3 步（参数类型特化）。

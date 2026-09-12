@@ -1551,6 +1551,8 @@ static JSValue js_create_array(JSContext *ctx, int len, JSValueConst *tab);
 static bool js_get_fast_array(JSContext *ctx, JSValue obj,
                               JSValue **arrpp, uint32_t *countp);
 static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len);
+static int add_fast_array_element(JSContext *ctx, JSObject *p,
+                                  JSValue val, int flags);
 static JSValue JS_CreateAsyncFromSyncIterator(JSContext *ctx,
                                               JSValue sync_iter);
 static void js_c_function_data_finalizer(JSRuntime *rt, JSValueConst val);
@@ -7572,6 +7574,76 @@ double JS_WhaleObjValueNum(JSContext *ctx, JSValue *v, int *deopt)
     (void)v;
     *deopt = 1;
     return 0;
+}
+
+/* ---- WhaleJS: packed-array access for the JIT ------------------------------
+ *
+ * Front-end code is full of `for (i = 0; i < n; i++) a[i] = ...` and the
+ * matching scan, so packed arrays are worth specialising the same way object
+ * literals were. The elements are JSValue, so the value itself is read inline
+ * (see the object path for the tag handling) and only the structural parts -
+ * getting the backing store, appending - need the engine.
+ */
+
+/* The backing store of a packed array in `slot`, plus its element count. NULL
+   means deopt: not the object we think, or not a packed array. A typed array
+   takes its own path; a sparse or exotic one is not something to index blind. */
+JSValue *JS_WhaleArrPtr(JSContext *ctx, int slot, double *len_out)
+{
+    JSValue a = whale_frame_obj_slots(ctx)[slot];
+    JSObject *p;
+
+    if (JS_VALUE_GET_TAG(a) != JS_TAG_OBJECT)
+        return NULL;
+    p = JS_VALUE_GET_OBJ(a);
+    if (!p->fast_array || p->class_id != JS_CLASS_ARRAY)
+        return NULL;
+    *len_out = (double)p->u.array.count;
+    return p->u.array.u.values;
+}
+
+/* A fresh empty array in `slot`, for `[]`. */
+int JS_WhaleArrNew(JSContext *ctx, int slot)
+{
+    JSValue a = JS_NewArray(ctx);
+
+    if (JS_IsException(a))
+        return 0;
+    JS_WhaleObjSlot(ctx, slot, a);
+    return 1;
+}
+
+/* arr[idx] = v. The append case is done here because it is the shape front-end
+   code actually writes; anything else (a hole, a shrink) goes through the
+   general property path. add_fast_array_element() takes over the value on
+   success and frees it itself on failure, so it must not be freed again. */
+int JS_WhaleArrSetNum(JSContext *ctx, int slot, double idx, double v)
+{
+    JSValue a = whale_frame_obj_slots(ctx)[slot];
+    JSObject *p;
+    uint32_t i;
+
+    if (JS_VALUE_GET_TAG(a) != JS_TAG_OBJECT)
+        return 0;
+    if (!(idx >= 0 && idx <= 4294967294.0))
+        return 0;
+    i = (uint32_t)idx;
+    p = JS_VALUE_GET_OBJ(a);
+    if (p->fast_array && p->class_id == JS_CLASS_ARRAY) {
+        if (i == p->u.array.count)
+            return add_fast_array_element(ctx, p, JS_NewFloat64(ctx, v),
+                                          JS_PROP_C_W_E) > 0;
+        if (i < p->u.array.count) {
+            JS_FreeValue(ctx, p->u.array.u.values[i]);
+            p->u.array.u.values[i] = JS_NewFloat64(ctx, v);
+            return 1;
+        }
+    }
+    /* anything else: the general path, which grows the array properly.
+       JS_SetPropertyInt64 takes over the value either way. */
+    if (JS_SetPropertyInt64(ctx, a, (int64_t)i, JS_NewFloat64(ctx, v)) < 0)
+        return 0;
+    return 1;
 }
 /* The numeric value of property `atom` on the object in `slot`, remembering
    both the shape and the resolved value pointer in the caller's cache. The

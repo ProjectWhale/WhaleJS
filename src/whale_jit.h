@@ -87,6 +87,11 @@ int JS_WhaleObjDefineNum(JSContext *ctx, int slot, int atom, double v);
 /* The cold branch of an inlined property read: sets *deopt and returns 0 when
    the value is neither an int32 nor a float64. */
 double JS_WhaleObjValueNum(JSContext *ctx, JSValue *v, int *deopt);
+/* Packed-array access: the backing store plus element count (NULL to deopt), a
+   fresh empty array, and a numeric element store that appends. */
+JSValue *JS_WhaleArrPtr(JSContext *ctx, int slot, double *len_out);
+int JS_WhaleArrNew(JSContext *ctx, int slot);
+int JS_WhaleArrSetNum(JSContext *ctx, int slot, double idx, double v);
 
 /* Numeric property access with a shape cache held in the caller: *shape_cache
    and *ptr_cache are two opaque words the generated code declares. Sets *deopt

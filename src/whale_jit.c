@@ -133,6 +133,8 @@ enum {
                          may touch it; anything else deopts. */
     WHALE_T_I32 = 5,  /* a number already known to be an in-range int32, so ToInt32
                          on it is just a cast. Bitwise results always are. */
+    WHALE_T_ARR = 6,  /* a packed array. Its elements are JSValue, so only the
+                         structural parts go through the engine. */
 };
 
 /* The object slot a type carries, packed into the same byte as the type.
@@ -146,6 +148,9 @@ enum {
 #define WHALE_OBJ_T(slot)  ((uint8_t)(WHALE_T_OBJ | (((slot) + 1) << 4)))
 #define WHALE_IS_OBJ(t)    (((t) & 0x0f) == WHALE_T_OBJ)
 #define WHALE_OBJ_SLOT(t)  ((int)((t) >> 4) - 1)
+/* a packed array carries its slot the same way an object does */
+#define WHALE_ARR_T(slot)  ((uint8_t)(WHALE_T_ARR | (((slot) + 1) << 4)))
+#define WHALE_IS_ARR(t)    (((t) & 0x0f) == WHALE_T_ARR)
 
 /* ------------------------------------------------------------------------
  * Token emitters.
@@ -1093,6 +1098,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     wk(JS_WK_EXTERN); wk(JS_WK_DOUBLE); wt_id("JS_WhaleObjValueNum"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wt_id("JSValue"); wt('*'); wt_id("v"); wt(',');
         wk(JS_WK_INT); wt('*'); wt_id("deopt"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_WhaleObjGet"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("k"); wt(')'); wt(';');
     /* object-slot test hook (WHALE_OBJ_TEST). Declared like the rest: without a
        prototype TinyCC applies the C89 implicit declaration, and while the int
        return happens to land correctly in eax here, relying on that is the same
@@ -1138,6 +1145,14 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wk(JS_WK_VOID); wt('*'); wt_slot("_fs", i); wt('='); wt_int(0); wt(';');
         /* JSValue *, not void *: the inlined read dereferences it */
         wt_id("JSValue"); wt('*'); wt_slot("_fp", i); wt('='); wt_int(0); wt(';');
+    }
+    /* Per-object-slot array cache: the backing store, its element count, and a
+       flag. A store can move the backing store (the array grows), which clears
+       the flag, so a store-heavy loop re-resolves and a scan does not. */
+    for (i = 0; i < WHALE_OBJ_SLOTS; i++) {
+        wt_id("JSValue"); wt('*'); wt_slot("_ap", i); wt('='); wt_int(0); wt(';');
+        wk(JS_WK_DOUBLE); wt_slot("_an", i); wt('='); wt_int(0); wt(';');
+        wk(JS_WK_INT); wt_slot("_ai", i); wt('='); wt_int(0); wt(';');
     }
     /* per-object-slot typed-array cache: base pointer, element count, and a flag
        so the pointer is fetched once per run rather than per element */
@@ -1596,6 +1611,51 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int tb = cur[var_count + sp - 1];
                 int os, nm, tk;
 
+                /* A packed array: the elements are JSValue, so the value is read
+                   inline exactly as an object field is. */
+                if (WHALE_IS_ARR(ta)) {
+                    if (!whale_type_is_num(tb))
+                        goto out;
+                    os = WHALE_OBJ_SLOT(ta);
+                    nm = whale_vserial++;      /* result */
+                    tk = whale_vserial++;      /* the index, evaluated once */
+                    {
+                        int fm = fold_mark();
+
+                        /* resolve the backing store once; a scan does not move it */
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_slot("_ai", os); wt(')'); wt('{');
+                        wt_slot("_ap", os); wt('='); wt_id("JS_WhaleArrPtr"); wt('(');
+                        wt_id("ctx"); wt(','); wt_int(os); wt(','); wt('&'); wt_slot("_an", os); wt(')'); wt(';');
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_slot("_ap", os); wt(')'); wt('{');
+                        wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        wt_slot("_ai", os); wt('='); wt_int(1); wt(';');
+                        wt('}');
+                        /* the index, evaluated once and range-checked */
+                        wt_slot("v", tk); wt('='); fold_inline(sp - 1); wt(';');
+                        wk(JS_WK_IF); wt('('); wt_slot("v", tk); wt_op(JS_OP_LT); wt_int(0); wt_op(JS_OP_OR);
+                        wt('('); wt_slot("v", tk); wt_op(JS_OP_GE); wt_slot("_an", os); wt(')'); wt(')');
+                        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        /* int32 or float64 inline; anything else hands off */
+                        wt_slot("v", nm); wt('=');
+                        wt('('); wt_slot("_ap", os); wt('['); wt('('); wk(JS_WK_INT); wt(')'); wt_slot("v", tk); wt(']');
+                        wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(8); wt(')');
+                        wt('?'); wt_slot("_ap", os); wt('['); wt('('); wk(JS_WK_INT); wt(')'); wt_slot("v", tk); wt(']');
+                        wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64");
+                        wt(':'); wt('('); wt_slot("_ap", os); wt('['); wt('('); wk(JS_WK_INT); wt(')'); wt_slot("v", tk); wt(']');
+                        wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(0); wt(')');
+                        wt('?'); wt('('); wk(JS_WK_DOUBLE); wt(')'); wt_slot("_ap", os); wt('['); wt('('); wk(JS_WK_INT); wt(')'); wt_slot("v", tk); wt(']');
+                        wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("int32");
+                        wt(':'); wt_id("JS_WhaleObjValueNum"); wt('('); wt_id("ctx"); wt(',');
+                        wt('&'); wt_slot("_ap", os); wt('['); wt('('); wk(JS_WK_INT); wt(')'); wt_slot("v", tk); wt(']'); wt(','); wt_id("deopt"); wt(')');
+                        wt(';');
+                        fold_commit(fm);
+                        whale_vname[sp - 2] = nm;
+                        whale_vmat[sp - 2] = 1;
+                    }
+                    cur[var_count + sp - 2] = WHALE_T_NUM;
+                    sp--;
+                    break;
+                }
                 if (!WHALE_IS_OBJ(ta) || !whale_type_is_num(tb))
                     goto out;
                 os = WHALE_OBJ_SLOT(ta);
@@ -1747,7 +1807,64 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             }
             break;
 
-        /* arr[idx] = v on a typed array */
+        /* --- packed arrays -----------------------------------------------------
+           Front-end code is full of `a = []; for (i < n) a[i] = ...` and the
+           matching scan. The elements are JSValue, so the value handling is the
+           same as the object path's; only the structure needs the engine. */
+        case OP_array_from:
+            {
+                int argc = (int)whale_get_u16(pc + pos + 1);
+                int os;
+
+                if (argc != 0)
+                    goto out;           /* only the empty literal `[]` */
+                if (whale_objs >= WHALE_OBJ_SLOTS)
+                    goto out;
+                os = whale_objs++;
+                {
+                    int fm = fold_mark();
+
+                    wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleArrNew"); wt('(');
+                    wt_id("ctx"); wt(','); wt_int(os); wt(')'); wt(')');
+                    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    fold_commit(fm);
+                }
+                cur[var_count + sp] = WHALE_ARR_T(os);
+                sp++;
+            }
+            break;
+
+        /* obj -> length */
+        case OP_get_length:
+            {
+                int ta = cur[var_count + sp - 1];
+                int os, nm;
+
+                if (!WHALE_IS_ARR(ta))
+                    goto out;
+                os = WHALE_OBJ_SLOT(ta);
+                nm = whale_vserial++;
+                {
+                    int fm = fold_mark();
+
+                    wk(JS_WK_IF); wt('('); wt('!'); wt_slot("_ai", os); wt(')'); wt('{');
+                    wt_slot("_ap", os); wt('='); wt_id("JS_WhaleArrPtr"); wt('(');
+                    wt_id("ctx"); wt(','); wt_int(os); wt(','); wt('&'); wt_slot("_an", os); wt(')'); wt(';');
+                    wk(JS_WK_IF); wt('('); wt('!'); wt_slot("_ap", os); wt(')'); wt('{');
+                    wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    wt_slot("_ai", os); wt('='); wt_int(1); wt(';');
+                    wt('}');
+                    wt_slot("v", nm); wt('='); wt_slot("_an", os); wt(';');
+                    fold_commit(fm);
+                    whale_vname[sp - 1] = nm;
+                    whale_vmat[sp - 1] = 1;
+                }
+                cur[var_count + sp - 1] = WHALE_T_NUM;
+            }
+            break;
+
+        /* arr[idx] = v on a typed array, or on a packed array */
         case OP_put_array_el:
             {
                 int ta = cur[var_count + sp - 3];
@@ -1755,6 +1872,29 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int tc = cur[var_count + sp - 1];
                 int os, tk;
 
+                if (WHALE_IS_ARR(ta)) {
+                    if (!whale_type_is_num(tb) || !whale_type_is_num(tc))
+                        goto out;
+                    os = WHALE_OBJ_SLOT(ta);
+                    tk = whale_vserial++;      /* the index, evaluated once */
+                    {
+                        int fm = fold_mark();
+
+                        /* A store can move the backing store (the array grows), so
+                           the cached pointer must not be trusted afterwards.
+                           Dropping the flag costs one re-resolve per store. */
+                        wt_slot("_ai", os); wt('='); wt_int(0); wt(';');
+                        wt_slot("v", tk); wt('='); fold_inline(sp - 2); wt(';');
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleArrSetNum"); wt('(');
+                        wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_slot("v", tk); wt(',');
+                        fold_inline(sp - 1); wt(')'); wt(')');
+                        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        fold_commit(fm);
+                    }
+                    sp -= 3;
+                    break;
+                }
                 if (!WHALE_IS_OBJ(ta) || !whale_type_is_num(tb) ||
                     !whale_type_is_num(tc))
                     goto out;
@@ -2254,6 +2394,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 t = cur[var_count + sp - 1];
                 if (!whale_type_is_num(t))
                     goto out;
+                /* Returning an array or object is not supported yet: the slot
+                   holds the reference but the return path is numeric, and a
+                   function with two return shapes should not be specialised. */
                 if (ret_is_bool == -1)
                     ret_is_bool = (t == WHALE_T_BOOL);
                 else if (ret_is_bool != (t == WHALE_T_BOOL))
@@ -2453,6 +2596,9 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
         tcc_add_symbol(s, "JS_WhaleObjFieldPtr", (void *)JS_WhaleObjFieldPtr);
         tcc_add_symbol(s, "JS_WhaleObjDefineNum", (void *)JS_WhaleObjDefineNum);
         tcc_add_symbol(s, "JS_WhaleObjValueNum", (void *)JS_WhaleObjValueNum);
+        tcc_add_symbol(s, "JS_WhaleArrPtr", (void *)JS_WhaleArrPtr);
+        tcc_add_symbol(s, "JS_WhaleArrNew", (void *)JS_WhaleArrNew);
+        tcc_add_symbol(s, "JS_WhaleArrSetNum", (void *)JS_WhaleArrSetNum);
         tcc_add_symbol(s, "JS_WhaleObjFieldNum", (void *)JS_WhaleObjFieldNum);
         tcc_add_symbol(s, "JS_WhaleObjStoreNum", (void *)JS_WhaleObjStoreNum);
         whale_jit_state = s;
