@@ -181,6 +181,17 @@ static void wt_slot(const char *prefix, int n)
     JS_WhaleTokSlot(prefix, n);  /* L0 / v3 / A2 */
 }
 
+static void wt_int(int v);
+
+/* A slot of the generated function's state block, as `W.v[i]`. The block is one
+   zero-initialised object: declaring and initialising each slot separately cost
+   a statement per slot, and TinyCC spills at every statement, so a short
+   function like fib spent almost all of its time in the prologue. */
+static void wt_arr(const char *field, int n)
+{
+    wt_id("_ws"); wt('.'); wt_id(field); wt('['); wt_int(n); wt(']');
+}
+
 static void wt_op(int o)
 {
     JS_WhaleTokOp(o);
@@ -602,7 +613,7 @@ static void fold_inline_expr(const WhaleVExpr *e)
 static void fold_inline(int k)
 {
     if (whale_vmat[k]) {
-        wt_slot("v", whale_vname[k]);   /* already a real variable */
+        wt_arr("v", whale_vname[k]);   /* already a real variable */
         return;
     }
     fold_inline_expr(&whale_vexpr[k]);
@@ -667,25 +678,25 @@ static void fold_obj_field_load(int os, int atom, int fc, int nm, int stable)
        check disappears entirely, which is the difference between beating the
        interpreter and merely matching it. */
     if (stable) {
-        wk(JS_WK_IF); wt('('); wt('!'); wt_slot("_fs", fc); wt(')'); wt('{');
+        wk(JS_WK_IF); wt('('); wt('!'); wt_arr("fs", fc); wt(')'); wt('{');
     } else {
-        wk(JS_WK_IF); wt('('); wt_slot("_fs", fc); wt_op(JS_OP_NE);
+        wk(JS_WK_IF); wt('('); wt_arr("fs", fc); wt_op(JS_OP_NE);
         wt_id("JS_WhaleObjShape"); wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(')'); wt(')');
         wt('{');
     }
-    wt_slot("_fp", fc); wt('='); wt_id("JS_WhaleObjFieldPtr"); wt('(');
-    wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_int(atom); wt(','); wt('&'); wt_slot("_fs", fc); wt(')'); wt(';');
-    wk(JS_WK_IF); wt('('); wt('!'); wt_slot("_fp", fc); wt(')'); wt('{');
+    wt_arr("fp", fc); wt('='); wt_id("JS_WhaleObjFieldPtr"); wt('(');
+    wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_int(atom); wt(','); wt('&'); wt_arr("fs", fc); wt(')'); wt(';');
+    wk(JS_WK_IF); wt('('); wt('!'); wt_arr("fp", fc); wt(')'); wt('{');
     wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
     wt('}');
     /* int32 or float64 inline; anything else hands off to the cold helper.
        Assignment, not a declaration: the prologue already declared every v<n>. */
-    wt_slot("v", nm); wt('=');
-    wt('('); wt_slot("_fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(8); wt(')');
-    wt('?'); wt_slot("_fp", fc); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64");
-    wt(':'); wt('('); wt_slot("_fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(0); wt(')');
-    wt('?'); wt('('); wk(JS_WK_DOUBLE); wt(')'); wt_slot("_fp", fc); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("int32");
-    wt(':'); wt_id("JS_WhaleObjValueNum"); wt('('); wt_id("ctx"); wt(','); wt_slot("_fp", fc); wt(','); wt_id("deopt"); wt(')');
+    wt_arr("v", nm); wt('=');
+    wt('('); wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(8); wt(')');
+    wt('?'); wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64");
+    wt(':'); wt('('); wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(0); wt(')');
+    wt('?'); wt('('); wk(JS_WK_DOUBLE); wt(')'); wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("int32");
+    wt(':'); wt_id("JS_WhaleObjValueNum"); wt('('); wt_id("ctx"); wt(','); wt_arr("fp", fc); wt(','); wt_id("deopt"); wt(')');
     wt(';');
     fold_commit(fm);
 }
@@ -699,19 +710,19 @@ static void fold_obj_field_resolve(int os, int atom, int fc, int stable)
     int fm = fold_mark();
 
     if (stable) {
-        wk(JS_WK_IF); wt('('); wt('!'); wt_slot("_fs", fc); wt(')'); wt('{');
+        wk(JS_WK_IF); wt('('); wt('!'); wt_arr("fs", fc); wt(')'); wt('{');
     } else {
-        wk(JS_WK_IF); wt('('); wt_slot("_fs", fc); wt_op(JS_OP_NE);
+        wk(JS_WK_IF); wt('('); wt_arr("fs", fc); wt_op(JS_OP_NE);
         wt_id("JS_WhaleObjShape"); wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(')'); wt(')');
         wt('{');
     }
-    wt_slot("_fp", fc); wt('='); wt_id("JS_WhaleObjFieldPtr"); wt('(');
-    wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_int(atom); wt(','); wt('&'); wt_slot("_fs", fc); wt(')'); wt(';');
-    wk(JS_WK_IF); wt('('); wt('!'); wt_slot("_fp", fc); wt(')'); wt('{');
+    wt_arr("fp", fc); wt('='); wt_id("JS_WhaleObjFieldPtr"); wt('(');
+    wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_int(atom); wt(','); wt('&'); wt_arr("fs", fc); wt(')'); wt(';');
+    wk(JS_WK_IF); wt('('); wt('!'); wt_arr("fp", fc); wt(')'); wt('{');
     wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
     wt('}');
-    wk(JS_WK_IF); wt('('); wt_slot("_fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_NE); wt_int(8); wt(')');
-    wt('{'); wk(JS_WK_IF); wt('('); wt_slot("_fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_NE); wt_int(0); wt(')');
+    wk(JS_WK_IF); wt('('); wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_NE); wt_int(8); wt(')');
+    wt('{'); wk(JS_WK_IF); wt('('); wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_NE); wt_int(0); wt(')');
     wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}'); wt('}');
     fold_commit(fm);
 }
@@ -816,7 +827,7 @@ static void fold_materialize(int k)
        so this cannot run out for any function seen so far. */
     whale_vname[k] = whale_vserial++;
     mark = fold_mark();
-    wt_slot("v", whale_vname[k]); wt('=');
+    wt_arr("v", whale_vname[k]); wt('=');
     fold_inline(k);
     wt(';');
     fold_commit(mark);
@@ -1223,35 +1234,30 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             wk(JS_WK_REGISTER);
         wk(JS_WK_DOUBLE); wt_slot("L", i); wt('='); wt_int(0); wt(';');
     }
-    /* stack_size vars for the slots themselves plus WHALE_VSER_MAX spare names
-       for the fresh names fold_materialize() hands out (see whale_vname) */
-    for (i = 0; i < stack_size + WHALE_VSER_MAX; i++) {
-        wk(JS_WK_DOUBLE); wt_slot("v", i); wt('='); wt_int(0); wt(';');
-    }
+    /* All of the generator's scratch state in one zero-initialised block: the
+       value slots (stack_size plus the spare names fold_materialize() hands out,
+       see whale_vname) and the per-slot caches. Declaring these as individual
+       variables cost one statement each, and TinyCC spills at every statement -
+       a short function spent nearly all of its time in its own prologue. */
+    wk(JS_WK_STRUCT); wt('{');
+        wk(JS_WK_DOUBLE); wt_id("v"); wt('['); wt_int(stack_size + WHALE_VSER_MAX); wt(']'); wt(';');
+        wk(JS_WK_VOID); wt('*'); wt_id("fs"); wt('['); wt_int(WHALE_FIELD_CACHE); wt(']'); wt(';');
+        wt_id("JSValue"); wt('*'); wt_id("fp"); wt('['); wt_int(WHALE_FIELD_CACHE); wt(']'); wt(';');
+        wt_id("JSValue"); wt('*'); wt_id("ap"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
+        wk(JS_WK_DOUBLE); wt_id("an"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
+        wk(JS_WK_INT); wt_id("ai"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
+        wk(JS_WK_UNSIGNED); wt_id("char"); wt('*'); wt_id("op"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
+        wk(JS_WK_DOUBLE); wt_id("on"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
+        wk(JS_WK_INT); wt_id("oi"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
+    wt('}'); wt_id("_ws"); wt('='); wt('{'); wt_int(0); wt('}'); wt(';');
     /* Per-property-access cache for object literals: the shape the property was
        resolved against and the address of its value. One pair per access site,
        and a site always touches the same property, so this is a compile-time
        constant. */
-    for (i = 0; i < WHALE_FIELD_CACHE; i++) {
-        wk(JS_WK_VOID); wt('*'); wt_slot("_fs", i); wt('='); wt_int(0); wt(';');
-        /* JSValue *, not void *: the inlined read dereferences it */
-        wt_id("JSValue"); wt('*'); wt_slot("_fp", i); wt('='); wt_int(0); wt(';');
-    }
-    /* Per-object-slot array cache: the backing store, its element count, and a
-       flag. A store can move the backing store (the array grows), which clears
-       the flag, so a store-heavy loop re-resolves and a scan does not. */
-    for (i = 0; i < WHALE_OBJ_SLOTS; i++) {
-        wt_id("JSValue"); wt('*'); wt_slot("_ap", i); wt('='); wt_int(0); wt(';');
-        wk(JS_WK_DOUBLE); wt_slot("_an", i); wt('='); wt_int(0); wt(';');
-        wk(JS_WK_INT); wt_slot("_ai", i); wt('='); wt_int(0); wt(';');
-    }
+
     /* per-object-slot typed-array cache: base pointer, element count, and a flag
        so the pointer is fetched once per run rather than per element */
-    for (i = 0; i < WHALE_OBJ_SLOTS; i++) {
-        wk(JS_WK_UNSIGNED); wt_id("char"); wt('*'); wt_slot("_op", i); wt('='); wt_int(0); wt(';');
-        wk(JS_WK_DOUBLE); wt_slot("_on", i); wt('='); wt_int(0); wt(';');
-        wk(JS_WK_INT); wt_slot("_oi", i); wt('='); wt_int(0); wt(';');
-    }
+    /* op/on/oi are covered by the state block above */
     for (i = 0; i < arg_count; i++) {
         if (args_used[i]) {
             wk(JS_WK_DOUBLE); wt_slot("A", i); wt('='); wt_id("An"); wt('['); wt_int(i); wt(']'); wt(';');
@@ -1714,30 +1720,30 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         int fm = fold_mark();
 
                         /* resolve the backing store once; a scan does not move it */
-                        wk(JS_WK_IF); wt('('); wt('!'); wt_slot("_ai", os); wt(')'); wt('{');
-                        wt_slot("_ap", os); wt('='); wt_id("JS_WhaleArrPtr"); wt('(');
-                        wt_id("ctx"); wt(','); wt_int(os); wt(','); wt('&'); wt_slot("_an", os); wt(')'); wt(';');
-                        wk(JS_WK_IF); wt('('); wt('!'); wt_slot("_ap", os); wt(')'); wt('{');
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_arr("ai", os); wt(')'); wt('{');
+                        wt_arr("ap", os); wt('='); wt_id("JS_WhaleArrPtr"); wt('(');
+                        wt_id("ctx"); wt(','); wt_int(os); wt(','); wt('&'); wt_arr("an", os); wt(')'); wt(';');
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_arr("ap", os); wt(')'); wt('{');
                         wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
-                        wt_slot("_ai", os); wt('='); wt_int(1); wt(';');
+                        wt_arr("ai", os); wt('='); wt_int(1); wt(';');
                         wt('}');
                         /* the index, evaluated once and range-checked */
-                        wt_slot("v", tk); wt('='); fold_inline(sp - 1); wt(';');
-                        wk(JS_WK_IF); wt('('); wt_slot("v", tk); wt_op(JS_OP_LT); wt_int(0); wt_op(JS_OP_OR);
-                        wt('('); wt_slot("v", tk); wt_op(JS_OP_GE); wt_slot("_an", os); wt(')'); wt(')');
+                        wt_arr("v", tk); wt('='); fold_inline(sp - 1); wt(';');
+                        wk(JS_WK_IF); wt('('); wt_arr("v", tk); wt_op(JS_OP_LT); wt_int(0); wt_op(JS_OP_OR);
+                        wt('('); wt_arr("v", tk); wt_op(JS_OP_GE); wt_arr("an", os); wt(')'); wt(')');
                         wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
                         /* int32 or float64 inline; anything else hands off */
-                        wt_slot("v", nm); wt('=');
-                        wt('('); wt_slot("_ap", os); wt('['); wt('('); wk(JS_WK_INT); wt(')'); wt_slot("v", tk); wt(']');
+                        wt_arr("v", nm); wt('=');
+                        wt('('); wt_arr("ap", os); wt('['); wt('('); wk(JS_WK_INT); wt(')'); wt_arr("v", tk); wt(']');
                         wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(8); wt(')');
-                        wt('?'); wt_slot("_ap", os); wt('['); wt('('); wk(JS_WK_INT); wt(')'); wt_slot("v", tk); wt(']');
+                        wt('?'); wt_arr("ap", os); wt('['); wt('('); wk(JS_WK_INT); wt(')'); wt_arr("v", tk); wt(']');
                         wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64");
-                        wt(':'); wt('('); wt_slot("_ap", os); wt('['); wt('('); wk(JS_WK_INT); wt(')'); wt_slot("v", tk); wt(']');
+                        wt(':'); wt('('); wt_arr("ap", os); wt('['); wt('('); wk(JS_WK_INT); wt(')'); wt_arr("v", tk); wt(']');
                         wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(0); wt(')');
-                        wt('?'); wt('('); wk(JS_WK_DOUBLE); wt(')'); wt_slot("_ap", os); wt('['); wt('('); wk(JS_WK_INT); wt(')'); wt_slot("v", tk); wt(']');
+                        wt('?'); wt('('); wk(JS_WK_DOUBLE); wt(')'); wt_arr("ap", os); wt('['); wt('('); wk(JS_WK_INT); wt(')'); wt_arr("v", tk); wt(']');
                         wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("int32");
                         wt(':'); wt_id("JS_WhaleObjValueNum"); wt('('); wt_id("ctx"); wt(',');
-                        wt('&'); wt_slot("_ap", os); wt('['); wt('('); wk(JS_WK_INT); wt(')'); wt_slot("v", tk); wt(']'); wt(','); wt_id("deopt"); wt(')');
+                        wt('&'); wt_arr("ap", os); wt('['); wt('('); wk(JS_WK_INT); wt(')'); wt_arr("v", tk); wt(']'); wt(','); wt_id("deopt"); wt(')');
                         wt(';');
                         fold_commit(fm);
                         whale_vname[sp - 2] = nm;
@@ -1757,17 +1763,17 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                     /* Fetch the buffer once per run, then index it directly. A
                        call per element costs more than the interpreter. */
-                    wk(JS_WK_IF); wt('('); wt('!'); wt_slot("_oi", os); wt(')'); wt('{');
-                    wt_slot("_op", os); wt('='); wt('('); wk(JS_WK_UNSIGNED); wt_id("char"); wt('*'); wt(')');
-                    wt_id("JS_WhaleTAU8Ptr"); wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(','); wt('&'); wt_slot("_on", os); wt(')'); wt(';');
-                    wt_slot("_oi", os); wt('='); wt_int(1); wt(';'); wt('}');
+                    wk(JS_WK_IF); wt('('); wt('!'); wt_arr("oi", os); wt(')'); wt('{');
+                    wt_arr("op", os); wt('='); wt('('); wk(JS_WK_UNSIGNED); wt_id("char"); wt('*'); wt(')');
+                    wt_id("JS_WhaleTAU8Ptr"); wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(','); wt('&'); wt_arr("on", os); wt(')'); wt(';');
+                    wt_arr("oi", os); wt('='); wt_int(1); wt(';'); wt('}');
                     wk(JS_WK_DOUBLE); wt_slot("_t", tk); wt('='); fold_inline(sp - 1); wt(';');
-                    wk(JS_WK_IF); wt('('); wt('('); wt('!'); wt_slot("_op", os); wt(')'); wt_op(JS_OP_OR);
+                    wk(JS_WK_IF); wt('('); wt('('); wt('!'); wt_arr("op", os); wt(')'); wt_op(JS_OP_OR);
                     wt('('); wt_slot("_t", tk); wt_op(JS_OP_LT); wt_int(0); wt(')'); wt_op(JS_OP_OR);
-                    wt('('); wt_slot("_t", tk); wt_op(JS_OP_GE); wt_slot("_on", os); wt(')'); wt(')');
+                    wt('('); wt_slot("_t", tk); wt_op(JS_OP_GE); wt_arr("on", os); wt(')'); wt(')');
                     wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
-                    wt_slot("v", nm); wt('='); wt('('); wk(JS_WK_DOUBLE); wt(')');
-                    wt_slot("_op", os); wt('['); wt('('); wk(JS_WK_INT); wt(')'); wt_slot("_t", tk); wt(']'); wt(';');
+                    wt_arr("v", nm); wt('='); wt('('); wk(JS_WK_DOUBLE); wt(')');
+                    wt_arr("op", os); wt('['); wt('('); wk(JS_WK_INT); wt(')'); wt_slot("_t", tk); wt(']'); wt(';');
                     fold_commit(fm);
                     whale_vname[sp - 2] = nm;
                     whale_vmat[sp - 2] = 1;
@@ -1847,8 +1853,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     fm = fold_mark();
                     /* the value is a double here, and the old one was a number too
                        (anything else deopted above) */
-                    wt_slot("_fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt('='); wt_int(8); wt(';');
-                    wt_slot("_fp", fc); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64"); wt('=');
+                    wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt('='); wt_int(8); wt(';');
+                    wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64"); wt('=');
                     fold_inline(sp - 1); wt(';');
                     fold_commit(fm);
                 }
@@ -1939,14 +1945,14 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 {
                     int fm = fold_mark();
 
-                    wk(JS_WK_IF); wt('('); wt('!'); wt_slot("_ai", os); wt(')'); wt('{');
-                    wt_slot("_ap", os); wt('='); wt_id("JS_WhaleArrPtr"); wt('(');
-                    wt_id("ctx"); wt(','); wt_int(os); wt(','); wt('&'); wt_slot("_an", os); wt(')'); wt(';');
-                    wk(JS_WK_IF); wt('('); wt('!'); wt_slot("_ap", os); wt(')'); wt('{');
+                    wk(JS_WK_IF); wt('('); wt('!'); wt_arr("ai", os); wt(')'); wt('{');
+                    wt_arr("ap", os); wt('='); wt_id("JS_WhaleArrPtr"); wt('(');
+                    wt_id("ctx"); wt(','); wt_int(os); wt(','); wt('&'); wt_arr("an", os); wt(')'); wt(';');
+                    wk(JS_WK_IF); wt('('); wt('!'); wt_arr("ap", os); wt(')'); wt('{');
                     wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
-                    wt_slot("_ai", os); wt('='); wt_int(1); wt(';');
+                    wt_arr("ai", os); wt('='); wt_int(1); wt(';');
                     wt('}');
-                    wt_slot("v", nm); wt('='); wt_slot("_an", os); wt(';');
+                    wt_arr("v", nm); wt('='); wt_arr("an", os); wt(';');
                     fold_commit(fm);
                     whale_vname[sp - 1] = nm;
                     whale_vmat[sp - 1] = 1;
@@ -1974,10 +1980,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         /* A store can move the backing store (the array grows), so
                            the cached pointer must not be trusted afterwards.
                            Dropping the flag costs one re-resolve per store. */
-                        wt_slot("_ai", os); wt('='); wt_int(0); wt(';');
-                        wt_slot("v", tk); wt('='); fold_inline(sp - 2); wt(';');
+                        wt_arr("ai", os); wt('='); wt_int(0); wt(';');
+                        wt_arr("v", tk); wt('='); fold_inline(sp - 2); wt(';');
                         wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleArrSetNum"); wt('(');
-                        wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_slot("v", tk); wt(',');
+                        wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_arr("v", tk); wt(',');
                         fold_inline(sp - 1); wt(')'); wt(')');
                         wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
                         wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
@@ -1994,16 +2000,16 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 {
                     int fm = fold_mark();
 
-                    wk(JS_WK_IF); wt('('); wt('!'); wt_slot("_oi", os); wt(')'); wt('{');
-                    wt_slot("_op", os); wt('='); wt('('); wk(JS_WK_UNSIGNED); wt_id("char"); wt('*'); wt(')');
-                    wt_id("JS_WhaleTAU8Ptr"); wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(','); wt('&'); wt_slot("_on", os); wt(')'); wt(';');
-                    wt_slot("_oi", os); wt('='); wt_int(1); wt(';'); wt('}');
+                    wk(JS_WK_IF); wt('('); wt('!'); wt_arr("oi", os); wt(')'); wt('{');
+                    wt_arr("op", os); wt('='); wt('('); wk(JS_WK_UNSIGNED); wt_id("char"); wt('*'); wt(')');
+                    wt_id("JS_WhaleTAU8Ptr"); wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(','); wt('&'); wt_arr("on", os); wt(')'); wt(';');
+                    wt_arr("oi", os); wt('='); wt_int(1); wt(';'); wt('}');
                     wk(JS_WK_DOUBLE); wt_slot("_t", tk); wt('='); fold_inline(sp - 2); wt(';');
-                    wk(JS_WK_IF); wt('('); wt('('); wt('!'); wt_slot("_op", os); wt(')'); wt_op(JS_OP_OR);
+                    wk(JS_WK_IF); wt('('); wt('('); wt('!'); wt_arr("op", os); wt(')'); wt_op(JS_OP_OR);
                     wt('('); wt_slot("_t", tk); wt_op(JS_OP_LT); wt_int(0); wt(')'); wt_op(JS_OP_OR);
-                    wt('('); wt_slot("_t", tk); wt_op(JS_OP_GE); wt_slot("_on", os); wt(')'); wt(')');
+                    wt('('); wt_slot("_t", tk); wt_op(JS_OP_GE); wt_arr("on", os); wt(')'); wt(')');
                     wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
-                    wt_slot("_op", os); wt('['); wt('('); wk(JS_WK_INT); wt(')'); wt_slot("_t", tk); wt(']'); wt('=');
+                    wt_arr("op", os); wt('['); wt('('); wk(JS_WK_INT); wt(')'); wt_slot("_t", tk); wt(']'); wt('=');
                     wt('('); wk(JS_WK_UNSIGNED); wt_id("char"); wt(')'); wt('('); fold_inline(sp - 1); wt(')'); wt(';');
                     fold_commit(fm);
                 }
@@ -2058,7 +2064,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                        array in the slot, so drop any cached buffer pointer. */
                     int fm = fold_mark();
 
-                    wt_slot("_oi", WHALE_OBJ_SLOT(t)); wt('='); wt_int(0); wt(';');
+                    wt_arr("oi", WHALE_OBJ_SLOT(t)); wt('='); wt_int(0); wt(';');
                     fold_commit(fm);
                     local_forget(idx);
                     cur[idx] = (uint8_t)t;
@@ -2177,7 +2183,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                     wk(JS_WK_IF); wt('('); wt('!');
                     wt_id("JS_WhaleVarRefGetNum"); wt('('); wt_id("ctx"); wt(',');
-                    wt_id("var_refs"); wt(','); wt_int(idx); wt(','); wt('&'); wt_slot("v", nm); wt(')');
+                    wt_id("var_refs"); wt(','); wt_int(idx); wt(','); wt('&'); wt_arr("v", nm); wt(')');
                     wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
                     wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
                     fold_commit(fm);
@@ -2257,7 +2263,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 {
                     int nm = whale_vserial++;   /* fresh name, never reused */
                     wk(JS_WK_IF); wt('('); wt('!');
-                    wt_id("JS_WhaleGetGlobalNum"); wt('('); wt_id("ctx"); wt(','); wt_int(atom); wt(','); wt('&'); wt_slot("v", nm); wt(')');
+                    wt_id("JS_WhaleGetGlobalNum"); wt('('); wt_id("ctx"); wt(','); wt_int(atom); wt(','); wt('&'); wt_arr("v", nm); wt(')');
                     wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
                     fold_commit(fm);
                     /* the helper wrote straight into the slot, so it is a real
@@ -2294,7 +2300,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 wk(JS_WK_IF); wt('('); wt_id("_dd"); wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
                 {
                     int nm = whale_vserial++;   /* fresh name, never reused */
-                    wt_slot("v", nm); wt('='); wt_id("_r"); wt(';'); wt('}');
+                    wt_arr("v", nm); wt('='); wt_id("_r"); wt(';'); wt('}');
                     fold_commit(fm);
                     /* The result is in that variable now. Marking it
                        materialised is what makes later uses refer to it: without
