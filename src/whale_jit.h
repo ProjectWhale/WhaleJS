@@ -90,6 +90,10 @@ int JS_WhaleCallValue(JSContext *ctx, int func_slot, int argc, int arg_base,
 /* Duplicate slot src into slot dst (moving an already-parked value into the
    contiguous scratch area a call needs). */
 int JS_WhaleObjSlotCopy(JSContext *ctx, int src, int dst);
+/* Park argument `v` in slot k when it is an object, so a parameter used as the
+   receiver of a property access can travel as the JSValue it is. 0 means "not an
+   object" and deopts. */
+int JS_WhaleArgGetObj(JSContext *ctx, JSValue v, int slot);
 /* The pending exception as a value the generated code can return. */
 JSValue JS_WhaleExceptionValue(JSContext *ctx);
 

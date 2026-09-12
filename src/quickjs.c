@@ -3147,6 +3147,19 @@ int JS_WhaleObjSlotCopy(JSContext *ctx, int src, int dst)
     return 1;
 }
 
+/* Park an argument that is used as an object. A parameter read for `o.x` cannot
+   be a double, so the generated code has to hold the JSValue itself - and an
+   argument that is not an object makes that a deopt, not a wrong answer. */
+int JS_WhaleArgGetObj(JSContext *ctx, JSValue v, int slot)
+{
+    if (slot < 0 || slot >= WHALE_OBJ_SLOTS)
+        return 0;
+    if (!JS_IsObject(v))
+        return 0;
+    JS_WhaleObjSlot(ctx, slot, js_dup(v));
+    return 1;
+}
+
 /* Call the value parked in func_slot with the arguments parked in
    arg_base..arg_base+argc-1, parking the result in ret_slot (or dropping it when
    ret_slot is negative).
