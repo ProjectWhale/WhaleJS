@@ -43,6 +43,8 @@ typedef struct JSWhaleFuncInfo {
 #define WHALE_FIELD_CACHE 24
 /* property names the generator can reason about (object literals only) */
 #define WHALE_ATOM_MAX 32
+/* direct calls the generator records, to see which loops contain one */
+#define WHALE_CALL_MAX 32
 
 /* Compile one function. Returns 1 and fills entry_out/handle_out on success;
    the caller owns both, and releases the handle with JS_WhaleJitRelease(). */

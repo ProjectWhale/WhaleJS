@@ -939,6 +939,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     int whale_put_atoms[WHALE_ATOM_MAX];
     int whale_def_atoms_n = 0;
     int whale_put_atoms_n = 0;
+    int whale_call_pos[WHALE_CALL_MAX];
+    int whale_call_n = 0;
     int whale_nloops = 0;   /* backward jumps; more than one means nesting */
 
     if (!info->is_normal)
@@ -1050,7 +1052,27 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        fixed only when that cannot happen, and only in a function with no calls -
        an object that cannot be passed anywhere cannot be reshaped from outside
        either. */
-    whale_shape_stable = !whale_has_call;
+    /* An object's field pointers stay valid as long as nothing adds or removes a
+       property. A call could hand the object to something that does, so a call
+       is only acceptable outside every loop: the common front-end shape is a
+       factory called once before the loop (`var o = make(); for (...) ...`), and
+       refusing that sent objfields to the interpreter at 26x. */
+    whale_shape_stable = 1;
+    {
+        int k;
+
+        for (k = 0; k < whale_call_n && whale_shape_stable; k++) {
+            int tgt;
+
+            for (tgt = 0; tgt < len; tgt++) {
+                if (loop_back[tgt] >= 0 && whale_call_pos[k] >= tgt &&
+                    whale_call_pos[k] <= loop_back[tgt]) {
+                    whale_shape_stable = 0;
+                    break;
+                }
+            }
+        }
+    }
     {
         int k;
 
