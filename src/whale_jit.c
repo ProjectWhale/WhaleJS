@@ -2566,8 +2566,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 /* Returning an array or object is disabled: it produced
                    intermittent access violations when the interpreter went on to
                    use the returned object, so it is not safe until that is
-                   understood. The ret_obj parameter stays - it costs nothing and
-                   is where the fix goes. */
+                   understood. The memo guard in quickjs.c was one real defect
+                   found on the way - a pure function's object result was parked
+                   in the memo table for ever - but fixing it did not stop the
+                   crash, so the cause is still open. The ret_obj parameter stays:
+                   it costs nothing and is where the fix goes. */
                 if (!whale_type_is_num(t))
                     goto out;
                 if (ret_is_bool == -1)

@@ -3494,6 +3494,17 @@ static void whale_memo_insert(JSContext *ctx, WhaleMemo *m, int argc,
                               const JSValue *argv, JSValue result)
 {
     WhaleMemoEntry *e;
+
+    /* Cached results are numbers, and the eviction and discard paths rely on
+       that: they free the entry without releasing the result, which is only
+       correct for a value that is not reference counted. A pure function that
+       returns an object would park a reference there for ever - and a function
+       is "pure" merely for not reading a global, which says nothing about what
+       it returns. Give the reference back instead of keeping it. */
+    if (!JS_IsNumber(result)) {
+        JS_FreeValue(ctx, result);
+        return;
+    }
     int k;
 
     for (k = 0; k < argc; k++) {
