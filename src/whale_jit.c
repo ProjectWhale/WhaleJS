@@ -2563,16 +2563,26 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int fm;
 
                 t = cur[var_count + sp - 1];
-                /* Returning an array or object is disabled: it produced
-                   intermittent access violations when the interpreter went on to
-                   use the returned object, so it is not safe until that is
-                   understood. The memo guard in quickjs.c was one real defect
-                   found on the way - a pure function's object result was parked
-                   in the memo table for ever - but fixing it did not stop the
-                   crash, so the cause is still open. The ret_obj parameter stays:
-                   it costs nothing and is where the fix goes. */
+                if (WHALE_IS_ARR(t) || WHALE_IS_OBJ(t)) {
+                    /* The slot holds the reference; hand a duplicate of it to
+                       the caller through ret_obj so the two do not compete for
+                       the same reference count. A function that returns both a
+                       number and an object is refused - one return shape only. */
+                    if (ret_is_bool != -1)
+                        goto out;
+                    whale_ret_obj = 1;
+                    fm = fold_mark();
+                    wt('*'); wt_id("ret_obj"); wt('='); wt_id("JS_WhaleObjGet"); wt('(');
+                    wt_id("ctx"); wt(','); wt_int(WHALE_OBJ_SLOT(t)); wt(')'); wt(';');
+                    wk(JS_WK_RETURN); wt_int(0); wt(';');
+                    fold_commit(fm);
+                    unreachable = 1;
+                    break;
+                }
                 if (!whale_type_is_num(t))
                     goto out;
+                if (whale_ret_obj)
+                    goto out; /* a numeric return after an object one: mixed */
                 if (ret_is_bool == -1)
                     ret_is_bool = (t == WHALE_T_BOOL);
                 else if (ret_is_bool != (t == WHALE_T_BOOL))

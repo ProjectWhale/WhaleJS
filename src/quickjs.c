@@ -3557,19 +3557,19 @@ static void whale_memo_discard(JSRuntime *rt, JSFunctionBytecode *b)
 extern int whale_gen_pure;
 extern int whale_gen_objs;
 
-static void whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
+static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
 {
     JSWhaleContext *w = &ctx->whale;
 
     if (w->jit_mode == JS_JIT_OFF)
-        return;
+        return 0;
 
     w->stat_requests++;
     b->whale_call_count++;
     if (b->whale_call_count < WHALE_JIT_HOT_THRESHOLD)
-        return;
+        return 0;
     if (b->whale_jit_entry || b->whale_jit_tried)
-        return;
+        return 0;
     b->whale_jit_tried = 1;
     {
         static int whale_op_probe;
@@ -3607,11 +3607,19 @@ static void whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
                     b->whale_pure = 1;
                 }
             }
+            /* A compile changes b->whale_needs_obj, and the stack frame for this
+               very call was sized before that happened: whale_obj_n drives both
+               alloca_size and where the object slots land. Running the brand-new
+               code here would use object slots the frame never reserved - they
+               would spill past the end of the alloca and into JS_CallInternal's
+               own locals. Report the compile so the caller falls through to the
+               interpreter; the next call sizes itself correctly and runs it. */
+            return 1;
         } else {
             JS_WhaleNoteJitResult(ctx, 0, 0);
         }
     }   /* compile failed: stay interpreted */
-    /* �??��已达阈��：下一步在这里�?TinyCC �?b 编译成机器码 */
+    return 0;
 }
 
 /* A loop back edge is heat exactly like a call is: a function that is entered
@@ -3624,7 +3632,7 @@ static void whale_note_backedge(JSContext *ctx, JSFunctionBytecode *b)
     if (b->whale_jit_tried)     /* compiled, or tried and gave up */
         return;
     if (++b->whale_call_count >= WHALE_JIT_HOT_THRESHOLD)
-        whale_on_call(ctx, b);
+        (void)whale_on_call(ctx, b);   /* a compile here only takes effect next call */
 }
 
 /* set the new value and free the old value after (freeing the value
@@ -18990,6 +18998,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSValue *local_buf, *stack_buf, *var_buf, *arg_buf, *sp, ret_val, *pval;
     JSValue *obj_slots;
     int whale_obj_n;         /* object slots reserved for this frame */
+    int whale_jit_ready;     /* 1 unless this very call compiled the function */
     JSVarRef **var_refs;
     size_t alloca_size;
 
@@ -19127,6 +19136,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        It is per call, so eight stores here (plus as many frees on the way out)
        show up as soon as the function recurses. */
     if (b->whale_needs_obj) {
+        /* Everything from arg_buf to cur_sp is walked by GC while the JIT runs,
+           and cur_sp has to reach past obj_slots - so the operand stack that
+           sits in between is inside the range too. The JIT keeps all its values
+           in C doubles and never touches it, so its contents are whatever the
+           previous user of this stack memory left behind: a bogus JSValue whose
+           tag happens to say "object" is a pointer GC will follow. Clear it. */
+        for(i = 0; i < b->stack_size; i++)
+            stack_buf[i] = JS_UNDEFINED;
         for(i = 0; i < WHALE_OBJ_SLOTS; i++)
             obj_slots[i] = JS_UNDEFINED;
     }
@@ -19145,12 +19162,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     ctx = b->realm; /* set the current realm */
 
     /* WhaleJS: �??��统�??（JIT 代码生成接入前先�????数，�?src/whalejs.h�?*/
-    whale_on_call(ctx, b);
+    whale_jit_ready = !whale_on_call(ctx, b);
 
     /* WhaleJS: native entry ready -> run it. The frame stays current while
        the JIT code runs (it may re-enter the engine for self-recursion). On
-       deopt we fall through and interpret the same frame again. */
-    if (b->whale_jit_entry) {
+       deopt we fall through and interpret the same frame again.
+       whale_jit_ready is false when this call is the one that just compiled the
+       function: the frame above was sized from the old b->whale_needs_obj, so it
+       has no room for the object slots the new code expects. Interpret this call
+       and let the next one - correctly sized - run the native entry. */
+    if (b->whale_jit_entry && whale_jit_ready) {
         int whale_deopt = 0;
         JSValue whale_ret;
         /* Loan the object slots to the JIT by extending the frame's live range
