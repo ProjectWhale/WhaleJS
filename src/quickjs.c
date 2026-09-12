@@ -899,6 +899,7 @@ typedef struct JSFunctionBytecode {
     void *whale_jit_entry;     /* �?NULL 表示已有机器码入�?*/
     uint8_t whale_jit_tried;   /* JIT compile already attempted */
     void *whale_jit_tcc;       /* owning TCCState (keeps the code alive) */
+void *whale_jit_entry2;    /* the other reading of a closure-slot call target */
     /* Memoisation: this function was JIT-compiled and never reads a global, so
        its result depends only on its numeric arguments - repeated calls with
        the same ones can reuse it. `whale_memo` is a small bounded table (see
@@ -3147,7 +3148,8 @@ int JS_WhaleObjSlotCopy(JSContext *ctx, int src, int dst)
 }
 
 /* Call the value parked in func_slot with the arguments parked in
-   arg_base..arg_base+argc-1, and drop the result.
+   arg_base..arg_base+argc-1, parking the result in ret_slot (or dropping it when
+   ret_slot is negative).
 
    Both the callee and the arguments are *borrowed* from their slots rather than
    duplicated: the slots stay alive, and GC-visible, for the whole call, which is
@@ -3158,7 +3160,8 @@ int JS_WhaleObjSlotCopy(JSContext *ctx, int src, int dst)
    generated code then hands that exception straight back instead of deopting:
    re-interpreting the frame would run the call a second time, and the callee is
    exactly the kind of thing (a DOM mutation) that must not happen twice. */
-int JS_WhaleCallValue(JSContext *ctx, int func_slot, int argc, int arg_base)
+int JS_WhaleCallValue(JSContext *ctx, int func_slot, int argc, int arg_base,
+                      int ret_slot)
 {
     JSValue *slots = whale_frame_obj_slots(ctx);
     JSValue r;
@@ -3170,7 +3173,10 @@ int JS_WhaleCallValue(JSContext *ctx, int func_slot, int argc, int arg_base)
     r = JS_Call(ctx, slots[func_slot], JS_UNDEFINED, argc, slots + arg_base);
     if (JS_IsException(r))
         return 0;
-    JS_FreeValue(ctx, r);
+    if (ret_slot >= 0 && ret_slot < WHALE_OBJ_SLOTS)
+        JS_WhaleObjSlot(ctx, ret_slot, r);   /* takes over the reference */
+    else
+        JS_FreeValue(ctx, r);
     return 1;
 }
 
@@ -3618,6 +3624,8 @@ static void whale_memo_discard(JSRuntime *rt, JSFunctionBytecode *b)
    (owned by src/tcc/whale_tcc_iface.c). */
 extern int whale_gen_pure;
 extern int whale_gen_objs;
+extern int whale_gen_self_ref;
+extern int whale_assume_self;
 
 static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
 {
@@ -3653,14 +3661,54 @@ static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
         info.var_ref_count = b->var_ref_count;
         info.cpool_count = b->cpool_count;
         info.cpool = b->cpool;
-        if (JS_WhaleJitCompileFunction(ctx, &info, &entry, &handle)) {
-            b->whale_jit_entry = entry;
-            b->whale_jit_tcc = handle;
-            b->whale_needs_obj = whale_gen_objs > 0;
+        /* A closure slot that feeds a call is either this very function
+           (self-recursion) or an enclosing closure's value, and the bytecode
+           does not say which - only the entry check does. So compile both
+           readings and let that check pick. Neither is guaranteed to compile: a
+           function calling a captured helper has no useful self reading, and a
+           recursive one has no closure reading that can do arithmetic on the
+           result. So try both and keep whichever worked. */
+        {
+            int pure1 = 0, objs1 = 0, selfref = 0;
+            void *entry2 = NULL, *handle2 = NULL;
+
+            b->whale_jit_entry2 = NULL;
+            whale_assume_self = 1;
+            if (JS_WhaleJitCompileFunction(ctx, &info, &entry, &handle)) {
+                pure1 = whale_gen_pure;
+                objs1 = whale_gen_objs;
+                selfref = whale_gen_self_ref;
+                b->whale_jit_entry = entry;
+                b->whale_jit_tcc = handle;
+            }
+            if (!b->whale_jit_entry || selfref) {
+                whale_assume_self = 0;
+                if (JS_WhaleJitCompileFunction(ctx, &info, &entry2, &handle2)) {
+                    if (b->whale_jit_entry) {
+                        b->whale_jit_entry2 = entry2;
+                    } else {
+                        /* the self reading did not compile, so this is the only
+                           one there is */
+                        b->whale_jit_entry = entry2;
+                        b->whale_jit_tcc = handle2;
+                        pure1 = whale_gen_pure;
+                        objs1 = whale_gen_objs;
+                    }
+                    if (whale_gen_objs > 0)
+                        objs1 = 1;
+                }
+            }
+            if (!b->whale_jit_entry) {
+                JS_WhaleNoteJitResult(ctx, 0, 0);
+                return 0;   /* neither reading compiled: stay interpreted */
+            }
+            b->whale_needs_obj = objs1 > 0;
             JS_WhaleNoteJitResult(ctx, 1, 0);
-            /* Memoise it only if the generator never had to read a global:
-               then the result is a function of the arguments alone. */
-            if (whale_gen_pure) {
+            /* Memoise on the self reading only - that is the one the generator
+               proved to depend on nothing but its arguments. If it turns out not
+               to be the right reading, the entry check fails on the very first
+               run and JS_CallInternal drops this (see *deopt == 3 there). */
+            if (pure1) {
                 WhaleMemo *m = js_mallocz(ctx, sizeof(*m));
 
                 if (m) {
@@ -3677,8 +3725,6 @@ static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
                own locals. Report the compile so the caller falls through to the
                interpreter; the next call sizes itself correctly and runs it. */
             return 1;
-        } else {
-            JS_WhaleNoteJitResult(ctx, 0, 0);
         }
     }   /* compile failed: stay interpreted */
     return 0;
@@ -7638,6 +7684,27 @@ int JS_WhaleObjNew(JSContext *ctx, int slot)
     if (JS_IsException(o))
         return 0;
     JS_WhaleObjSlot(ctx, slot, o);
+    return 1;
+}
+
+/* Park closure slot idx in object slot `slot`, as-is. A call target read out of
+   a closure is either this very function or an enclosing closure's value, and
+   the generated code only needs "a JSValue to call" - so this does not try to
+   decide which, it duplicates whatever is there.
+
+   pvalue is always valid (a detached var_ref points at its own value), so this
+   needs no state check beyond a null guard. */
+int JS_WhaleVarRefGetObj(JSContext *ctx, void *var_refs, int idx, int slot)
+{
+    JSVarRef **vrs = (JSVarRef **)var_refs;
+    JSVarRef *vr;
+
+    if (!vrs || idx < 0 || slot < 0 || slot >= WHALE_OBJ_SLOTS)
+        return 0;
+    vr = vrs[idx];
+    if (!vr || !vr->pvalue)
+        return 0;
+    JS_WhaleObjSlot(ctx, slot, js_dup(*vr->pvalue));
     return 1;
 }
 
@@ -19246,16 +19313,39 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
            would have left it. */
         if (b->whale_needs_obj)
             sf->cur_sp = obj_slots + WHALE_OBJ_SLOTS;
-        whale_ret = ((JSValue (*)(JSContext *, JSValue *, JSValue *, int *, JSValue, void *, void *))b->whale_jit_entry)
-                        (ctx, arg_buf, var_buf, &whale_deopt, func_obj, (void *)b->whale_jit_entry, (void *)var_refs);
-        if (b->whale_needs_obj) {
-            sf->cur_sp = NULL;
-            /* drop whatever the JIT parked, on both the deopt and the normal
-               path: the slots are only borrowed for the duration of this call */
-            for (pval = obj_slots; pval < obj_slots + WHALE_OBJ_SLOTS; pval++) {
-                JS_FreeValue(ctx, *pval);
-                *pval = JS_UNDEFINED;
+        /* Two compilations of one function are possible: one reading a closure
+           slot that feeds a call as this function, one reading it as an
+           enclosing closure's value. *deopt == 3 is that entry check failing,
+           and it happens before anything of the body has run - so switching to
+           the other compilation here is safe, and it is the only deopt where
+           that is true (any other one may have run a host call already). */
+        for (;;) {
+            whale_deopt = 0;
+            whale_ret = ((JSValue (*)(JSContext *, JSValue *, JSValue *, int *, JSValue, void *, void *))b->whale_jit_entry)
+                            (ctx, arg_buf, var_buf, &whale_deopt, func_obj, (void *)b->whale_jit_entry, (void *)var_refs);
+            if (b->whale_needs_obj) {
+                sf->cur_sp = NULL;
+                /* drop whatever the JIT parked, on both the deopt and the normal
+                   path: the slots are only borrowed for the duration of this call */
+                for (pval = obj_slots; pval < obj_slots + WHALE_OBJ_SLOTS; pval++) {
+                    JS_FreeValue(ctx, *pval);
+                    *pval = JS_UNDEFINED;
+                }
+                sf->cur_sp = obj_slots + WHALE_OBJ_SLOTS;
             }
+            if (whale_deopt == 3 && b->whale_jit_entry2) {
+                void *whale_e2 = b->whale_jit_entry2;
+
+                b->whale_jit_entry2 = NULL;
+                b->whale_jit_entry = whale_e2;
+                b->whale_pure = 0;   /* this reading depends on captured state */
+                if (getenv("WHALE_JIT_DUMP"))
+                    fprintf(stderr, "whale jit: call target is not this function, using the other reading\n");
+                continue;
+            }
+            if (b->whale_needs_obj)
+                sf->cur_sp = NULL;
+            break;
         }
         if (unlikely(whale_deopt)) {
             if (getenv("WHALE_JIT_DUMP"))

@@ -311,6 +311,11 @@ int whale_gen_pure = 1;
    non-zero, which keeps plain numeric functions (fib, arith, ...) from paying
    for machinery they never touch. */
 int whale_gen_objs = 0;
+/* Which reading of a closure slot that feeds a call to compile. 1 = the slot is
+   this function (self-recursion); 0 = it is an enclosing closure's value. The
+   bytecode is identical, so the engine compiles both and lets the entry check
+   decide which one is running. */
+int whale_assume_self = 1;
 static int whale_tok_buf[16384];
 static double whale_tok_num[16384];
 static int whale_tok_len;

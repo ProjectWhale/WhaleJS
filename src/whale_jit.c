@@ -162,6 +162,12 @@ enum {
 #define WHALE_VAL_T(slot)  ((uint8_t)(WHALE_T_VAL | (((slot) + 1) << 4)))
 #define WHALE_IS_VAL(t)    (((t) & 0x0f) == WHALE_T_VAL)
 #define WHALE_VAL_SLOT(t)  ((int)((t) >> 4) - 1)
+/* Anything that carries an object slot - a plain object, a packed array, or an
+   arbitrary value - encodes the slot the same way, so one accessor serves all
+   three. WHALE_T_VAL only exists because a value from a call is not a literal
+   whose shape we can see; the slot mechanics are identical. */
+#define WHALE_IS_SLOT(t)   (WHALE_IS_OBJ(t) || WHALE_IS_ARR(t) || WHALE_IS_VAL(t))
+#define WHALE_SLOT(t)      ((int)((t) >> 4) - 1)
 
 /* ------------------------------------------------------------------------
  * Token emitters.
@@ -286,6 +292,15 @@ static int whale_is_call_op(int op)
    few instructions ahead is enough, and being wrong here only means falling
    back to the self-recursion reading of the slot, which then bails out rather
    than computing something wrong. */
+/* How a closure slot that feeds a call is read - see the note where it is
+   defined (whale_tcc_iface.c). The engine compiles both readings when a
+   function needs it, so this is set by the caller rather than sniffed here. */
+extern int whale_assume_self;
+/* 1 when this compilation put a "is this closure slot this function?" check in
+   the entry, i.e. when the two readings above actually differ for this
+   function. That is what tells the engine a second compilation is worth it. */
+int whale_gen_self_ref = 0;
+
 /* Does this instruction push a literal or a variable read? Used only to look a
    few instructions ahead for the `f(a, b)` shape. */
 static int whale_is_push_op(int op)
@@ -991,6 +1006,7 @@ static void local_flush_all(int n)
    candidate (unsupported opcode, unknown type, inconsistent jump target). */
 static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 {
+    whale_gen_self_ref = 0;
     {
         static int once;
         if (!once && getenv("WHALE_JIT_DUMP")) {
@@ -1108,13 +1124,18 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         } else if (op >= OP_get_var_ref0 && op < OP_get_var_ref0 + 4) {
             /* Only a slot used as a call target has to be this very function; an
                enclosing closure's variable is read as a number instead. */
-            if (whale_var_ref_feeds_call(pc, len, pos, sz))
+            if (whale_assume_self && whale_var_ref_feeds_call(pc, len, pos, sz)) {
                 var_ref_used[op - OP_get_var_ref0] = 1;
+                whale_gen_self_ref = 1;
+            }
         } else if (op == OP_get_var_ref) {
             int a = (int)whale_get_u16(pc + pos + 1);
 
-            if (a >= 0 && a < 4 && whale_var_ref_feeds_call(pc, len, pos, sz))
+            if (a >= 0 && a < 4 && whale_assume_self &&
+                whale_var_ref_feeds_call(pc, len, pos, sz)) {
                 var_ref_used[a] = 1;
+                whale_gen_self_ref = 1;
+            }
         }
         pos += sz;
     }
@@ -1197,7 +1218,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     wt('}'); wt_id("JSValue"); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleVarRefGetNum"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_VOID); wt('*'); wt_id("var_refs"); wt(',');
-        wk(JS_WK_INT); wt_id("idx"); wt(','); wk(JS_WK_DOUBLE); wt('*'); wt_id("out"); wt(')'); wt(';');    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleVarRefSetNum"); wt('(');
+        wk(JS_WK_INT); wt_id("idx"); wt(','); wk(JS_WK_DOUBLE); wt('*'); wt_id("out"); wt(')'); wt(';');    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleVarRefGetObj"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_VOID); wt('*'); wt_id("var_refs"); wt(',');
+        wk(JS_WK_INT); wt_id("idx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleVarRefSetNum"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_VOID); wt('*'); wt_id("var_refs"); wt(',');
         wk(JS_WK_INT); wt_id("idx"); wt(','); wk(JS_WK_DOUBLE); wt_id("v"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleVarRefIsSelf"); wt('(');
@@ -1276,7 +1300,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wk(JS_WK_INT); wt_id("dst"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleCallValue"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("func_slot"); wt(',');
-        wk(JS_WK_INT); wt_id("argc"); wt(','); wk(JS_WK_INT); wt_id("arg_base"); wt(')'); wt(';');
+        wk(JS_WK_INT); wt_id("argc"); wt(','); wk(JS_WK_INT); wt_id("arg_base"); wt(',');
+        wk(JS_WK_INT); wt_id("ret_slot"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_WhaleExceptionValue"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(')'); wt(';');
     /* object-slot test hook (WHALE_OBJ_TEST). Declared like the rest: without a
@@ -1912,13 +1937,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int tb = cur[var_count + sp - 1];
                 int atom = (int)whale_get_u32(pc + pos + 1);
 
-                if (!WHALE_IS_OBJ(ta) || !whale_type_is_num(tb))
+                if (!WHALE_IS_SLOT(ta) || !whale_type_is_num(tb))
                     goto out;
                 {
                     int fm = fold_mark();
 
                     wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjDefineNum"); wt('(');
-                    wt_id("ctx"); wt(','); wt_int(WHALE_OBJ_SLOT(ta)); wt(','); wt_int(atom); wt(',');
+                    wt_id("ctx"); wt(','); wt_int(WHALE_SLOT(ta)); wt(','); wt_int(atom); wt(',');
                     fold_inline(sp - 1); wt(')'); wt(')');
                     wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
                     wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
@@ -1935,7 +1960,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int tb = cur[var_count + sp - 1];
                 int atom = (int)whale_get_u32(pc + pos + 1);
 
-                if (!WHALE_IS_OBJ(ta) || !whale_type_is_num(tb))
+                if (!WHALE_IS_SLOT(ta) || !whale_type_is_num(tb))
                     goto out;
                 if (whale_fields >= WHALE_FIELD_CACHE)
                     goto out;
@@ -1943,7 +1968,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     int fc = whale_fields++;
                     int fm;
 
-                    fold_obj_field_resolve(WHALE_OBJ_SLOT(ta), atom, fc, whale_shape_stable);
+                    /* `stable` means "the shape cannot change for the rest of
+                       this function", which was proved about a local literal.
+                       An object that came from a call is not one, so it always
+                       keeps its shape check. */
+                    fold_obj_field_resolve(WHALE_SLOT(ta), atom, fc,
+                                           whale_shape_stable && WHALE_IS_OBJ(ta));
                     fm = fold_mark();
                     /* the value is a double here, and the old one was a number too
                        (anything else deopted above) */
@@ -1964,13 +1994,14 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int atom = (int)whale_get_u32(pc + pos + 1);
                 int fc, nm;
 
-                if (!WHALE_IS_OBJ(ta))
+                if (!WHALE_IS_SLOT(ta))
                     goto out;
                 if (whale_fields >= WHALE_FIELD_CACHE)
                     goto out;
                 fc = whale_fields++;
                 nm = whale_vserial++;
-                fold_obj_field_load(WHALE_OBJ_SLOT(ta), atom, fc, nm, whale_shape_stable);
+                fold_obj_field_load(WHALE_SLOT(ta), atom, fc, nm,
+                                    whale_shape_stable && WHALE_IS_OBJ(ta));
                 whale_vname[sp] = nm;
                 whale_vmat[sp] = 1;
                 cur[var_count + sp] = WHALE_T_NUM;
@@ -1985,13 +2016,14 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int atom = (int)whale_get_u32(pc + pos + 1);
                 int fc, nm;
 
-                if (!WHALE_IS_OBJ(ta))
+                if (!WHALE_IS_SLOT(ta))
                     goto out;
                 if (whale_fields >= WHALE_FIELD_CACHE)
                     goto out;
                 fc = whale_fields++;
                 nm = whale_vserial++;
-                fold_obj_field_load(WHALE_OBJ_SLOT(ta), atom, fc, nm, whale_shape_stable);
+                fold_obj_field_load(WHALE_SLOT(ta), atom, fc, nm,
+                                    whale_shape_stable && WHALE_IS_OBJ(ta));
                 whale_vname[sp - 1] = nm;
                 whale_vmat[sp - 1] = 1;
                 cur[var_count + sp - 1] = WHALE_T_NUM;
@@ -2121,7 +2153,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 t = (idx >= 0 && idx < var_count) ? cur[idx] : WHALE_T_UNKNOWN;
                 if (t == WHALE_T_UNKNOWN)
                     goto out;
-                if (WHALE_IS_OBJ(t) || WHALE_IS_ARR(t)) {
+                if (WHALE_IS_SLOT(t)) {
                     /* An object is its slot number, which the type already
                        carries - nothing to emit, the value is the same in every
                        copy. Only the value path needs folding. */
@@ -2151,14 +2183,14 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 t = cur[var_count + sp - 1];
                 if (t == WHALE_T_UNKNOWN || idx < 0 || idx >= var_count)
                     goto out;
-                if (WHALE_IS_OBJ(t) || WHALE_IS_ARR(t)) {
+                if (WHALE_IS_SLOT(t)) {
                     /* Same reasoning as get_loc: the value *is* the slot number,
                        so this store is a type change and nothing else - no
                        deferred store and no fold slot. It can put a different
                        array in the slot, so drop any cached buffer pointer. */
                     int fm = fold_mark();
 
-                    wt_arr("oi", WHALE_OBJ_SLOT(t)); wt('='); wt_int(0); wt(';');
+                    wt_arr("oi", WHALE_SLOT(t)); wt('='); wt_int(0); wt(';');
                     fold_commit(fm);
                     local_forget(idx);
                     cur[idx] = (uint8_t)t;
@@ -2287,6 +2319,27 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     sp++;
                     break;
                 }
+                if (!whale_assume_self) {
+                    /* The other reading of the same bytecode: the slot holds an
+                       enclosing closure's value. Park it as-is and let the call
+                       site hand it to the engine. */
+                    int slot = whale_objs++;
+                    int fmb;
+
+                    if (slot >= WHALE_CALL_BASE)
+                        goto out;
+                    whale_gen_pure = 0;   /* depends on captured state */
+                    fmb = fold_mark();
+                    wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleVarRefGetObj"); wt('(');
+                    wt_id("ctx"); wt(','); wt_id("var_refs"); wt(','); wt_int(idx); wt(',');
+                    wt_int(slot); wt(')'); wt(')');
+                    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    fold_commit(fmb);
+                    cur[var_count + sp] = WHALE_VAL_T(slot);
+                    sp++;
+                    break;
+                }
                 (void)idx;
                 cur[var_count + sp] = WHALE_T_SELF;
                 /* SELF has no value expression: mark the slot materialised so
@@ -2329,6 +2382,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             {
                 int atom = (int)whale_get_u32(pc + pos + 1);
                 int fm = fold_mark();
+
 
                 /* Reading a global makes the result depend on something other
                    than the arguments, so the engine must not memoise this
@@ -2417,13 +2471,24 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                        drop that follows in the bytecode confirms it is dead. */
                     int tc = cur[var_count + func_slot];
                     int nxt = pos + sz;
+                    int ret_slot;
 
-                    if (!WHALE_IS_VAL(tc) && !WHALE_IS_OBJ(tc))
-                        goto out;
-                    if (nxt >= len || (int)pc[nxt] != OP_drop)
+                    if (!WHALE_IS_SLOT(tc))
                         goto out;
                     if (argc > WHALE_CALL_SLOTS)
                         goto out;
+                    /* Either the result is dead - the bytecode drops it right
+                       after - or it is parked in a slot as an opaque value. A
+                       result that is neither is refused: needing a number from
+                       it later would deopt, and re-running this frame would run
+                       the call a second time. */
+                    if (nxt < len && (int)pc[nxt] == OP_drop) {
+                        ret_slot = -1;
+                    } else {
+                        if (whale_objs >= WHALE_CALL_BASE)
+                            goto out;
+                        ret_slot = whale_objs++;
+                    }
                     for (k = 0; k < argc; k++) {
                         int tk = cur[var_count + sp - argc + k];
 
@@ -2450,11 +2515,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleCallValue"); wt('(');
                     wt_id("ctx"); wt(',');
                     wt_int(WHALE_IS_VAL(tc) ? WHALE_VAL_SLOT(tc) : WHALE_OBJ_SLOT(tc)); wt(',');
-                    wt_int(argc); wt(','); wt_int(WHALE_CALL_BASE); wt(')'); wt(')');
+                    wt_int(argc); wt(','); wt_int(WHALE_CALL_BASE); wt(',');
+                    wt_int(ret_slot); wt(')'); wt(')');
                     wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(2); wt(';');
                     wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
                     fold_commit(fm);
-                    cur[var_count + func_slot] = WHALE_T_UNKNOWN;
+                    cur[var_count + func_slot] = (ret_slot < 0)
+                        ? (uint8_t)WHALE_T_UNKNOWN : WHALE_VAL_T(ret_slot);
                     sp = func_slot + 1;
                     break;
                 }
@@ -2796,7 +2863,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        the closure cannot change during the call, so recursion need not re-check) */
     for (i = 0; i < 4; i++) {
         if (var_ref_used[i]) {
-            wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleVarRefIsSelf"); wt('('); wt_id("ctx"); wt(','); wt_id("whale_var_refs"); wt(','); wt_int(i); wt(','); wt_id("whale_self"); wt(')'); wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_id("whale_jit_box_num"); wt('('); wt_id("ctx"); wt(','); wt_int(0); wt(')'); wt(';'); wt('}');
+            wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleVarRefIsSelf"); wt('('); wt_id("ctx"); wt(','); wt_id("whale_var_refs"); wt(','); wt_int(i); wt(','); wt_id("whale_self"); wt(')'); wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(3); wt(';'); wk(JS_WK_RETURN); wt_id("whale_jit_box_num"); wt('('); wt_id("ctx"); wt(','); wt_int(0); wt(')'); wt(';'); wt('}');
         }
     }
     wt_id("_r"); wt('='); wt_id(whale_core_name); wt('('); wt_id("ctx"); wt(','); wt_id("args"); wt(','); wt_id("An"); wt(','); wt_id("deopt"); wt(','); wt('&'); wt_id("_ret"); wt(','); wt_id("whale_var_refs"); wt(')'); wt(';');
@@ -2923,6 +2990,7 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
         tcc_add_symbol(s, "JS_WhaleVarRefIsSelf", (void *)JS_WhaleVarRefIsSelf);
         tcc_add_symbol(s, "JS_WhaleVarRefGetNum", (void *)JS_WhaleVarRefGetNum);
         tcc_add_symbol(s, "JS_WhaleVarRefSetNum", (void *)JS_WhaleVarRefSetNum);
+        tcc_add_symbol(s, "JS_WhaleVarRefGetObj", (void *)JS_WhaleVarRefGetObj);
         tcc_add_symbol(s, "JS_WhaleCheckStack", (void *)JS_WhaleCheckStack);
         tcc_add_symbol(s, "whale_jit_box_num", (void *)whale_jit_box_num);
         tcc_add_symbol(s, "whale_jit_unbox_num", (void *)whale_jit_unbox_num);

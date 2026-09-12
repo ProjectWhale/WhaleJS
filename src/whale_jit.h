@@ -66,6 +66,10 @@ int JS_WhaleVarRefIsSelf(JSContext *ctx, void **var_refs, int idx, JSValue self)
    variable stay in the JIT instead of falling back to the interpreter. */
 int JS_WhaleVarRefGetNum(JSContext *ctx, void *var_refs, int idx, double *out);
 int JS_WhaleVarRefSetNum(JSContext *ctx, void *var_refs, int idx, double v);
+/* Park whatever closure slot idx holds in object slot `slot`, whatever kind of
+   value it is. Used when the slot feeds a call: the value is either this
+   function (self-recursion) or an enclosing closure's function. */
+int JS_WhaleVarRefGetObj(JSContext *ctx, void *var_refs, int idx, int slot);
 int JS_WhaleCheckStack(JSContext *ctx);
 int JS_WhaleOpSize(int op);   /* bytecode operand size, from the interpreter table */
 
@@ -78,10 +82,11 @@ JSValue JS_WhaleObjGet(JSContext *ctx, int k);            /* read it back */
    JSValues, and an argument has to stay visible to GC while the callee runs). */
 int JS_WhaleObjSlotNum(JSContext *ctx, int slot, double v);
 /* Call the value in func_slot with the arguments parked in
-   arg_base..arg_base+argc-1; the result is dropped. 0 means deopt (the call
-   threw). Callee and arguments are borrowed from their slots, which is what
-   keeps them alive across the call. */
-int JS_WhaleCallValue(JSContext *ctx, int func_slot, int argc, int arg_base);
+   arg_base..arg_base+argc-1. The result is parked in ret_slot, or dropped when
+   ret_slot is negative. 0 means deopt (the call threw). Callee and arguments are
+   borrowed from their slots, which is what keeps them alive across the call. */
+int JS_WhaleCallValue(JSContext *ctx, int func_slot, int argc, int arg_base,
+                      int ret_slot);
 /* Duplicate slot src into slot dst (moving an already-parked value into the
    contiguous scratch area a call needs). */
 int JS_WhaleObjSlotCopy(JSContext *ctx, int src, int dst);
