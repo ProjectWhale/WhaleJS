@@ -70,3 +70,43 @@ function inlineVer(n) { var st = {a:0,b:0,e:0}; for (i) { var v = i % 11; st = {
 
 **这一步（D6 的"IC 提到函数级"）是 `immutable_update` 这类形状的真正出口，
 而不是内联。** 内联在"被调者编译期不可见"时没有立足点。
+
+
+## 补测：也不是字段解析
+
+把被调函数的内部工作拆成"读 0 / 1 / 3 个字段 + 建 1 个对象"：
+
+| | node | whalejs |
+|---|---|---|
+| `read3`（读 3 字段） | 50 ms | 352 ms |
+| `read0`（读 0 字段） | 14 ms | **331 ms** |
+| `read1`（读 1 字段） | 11 ms | 410 ms |
+
+whalejs 的 `read0` 和 `read3` **几乎一样**，而 node 差 3.5 倍。所以字段解析
+（per-call `find_own_property`）**不是**这 300ns 的来源——把它优化掉也不会动这个数。
+（顺带说明 `read1` 比 `read3` 还慢是噪声：这条测量在 `--repeat` 上跑一次，抖动量级就是几十 ms。）
+
+结合前面：纯调用 ~55ns，字段解析不是大头，而"调用 + 建一个对象"就是 331ms/100万 = 331ns，
+同样的工作在展开版里是 10ns。**差异集中在"被调者里的对象字面量"这一个组合上**，
+具体机制还没确定（候选：跨帧的分配/释放路径、或 `whale_needs_obj` 那 12 个槽的
+初始化与释放每次都重来）。**在查清它之前，做跨函数内联是在赌一个自己还不理解的开销。**
+
+## 路径是存在的，但不在这一轮的量级
+
+用户提的"在 QuickJS 侧展开"是对的，而且比想象的近：`JSWhaleFuncInfo` 里**已经有**
+`cpool`（`const JSValue *`），而函数字面量就住在 `cpool` 里——`OP_fclosure <idx>` 取的就是它。
+所以生成器不需要新的编译器支持就能看到被调者的字节码：
+
+1. 预扫描识别 `OP_fclosure M` + `OP_put_locN` → `local_fn[N] = M`
+2. `OP_get_locN` 时若已知，标成"这个槽里的函数是 cpool[M]"（新类型，编码同 `WHALE_T_VAL`）
+3. `OP_call` 时据此展开
+
+`whale_jit.c` 现在还不认识 `JSFunctionBytecode`（它刻意"knows nothing about quickjs internals"），
+所以要加一个引擎侧入口，比如 `JS_WhaleCpoolFuncInfo(ctx, cpool, idx, &out)`，
+把那个函数的 `byte_code`/`var_count`/`stack_size`/`arg_count` 填进一个 `JSWhaleFuncInfo`。
+
+**但第 3 步是真正的字节码展开**：callee 的参数、局部变量、栈槽都要映射到 caller 的槽位，
+`return` 要跳回调用点，跳转偏移要重定位。这是几百行新代码，外加一整套新的正确性测试
+（尤其"被内联的函数自己也有对象字面量"这种情况，两个函数的对象槽必须不重叠）。
+
+**结论：值得做，但应该是一轮自己的事，而不是这一轮的尾巴。**
