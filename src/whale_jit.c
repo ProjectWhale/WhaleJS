@@ -1126,7 +1126,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(',');
         wt_id("JSValue"); wt('*'); wt_id("args"); wt(',');
         wk(JS_WK_DOUBLE); wt('*'); wt_id("An"); wt(',');
-        wk(JS_WK_INT); wt('*'); wt_id("deopt"); wt(')'); wt('{');
+        wk(JS_WK_INT); wt('*'); wt_id("deopt"); wt(',');
+        /* An array or object result cannot come back through the double return,
+           so core writes the reference here; the numeric path leaves it
+           undefined. */
+        wt_id("JSValue"); wt('*'); wt_id("ret_obj"); wt(')'); wt('{');
+    wt_id("JSValue"); wt_id("_cref"); wt(';');
+    wt_id("_cref"); wt('.'); wt_id("tag"); wt('='); wt_int(3); wt(';');
     for (i = 0; i < var_count; i++) {
         if (!whale_has_call && whale_nloops <= 1)
             wk(JS_WK_REGISTER);
@@ -1930,7 +1936,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 t = (idx >= 0 && idx < var_count) ? cur[idx] : WHALE_T_UNKNOWN;
                 if (t == WHALE_T_UNKNOWN)
                     goto out;
-                if (WHALE_IS_OBJ(t)) {
+                if (WHALE_IS_OBJ(t) || WHALE_IS_ARR(t)) {
                     /* An object is its slot number, which the type already
                        carries - nothing to emit, the value is the same in every
                        copy. Only the value path needs folding. */
@@ -1960,7 +1966,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 t = cur[var_count + sp - 1];
                 if (t == WHALE_T_UNKNOWN || idx < 0 || idx >= var_count)
                     goto out;
-                if (WHALE_IS_OBJ(t)) {
+                if (WHALE_IS_OBJ(t) || WHALE_IS_ARR(t)) {
                     /* Same reasoning as get_loc: the value *is* the slot number,
                        so this store is a type change and nothing else - no
                        deferred store and no fold slot. It can put a different
@@ -2154,7 +2160,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     wt_id("_an"); wt('['); wt_int(k); wt(']'); wt('='); fold_inline(sp - argc + k); wt(';');
                 }
                 wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleCheckStack"); wt('('); wt_id("ctx"); wt(')'); wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
-                wt_id("_r"); wt('='); wt_id(whale_core_name); wt('('); wt_id("ctx"); wt(','); wt_id("args"); wt(','); wt_id("_an"); wt(','); wt('&'); wt_id("_dd"); wt(')'); wt(';');
+                wt_id("_r"); wt('='); wt_id(whale_core_name); wt('('); wt_id("ctx"); wt(','); wt_id("args"); wt(','); wt_id("_an"); wt(','); wt('&'); wt_id("_dd"); wt(','); wt('&'); wt_id("_cref"); wt(')'); wt(';');
                 wk(JS_WK_IF); wt('('); wt_id("_dd"); wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
                 {
                     int nm = whale_vserial++;   /* fresh name, never reused */
@@ -2392,11 +2398,23 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int fm;
 
                 t = cur[var_count + sp - 1];
+                if (WHALE_IS_ARR(t) || WHALE_IS_OBJ(t)) {
+                    /* The slot holds the reference; hand it to the caller
+                       through ret_obj. Mixing it with the numeric return path
+                       is refused - a function with two return shapes is not to
+                       be specialised. */
+                    if (ret_is_bool != -1)
+                        goto out;
+                    fm = fold_mark();
+                    wt('*'); wt_id("ret_obj"); wt('='); wt_id("JS_WhaleObjGet"); wt('(');
+                    wt_id("ctx"); wt(','); wt_int(WHALE_OBJ_SLOT(t)); wt(')'); wt(';');
+                    wk(JS_WK_RETURN); wt_int(0); wt(';');
+                    fold_commit(fm);
+                    unreachable = 1;
+                    break;
+                }
                 if (!whale_type_is_num(t))
                     goto out;
-                /* Returning an array or object is not supported yet: the slot
-                   holds the reference but the return path is numeric, and a
-                   function with two return shapes should not be specialised. */
                 if (ret_is_bool == -1)
                     ret_is_bool = (t == WHALE_T_BOOL);
                 else if (ret_is_bool != (t == WHALE_T_BOOL))
@@ -2430,7 +2448,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     wt('}');
     /* engine entry: unbox the arguments once, run core, box the result */
     wt_id("JSValue"); wt_id(whale_entry_name); wt('('); wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wt_id("JSValue"); wt('*'); wt_id("args"); wt(','); wt_id("JSValue"); wt('*'); wt_id("var_buf"); wt(','); wk(JS_WK_INT); wt('*'); wt_id("deopt"); wt(','); wt_id("JSValue"); wt_id("whale_self"); wt(','); wk(JS_WK_VOID); wt('*'); wt_id("whale_entry"); wt(','); wk(JS_WK_VOID); wt('*'); wt_id("whale_var_refs"); wt(')'); wt('{');
-    wk(JS_WK_DOUBLE); wt_id("An"); wt('['); wt_int(arg_count > 0 ? arg_count : 1); wt(']'); wt(';'); wk(JS_WK_DOUBLE); wt_id("_r"); wt(';');
+    wk(JS_WK_DOUBLE); wt_id("An"); wt('['); wt_int(arg_count > 0 ? arg_count : 1); wt(']'); wt(';'); wk(JS_WK_DOUBLE); wt_id("_r"); wt(';'); wt_id("JSValue"); wt_id("_ret"); wt(';'); wt_id("_ret"); wt('.'); wt_id("tag"); wt('='); wt_int(3); wt(';');
     /* On any failure set *deopt and return 0: the caller checks the flag first
        and interprets the frame itself, so the returned JSValue is discarded.
        That keeps JS_EXCEPTION (a macro with no linkable address) out of the
@@ -2465,8 +2483,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleVarRefIsSelf"); wt('('); wt_id("ctx"); wt(','); wt_id("whale_var_refs"); wt(','); wt_int(i); wt(','); wt_id("whale_self"); wt(')'); wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_id("whale_jit_box_num"); wt('('); wt_id("ctx"); wt(','); wt_int(0); wt(')'); wt(';'); wt('}');
         }
     }
-    wt_id("_r"); wt('='); wt_id(whale_core_name); wt('('); wt_id("ctx"); wt(','); wt_id("args"); wt(','); wt_id("An"); wt(','); wt_id("deopt"); wt(')'); wt(';');
+    wt_id("_r"); wt('='); wt_id(whale_core_name); wt('('); wt_id("ctx"); wt(','); wt_id("args"); wt(','); wt_id("An"); wt(','); wt_id("deopt"); wt(','); wt('&'); wt_id("_ret"); wt(')'); wt(';');
     wk(JS_WK_IF); wt('('); wt('*'); wt_id("deopt"); wt(')'); wk(JS_WK_RETURN); wt_id("whale_jit_box_num"); wt('('); wt_id("ctx"); wt(','); wt_int(0); wt(')'); wt(';');
+    /* an array or object result came back through ret_obj instead */
+    wk(JS_WK_IF); wt('('); wt_id("_ret"); wt('.'); wt_id("tag"); wt_op(JS_OP_NE); wt_int(3); wt(')');
+    wk(JS_WK_RETURN); wt_id("_ret"); wt(';');
     if (ret_is_bool == 1) {
         wk(JS_WK_RETURN); wt_id("JS_NewBool"); wt('('); wt_id("ctx"); wt(','); wt_id("_r"); wt_op(JS_OP_NE); wt_int(0); wt(')'); wt(';');
     } else {
