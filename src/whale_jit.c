@@ -779,14 +779,17 @@ static void fold_obj_field_load(int os, int atom, int fc, int nm, int stable)
        check disappears entirely, which is the difference between beating the
        interpreter and merely matching it. */
     if (stable) {
-        wk(JS_WK_IF); wt('('); wt('!'); wt_arr("fs", fc); wt(')'); wt('{');
+        wk(JS_WK_IF); wt('('); wt('!'); wt_arr("fs", fc); wt_op(JS_OP_OR);
+        wt_arr("fv", fc); wt_op(JS_OP_NE); wt_id("_ws"); wt('.'); wt_id("fver"); wt(')'); wt('{');
     } else {
-        wk(JS_WK_IF); wt('('); wt_arr("fs", fc); wt_op(JS_OP_NE);
+        wk(JS_WK_IF); wt('('); wt_arr("fv", fc); wt_op(JS_OP_NE); wt_id("_ws"); wt('.'); wt_id("fver");
+        wt_op(JS_OP_OR); wt_arr("fs", fc); wt_op(JS_OP_NE);
         wt_id("JS_WhaleObjShape"); wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(')'); wt(')');
         wt('{');
     }
     wt_arr("fp", fc); wt('='); wt_id("JS_WhaleObjFieldPtr"); wt('(');
     wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_int(atom); wt(','); wt('&'); wt_arr("fs", fc); wt(')'); wt(';');
+    wt_arr("fv", fc); wt('='); wt_id("_ws"); wt('.'); wt_id("fver"); wt(';');
     wk(JS_WK_IF); wt('('); wt('!'); wt_arr("fp", fc); wt(')'); wt('{');
     wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
     wt('}');
@@ -811,14 +814,17 @@ static void fold_obj_field_resolve(int os, int atom, int fc, int stable)
     int fm = fold_mark();
 
     if (stable) {
-        wk(JS_WK_IF); wt('('); wt('!'); wt_arr("fs", fc); wt(')'); wt('{');
+        wk(JS_WK_IF); wt('('); wt('!'); wt_arr("fs", fc); wt_op(JS_OP_OR);
+        wt_arr("fv", fc); wt_op(JS_OP_NE); wt_id("_ws"); wt('.'); wt_id("fver"); wt(')'); wt('{');
     } else {
-        wk(JS_WK_IF); wt('('); wt_arr("fs", fc); wt_op(JS_OP_NE);
+        wk(JS_WK_IF); wt('('); wt_arr("fv", fc); wt_op(JS_OP_NE); wt_id("_ws"); wt('.'); wt_id("fver");
+        wt_op(JS_OP_OR); wt_arr("fs", fc); wt_op(JS_OP_NE);
         wt_id("JS_WhaleObjShape"); wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(')'); wt(')');
         wt('{');
     }
     wt_arr("fp", fc); wt('='); wt_id("JS_WhaleObjFieldPtr"); wt('(');
     wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_int(atom); wt(','); wt('&'); wt_arr("fs", fc); wt(')'); wt(';');
+    wt_arr("fv", fc); wt('='); wt_id("_ws"); wt('.'); wt_id("fver"); wt(';');
     wk(JS_WK_IF); wt('('); wt('!'); wt_arr("fp", fc); wt(')'); wt('{');
     wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
     wt('}');
@@ -1382,6 +1388,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wk(JS_WK_DOUBLE); wt_id("v"); wt('['); wt_int(stack_size + WHALE_VSER_MAX); wt(']'); wt(';');
         wk(JS_WK_VOID); wt('*'); wt_id("fs"); wt('['); wt_int(WHALE_FIELD_CACHE); wt(']'); wt(';');
         wt_id("JSValue"); wt('*'); wt_id("fp"); wt('['); wt_int(WHALE_FIELD_CACHE); wt(']'); wt(';');
+        wk(JS_WK_INT); wt_id("fver"); wt(';');
+        wk(JS_WK_INT); wt_id("fv"); wt('['); wt_int(WHALE_FIELD_CACHE); wt(']'); wt(';');
         wt_id("JSValue"); wt('*'); wt_id("ap"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
         wk(JS_WK_DOUBLE); wt_id("an"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
         wk(JS_WK_INT); wt_id("ai"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
@@ -1389,6 +1397,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wk(JS_WK_DOUBLE); wt_id("on"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
         wk(JS_WK_INT); wt_id("oi"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
     wt('}'); wt_id("_ws"); wt('='); wt('{'); wt_int(0); wt('}'); wt(';');
+    /* 1, because a cached fv[] of 0 (from that zero initialiser) must not look
+       like the current generation. */
+    wt_id("_ws"); wt('.'); wt_id("fver"); wt('='); wt_int(1); wt(';');
     /* Per-property-access cache for object literals: the shape the property was
        resolved against and the address of its value. One pair per access site,
        and a site always touches the same property, so this is a compile-time
@@ -1916,9 +1927,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     sp--;
                     break;
                 }
-                if (!WHALE_IS_OBJ(ta) || !whale_type_is_num(tb))
+                if (!WHALE_IS_SLOT(ta) || !whale_type_is_num(tb))
                     goto out;
-                os = WHALE_OBJ_SLOT(ta);
+                os = WHALE_SLOT(ta);
                 nm = whale_vserial++;      /* result */
                 tk = whale_vserial++;      /* the index, evaluated once */
                 {
@@ -2162,10 +2173,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     sp -= 3;
                     break;
                 }
-                if (!WHALE_IS_OBJ(ta) || !whale_type_is_num(tb) ||
+                if (!WHALE_IS_SLOT(ta) || !whale_type_is_num(tb) ||
                     !whale_type_is_num(tc))
                     goto out;
-                os = WHALE_OBJ_SLOT(ta);
+                os = WHALE_SLOT(ta);
                 tk = whale_vserial++;      /* the index, evaluated once */
                 {
                     int fm = fold_mark();
@@ -2242,6 +2253,20 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     int fm;
                     int src = WHALE_SLOT(t);
 
+                    if (WHALE_IS_ARR(t)) {
+                        /* A packed array keeps its own type rather than becoming
+                           a plain slot value: the element access ops require it,
+                           and unlike an object there is no second reading of the
+                           same variable that could disagree with this one. */
+                        fm = fold_mark();
+                        wt_arr("oi", src); wt('='); wt_int(0); wt(';');
+                        fold_commit(fm);
+                        local_forget(idx);
+                        cur[idx] = (uint8_t)t;
+                        lo_c[idx] = 0;
+                        sp--;
+                        break;
+                    }
                     {
                         if (loc_slot[idx] < 0) {
                             if (whale_objs >= WHALE_CALL_BASE)
@@ -2264,7 +2289,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     fold_commit(fm);
                     local_forget(idx);
                     cur[idx] = (uint8_t)t;
-                    lo_c[idx] = 0;
+                    lo_c[idx] = 0;                    fm = fold_mark();
+                    wt_id("_ws"); wt('.'); wt_id("fver"); wt('=');
+                    wt_id("_ws"); wt('.'); wt_id("fver"); wt_op(JS_OP_ADD); wt_int(1); wt(';');
+                    fold_commit(fm);
                     sp--;
                     break;
                 }
@@ -2293,6 +2321,47 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 t = cur[var_count + sp - 1];
                 if (t == WHALE_T_UNKNOWN || idx < 0 || idx >= var_count)
                     goto out;
+                if (WHALE_IS_ARR(t)) {
+                    /* An array keeps its own type - see the note in put_loc. */
+                    local_forget(idx);
+                    fm = fold_mark();
+                    wt_arr("oi", WHALE_SLOT(t)); wt('='); wt_int(0); wt(';');
+                    fold_commit(fm);
+                    cur[idx] = (uint8_t)t;
+                    lo_c[idx] = 0;
+                    break;
+                }
+                if (WHALE_IS_SLOT(t)) {
+                    /* The same slot unification put_loc does, and for the same
+                       reason: without it this assignment leaves a slot number in
+                       the variable that the next one will not match, and the two
+                       meet at a jump target as different types. The value also
+                       stays on the stack, so both places have to name the same
+                       slot. */
+                    int src = WHALE_SLOT(t);
+
+                    if (loc_slot[idx] < 0) {
+                        if (whale_objs >= WHALE_CALL_BASE)
+                            goto out;
+                        loc_slot[idx] = whale_objs++;
+                    }
+                    if (src != loc_slot[idx]) {
+                        fm = fold_mark();
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjSlotCopy"); wt('(');
+                        wt_id("ctx"); wt(','); wt_int(src); wt(','); wt_int(loc_slot[idx]); wt(')'); wt(')');
+                        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        fold_commit(fm);
+                    }
+                    local_forget(idx);
+                    cur[idx] = WHALE_VAL_T(loc_slot[idx]);
+                    cur[var_count + sp - 1] = WHALE_VAL_T(loc_slot[idx]);
+                    lo_c[idx] = 0;                    fm = fold_mark();
+                    wt_id("_ws"); wt('.'); wt_id("fver"); wt('=');
+                    wt_id("_ws"); wt('.'); wt_id("fver"); wt_op(JS_OP_ADD); wt_int(1); wt(';');
+                    fold_commit(fm);
+                    break;
+                }
                 local_forget(idx);
                 fm = fold_mark();
                 fold_inline(sp - 1);
