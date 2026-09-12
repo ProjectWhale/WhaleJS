@@ -7549,6 +7549,99 @@ JSValue *JS_WhaleObjFieldPtr(JSContext *ctx, int slot, int atom, void **shape_io
     return &pr->u.value;
 }
 
+/* Define (or redefine) numeric property `atom` on the object in `slot`. Only
+   reached while an object literal is being built, so it does not need to be
+   fast - the accesses that matter are the get_field/put_field ones in the loop,
+   and those get inlined. */
+int JS_WhaleObjDefineNum(JSContext *ctx, int slot, int atom, double v)
+{
+    JSValue o = whale_frame_obj_slots(ctx)[slot];
+
+    if (JS_VALUE_GET_TAG(o) != JS_TAG_OBJECT)
+        return 0;
+    return JS_DefinePropertyValue(ctx, o, atom, JS_NewFloat64(ctx, v),
+                                  JS_PROP_C_W_E) >= 0;
+}
+
+/* The numeric value of property `atom` on the object in `slot`, remembering
+   both the shape and the resolved value pointer in the caller's cache. The
+   shape only changes when a property is added or removed, so a loop over fixed
+   fields hits the cache every iteration and pays one pointer comparison; a
+   helper call per access would lose to the interpreter otherwise.
+
+   Anything that is not an int32 or a float64 (or a property that turns out to
+   be an accessor) sets *deopt and returns 0 - the caller falls back. */
+double JS_WhaleObjFieldNum(JSContext *ctx, int slot, int atom,
+                           void **shape_cache, void **ptr_cache, int *deopt)
+{
+    JSValue o = whale_frame_obj_slots(ctx)[slot];
+    JSObject *p;
+    JSValue *v;
+
+    if (JS_VALUE_GET_TAG(o) != JS_TAG_OBJECT)
+        goto bad;
+    p = JS_VALUE_GET_OBJ(o);
+    if (p->shape == *shape_cache) {
+        v = *ptr_cache;                 /* resolved before, shape unchanged */
+    } else {
+        JSProperty *pr;
+        JSShapeProperty *prs;
+
+        if (p->class_id != JS_CLASS_OBJECT)
+            goto bad;
+        prs = find_own_property(&pr, p, atom);
+        if (!prs)
+            goto bad;
+        if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+            goto bad;                   /* an accessor would have side effects */
+        v = &pr->u.value;
+        *shape_cache = p->shape;
+        *ptr_cache = v;
+    }
+    if (v->tag == JS_TAG_FLOAT64)
+        return v->u.float64;
+    if (v->tag == JS_TAG_INT)
+        return (double)v->u.int32;
+bad:
+    *deopt = 1;
+    return 0;
+}
+
+/* Store `v` into property `atom` of the object in `slot`, using the same shape
+   cache. The value is always written as a float64: the generated code only
+   reaches here for numbers, and a property that held a reference would have
+   deopted on the way in. */
+int JS_WhaleObjStoreNum(JSContext *ctx, int slot, int atom, double v,
+                        void **shape_cache, void **ptr_cache)
+{
+    JSValue o = whale_frame_obj_slots(ctx)[slot];
+    JSObject *p;
+    JSValue *dst;
+
+    if (JS_VALUE_GET_TAG(o) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(o);
+    if (p->shape == *shape_cache) {
+        dst = *ptr_cache;
+    } else {
+        JSProperty *pr;
+        JSShapeProperty *prs;
+
+        if (p->class_id != JS_CLASS_OBJECT)
+            return 0;
+        prs = find_own_property(&pr, p, atom);
+        if (!prs)
+            return 0;
+        if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+            return 0;
+        dst = &pr->u.value;
+        *shape_cache = p->shape;
+        *ptr_cache = dst;
+    }
+    *dst = JS_NewFloat64(ctx, v);
+    return 1;
+}
+
 /* Release a counted reference an open var_ref held on the coroutine
    (async function / generator / async generator) owning the frame it
    points into. */

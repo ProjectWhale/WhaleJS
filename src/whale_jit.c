@@ -529,6 +529,7 @@ static int fold_mark(void)
 #define WHALE_EXPR_MAX 24
 
 static void fold_materialize(int k);
+static void fold_commit(int mark);
 
 /* Record [mark, now) as the value of stack slot k. */
 static void fold_set(int k, int mark)
@@ -608,6 +609,57 @@ static void fold_toint32(int k, int is_i32)
    Only strictly positive integers take the fast path. Zero and -0 are left to
    fmod() on purpose: a truncating cast turns -0 into +0, and `fmod(-0, n)` is
    -0 while `1/x` downstream would notice the difference. */
+/* Resolve property `atom` of the object in slot `os` through cache pair `fc`,
+   storing the result in `v<nm>`. Both the slot and the atom are compile-time
+   constants, so the shape check is the whole cost once the shape settles - the
+   resolution only runs again if a property is added or removed. Reading the
+   value itself is inlined: a helper call per access lands at interpreter speed,
+   which is where the first version of this sat. */
+static void fold_obj_field_load(int os, int atom, int fc, int nm)
+{
+    int fm = fold_mark();
+
+    wk(JS_WK_IF); wt('('); wt_slot("_fs", fc); wt_op(JS_OP_NE);
+    wt_id("JS_WhaleObjShape"); wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(')'); wt(')');
+    wt('{');
+    wt_slot("_fp", fc); wt('='); wt_id("JS_WhaleObjFieldPtr"); wt('(');
+    wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_int(atom); wt(','); wt('&'); wt_slot("_fs", fc); wt(')'); wt(';');
+    wk(JS_WK_IF); wt('('); wt('!'); wt_slot("_fp", fc); wt(')'); wt('{');
+    wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+    wt('}');
+    /* int32 or float64 inline; anything else hands off to the cold helper */
+    wk(JS_WK_DOUBLE); wt_slot("v", nm); wt('=');
+    wt('('); wt_slot("_fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(8); wt(')');
+    wt('?'); wt_slot("_fp", fc); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64");
+    wt(':'); wt('('); wt_slot("_fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(0); wt(')');
+    wt('?'); wt('('); wk(JS_WK_DOUBLE); wt(')'); wt_slot("_fp", fc); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("int32");
+    wt(':'); wt_id("JS_WhaleObjValueNum"); wt('('); wt_id("ctx"); wt(','); wt_slot("_fp", fc); wt(','); wt_id("deopt"); wt(')');
+    wt(';');
+    fold_commit(fm);
+}
+
+/* Resolve `atom` of the object in slot `os` through cache pair `fc` without
+   loading anything, so a store can follow. Emits a deopt when the value it
+   would overwrite is not a number: overwriting a reference without freeing it
+   would leak. */
+static void fold_obj_field_resolve(int os, int atom, int fc)
+{
+    int fm = fold_mark();
+
+    wk(JS_WK_IF); wt('('); wt_slot("_fs", fc); wt_op(JS_OP_NE);
+    wt_id("JS_WhaleObjShape"); wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(')'); wt(')');
+    wt('{');
+    wt_slot("_fp", fc); wt('='); wt_id("JS_WhaleObjFieldPtr"); wt('(');
+    wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_int(atom); wt(','); wt('&'); wt_slot("_fs", fc); wt(')'); wt(';');
+    wk(JS_WK_IF); wt('('); wt('!'); wt_slot("_fp", fc); wt(')'); wt('{');
+    wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+    wt('}');
+    wk(JS_WK_IF); wt('('); wt_slot("_fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_NE); wt_int(8); wt(')');
+    wt('{'); wk(JS_WK_IF); wt('('); wt_slot("_fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_NE); wt_int(0); wt(')');
+    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}'); wt('}');
+    fold_commit(fm);
+}
+
 static void fold_mod(int ka, int kb)
 {
     int repeat = (whale_vmat[ka] || whale_vexpr[ka].len <= 8) &&
@@ -825,6 +877,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     int ret_is_bool = -1;
     int whale_objs = 0;   /* object slots handed out; each new object takes one */
     int whale_has_call = 0; /* a call clobbers registers, so no pinning then */
+    int whale_fields = 0;   /* object-property cache pairs handed out */
     int whale_nloops = 0;   /* backward jumps; more than one means nesting */
 
     if (!info->is_normal)
@@ -1010,6 +1063,14 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        for the fresh names fold_materialize() hands out (see whale_vname) */
     for (i = 0; i < stack_size + WHALE_VSER_MAX; i++) {
         wk(JS_WK_DOUBLE); wt_slot("v", i); wt('='); wt_int(0); wt(';');
+    }
+    /* Per-property-access cache for object literals: the shape the property was
+       resolved against and the address of its value. One pair per access site,
+       and a site always touches the same property, so this is a compile-time
+       constant. */
+    for (i = 0; i < WHALE_FIELD_CACHE; i++) {
+        wk(JS_WK_VOID); wt('*'); wt_slot("_fs", i); wt('='); wt_int(0); wt(';');
+        wk(JS_WK_VOID); wt('*'); wt_slot("_fp", i); wt('='); wt_int(0); wt(';');
     }
     /* per-object-slot typed-array cache: base pointer, element count, and a flag
        so the pointer is fetched once per run rather than per element */
@@ -1495,6 +1556,127 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 }
                 cur[var_count + sp - 2] = WHALE_T_NUM;
                 sp--;
+            }
+            break;
+
+        /* --- object literals and their fields ---------------------------------
+           Only a local object literal is handled, and only field access on it.
+           A helper call per access would lose to the interpreter, so the
+           helpers take a cache pair the generated code owns: they compare the
+           object's shape and, when it is unchanged, go straight to the value.
+           Anything unexpected (missing field, accessor, a value that is not a
+           number) deopts. */
+        case OP_object:
+            {
+                int os;
+
+                if (whale_objs >= WHALE_OBJ_SLOTS)
+                    goto out;
+                os = whale_objs++;
+                {
+                    int fm = fold_mark();
+
+                    wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjNew"); wt('(');
+                    wt_id("ctx"); wt(','); wt_int(os); wt(')'); wt(')');
+                    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    fold_commit(fm);
+                }
+                cur[var_count + sp] = WHALE_OBJ_T(os);
+                sp++;
+            }
+            break;
+
+        /* obj value -> obj */
+        case OP_define_field:
+            {
+                int ta = cur[var_count + sp - 2];
+                int tb = cur[var_count + sp - 1];
+                int atom = (int)whale_get_u32(pc + pos + 1);
+
+                if (!WHALE_IS_OBJ(ta) || !whale_type_is_num(tb))
+                    goto out;
+                {
+                    int fm = fold_mark();
+
+                    wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjDefineNum"); wt('(');
+                    wt_id("ctx"); wt(','); wt_int(WHALE_OBJ_SLOT(ta)); wt(','); wt_int(atom); wt(',');
+                    fold_inline(sp - 1); wt(')'); wt(')');
+                    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    fold_commit(fm);
+                }
+                sp--;   /* the object stays on the stack */
+            }
+            break;
+
+        /* obj value -> nothing */
+        case OP_put_field:
+            {
+                int ta = cur[var_count + sp - 2];
+                int tb = cur[var_count + sp - 1];
+                int atom = (int)whale_get_u32(pc + pos + 1);
+
+                if (!WHALE_IS_OBJ(ta) || !whale_type_is_num(tb))
+                    goto out;
+                if (whale_fields >= WHALE_FIELD_CACHE)
+                    goto out;
+                {
+                    int fc = whale_fields++;
+                    int fm;
+
+                    fold_obj_field_resolve(WHALE_OBJ_SLOT(ta), atom, fc);
+                    fm = fold_mark();
+                    /* the value is a double here, and the old one was a number too
+                       (anything else deopted above) */
+                    wt_slot("_fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt('='); wt_int(8); wt(';');
+                    wt_slot("_fp", fc); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64"); wt('=');
+                    fold_inline(sp - 1); wt(';');
+                    fold_commit(fm);
+                }
+                sp -= 2;
+            }
+            break;
+
+        /* obj -> obj value. This is the shape `o.a += x` compiles to: the object
+           stays on the stack under the value so the store can follow. */
+        case OP_get_field2:
+            {
+                int ta = cur[var_count + sp - 1];
+                int atom = (int)whale_get_u32(pc + pos + 1);
+                int fc, nm;
+
+                if (!WHALE_IS_OBJ(ta))
+                    goto out;
+                if (whale_fields >= WHALE_FIELD_CACHE)
+                    goto out;
+                fc = whale_fields++;
+                nm = whale_vserial++;
+                fold_obj_field_load(WHALE_OBJ_SLOT(ta), atom, fc, nm);
+                whale_vname[sp] = nm;
+                whale_vmat[sp] = 1;
+                cur[var_count + sp] = WHALE_T_NUM;
+                sp++;
+            }
+            break;
+
+        /* obj -> value */
+        case OP_get_field:
+            {
+                int ta = cur[var_count + sp - 1];
+                int atom = (int)whale_get_u32(pc + pos + 1);
+                int fc, nm;
+
+                if (!WHALE_IS_OBJ(ta))
+                    goto out;
+                if (whale_fields >= WHALE_FIELD_CACHE)
+                    goto out;
+                fc = whale_fields++;
+                nm = whale_vserial++;
+                fold_obj_field_load(WHALE_OBJ_SLOT(ta), atom, fc, nm);
+                whale_vname[sp - 1] = nm;
+                whale_vmat[sp - 1] = 1;
+                cur[var_count + sp - 1] = WHALE_T_NUM;
             }
             break;
 
@@ -2199,6 +2381,12 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
         tcc_add_symbol(s, "JS_WhaleTAU8Get", (void *)JS_WhaleTAU8Get);
         tcc_add_symbol(s, "JS_WhaleTAU8Set", (void *)JS_WhaleTAU8Set);
         tcc_add_symbol(s, "JS_WhaleTAU8Ptr", (void *)JS_WhaleTAU8Ptr);
+        tcc_add_symbol(s, "JS_WhaleObjNew", (void *)JS_WhaleObjNew);
+        tcc_add_symbol(s, "JS_WhaleObjShape", (void *)JS_WhaleObjShape);
+        tcc_add_symbol(s, "JS_WhaleObjFieldPtr", (void *)JS_WhaleObjFieldPtr);
+        tcc_add_symbol(s, "JS_WhaleObjDefineNum", (void *)JS_WhaleObjDefineNum);
+        tcc_add_symbol(s, "JS_WhaleObjFieldNum", (void *)JS_WhaleObjFieldNum);
+        tcc_add_symbol(s, "JS_WhaleObjStoreNum", (void *)JS_WhaleObjStoreNum);
         whale_jit_state = s;
     }
     s = whale_jit_state;

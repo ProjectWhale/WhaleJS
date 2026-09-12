@@ -215,3 +215,14 @@ val = pr->u.value;
 - 别忘了 `whale_load_analyze`/`whale_op_size_of` 那两处（`5` 字节）
 
 **顺序**：先 `object`，通了再照同一套做 `array`（`array_from`/`get_length`，但 `scan(a)` 的数组是参数、形状不可静态确定，更难）。
+## `object` 阶段 2 的结果：编进了 JIT，但只到解释器速度
+
+`object.js` 从**完全被拒**（`gen gave up at pos=0 op=11 (object)`，404ms）变成**能编译**（364ms）。**但只快 10%，这是本轮诚实的结论。**
+
+**为什么快不了**：内联缓存确实建立了（每个访问点一对 `_fs`/`_fp`），**但每次属性访问仍要调用一次 `JS_WhaleObjShape(ctx, slot)` 来取当前 shape 做比较** —— 而它要经 `whale_frame_obj_slots(ctx)` 走几次内存解引用，约 5–10ns。2400 万次访问就是 120ms 上下，正好把内联读省下的那点吃回去。**解释器本身也就是这个量级。**
+
+**要真正变快，只有两条路**：
+1. **把 shape 检查也内联** —— 需要让生成的 C 看见 `JSObject` 的 `shape` 偏移（或让引擎在固定偏移放一个 shape 字）。**`JSObject` 的头是 `JSGCObjectHeader`，偏移随构建选项变，靠猜太脆** —— 属于需要**刻意设计**的改动（比如在对象槽旁边单独存一个 `void *shape` 副本，由 helper 在解析时写入，生成代码只比较两个指针）。
+2. **减少访问次数** —— 把 `o.a += x; o.b += y; o.c += z` 融合成一次调用。那是**语句级融合**，生成器层面很难。
+
+**路线 1 的具体做法（下次可直接做）**：生成代码里每个对象槽再声明一个 `void *_oscK`（shape copy）。`JS_WhaleObjFieldPtr` 解析时顺手写 `_oscK`；比较时生成代码直接比 `_oscK` 与它自己缓存的 `_fs` —— **两个都是生成代码持有的指针，零调用**。只有不等时才调 helper 重新解析。

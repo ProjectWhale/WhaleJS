@@ -39,6 +39,8 @@ typedef struct JSWhaleFuncInfo {
    value in C doubles and never uses the JS operand stack, which is the region
    these slots sit right behind. */
 #define WHALE_OBJ_SLOTS 8
+/* object-property inline-cache pairs the generated code can declare */
+#define WHALE_FIELD_CACHE 24
 
 /* Compile one function. Returns 1 and fills entry_out/handle_out on success;
    the caller owns both, and releases the handle with JS_WhaleJitRelease(). */
@@ -77,6 +79,17 @@ uint8_t *JS_WhaleTAU8Ptr(JSContext *ctx, int slot, double *len_out);
 int JS_WhaleObjNew(JSContext *ctx, int slot);
 void *JS_WhaleObjShape(JSContext *ctx, int slot);
 JSValue *JS_WhaleObjFieldPtr(JSContext *ctx, int slot, int atom, void **shape_io);
+/* Define a numeric property, for an object literal's initialisers. */
+int JS_WhaleObjDefineNum(JSContext *ctx, int slot, int atom, double v);
+
+/* Numeric property access with a shape cache held in the caller: *shape_cache
+   and *ptr_cache are two opaque words the generated code declares. Sets *deopt
+   and returns 0 when the shape changed under it, the property is missing, or
+   the value is neither an int32 nor a float64. */
+double JS_WhaleObjFieldNum(JSContext *ctx, int slot, int atom,
+                           void **shape_cache, void **ptr_cache, int *deopt);
+int JS_WhaleObjStoreNum(JSContext *ctx, int slot, int atom, double v,
+                        void **shape_cache, void **ptr_cache);
 
 /* Compile-time only - never called by generated code. Does global `atom` name
    the Uint8Array constructor? Asking while emitting is what keeps each stack
@@ -113,6 +126,8 @@ enum {
        a lexer, so `wt('<'); wt('<')` would arrive as two `<` and fail with
        "')' expected (got \"<\")". */
     JS_OP_SHL, JS_OP_SAR, JS_OP_SHR,
+    /* member access, for inlined property reads: -> is one token in C */
+    JS_OP_ARROW, JS_OP_DOT,
 };
 
 /* provided by src/tcc/whale_tcc_iface.c */
