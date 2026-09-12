@@ -935,6 +935,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     int whale_has_call = 0; /* a call clobbers registers, so no pinning then */
     int whale_fields = 0;   /* object-property cache pairs handed out */
     int whale_shape_stable = 0; /* object shapes cannot change after this point */
+    int whale_ret_obj = 0;      /* the function can return an array or object */
     int whale_def_atoms[WHALE_ATOM_MAX];
     int whale_put_atoms[WHALE_ATOM_MAX];
     int whale_def_atoms_n = 0;
@@ -1213,8 +1214,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wt_id("JSValue"); wt('*'); wt_id("ret_obj"); wt(',');
         /* the closure slots, for reading a captured variable as a number */
         wk(JS_WK_VOID); wt('*'); wt_id("var_refs"); wt(')'); wt('{');
+    /* Not initialised: `_cref` is only ever the out parameter of a self-recursive
+       call, and those return numbers, so nothing reads it. Every statement here
+       is one TinyCC spills, on every call. */
     wt_id("JSValue"); wt_id("_cref"); wt(';');
-    wt_id("_cref"); wt('.'); wt_id("tag"); wt('='); wt_int(3); wt(';');
     for (i = 0; i < var_count; i++) {
         if (!whale_has_call && whale_nloops <= 1)
             wk(JS_WK_REGISTER);
@@ -2532,6 +2535,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                        be specialised. */
                     if (ret_is_bool != -1)
                         goto out;
+                    whale_ret_obj = 1;
                     fm = fold_mark();
                     wt('*'); wt_id("ret_obj"); wt('='); wt_id("JS_WhaleObjGet"); wt('(');
                     wt_id("ctx"); wt(','); wt_int(WHALE_OBJ_SLOT(t)); wt(')'); wt(';');
@@ -2575,7 +2579,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     wt('}');
     /* engine entry: unbox the arguments once, run core, box the result */
     wt_id("JSValue"); wt_id(whale_entry_name); wt('('); wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wt_id("JSValue"); wt('*'); wt_id("args"); wt(','); wt_id("JSValue"); wt('*'); wt_id("var_buf"); wt(','); wk(JS_WK_INT); wt('*'); wt_id("deopt"); wt(','); wt_id("JSValue"); wt_id("whale_self"); wt(','); wk(JS_WK_VOID); wt('*'); wt_id("whale_entry"); wt(','); wk(JS_WK_VOID); wt('*'); wt_id("whale_var_refs"); wt(')'); wt('{');
-    wk(JS_WK_DOUBLE); wt_id("An"); wt('['); wt_int(arg_count > 0 ? arg_count : 1); wt(']'); wt(';'); wk(JS_WK_DOUBLE); wt_id("_r"); wt(';'); wt_id("JSValue"); wt_id("_ret"); wt(';'); wt_id("_ret"); wt('.'); wt_id("tag"); wt('='); wt_int(3); wt(';');
+    wk(JS_WK_DOUBLE); wt_id("An"); wt('['); wt_int(arg_count > 0 ? arg_count : 1); wt(']'); wt(';'); wk(JS_WK_DOUBLE); wt_id("_r"); wt(';'); wt_id("JSValue"); wt_id("_ret"); wt(';'); 
     /* On any failure set *deopt and return 0: the caller checks the flag first
        and interprets the frame itself, so the returned JSValue is discarded.
        That keeps JS_EXCEPTION (a macro with no linkable address) out of the
@@ -2612,9 +2616,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     }
     wt_id("_r"); wt('='); wt_id(whale_core_name); wt('('); wt_id("ctx"); wt(','); wt_id("args"); wt(','); wt_id("An"); wt(','); wt_id("deopt"); wt(','); wt('&'); wt_id("_ret"); wt(','); wt_id("whale_var_refs"); wt(')'); wt(';');
     wk(JS_WK_IF); wt('('); wt('*'); wt_id("deopt"); wt(')'); wk(JS_WK_RETURN); wt_id("whale_jit_box_num"); wt('('); wt_id("ctx"); wt(','); wt_int(0); wt(')'); wt(';');
-    /* an array or object result came back through ret_obj instead */
-    wk(JS_WK_IF); wt('('); wt_id("_ret"); wt('.'); wt_id("tag"); wt_op(JS_OP_NE); wt_int(3); wt(')');
-    wk(JS_WK_RETURN); wt_id("_ret"); wt(';');
+    /* An array or object result came back through ret_obj instead. Only a
+       function that can actually return one gets the check - a numeric one
+       should not pay a comparison per call. */
+    if (whale_ret_obj) {
+        wk(JS_WK_IF); wt('('); wt_id("_ret"); wt('.'); wt_id("tag"); wt_op(JS_OP_NE); wt_int(3); wt(')');
+        wk(JS_WK_RETURN); wt_id("_ret"); wt(';');
+    }
     if (ret_is_bool == 1) {
         wk(JS_WK_RETURN); wt_id("JS_NewBool"); wt('('); wt_id("ctx"); wt(','); wt_id("_r"); wt_op(JS_OP_NE); wt_int(0); wt(')'); wt(';');
     } else {
