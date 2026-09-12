@@ -1049,6 +1049,17 @@ static void local_flush_all(int n)
 /* ---------------------------------------------------------------------------
  * Inlining a callee the generator can see.
  *
+ * NOT WIRED UP - none of this ever fires. The recogniser is correct and the
+ * pre-scan does record the declaration (verified: "[prescan] pos=0 m=0 ln=0
+ * var_count=4"), but the caller's compilation ends before its main loop reads
+ * that local, so WHALE_T_FN is never produced and no call site expands. It ends
+ * without reporting a bail, which is why it is worth another look. Until then
+ * this is inert: 24 perftest cases, checks identical to node.
+ *
+ * What IS live from this work: a function declaration emits nothing, so a
+ * nested unction no longer makes its enclosing body uncompilable (it used to
+ * bail at OP_fclosure8).
+ *
  * A function declared inside this very body reaches its call sites through a
  * local, and `push_const M; fclosure; put_locN` is what puts it there. That local
  * is a compile-time fact, so the call can be expanded instead of going through

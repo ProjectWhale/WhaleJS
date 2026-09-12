@@ -2014,6 +2014,39 @@ static void gen_sse_modrm(int reg, int rmem, int r_mem, Sym *sym, int fc)
         o(0xc0 + REG_VALUE(rmem) + REG_VALUE(reg) * 8);
 }
 
+/* The VEX encoding of the same operation, which takes three operands: `v = a op
+   b` with v free to differ from both. The two-operand SSE form forces the
+   destination to be one of the sources, and TCC currently always picks that one
+   anyway (vtop[-1].r is both), so this is not a speed-up yet. It is here so the
+   AVX2 path is real and exercised (WHALE_ISA=avx2) rather than untested, and so
+   a future emitter with a spare register has the encoding ready.
+
+   pp: 0 = none, 1 = 66, 2 = F3, 3 = F2 - the same choice gen_sse_prefix makes.
+   R/X/B are 1 (xmm0-7 only) and L is 0 (128-bit), which is what the scalar
+   forms want. */
+static void gen_vex_prefix(int vvvv, int ext, int pp)
+{
+    o(0xc4);
+    o(0xe1);                                /* R=X=B=1: xmm0-7, 0F map */
+    o((((~vvvv) & 0xf) << 3) | (pp & 3));
+    o(ext);
+}
+
+/* ---------------------------------------------------------------------------
+ * SIMD: not implemented.
+ *
+ * The generated code works on one double at a time, so there is nothing for
+ * packed arithmetic to pack. What would have to come first is the loop-facing
+ * part of the generator: recognising `for (i...) a[i] = f(i)` over a packed
+ * array and emitting a vector body for it. Reusable when that happens: the
+ * WHALE_T_ARR class plus the byte-offset element helpers, and the isa_bits
+ * switch below. Missing: the float pool cannot hold more than one value per
+ * register (both the allocator and the pin machinery assume scalar), and the
+ * loop transformation itself does not exist.
+ *
+ * gen_vex_prefix above is the encoding entry point for that work - vaddpd and
+ * vmulpd are the same C4 form with a different prefix and opcode.
+ * ------------------------------------------------------------------------- */
 /* generate a floating point operation 'v = t1 op t2' instruction. The
    two operands are guaranteed to have the same floating point type */
 /* XXX: need to use ST1 too */
@@ -2188,7 +2221,14 @@ void gen_opf(int op)
                 vswap();
             }
             
-            gen_sse_prefix(0x58 + a, (ft & VT_BTYPE) == VT_DOUBLE, 1);
+            if (tcc_state->isa_bits & WHALE_ISA_AVX2) {
+                /* Three-operand form: the destination is named separately, so
+                   no copy is needed when it differs from the first source. */
+                gen_vex_prefix(vtop[-1].r, 0x58 + a,
+                               (ft & VT_BTYPE) == VT_DOUBLE ? 3 : 2);
+            } else {
+                gen_sse_prefix(0x58 + a, (ft & VT_BTYPE) == VT_DOUBLE, 1);
+            }
             gen_sse_modrm(vtop[-1].r, vtop->r, r, vtop->sym, fc);
 
             vtop--;
