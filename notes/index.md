@@ -85,3 +85,19 @@ The process of project: WhaleJS —— 基于 QuickJS-ng + TinyCC 实现带 JIT/
 <48>(SOLVED, 大突破): **值域扩展 —— 闭包调用目标 + 任意值 + 双版本编译** 已单独记录 → notes/value-domain.md。起因：三个最大缺口（`objfields` 621 / `immutable_update` 693 / `vnode_build` 420ms）实际是**同一个形状** —— `var o = make()`，对象来自一次调用，形状只能运行时知道。**障碍一**：`make()` 的字节码是 `get_var_ref0` + `call0`，与自递归（`fib`）**完全相同**，生成器一律读作「被调者就是本函数」（那正是 `fib` 免装箱的原因），于是调用捕获辅助函数的函数入口检查失败、整函数退回解释器。**修法 = 两种读法都编译**：生成器从引擎拿 `whale_assume_self`；`whale_on_call` 先编 self 读法、再编 closure 读法（**两种都可能编不过，且这是预期**）；两种都在时入口检查失败设 `*deopt == 3` —— 它是**唯一**在函数体执行前发生的 deopt，所以 `JS_CallInternal` 只凭这个码切版本，**宿主调用绝不会执行两次**；memo 只按 self 读法建。**障碍二**：新增 `WHALE_T_VAL`（放在对象槽里的任意 JSValue，`WHALE_IS_SLOT`/`WHALE_SLOT` 统一取槽）；调用可以有**活结果**（`JS_WhaleCallValue` 多一个 `ret_slot`，既没丢弃又不可用的结果仍拒绝 —— 日后向它要数值会 deopt 而重跑帧会**再执行一次调用**）；`WHALE_T_VAL` 能在 `get_loc`/`put_loc` 传播并作为 `get_field`/`put_field`/`get_field2` 的**对象**（`o.tag = i` 里 `o` 来自调用），且这类对象**始终保留形状检查**（`stable` 只就本地字面量成立）。调用暂存用对象槽顶部（`WHALE_CALL_BASE`，槽数 8→12），字面量被限制在基址下。**结果**：`objfields` 621→**173ms**，`fib` 保持 ~8ms，24 case 0 mismatch。**剩余**：`immutable_update` 需要**参数作为对象**（`setField(o,v)` 里 `o.a`）= 参数类型特化 D3；`vnode_build` 需要非数值字面量（`push_atom_value`/`null`）与字符串拼接 D7。**工具教训（踩了两次）**：xmake 增量判断不可靠 —— 改 `whale_jit.c` 后 `xmake -y` 仅 3 秒「cache compiling」而二进制没更新，**判断构建是否真发生要看二进制里有没有新符号**，必要时 `xmake -r -y`；`quickjs.c` 有**混合行尾**（少数 CRLF 夹在大量 LF 里），跨行锚点的补丁会因此失配且报错位置误导，脚本应先归一化再做替换。见 notes/value-domain.md
 
 <49>(TIPS, 定位手法): **`gen gave up` 报的 pos 常常不是放弃的**原因**** 已单独记录 → notes/bail-locating.md。查 `immutable_update` 循环体时，dump 说 `gave up at pos=44 op=203 (get_loc0)`，注意力全跑到 `get_loc0` 上；真正放弃的是**跳转目标的状态合并**（`if (differ) goto out;`），发生在处理任意指令之前、恢复快照的那一小段里 —— `get_loc0` 只是恰好是那一轮的跳转目标。**方法**：61 处 `goto out;` 一次性换成 `{ whale_out_line = __LINE__; goto out; }`，`out:` 的诊断加 `bail=whale_jit.c:%d` —— 一次替换永久可用。**坑**：`goto` 不是表达式，**不能用逗号表达式**（`x = __LINE__, goto out;` 报 `expected expression before 'goto'`），必须是块语句。**立刻换来**：`[merge] pos=44 local=0 was=40 now=72` = `VAL(1)` vs `VAL(3)`，**两个都是 VAL 但槽号不同**；而槽统一逻辑是对的（`[put_loc] pos=19 loc_slot=1`），**循环体那次赋值根本没走 `put_loc`** —— 即 `cur[0]` 是被**别处**设成 `VAL(3)` 的（3 是 `whale_objs++` 的第四个值）。**问题未解，但形状变了**：从「合并规则不对」变成「某个未找到的地方在写 `cur[0]`」。**教训**：dump 的 `op` 看起来完全正常（`get_loc0` 不该失败）时，原因在别处。见 notes/bail-locating.md
+
+## <50> One `JS_OP_*` value cannot serve both the condition joiner and the bitwise operator
+
+`notes/operator-table.md` has the detail. Short version: `JS_WhaleTokOp`'s table is
+one entry shorter than `JS_OP_*`, so `JS_OP_DOT` falls off the end and pushes
+nothing - that is where the empty `()` in ident.js's generated code came from, and
+it went unnoticed because every `JS_OP_OR`/`JS_OP_AND` use is inside an `if`,
+where any non-zero value reads as true.
+
+Aligning the table fixes the C but breaks `bitops` (60479 -> 56575). Changing
+`JS_OP_OR`/`AND` to the bitwise spelling instead makes `bitops` correct. Both
+cannot be right at once, so the joiner must become its own value before anything
+else in this area is touched.
+
+Next: grep what emits the bitwise `|`, `&`, `<<`, `>>` for a value expression and
+see which `JS_OP_*` it asks for. That is the missing half.
