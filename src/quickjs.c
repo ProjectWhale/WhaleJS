@@ -7648,6 +7648,31 @@ JSValue *JS_WhaleArrPtr(JSContext *ctx, int slot, double *len_out)
     return p->u.array.u.values;
 }
 
+/* Park argument `idx` in object slot `slot` as a packed array. 0 to deopt: not
+   a packed array at all.
+
+   This is what lets a function that takes an array stay in the JIT. The
+   generated code assumes the parameter is one - which it can, because assuming
+   wrong only bails out, it never computes something wrong - and this is the
+   check that makes the assumption safe. The slot takes its own reference: the
+   argument belongs to the caller's frame. */
+int JS_WhaleArrBind(JSContext *ctx, int slot, JSValue *args, int idx)
+{
+    JSValue a;
+    JSObject *p;
+
+    if (!args || idx < 0)
+        return 0;
+    a = args[idx];
+    if (JS_VALUE_GET_TAG(a) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(a);
+    if (!p->fast_array || p->class_id != JS_CLASS_ARRAY)
+        return 0;
+    JS_WhaleObjSlot(ctx, slot, js_dup(a));
+    return 1;
+}
+
 /* A fresh empty array in `slot`, for `[]`. */
 int JS_WhaleArrNew(JSContext *ctx, int slot)
 {

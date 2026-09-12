@@ -99,6 +99,10 @@ double JS_WhaleObjValueNum(JSContext *ctx, JSValue *v, int *deopt);
 JSValue *JS_WhaleArrPtr(JSContext *ctx, int slot, double *len_out);
 int JS_WhaleArrNew(JSContext *ctx, int slot);
 int JS_WhaleArrSetNum(JSContext *ctx, int slot, double idx, double v);
+/* Park argument `idx` in object slot `slot` as a packed array; 0 to deopt. Lets
+   a function that takes an array stay in the JIT - the generated code assumes
+   the parameter is one (a wrong guess only bails) and this checks it. */
+int JS_WhaleArrBind(JSContext *ctx, int slot, JSValue *args, int idx);
 
 /* Numeric property access with a shape cache held in the caller: *shape_cache
    and *ptr_cache are two opaque words the generated code declares. Sets *deopt
