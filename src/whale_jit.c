@@ -660,6 +660,9 @@ static uint8_t    *whale_vmat;    /* 1 = already forced into a variable */
    *first* one. References go through whale_vname[k]. */
 #define WHALE_VSER_MAX 64
 static int whale_vname[WHALE_JIT_MAX_SLOTS];  /* slot -> name number */
+/* Diagnostics: how many times fold_inline_expr was handed a range that no longer
+   points at an expression. See the note in its body. */
+int whale_empty_ranges;
 /* Which pool entry a local / stack slot holds a *function* for, or -1. Filled by
    the pre-scan from 'fclosure' + 'put_locN', and read when a call is expanded. */
 static int whale_loc_fn[WHALE_JIT_MAX_SLOTS];
@@ -678,6 +681,7 @@ static void fold_begin(void)
     whale_out_len = &go_len;
     /* fresh name space for this function's materialised slots */
     whale_vserial = 0;
+    whale_empty_ranges = 0;
 
     memset(whale_vname, 0, sizeof(whale_vname));
 }
@@ -723,6 +727,8 @@ static void fold_inline_expr(const WhaleVExpr *e)
 /* Append the value of slot k to what is being built right now. */
 static void fold_inline(int k)
 {
+    if (getenv("WHALE_EMPTY_DBG") && !whale_vmat[k] && whale_vexpr[k].len == 0)
+        fprintf(stderr, "[empty] slot=%d (len=0, off=%d)\n", k, whale_vexpr[k].off);
     if (whale_vmat[k]) {
         wt_arr("v", whale_vname[k]);   /* already a real variable */
         return;
