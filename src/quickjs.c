@@ -7563,6 +7563,16 @@ int JS_WhaleObjDefineNum(JSContext *ctx, int slot, int atom, double v)
                                   JS_PROP_C_W_E) >= 0;
 }
 
+/* The cold branch of an inlined property read: the generated code handles the
+   int32 and float64 tags itself, so anything reaching here has to go back to
+   the interpreter rather than be guessed at. */
+double JS_WhaleObjValueNum(JSContext *ctx, JSValue *v, int *deopt)
+{
+    (void)ctx;
+    (void)v;
+    *deopt = 1;
+    return 0;
+}
 /* The numeric value of property `atom` on the object in `slot`, remembering
    both the shape and the resolved value pointer in the caller's cache. The
    shape only changes when a property is added or removed, so a loop over fixed

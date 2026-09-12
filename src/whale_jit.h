@@ -41,6 +41,8 @@ typedef struct JSWhaleFuncInfo {
 #define WHALE_OBJ_SLOTS 8
 /* object-property inline-cache pairs the generated code can declare */
 #define WHALE_FIELD_CACHE 24
+/* property names the generator can reason about (object literals only) */
+#define WHALE_ATOM_MAX 32
 
 /* Compile one function. Returns 1 and fills entry_out/handle_out on success;
    the caller owns both, and releases the handle with JS_WhaleJitRelease(). */
@@ -81,6 +83,10 @@ void *JS_WhaleObjShape(JSContext *ctx, int slot);
 JSValue *JS_WhaleObjFieldPtr(JSContext *ctx, int slot, int atom, void **shape_io);
 /* Define a numeric property, for an object literal's initialisers. */
 int JS_WhaleObjDefineNum(JSContext *ctx, int slot, int atom, double v);
+
+/* The cold branch of an inlined property read: sets *deopt and returns 0 when
+   the value is neither an int32 nor a float64. */
+double JS_WhaleObjValueNum(JSContext *ctx, JSValue *v, int *deopt);
 
 /* Numeric property access with a shape cache held in the caller: *shape_cache
    and *ptr_cache are two opaque words the generated code declares. Sets *deopt

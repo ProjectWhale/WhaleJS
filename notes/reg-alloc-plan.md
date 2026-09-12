@@ -226,3 +226,26 @@ val = pr->u.value;
 2. **减少访问次数** —— 把 `o.a += x; o.b += y; o.c += z` 融合成一次调用。那是**语句级融合**，生成器层面很难。
 
 **路线 1 的具体做法（下次可直接做）**：生成代码里每个对象槽再声明一个 `void *_oscK`（shape copy）。`JS_WhaleObjFieldPtr` 解析时顺手写 `_oscK`；比较时生成代码直接比 `_oscK` 与它自己缓存的 `_fs` —— **两个都是生成代码持有的指针，零调用**。只有不等时才调 helper 重新解析。
+## `object` 修好了：404ms → **4ms**（node 25ms，反超 6 倍）
+
+上一节的路线 2 生效了，而且是决定性的。做法是**在编译期证明"形状不会变"**，从而把运行时 shape 检查整个去掉：
+
+**判据**（预扫描收集，一次搞定）：
+- **函数内没有 `OP_call`/`OP_call0..3`** —— 对象无法被传递出去，外面改不到它；
+- **每个 `OP_put_field` 的 atom 都在某个 `OP_define_field` 的 atom 集合里** —— 不会新增属性，属性数组不会重分配；
+- 顺带：生成器本来就不支持 `OP_set_field`/`OP_set_array_el`（它们会让函数 `goto out`），所以**动态属性名不可能出现**。
+
+满足这两条时，生成代码里的解析变成**一次性**：
+```c
+if (!_fs0) { _fs0 = JS_WhaleObjShape(ctx, 0); _fp0 = JS_WhaleObjFieldPtr(ctx, 0, atom, &_fs0); ... }
+v0 = (_fp0->tag == 8) ? _fp0->u.float64 : (_fp0->tag == 0) ? (double)_fp0->u.int32 : <冷分支>
+```
+**之后每轮只剩一次指针判空 + 内联读写**，没有任何函数调用。这正是和"每访问一次调 `JS_WhaleObjShape`"之间的差别 —— 后者只能和解释器打平（364ms），前者反超 node 6 倍（4ms）。
+
+不满足判据时行为不变（每次访问都比 shape），**所以既快又安全**。
+
+途中踩到的四个坑（都值得记）：
+1. **新 helper 必须在**生成器 preamble**里也声明** —— 只加 `whale_jit.h` 原型 + `tcc_add_symbol` 不够，缺 preamble 原型会让 TCC 走隐式声明、参数传错。**这是第四次犯同一个错**（前三次是 `fmod`、`JS_WhaleObjProbeFrom`、`JS_WhaleTAU8Ptr`）。
+2. `_fp` 必须声明成 **`JSValue *`**，不能是 `void *`（内联读要 `->tag`）。
+3. **`v<n>` 在 prologue 已经声明过**，赋值不能写成 `double v<n> = ...`，否则 `redeclaration`。
+4. 替换代码块时 `old` 要覆盖**整个**要删的片段 —— 我少覆盖了三行，残留的 `JS_WhaleObjShape(...)` 生成了 `if (!_fs0) { JS_WhaleObjShape(ctx,0)) {`。
