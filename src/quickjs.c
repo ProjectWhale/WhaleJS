@@ -620,7 +620,7 @@ struct JSContext {
                              const char *filename, int line, int flags, int scope_idx);
     void *user_opaque;
 
-    /* WhaleJS: embedded JIT/AOT state, see whalejs.h（零分配，随 context 释放�?*/
+    /* WhaleJS: embedded JIT/AOT state, see whalejs.h（零分配，随 context 释放�?*/
     JSWhaleContext whale;
 };
 
@@ -894,9 +894,9 @@ typedef struct JSFunctionBytecode {
     uint8_t *pc2line_buf;
     char *source;
 
-    /* WhaleJS: JIT/AOT 状��（零初始化，�?? src/whalejs.h�?*/
-    uint32_t whale_call_count; /* 调用次数，用于热点判�?*/
-    void *whale_jit_entry;     /* �?NULL 表示已有机器码入�?*/
+    /* WhaleJS: JIT/AOT 状��（零初始化，�?? src/whalejs.h�?*/
+    uint32_t whale_call_count; /* 调用次数，用于热点判�?*/
+    void *whale_jit_entry;     /* �?NULL 表示已有机器码入�?*/
     uint8_t whale_jit_tried;   /* JIT compile already attempted */
     void *whale_jit_tcc;       /* owning TCCState (keeps the code alive) */
     /* Memoisation: this function was JIT-compiled and never reads a global, so
@@ -3003,7 +3003,7 @@ void JS_WhaleNoteJitResult(JSContext *ctx, int ok, uint64_t code_bytes)
     }
 }
 
-/* WhaleJS: JS_CallInternal 的热点入口��?   当前�??��计；TinyCC 编译接入后在这里产出机器码并�?b->whale_jit_entry�?   注意：JIT=OFF 时必须零弢�锢�返回�?*/
+/* WhaleJS: JS_CallInternal 的热点入口��?   当前�??��计；TinyCC 编译接入后在这里产出机器码并�?b->whale_jit_entry�?   注意：JIT=OFF 时必须零弢�锢�返回�?*/
 /* ---- services the JIT codegen module (src/whale_jit.c) needs from us ---- */
 
 /* Is closure slot idx of the running frame this very function? The generator
@@ -3119,6 +3119,68 @@ JSValue JS_WhaleObjGet(JSContext *ctx, int k)
     if (k < 0 || k >= WHALE_OBJ_SLOTS)
         return JS_UNDEFINED;
     return js_dup(whale_frame_obj_slots(ctx)[k]);
+}
+
+/* Park a number in slot k. Generated code needs this for a call argument: the
+   argument has to be a JSValue in a slot (not a C double) because JS_Call reads
+   JSValues and because the collector has to see it while the callee runs.
+   JS_NewFloat64 never allocates, so this cannot fail. */
+int JS_WhaleObjSlotNum(JSContext *ctx, int slot, double v)
+{
+    if (slot < 0 || slot >= WHALE_OBJ_SLOTS)
+        return 0;
+    JS_WhaleObjSlot(ctx, slot, JS_NewFloat64(ctx, v));
+    return 1;
+}
+
+/* Duplicate slot src into slot dst - how a value that is already parked (an
+   object literal, a property that is not a number) gets into the contiguous
+   scratch area a compiled call needs. */
+int JS_WhaleObjSlotCopy(JSContext *ctx, int src, int dst)
+{
+    if (src < 0 || src >= WHALE_OBJ_SLOTS)
+        return 0;
+    if (dst < 0 || dst >= WHALE_OBJ_SLOTS)
+        return 0;
+    JS_WhaleObjSlot(ctx, dst, js_dup(whale_frame_obj_slots(ctx)[src]));
+    return 1;
+}
+
+/* Call the value parked in func_slot with the arguments parked in
+   arg_base..arg_base+argc-1, and drop the result.
+
+   Both the callee and the arguments are *borrowed* from their slots rather than
+   duplicated: the slots stay alive, and GC-visible, for the whole call, which is
+   what makes a borrowed JSValue safe here. A slow host call (a DOM write, say)
+   may allocate freely while it runs.
+
+   Returns 0 when the call threw, with the exception left pending in ctx. The
+   generated code then hands that exception straight back instead of deopting:
+   re-interpreting the frame would run the call a second time, and the callee is
+   exactly the kind of thing (a DOM mutation) that must not happen twice. */
+int JS_WhaleCallValue(JSContext *ctx, int func_slot, int argc, int arg_base)
+{
+    JSValue *slots = whale_frame_obj_slots(ctx);
+    JSValue r;
+
+    if (func_slot < 0 || func_slot >= WHALE_OBJ_SLOTS)
+        return 0;
+    if (argc < 0 || arg_base < 0 || arg_base + argc > WHALE_OBJ_SLOTS)
+        return 0;
+    r = JS_Call(ctx, slots[func_slot], JS_UNDEFINED, argc, slots + arg_base);
+    if (JS_IsException(r))
+        return 0;
+    JS_FreeValue(ctx, r);
+    return 1;
+}
+
+/* The pending exception as a value the generated code can return. JS_EXCEPTION
+   is a macro with no linkable address, so it cannot appear in emitted code; this
+   gives it one. */
+JSValue JS_WhaleExceptionValue(JSContext *ctx)
+{
+    (void)ctx;
+    return JS_EXCEPTION;
 }
 
 /* Collect, then report the .length of the object in slot k (-1 if none).
@@ -19161,7 +19223,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     rt->current_stack_frame = sf;
     ctx = b->realm; /* set the current realm */
 
-    /* WhaleJS: �??��统�??（JIT 代码生成接入前先�????数，�?src/whalejs.h�?*/
+    /* WhaleJS: �??��统�??（JIT 代码生成接入前先�????数，�?src/whalejs.h�?*/
     whale_jit_ready = !whale_on_call(ctx, b);
 
     /* WhaleJS: native entry ready -> run it. The frame stays current while

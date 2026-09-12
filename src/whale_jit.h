@@ -38,7 +38,14 @@ typedef struct JSWhaleFuncInfo {
    Borrowing them costs nothing at run time: the JIT keeps every intermediate
    value in C doubles and never uses the JS operand stack, which is the region
    these slots sit right behind. */
-#define WHALE_OBJ_SLOTS 8
+#define WHALE_OBJ_SLOTS 12
+/* The slots from WHALE_CALL_BASE up are the scratch a compiled call needs: the
+   arguments have to sit in JSValues the collector can see for as long as the
+   callee runs, and slots are the only such place the generated code has. Object
+   literals and arrays take slots from 0, so they must stay below the base - the
+   generator refuses a function that allocates past it. */
+#define WHALE_CALL_BASE 8
+#define WHALE_CALL_SLOTS (WHALE_OBJ_SLOTS - WHALE_CALL_BASE)
 /* object-property inline-cache pairs the generated code can declare */
 #define WHALE_FIELD_CACHE 24
 /* property names the generator can reason about (object literals only) */
@@ -67,6 +74,19 @@ int JS_WhaleOpSize(int op);   /* bytecode operand size, from the interpreter tab
    the calling frame, so the generated code does not have to pass an address. */
 void JS_WhaleObjSlot(JSContext *ctx, int k, JSValue v);   /* park object in slot k */
 JSValue JS_WhaleObjGet(JSContext *ctx, int k);            /* read it back */
+/* Park a plain number in slot k, so it can be a call argument (JS_Call takes
+   JSValues, and an argument has to stay visible to GC while the callee runs). */
+int JS_WhaleObjSlotNum(JSContext *ctx, int slot, double v);
+/* Call the value in func_slot with the arguments parked in
+   arg_base..arg_base+argc-1; the result is dropped. 0 means deopt (the call
+   threw). Callee and arguments are borrowed from their slots, which is what
+   keeps them alive across the call. */
+int JS_WhaleCallValue(JSContext *ctx, int func_slot, int argc, int arg_base);
+/* Duplicate slot src into slot dst (moving an already-parked value into the
+   contiguous scratch area a call needs). */
+int JS_WhaleObjSlotCopy(JSContext *ctx, int src, int dst);
+/* The pending exception as a value the generated code can return. */
+JSValue JS_WhaleExceptionValue(JSContext *ctx);
 
 /* Typed-array support. The generated code has no JSValue domain, so an array
    travels as an object slot number - a compile-time constant - and these do the

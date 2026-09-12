@@ -138,6 +138,10 @@ enum {
     WHALE_T_ICONST = 7, /* a literal int32. ToInt32 of it is a cast to a known
                            constant, so the whole range test is unnecessary -
                            bitwise code is full of these (255, 3, 1, 0xffff). */
+    WHALE_T_VAL = 8,  /* an arbitrary JSValue parked in an object slot: a global
+                         function (a call target) or a property that is not a
+                         number. Only a call may consume it - arithmetic on it
+                         deopts, and that is what keeps it safe. */
 };
 
 /* The object slot a type carries, packed into the same byte as the type.
@@ -154,6 +158,10 @@ enum {
 /* a packed array carries its slot the same way an object does */
 #define WHALE_ARR_T(slot)  ((uint8_t)(WHALE_T_ARR | (((slot) + 1) << 4)))
 #define WHALE_IS_ARR(t)    (((t) & 0x0f) == WHALE_T_ARR)
+/* an arbitrary JSValue parked in a slot, named the same way as an object's */
+#define WHALE_VAL_T(slot)  ((uint8_t)(WHALE_T_VAL | (((slot) + 1) << 4)))
+#define WHALE_IS_VAL(t)    (((t) & 0x0f) == WHALE_T_VAL)
+#define WHALE_VAL_SLOT(t)  ((int)((t) >> 4) - 1)
 
 /* ------------------------------------------------------------------------
  * Token emitters.
@@ -278,6 +286,54 @@ static int whale_is_call_op(int op)
    few instructions ahead is enough, and being wrong here only means falling
    back to the self-recursion reading of the slot, which then bails out rather
    than computing something wrong. */
+/* Does this instruction push a literal or a variable read? Used only to look a
+   few instructions ahead for the `f(a, b)` shape. */
+static int whale_is_push_op(int op)
+{
+    switch (op) {
+    case OP_push_0: case OP_push_1: case OP_push_2: case OP_push_3:
+    case OP_push_i8: case OP_push_i32:
+    case OP_push_const: case OP_push_const8:
+    case OP_get_loc0: case OP_get_loc1: case OP_get_loc2: case OP_get_loc3:
+    case OP_get_loc:
+    case OP_get_arg0: case OP_get_arg1: case OP_get_arg2: case OP_get_arg3:
+    case OP_get_arg:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Is the value this instruction leaves on the stack about to become the callee
+   of a call? `f(x)` compiles to `get_var f`, `get_loc0 x`, `call1`, so the
+   callee is not adjacent to the instruction that loads it. A short run of pure
+   pushes followed by a call is the shape we look for.
+
+   Being wrong here is safe by construction: the value is then marked
+   WHALE_T_VAL, and the only thing that accepts a WHALE_T_VAL is a call - any
+   arithmetic on it deopts, so the function is simply not compiled. */
+static int whale_feeds_call_as_callee(const uint8_t *pc, int len, int pos, int sz)
+{
+    int k = pos + sz;
+    int n = 0;
+
+    while (k < len && n < 5) {
+        int o = (int)pc[k];
+        int s;
+
+        if (whale_is_call_op(o))
+            return 1;
+        if (!whale_is_push_op(o))
+            return 0;
+        s = whale_op_size_of(o);
+        if (s <= 0)
+            return 0;
+        k += s;
+        n++;
+    }
+    return 0;
+}
+
 static int whale_var_ref_feeds_call(const uint8_t *pc, int len, int pos, int sz)
 {
     int k = pos + sz;
@@ -1209,6 +1265,20 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleArrSetNum"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(',');
         wk(JS_WK_DOUBLE); wt_id("idx"); wt(','); wk(JS_WK_DOUBLE); wt_id("v"); wt(')'); wt(';');
+    /* Host calls. Declared like everything else: without a prototype TinyCC
+       applies the C89 implicit declaration and a double argument goes to the
+       wrong register - the call still links and silently computes nonsense. */
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleObjSlotNum"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(',');
+        wk(JS_WK_DOUBLE); wt_id("v"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleObjSlotCopy"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("src"); wt(',');
+        wk(JS_WK_INT); wt_id("dst"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleCallValue"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("func_slot"); wt(',');
+        wk(JS_WK_INT); wt_id("argc"); wt(','); wk(JS_WK_INT); wt_id("arg_base"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_WhaleExceptionValue"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(')'); wt(';');
     /* object-slot test hook (WHALE_OBJ_TEST). Declared like the rest: without a
        prototype TinyCC applies the C89 implicit declaration, and while the int
        return happens to land correctly in eax here, relying on that is the same
@@ -1818,7 +1888,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             {
                 int os;
 
-                if (whale_objs >= WHALE_OBJ_SLOTS)
+                if (whale_objs >= WHALE_CALL_BASE)
                     goto out;
                 os = whale_objs++;
                 {
@@ -1939,7 +2009,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                 if (argc != 0)
                     goto out;           /* only the empty literal `[]` */
-                if (whale_objs >= WHALE_OBJ_SLOTS)
+                if (whale_objs >= WHALE_CALL_BASE)
                     goto out;
                 os = whale_objs++;
                 {
@@ -2264,6 +2334,27 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                    than the arguments, so the engine must not memoise this
                    function. */
                 whale_gen_pure = 0;
+                if (whale_feeds_call_as_callee(pc, len, pos, sz)) {
+                    /* The value is about to be called, so it has to travel as
+                       the JSValue it is. A slot is the only way the generated
+                       code can hold something that is not a number. A wrong
+                       guess here costs the optimisation, never correctness:
+                       nothing but a call accepts WHALE_T_VAL. */
+                    int slot = whale_objs++;
+                    int fm2;
+
+                    if (slot >= WHALE_CALL_BASE)
+                        goto out;
+                    fm2 = fold_mark();
+                    wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleGetGlobalObj"); wt('(');
+                    wt_id("ctx"); wt(','); wt_int(atom); wt(','); wt_int(slot); wt(')'); wt(')');
+                    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    fold_commit(fm2);
+                    cur[var_count + sp] = WHALE_VAL_T(slot);
+                    sp++;
+                    break;
+                }
                 if (JS_WhaleGlobalIsU8Ctor(ctx, atom)) {
                     /* `new Uint8Array(...)` needs the constructor itself kept.
                        Judged here, while emitting, so the slot's identity is a
@@ -2271,7 +2362,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     int slot = whale_objs++;
                     int nm;
 
-                    if (slot >= WHALE_OBJ_SLOTS)
+                    if (slot >= WHALE_CALL_BASE)
                         goto out;
                     nm = whale_vserial++;
                     wk(JS_WK_IF); wt('('); wt('!');
@@ -2308,8 +2399,65 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int func_slot = sp - 1 - argc;
                 int k, fm;
 
-                if (func_slot < 0 || cur[var_count + func_slot] != WHALE_T_SELF)
+                if (func_slot < 0)
                     goto out;
+                if (cur[var_count + func_slot] != WHALE_T_SELF) {
+                    /* Not this function, so it is a host call - a DOM write, a
+                       logging call. Compile it as a single call into the engine
+                       and carry on, which is what stops a function that is
+                       mostly arithmetic with one host call at the end from
+                       falling back to the interpreter entirely.
+
+                       Only the shape where the result is dropped is accepted.
+                       Keeping a result would mean holding a JSValue the
+                       generated code cannot do arithmetic on, and asking for a
+                       number later would deopt - re-running the frame, and with
+                       it the call. A DOM mutation must not happen twice, so a
+                       result we cannot use is a result we refuse to have; the
+                       drop that follows in the bytecode confirms it is dead. */
+                    int tc = cur[var_count + func_slot];
+                    int nxt = pos + sz;
+
+                    if (!WHALE_IS_VAL(tc) && !WHALE_IS_OBJ(tc))
+                        goto out;
+                    if (nxt >= len || (int)pc[nxt] != OP_drop)
+                        goto out;
+                    if (argc > WHALE_CALL_SLOTS)
+                        goto out;
+                    for (k = 0; k < argc; k++) {
+                        int tk = cur[var_count + sp - argc + k];
+
+                        if (!whale_type_is_num(tk) && !WHALE_IS_VAL(tk) && !WHALE_IS_OBJ(tk))
+                            goto out;
+                    }
+                    fm = fold_mark();
+                    for (k = 0; k < argc; k++) {
+                        int tk = cur[var_count + sp - argc + k];
+
+                        wk(JS_WK_IF); wt('('); wt('!');
+                        if (whale_type_is_num(tk)) {
+                            wt_id("JS_WhaleObjSlotNum"); wt('('); wt_id("ctx"); wt(',');
+                            wt_int(WHALE_CALL_BASE + k); wt(',');
+                            fold_inline(sp - argc + k); wt(')');
+                        } else {
+                            wt_id("JS_WhaleObjSlotCopy"); wt('('); wt_id("ctx"); wt(',');
+                            wt_int(WHALE_IS_VAL(tk) ? WHALE_VAL_SLOT(tk) : WHALE_OBJ_SLOT(tk)); wt(',');
+                            wt_int(WHALE_CALL_BASE + k); wt(')');
+                        }
+                        wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    }
+                    wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleCallValue"); wt('(');
+                    wt_id("ctx"); wt(',');
+                    wt_int(WHALE_IS_VAL(tc) ? WHALE_VAL_SLOT(tc) : WHALE_OBJ_SLOT(tc)); wt(',');
+                    wt_int(argc); wt(','); wt_int(WHALE_CALL_BASE); wt(')'); wt(')');
+                    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(2); wt(';');
+                    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    fold_commit(fm);
+                    cur[var_count + func_slot] = WHALE_T_UNKNOWN;
+                    sp = func_slot + 1;
+                    break;
+                }
                 for (k = 0; k < argc; k++) {
                     if (!whale_type_is_num(cur[var_count + sp - argc + k]))
                         goto out;
@@ -2652,6 +2800,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         }
     }
     wt_id("_r"); wt('='); wt_id(whale_core_name); wt('('); wt_id("ctx"); wt(','); wt_id("args"); wt(','); wt_id("An"); wt(','); wt_id("deopt"); wt(','); wt('&'); wt_id("_ret"); wt(','); wt_id("whale_var_refs"); wt(')'); wt(';');
+    /* *deopt == 2 is not "reinterpret this frame", it is "a host call inside
+       the compiled body threw". The exception is already pending in ctx and the
+       callee must not run a second time - it is exactly the kind of thing (a
+       DOM mutation) that is not safe to repeat - so hand the exception back.
+       Clearing the flag keeps the engine's deopt path out of it. */
+    wk(JS_WK_IF); wt('('); wt('*'); wt_id("deopt"); wt_op(JS_OP_EQ); wt_int(2); wt(')'); wt('{');
+    wt('*'); wt_id("deopt"); wt('='); wt_int(0); wt(';'); wk(JS_WK_RETURN); wt_id("JS_WhaleExceptionValue"); wt('('); wt_id("ctx"); wt(')'); wt(';'); wt('}');
     wk(JS_WK_IF); wt('('); wt('*'); wt_id("deopt"); wt(')'); wk(JS_WK_RETURN); wt_id("whale_jit_box_num"); wt('('); wt_id("ctx"); wt(','); wt_int(0); wt(')'); wt(';');
     /* An array or object result came back through ret_obj instead. Only a
        function that can actually return one gets the check - a numeric one
@@ -2796,6 +2951,10 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
         tcc_add_symbol(s, "JS_WhaleArrSetNum", (void *)JS_WhaleArrSetNum);
         tcc_add_symbol(s, "JS_WhaleObjFieldNum", (void *)JS_WhaleObjFieldNum);
         tcc_add_symbol(s, "JS_WhaleObjStoreNum", (void *)JS_WhaleObjStoreNum);
+        tcc_add_symbol(s, "JS_WhaleObjSlotNum", (void *)JS_WhaleObjSlotNum);
+        tcc_add_symbol(s, "JS_WhaleObjSlotCopy", (void *)JS_WhaleObjSlotCopy);
+        tcc_add_symbol(s, "JS_WhaleCallValue", (void *)JS_WhaleCallValue);
+        tcc_add_symbol(s, "JS_WhaleExceptionValue", (void *)JS_WhaleExceptionValue);
         whale_jit_state = s;
     }
     s = whale_jit_state;
