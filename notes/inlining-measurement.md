@@ -146,3 +146,64 @@ whalejs 的 `read0` 和 `read3` **几乎一样**，而 node 差 3.5 倍。所以
 
 如果将来还想查它，入口在这里：`JS_CallInternal` 里 JIT 成功返回后的那一段
 （`whale_needs_obj` 的对象槽释放循环 + `local_buf..stack_buf` 清理 + memo 插入）。
+
+
+## spill：量了，也试了两次，问题不在我以为的地方
+
+用户指出 spill 才是核心。先量：
+
+| 形态（100 万次迭代） | node | whalejs |
+|---|---|---|
+| `multi`（4 条语句 / 迭代） | 5 ms | **0 ms** |
+| `single`（1 条语句 / 迭代） | 6 ms | **1 ms** |
+| `fewvars`（1 个累加变量） | 5 ms | **0 ms** |
+| `manyvars`（4 个局部变量） | 5 ms | **1 ms** |
+
+**这些形态 whalejs 已经比 node 快**，所以"语句多 / 变量多"本身不是问题——
+`multi` 和 `single` 没有差异，`manyvars` 和 `fewvars` 也没有。
+
+真正的缺口在别处，都是**已经进了 JIT 的纯数值循环**：
+
+| case | node | whalejs | 倍数 |
+|---|---|---|---|
+| `bitops` | 15 ms | 173 ms | 11× |
+| `ident` | 8 ms | 68 ms | 9× |
+| `nested` | 16 ms | 101 ms | 5× |
+| `locals` | 27 ms | 109 ms | 4× |
+| `branch` | 29 ms | 123 ms | 4× |
+
+### 两次尝试，都没有收益（都已回退）
+
+1. **不整体清零 `_ws`**（约 1KB → 只清 40 个 int）：**更慢**（`fib` 9→49ms）。
+   编译器生成的 `memset` 比我手写的循环好。
+2. **把活跃值槽从 `_ws.v[]` 改成真正的 C 局部变量**（TCC 对普通局部能保持寄存器，
+   而结构体成员是它无法避免的内存访问）：**噪声内**。
+
+第 2 条尤其说明问题：如果瓶颈是"值在内存里"，把它变成局部变量应该立竿见影。**没有。**
+
+### 可能是真正入口的地方
+
+生成器里有这个：
+
+```c
+for (i = 0; i < var_count; i++) {
+    if (!whale_has_call && whale_nloops <= 1)
+        wk(JS_WK_REGISTER);        /* <- 这会让 TCC 把 L<i> pin 到寄存器 */
+    wk(JS_WK_DOUBLE); wt_slot("L", i); wt('='); wt_int(0); wt(';');
+}
+```
+
+而 `whale_nloops` 是**回边数**：慢的那些用例**全都有循环**，也就是 `nloops >= 1`，
+而嵌套循环是 `nloops >= 2` —— 后者被条件直接排除（notes 里记过：两个归纳变量都 pin
+会让 `minmax` **死循环**，所以当时排除了嵌套）。
+
+**所以"pin"很可能只作用在那些本来就快到 0-1ms 的无循环函数上，而所有真正慢的循环函数
+一个都没 pin。** 这正是 4-11× 的形状。
+
+用 `WHALE_IR_DEBUG` 的 dump 数 `register` 是**不可靠**的：`JS_WhaleTokDump` 对关键字走
+`get_tok_str()`，而 notes `<32>` 已经记过 `int` 会渲染成空 —— 关键字在 dump 里看不见，
+所以"数到 0 个"不能证明它没发。**要确认只能看机器码**（反汇编那个 core，看循环体里
+`L<i>` 是否真的在 xmm 寄存器里而不是 `[rbp-N]`）。
+
+**下一步是明确的**：反汇编一个慢用例的循环体，确认 pin 有没有生效；如果没有，就在
+`whale_nloops <= 1` 这个条件上做文章（而不是继续动内存布局）。
