@@ -868,6 +868,7 @@ static void fold_obj_field_resolve(int os, int atom, int fc, int stable)
 
 static void fold_mod(int ka, int kb)
 {
+
     int repeat = (whale_vmat[ka] || whale_vexpr[ka].len <= 8) &&
                  (whale_vmat[kb] || whale_vexpr[kb].len <= 8);
 
@@ -3053,8 +3054,21 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             if (!whale_type_is_num(ta) || !whale_type_is_num(tb))
                 goto out;
             {
-                int fm = fold_mark();
+                int fm;
 
+                /* The form fold_mod emits mentions each operand up to four times
+                   (two range tests, the fast path, the fmod fallback), so give
+                   both names first: inlining a pending expression into all those
+                   copies copies it, copies of copies included. One `%` in a loop
+                   generated kilobytes of C that way. This has to happen before
+                   fold_mark(): materialising appends statements, and anything
+                   inside the marked range would be treated as part of the
+                   expression. */
+                if (!whale_vmat[sp - 2])
+                    fold_materialize(sp - 2);
+                if (!whale_vmat[sp - 1])
+                    fold_materialize(sp - 1);
+                fm = fold_mark();
                 fold_mod(sp - 2, sp - 1);
                 fold_set(sp - 2, fm);
             }
