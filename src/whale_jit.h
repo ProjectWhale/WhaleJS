@@ -61,6 +61,11 @@ void JS_WhaleJitRelease(void *handle);
 
 /* services the engine provides to the generator */
 int JS_WhaleVarRefIsSelf(JSContext *ctx, void **var_refs, int idx, JSValue self);
+/* Fill `out` with the bytecode of the function literal in cpool[idx], so the
+   generator can look inside a callee that was declared in the same body. Returns
+   0 when that pool entry is not a function. */
+int JS_WhaleCpoolFuncInfo(JSContext *ctx, const JSValue *cpool, int idx,
+                          JSWhaleFuncInfo *out);
 /* Closure slot read/write as a number. 0 to deopt: no binding, or a value that
    is not a number. This is what lets a function that captures an enclosing
    variable stay in the JIT instead of falling back to the interpreter. */

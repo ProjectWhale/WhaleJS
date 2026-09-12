@@ -3122,6 +3122,39 @@ JSValue JS_WhaleObjGet(JSContext *ctx, int k)
     return js_dup(whale_frame_obj_slots(ctx)[k]);
 }
 
+/* The bytecode behind a function literal in the constant pool. A cpool entry for
+   a function literal holds the JSFunctionBytecode directly, so this is a straight
+   unwrap - it exists because whale_jit.c deliberately knows nothing about quickjs
+   internals. */
+int JS_WhaleCpoolFuncInfo(JSContext *ctx, const JSValue *cpool, int idx,
+                          JSWhaleFuncInfo *out)
+{
+    JSValue v;
+    JSObject *p;
+    JSFunctionBytecode *b;
+
+    if (!cpool || !out || idx < 0)
+        return 0;
+    v = cpool[idx];
+    if (!JS_IsFunction(ctx, v))
+        return 0;
+    p = JS_VALUE_GET_OBJ(v);
+    b = p->u.func.function_bytecode;
+    if (!b)
+        return 0;
+    memset(out, 0, sizeof(*out));
+    out->byte_code = b->byte_code_buf;
+    out->byte_code_len = b->byte_code_len;
+    out->is_normal = (b->func_kind == JS_FUNC_NORMAL);
+    out->arg_count = b->arg_count;
+    out->var_count = b->var_count;
+    out->stack_size = b->stack_size;
+    out->var_ref_count = b->var_ref_count;
+    out->cpool_count = b->cpool_count;
+    out->cpool = b->cpool;
+    return 1;
+}
+
 /* Park a number in slot k. Generated code needs this for a call argument: the
    argument has to be a JSValue in a slot (not a C double) because JS_Call reads
    JSValues and because the collector has to see it while the callee runs.
@@ -3687,7 +3720,20 @@ static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
 
             b->whale_jit_entry2 = NULL;
             whale_assume_self = 1;
-            if (JS_WhaleJitCompileFunction(ctx, &info, &entry, &handle)) {
+            if (getenv("WHALE_INL_DBG")) {
+            int ci;
+
+            fprintf(stderr, "[cpool] %d entries:", b->cpool_count);
+            for (ci = 0; ci < b->cpool_count; ci++) {
+                JSWhaleFuncInfo fi;
+
+                if (JS_WhaleCpoolFuncInfo(ctx, b->cpool, ci, &fi))
+                    fprintf(stderr, " %d=(argc=%d,var=%d,stack=%d,len=%d)", ci,
+                            fi.arg_count, fi.var_count, fi.stack_size, fi.byte_code_len);
+            }
+            fprintf(stderr, "\n");
+        }
+        if (JS_WhaleJitCompileFunction(ctx, &info, &entry, &handle)) {
                 pure1 = whale_gen_pure;
                 objs1 = whale_gen_objs;
                 selfref = whale_gen_self_ref;
