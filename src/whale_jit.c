@@ -1100,6 +1100,18 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wk(JS_WK_INT); wt('*'); wt_id("deopt"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_WhaleObjGet"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("k"); wt(')'); wt(';');
+    /* Packed arrays. Same warning as the object ones: a missing prototype here
+       makes TinyCC declare the function implicitly, and then a double argument
+       is passed as an int - the call still links and silently computes
+       nonsense. */
+    wk(JS_WK_EXTERN); wt_id("JSValue"); wt('*'); wt_id("JS_WhaleArrPtr"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(',');
+        wk(JS_WK_DOUBLE); wt('*'); wt_id("len_out"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleArrNew"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleArrSetNum"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(',');
+        wk(JS_WK_DOUBLE); wt_id("idx"); wt(','); wk(JS_WK_DOUBLE); wt_id("v"); wt(')'); wt(';');
     /* object-slot test hook (WHALE_OBJ_TEST). Declared like the rest: without a
        prototype TinyCC applies the C89 implicit declaration, and while the int
        return happens to land correctly in eax here, relying on that is the same
