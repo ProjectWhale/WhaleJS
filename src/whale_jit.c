@@ -138,6 +138,9 @@ enum {
     WHALE_T_ICONST = 7, /* a literal int32. ToInt32 of it is a cast to a known
                            constant, so the whole range test is unnecessary -
                            bitwise code is full of these (255, 3, 1, 0xffff). */
+    WHALE_T_FN = 9,   /* a function this compilation can see through: the local
+                         it sits in and the pool entry it came from are both
+                         compile-time facts, so a call to it can be expanded. */
     WHALE_T_VAL = 8,  /* an arbitrary JSValue parked in an object slot: a global
                          function (a call target) or a property that is not a
                          number. Only a call may consume it - arithmetic on it
@@ -317,6 +320,21 @@ static int whale_is_push_op(int op)
     default:
         return 0;
     }
+}
+
+/* The local a store writes, or -1. */
+static int whale_store_local(const uint8_t *pc, int len, int pos, int sz)
+{
+    int op = (int)pc[pos];
+
+    (void)len; (void)sz;
+    if (op >= OP_put_loc0 && op <= OP_put_loc3)
+        return op - OP_put_loc0;
+    if (op == OP_put_loc8)
+        return (int)pc[pos + 1];
+    if (op == OP_put_loc)
+        return (int)whale_get_u16(pc + pos + 1);
+    return -1;
 }
 
 /* Is the value this instruction pushes read as the *object* of a property
@@ -642,6 +660,10 @@ static uint8_t    *whale_vmat;    /* 1 = already forced into a variable */
    *first* one. References go through whale_vname[k]. */
 #define WHALE_VSER_MAX 64
 static int whale_vname[WHALE_JIT_MAX_SLOTS];  /* slot -> name number */
+/* Which pool entry a local / stack slot holds a *function* for, or -1. Filled by
+   the pre-scan from 'fclosure' + 'put_locN', and read when a call is expanded. */
+static int whale_loc_fn[WHALE_JIT_MAX_SLOTS];
+static int whale_slot_fn[WHALE_JIT_MAX_SLOTS];
 static int whale_vserial;                     /* next unused name number */
 
 /* Everything encoded from now on goes into the workspace. */
@@ -656,6 +678,7 @@ static void fold_begin(void)
     whale_out_len = &go_len;
     /* fresh name space for this function's materialised slots */
     whale_vserial = 0;
+
     memset(whale_vname, 0, sizeof(whale_vname));
 }
 
@@ -1023,6 +1046,212 @@ static void local_flush_all(int n)
 
 /* Generate + type-check in one pass. Returns 0 when the function is not a
    candidate (unsupported opcode, unknown type, inconsistent jump target). */
+/* ---------------------------------------------------------------------------
+ * Inlining a callee the generator can see.
+ *
+ * A function declared inside this very body reaches its call sites through a
+ * local, and `push_const M; fclosure; put_locN` is what puts it there. That local
+ * is a compile-time fact, so the call can be expanded instead of going through
+ * the engine - and that is the whole difference: this shape spends ~190ms per
+ * 10^6 calls on the crossing alone, while the expanded form runs at node speed.
+ *
+ * The expansion does not invent a stack. The callee's arguments are the caller's
+ * operand slots at arg_base..arg_base+arg_count-1 (already evaluated), its
+ * temporaries use the caller's stack above that point, and its result is left in
+ * caller slot arg_base (the callee's result slot). Object slots and field-cache
+ * entries are shared, which is safe because one linear pass hands them out from
+ * the same counters.
+ *
+ * Returns the type of the inlined result, or -1 if the callee is out of shape.
+ * v1 accepts what the front-end helpers actually look like: no locals of its own,
+ * straight line, one `return <expression>`.
+ * ------------------------------------------------------------------------- */
+static int whale_inline_argmap[4];   /* inlined callee's arg k -> caller stack slot */
+static int whale_inline_nested;      /* one level at a time: see the call site */
+/* Declared again further down with the generator's own state. The inliner hands
+   out slots from both, which is safe because a single linear pass allocates from
+   them - the two areas cannot collide. */
+int whale_objs;
+int whale_fields;
+/* Defined further down with the rest of the generator state. The inliner hands
+   out slots from both, which is safe because a single linear pass allocates from
+   them - the two areas cannot collide. */
+int whale_objs;
+int whale_fields;
+
+static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
+                             int var_count, int arg_base)
+{
+    const uint8_t *pc = callee->byte_code;
+    int len = callee->byte_code_len;
+    int pos, sp = 0, i, ret = -1;
+    int saved_argmap[4];
+
+    if (callee->var_count != 0)
+        return -1;                      /* locals would need slot remapping */
+    if (callee->arg_count > 4)
+        return -1;
+    for (i = 0; i < 4; i++) {
+        saved_argmap[i] = whale_inline_argmap[i];
+        whale_inline_argmap[i] = (i < callee->arg_count) ? arg_base + i : -1;
+    }
+
+    for (pos = 0; pos < len; ) {
+        int op = (int)pc[pos];
+        int sz = whale_op_size_of(op);
+        int ta, tb, fm;
+
+        if (sz <= 0 || pos + sz > len)
+            goto done;
+        switch (op) {
+        case OP_get_arg0: case OP_get_arg1: case OP_get_arg2: case OP_get_arg3:
+        case OP_get_arg:
+            {
+                int a = (op == OP_get_arg) ? (int)whale_get_u16(pc + pos + 1) : op - OP_get_arg0;
+
+                if (a < 0 || a >= callee->arg_count || whale_inline_argmap[a] < 0)
+                    goto done;
+                fm = fold_mark();
+                fold_inline(whale_inline_argmap[a]);
+                fold_set(sp, fm);
+                cur[var_count + sp] = WHALE_T_NUM;
+                sp++;
+            }
+            break;
+
+        case OP_object:
+            {
+                int os;
+
+                if (whale_objs >= WHALE_CALL_BASE)
+                    goto done;
+                os = whale_objs++;
+                fm = fold_mark();
+                wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjNew"); wt('(');
+                wt_id("ctx"); wt(','); wt_int(os); wt(')'); wt(')');
+                wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                fold_commit(fm);
+                cur[var_count + sp] = WHALE_OBJ_T(os);
+                sp++;
+            }
+            break;
+
+        case OP_define_field:
+            {
+                int atom = (int)whale_get_u32(pc + pos + 1);
+
+                if (sp < 2)
+                    goto done;
+                ta = cur[var_count + sp - 2];
+                tb = cur[var_count + sp - 1];
+                if (!WHALE_IS_OBJ(ta) || !whale_type_is_num(tb))
+                    goto done;
+                fm = fold_mark();
+                wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjDefineNum"); wt('(');
+                wt_id("ctx"); wt(','); wt_int(WHALE_OBJ_SLOT(ta)); wt(','); wt_int(atom); wt(',');
+                fold_inline(sp - 1); wt(')'); wt(')');
+                wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                fold_commit(fm);
+                sp--;
+            }
+            break;
+
+        case OP_get_field:
+            {
+                int atom = (int)whale_get_u32(pc + pos + 1);
+                int fc, nm;
+
+                if (sp < 1)
+                    goto done;
+                ta = cur[var_count + sp - 1];
+                if (!WHALE_IS_SLOT(ta) || whale_fields >= WHALE_FIELD_CACHE)
+                    goto done;
+                fc = whale_fields++;
+                nm = whale_vserial++;
+                /* not a literal we can prove stable: keep the shape check */
+                fold_obj_field_load(WHALE_SLOT(ta), atom, fc, nm, 0);
+                whale_vname[sp - 1] = nm;
+                whale_vmat[sp - 1] = 1;
+                cur[var_count + sp - 1] = WHALE_T_NUM;
+            }
+            break;
+
+        case OP_push_0: case OP_push_1: case OP_push_2: case OP_push_3:
+            {
+                fm = fold_mark();
+                wt_int(op - OP_push_0);
+                fold_set(sp, fm);
+                cur[var_count + sp] = WHALE_T_ICONST;
+                sp++;
+            }
+            break;
+
+        case OP_add: case OP_sub: case OP_mul: case OP_div:
+            {
+                int opid = (op == OP_add) ? JS_OP_ADD : (op == OP_sub) ? JS_OP_SUB :
+                           (op == OP_mul) ? JS_OP_MUL : JS_OP_DIV;
+
+                if (sp < 2)
+                    goto done;
+                ta = cur[var_count + sp - 2];
+                tb = cur[var_count + sp - 1];
+                if (!whale_type_is_num(ta) || !whale_type_is_num(tb))
+                    goto done;
+                fm = fold_mark();
+                fold_inline(sp - 2); wt_op(opid); fold_inline(sp - 1);
+                fold_set(sp - 2, fm);
+                cur[var_count + sp - 2] = WHALE_T_NUM;
+                sp--;
+            }
+            break;
+
+        case OP_return:
+            {
+                if (sp < 1)
+                    goto done;
+                ta = cur[var_count + sp - 1];
+                fm = fold_mark();
+                if (WHALE_IS_SLOT(ta)) {
+                    /* An object result cannot live in a double slot, so park it in
+                       one of its own - the caller then sees a slot value, which is
+                       what it would have seen from the compiled form. */
+                    int os = whale_objs++;
+
+                    if (os >= WHALE_CALL_BASE)
+                        goto done;
+                    wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjSlotCopy"); wt('(');
+                    wt_id("ctx"); wt(','); wt_int(WHALE_SLOT(ta)); wt(','); wt_int(os); wt(')'); wt(')');
+                    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    ret = WHALE_VAL_T(os);
+                } else if (whale_type_is_num(ta)) {
+                    int nm = whale_vserial++;
+
+                    wt_arr("v", nm); wt('='); fold_inline(sp - 1); wt(';');
+                    whale_vname[sp - 1] = nm;
+                    whale_vmat[sp - 1] = 1;
+                    ret = WHALE_T_NUM;
+                } else {
+                    goto done;
+                }
+                fold_commit(fm);
+                cur[var_count + sp - 1] = (uint8_t)ret;
+                goto done;
+            }
+
+        default:
+            goto done;
+        }
+        pos += sz;
+    }
+
+  done:
+    for (i = 0; i < 4; i++)
+        whale_inline_argmap[i] = saved_argmap[i];
+    return ret;
+}
 static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 {
     whale_gen_self_ref = 0;
@@ -1041,6 +1270,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     int stack_size = info->stack_size;
     int arg_count = info->arg_count;
     int state_len = var_count + stack_size + 1; /* +1: sp */
+    /* Before the pre-scan, which is what fills these in: clearing them later
+       (fold_begin runs further down) would wipe what it found. */
+    memset(whale_loc_fn, 0xff, sizeof(whale_loc_fn));
+    memset(whale_slot_fn, 0xff, sizeof(whale_slot_fn));
     int pos, i, sp, ret = 0, tail_mark;
     uint8_t *targets = NULL, *seen = NULL, *snap = NULL, *cur = NULL, *args_used = NULL;
     uint8_t *args_obj = NULL;   /* per argument: read as the object of a field access */
@@ -1124,6 +1357,21 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 if (whale_next_is_field_read(pc, len, pos, sz))
                     args_obj[a] = 1;
             }
+        } else if (op == OP_fclosure || op == OP_fclosure8) {
+            /* 'fclosure8 M' carries its pool index; the 5-byte 'fclosure'
+               form follows a 'push_const M'. Either way this is a function
+               declared in this body, and it lands in the local the next store
+               writes - a compile-time fact, so a later call through that
+               local can be expanded in place. */
+            int m = (op == OP_fclosure8)
+                        ? (int)pc[pos + 1]
+                        : ((pos >= 5 && pc[pos - 5] == OP_push_const)
+                               ? (int)whale_get_u32(pc + pos - 5 + 1) : -1);
+            int npos = pos + sz;
+            int ln = (npos < len) ? whale_store_local(pc, len, npos, whale_op_size_of(pc[npos])) : -1;
+
+            if (m >= 0 && ln >= 0 && ln < var_count)
+                whale_loc_fn[ln] = m;
         } else if (op == OP_inc_loc || op == OP_dec_loc) {
             {   /* these write a local too, so it is not a constant */
                 int a = (int)pc[pos + 1];
@@ -1748,6 +1996,23 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 sp++;
             }
             break;
+        case OP_fclosure:
+        case OP_fclosure8:
+            /* A function declaration. The pre-scan recorded which pool entry the
+               local ends up holding, and that is what a call will use, so there
+               is nothing to emit - pushing the closure as a value would put a
+               function where the type system expects a number. The store that
+               follows is part of the declaration and goes with it. */
+            {
+                int npos = pos + sz;
+                int s4 = (npos < len) ? whale_op_size_of(pc[npos]) : 0;
+                int ln = (s4 > 0) ? whale_store_local(pc, len, npos, s4) : -1;
+
+                if (ln >= 0)
+                    pos = npos + s4;
+            }
+            break;
+
         case OP_push_const:
         case OP_push_const8:
             {
@@ -2215,6 +2480,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     cur[var_count + sp] = (uint8_t)t;
                     sp++;
                     break;
+                }                if (whale_loc_fn[idx] >= 0) {
+                    /* this local holds a function this compilation can see */
+                    cur[var_count + sp] = WHALE_T_FN;
+                    whale_slot_fn[sp] = whale_loc_fn[idx];
+                    sp++;
+                    break;
                 }
                 {
                     int fm = fold_mark();
@@ -2602,6 +2873,34 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                 if (func_slot < 0)
                     goto out;
+                if (cur[var_count + func_slot] == WHALE_T_FN && !whale_inline_nested) {
+                    /* A callee this compilation can see through: expand it in
+                       place instead of crossing into the engine. */
+                    JSWhaleFuncInfo ci;
+
+                    if (JS_WhaleCpoolFuncInfo(ctx, info->cpool, whale_slot_fn[func_slot], &ci)) {
+                        int rtype, saved_nested = whale_inline_nested;
+
+                        whale_inline_nested = 1;
+                        for (k = 0; k < argc; k++) {
+                            int tk = cur[var_count + sp - argc + k];
+
+                            if (!whale_type_is_num(tk) && !WHALE_IS_SLOT(tk)) {
+                                whale_inline_nested = saved_nested;
+                                goto out;
+                            }
+                        }
+                        fm = fold_mark();
+                        rtype = whale_inline_body(&ci, cur, var_count, sp - argc);
+                        whale_inline_nested = saved_nested;
+                        if (rtype < 0)
+                            goto out;
+                        fold_commit(fm);
+                        cur[var_count + func_slot] = (uint8_t)rtype;
+                        sp = func_slot + 1;
+                        break;
+                    }
+                }
                 if (cur[var_count + func_slot] != WHALE_T_SELF) {
                     /* Not this function, so it is a host call - a DOM write, a
                        logging call. Compile it as a single call into the engine
