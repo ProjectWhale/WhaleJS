@@ -52,6 +52,11 @@ void JS_WhaleJitRelease(void *handle);
 
 /* services the engine provides to the generator */
 int JS_WhaleVarRefIsSelf(JSContext *ctx, void **var_refs, int idx, JSValue self);
+/* Closure slot read/write as a number. 0 to deopt: no binding, or a value that
+   is not a number. This is what lets a function that captures an enclosing
+   variable stay in the JIT instead of falling back to the interpreter. */
+int JS_WhaleVarRefGetNum(JSContext *ctx, void *var_refs, int idx, double *out);
+int JS_WhaleVarRefSetNum(JSContext *ctx, void *var_refs, int idx, double v);
 int JS_WhaleCheckStack(JSContext *ctx);
 int JS_WhaleOpSize(int op);   /* bytecode operand size, from the interpreter table */
 

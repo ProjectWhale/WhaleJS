@@ -3023,6 +3023,52 @@ int JS_WhaleVarRefIsSelf(JSContext *ctx, void **var_refs, int idx, JSValue self)
 }
 
 
+/* The number held by closure slot `idx`, or 0 to deopt. This is the captured
+   variable of an enclosing function - the case the JIT used to refuse
+   outright, which sent every closure-using function to the interpreter.
+
+   `pvalue` is always valid: when a var_ref is detached it points at the
+   var_ref's own `value` field, otherwise at the captured slot (JSVarRef's
+   comment says exactly that), so there is nothing to check. */
+int JS_WhaleVarRefGetNum(JSContext *ctx, void *var_refs, int idx, double *out)
+{
+    JSVarRef *vr;
+    JSValue v;
+
+    (void)ctx;
+    if (!var_refs || idx < 0 || idx >= 4)
+        return 0;
+    vr = (JSVarRef *)((void **)var_refs)[idx];
+    if (!vr || !vr->pvalue)
+        return 0;
+    v = *vr->pvalue;
+    if (JS_VALUE_GET_TAG(v) == JS_TAG_FLOAT64) {
+        *out = v.u.float64;
+        return 1;
+    }
+    if (JS_VALUE_GET_TAG(v) == JS_TAG_INT) {
+        *out = (double)v.u.int32;
+        return 1;
+    }
+    return 0;
+}
+
+/* Store a number into closure slot `idx`. 0 to deopt. The old value is
+   released: it may be a reference. */
+int JS_WhaleVarRefSetNum(JSContext *ctx, void *var_refs, int idx, double v)
+{
+    JSVarRef *vr;
+
+    if (!var_refs || idx < 0 || idx >= 4)
+        return 0;
+    vr = (JSVarRef *)((void **)var_refs)[idx];
+    if (!vr || !vr->pvalue)
+        return 0;
+    JS_FreeValue(ctx, *vr->pvalue);
+    *vr->pvalue = JS_NewFloat64(ctx, v);
+    return 1;
+}
+
 /* 1 = enough stack, 0 = overflow raised (the JIT code then bails out) */
 int JS_WhaleCheckStack(JSContext *ctx)
 {
