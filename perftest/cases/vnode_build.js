@@ -1,0 +1,17 @@
+/* React shape: a render pass creating vnodes - one fresh object per element,
+   with a shallow props object inside each. Object creation dominates. */
+function createElement(type, props) { return { type: type, props: props, key: null }; }
+function render(n) {
+    var out = 0;
+    for (var i = 0; i < n; i++) {
+        var v = createElement(i % 5, { id: i, cls: "c" + (i % 3) });
+        out += v.type + v.props.id;
+    }
+    return out;
+}
+render(1000);
+var t0 = Date.now();
+var check = 0;
+for (var r = 0; r < 30; r++) check = render(20000);
+var ms = Date.now() - t0;
+console.log("WHALE_BENCH vnode_build ms=" + ms + " check=" + check);
