@@ -771,10 +771,19 @@ static void fold_toint32(int k, int is_i32, int is_iconst)
         return;
     }
     wt('(');
-    wt('('); fold_inline(k); wt_op(JS_OP_GE); wt_num(-2147483648.0); wt(')');
+    /* The window is int64, not int32: for any double below 2^63 the C conversions
+       below give exactly ToInt32's result (truncate, then take the low 32 bits),
+       because long long holds it exactly. Testing against int32 instead made every
+       int32-wrapping value - an accumulator a loop has been adding to for a while,
+       say - take the helper on *every* operation, and the helper calls fmod. A
+       one-shot 5e6-iteration bitwise loop measured 165ms that way against 2ms when
+       the same work was split into 100 calls: the accumulator never left int32 in
+       the second case, so it never left the fast path. */
+    wt('('); fold_inline(k); wt_op(JS_OP_GE); wt_num(-4611686018427387904.0); wt(')');
     wt_op(JS_OP_AND);
-    wt('('); fold_inline(k); wt_op(JS_OP_LE); wt_num(2147483647.0); wt(')');
-    wt('?'); wt('('); wk(JS_WK_INT); wt(')'); fold_inline(k);
+    wt('('); fold_inline(k); wt_op(JS_OP_LE); wt_num(4611686018427387904.0); wt(')');
+    wt('?'); wt('('); wk(JS_WK_INT); wt(')'); wt('('); wk(JS_WK_LONG); wk(JS_WK_LONG); wt(')');
+    fold_inline(k);
     wt(':'); wt_id("JS_WhaleToInt32"); wt('('); fold_inline(k); wt(')');
     wt(')');
 }
