@@ -135,6 +135,9 @@ enum {
                          on it is just a cast. Bitwise results always are. */
     WHALE_T_ARR = 6,  /* a packed array. Its elements are JSValue, so only the
                          structural parts go through the engine. */
+    WHALE_T_ICONST = 7, /* a literal int32. ToInt32 of it is a cast to a known
+                           constant, so the whole range test is unnecessary -
+                           bitwise code is full of these (255, 3, 1, 0xffff). */
 };
 
 /* The object slot a type carries, packed into the same byte as the type.
@@ -295,7 +298,8 @@ static int whale_type_is_num(int t)
 {
     /* WHALE_T_I32 counts as a number: it only adds the knowledge that the value
        is already an in-range int32. */
-    return t == WHALE_T_NUM || t == WHALE_T_BOOL || t == WHALE_T_I32;
+    return t == WHALE_T_NUM || t == WHALE_T_BOOL || t == WHALE_T_I32 ||
+           t == WHALE_T_ICONST;
 }
 
 /* numeric binary opcode -> C operator. Returns NULL when the opcode is not a
@@ -628,9 +632,22 @@ static void fold_inline(int k)
    is a plain variable or a short expression, which is exactly the shape the
    bitwise operators see. Without this, every bitwise operand paid a helper
    call whose fmod() dominated the loop. */
-static void fold_toint32(int k, int is_i32)
+static void fold_toint32(int k, int is_i32, int is_iconst)
 {
     int repeat;
+
+    /* A literal already in range needs the cast and nothing else - no range
+       test, no helper, and about fifteen tokens less than the general form.
+       Bitwise code is full of these. */
+    if (is_iconst) {
+        if (!whale_vmat[k]) {
+            if (whale_vexpr[k].len == 1) {
+                wt('('); wk(JS_WK_INT); wt(')');
+                wt_int((int)gw_num[whale_vexpr[k].off]);
+                return;
+            }
+        }
+    }
 
     /* Already an in-range int32: the range test and the helper call both fall
        away, leaving a plain cast. Only when the operand is already a variable -
@@ -1316,10 +1333,17 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                        difference as a conflict refused to compile the whole
                        function - which is how `acc` (NUM down one branch of an
                        `if`, I32 down the other) lost bitops to the interpreter. */
-                    if ((sv == WHALE_T_I32 && whale_type_is_num(cv)) ||
-                        (cv == WHALE_T_I32 && whale_type_is_num(sv))) {
-                        snap[base + k] = WHALE_T_NUM;
-                        continue;
+                    if (sv == WHALE_T_I32 || sv == WHALE_T_ICONST) {
+                        if (whale_type_is_num(cv)) {
+                            snap[base + k] = WHALE_T_NUM;
+                            continue;
+                        }
+                    }
+                    if (cv == WHALE_T_I32 || cv == WHALE_T_ICONST) {
+                        if (whale_type_is_num(sv)) {
+                            snap[base + k] = WHALE_T_NUM;
+                            continue;
+                        }
                     }
                     if (sv == WHALE_T_UNKNOWN) {
                         snap[base + k] = cv; /* optimistic merge */
@@ -1540,7 +1564,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                 wt_int(op == OP_push_minus1 ? -1 : op - OP_push_0);
                 fold_set(sp, fm);
-                cur[var_count + sp] = WHALE_T_NUM;
+                cur[var_count + sp] = WHALE_T_ICONST;
                 sp++;
             }
             break;
@@ -1550,7 +1574,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                 wt_int((int)(int8_t)pc[pos + 1]);
                 fold_set(sp, fm);
-                cur[var_count + sp] = WHALE_T_NUM;
+                cur[var_count + sp] = WHALE_T_ICONST;
                 sp++;
             }
             break;
@@ -1560,7 +1584,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                 wt_int((int)(int16_t)whale_get_u16(pc + pos + 1));
                 fold_set(sp, fm);
-                cur[var_count + sp] = WHALE_T_NUM;
+                cur[var_count + sp] = WHALE_T_ICONST;
                 sp++;
             }
             break;
@@ -1570,7 +1594,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                 wt_int((int)(int32_t)whale_get_u32(pc + pos + 1));
                 fold_set(sp, fm);
-                cur[var_count + sp] = WHALE_T_NUM;
+                cur[var_count + sp] = WHALE_T_ICONST;
                 sp++;
             }
             break;
@@ -2369,9 +2393,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int fm = fold_mark();
 
                 wt('('); wk(JS_WK_DOUBLE); wt(')'); wt('(');
-                fold_toint32(sp - 2, cur[var_count + sp - 2] == WHALE_T_I32);
+                fold_toint32(sp - 2, cur[var_count + sp - 2] == WHALE_T_I32,
+                     cur[var_count + sp - 2] == WHALE_T_ICONST);
                 wt(op == OP_and ? '&' : op == OP_or ? '|' : '^');
-                fold_toint32(sp - 1, cur[var_count + sp - 1] == WHALE_T_I32);
+                fold_toint32(sp - 1, cur[var_count + sp - 1] == WHALE_T_I32,
+                         cur[var_count + sp - 1] == WHALE_T_ICONST);
                 wt(')');
                 fold_set(sp - 2, fm);
             }
@@ -2388,10 +2414,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                 wt('('); wk(JS_WK_DOUBLE); wt(')'); wt('(');
                 if (op == OP_shr) { wk(JS_WK_UNSIGNED); wk(JS_WK_INT); wt(')'); }   /* >>> is logical */
-                fold_toint32(sp - 2, cur[var_count + sp - 2] == WHALE_T_I32);
+                fold_toint32(sp - 2, cur[var_count + sp - 2] == WHALE_T_I32,
+                     cur[var_count + sp - 2] == WHALE_T_ICONST);
                 /* one token, not two '<' - there is no lexer to join them */
                 wt_op(op == OP_shl ? JS_OP_SHL : JS_OP_SAR);
-                wt('('); fold_toint32(sp - 1, cur[var_count + sp - 1] == WHALE_T_I32); wt('&'); wt_int(31); wt(')');
+                wt('('); fold_toint32(sp - 1, cur[var_count + sp - 1] == WHALE_T_I32,
+                         cur[var_count + sp - 1] == WHALE_T_ICONST); wt('&'); wt_int(31); wt(')');
                 wt(')');
                 fold_set(sp - 2, fm);
             }
@@ -2439,7 +2467,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             {
                 int fm = fold_mark();
 
-                wt('('); wk(JS_WK_DOUBLE); wt(')'); wt('~'); fold_toint32(sp - 1, cur[var_count + sp - 1] == WHALE_T_I32);
+                wt('('); wk(JS_WK_DOUBLE); wt(')'); wt('~'); fold_toint32(sp - 1, cur[var_count + sp - 1] == WHALE_T_I32,
+                         cur[var_count + sp - 1] == WHALE_T_ICONST);
                 fold_set(sp - 1, fm);
             }
             cur[var_count + sp - 1] = WHALE_T_I32;
