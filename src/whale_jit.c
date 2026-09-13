@@ -750,6 +750,13 @@ int whale_empty_ranges;
 /* Which pool entry a local / stack slot holds a *function* for, or -1. Filled by
    the pre-scan from 'fclosure' + 'put_locN', and read when a call is expanded. */
 static int whale_loc_fn[WHALE_JIT_MAX_SLOTS];
+/* Which locals hold an object built in this body - 'object' followed by a store to
+   that local, the same shape as whale_loc_fn above. Filled by the pre-scan (which
+   already walks every opcode and already watches for exactly this pattern for
+   fclosure) and read when the object is created, because whether it can be unboxed
+   depends on the field accesses that come later. */
+static uint8_t whale_loc_obj[WHALE_JIT_MAX_SLOTS];
+static int whale_obj_pending;
 static int whale_slot_fn[WHALE_JIT_MAX_SLOTS];
 static int whale_vserial;                     /* next unused name number */
 
@@ -1612,6 +1619,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
             if (m >= 0 && ln >= 0 && ln < var_count)
                 whale_loc_fn[ln] = m;
+        } else if (op == OP_object) {
+            /* the next store into a local names the one holding this object */
+            whale_obj_pending = 1;
         } else if (op == OP_inc_loc || op == OP_dec_loc) {
             {   /* these write a local too, so it is not a constant.
                    Recorded separately rather than folded into assign_cnt: an
@@ -1625,14 +1635,31 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 }
             }
         } else if (op >= OP_put_loc0 && op <= OP_put_loc3) {
-            assign_cnt[op - OP_put_loc0]++;
+            int a = op - OP_put_loc0;
+
+            assign_cnt[a]++;
+            if (whale_obj_pending && a < var_count) {
+                whale_loc_obj[a] = 1;
+                whale_obj_pending = 0;
+            }
         } else if (op == OP_put_loc8) {
-            if ((int)pc[pos + 1] < var_count)
+            if ((int)pc[pos + 1] < var_count) {
                 assign_cnt[pc[pos + 1]]++;
+                if (whale_obj_pending) {
+                    whale_loc_obj[pc[pos + 1]] = 1;
+                    whale_obj_pending = 0;
+                }
+            }
         } else if (op == OP_put_loc) {
             int a = (int)whale_get_u16(pc + pos + 1);
-            if (a < var_count)
+
+            if (a < var_count) {
                 assign_cnt[a]++;
+                if (whale_obj_pending) {
+                    whale_loc_obj[a] = 1;
+                    whale_obj_pending = 0;
+                }
+            }
         } else if (op == OP_define_field) {
             int atom = (int)whale_get_u32(pc + pos + 1);
 
