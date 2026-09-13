@@ -965,6 +965,11 @@ ST_FUNC void vpush_global_sym(CType *type, int v)
  * whale_pinned_regs keeps a pinned register out of get_reg()'s hands.
  */
 static int whale_pin_next;          /* set by the TOK_REGISTER case below */
+/* Non-zero while the JIT generator owns the pin map. gen_function then leaves it
+   alone, because every C function it is asked to compile belongs to the same JS
+   function. See the reset in gen_function. */
+static int whale_pin_scope;
+
 static unsigned whale_pinned_regs;  /* one bit per pinned register */
 
 static int whale_pin_alloc(int t)
@@ -999,6 +1004,18 @@ static int whale_pin_alloc(int t)
 static int whale_pin_loc[16];
 static int whale_pin_reg[16];
 static int whale_pin_n;
+
+/* Claim the pin map for one JIT compilation. The generator calls this once
+   before it emits anything, so the map spans all the C functions it is about to
+   produce. Resetting here rather than never is what keeps one compile's stack
+   offsets from matching a later compile's. */
+void JS_WhalePinEnter(void);
+void JS_WhalePinEnter(void)
+{
+    whale_pinned_regs = 0;
+    whale_pin_n = 0;
+    whale_pin_scope = 1;
+}
 
 static int whale_pin_find(int loc)
 {
@@ -1394,6 +1411,8 @@ ST_FUNC int gv(int rc)
         if ((vtop->r & VT_VALMASK) == VT_LOCAL) {
             {
                 int pr = whale_pin_find((int)vtop->c.i);
+                if (getenv("WHALE_PIN_DBG"))
+                    fprintf(stderr, "[pin] read  loc=%d -> reg=%d\n", (int)vtop->c.i, pr);
                 if (pr >= 0) {
 
 
@@ -7077,6 +7096,8 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
             sym->a = ad->a;
             if (whale_pin_next) {
                 int pr = whale_pin_alloc(type->t);
+                if (getenv("WHALE_PIN_DBG"))
+                    fprintf(stderr, "[pin] alloc loc=%d -> reg=%d\n", (int)addr, pr);
                 if (pr >= 0) {
                     sym->pin_reg = pr + 1;
                     if (whale_pin_n < 16) {
@@ -7210,8 +7231,22 @@ static void gen_function(Sym *sym)
     /* WhaleJS: pinned registers belong to one function. A new one starts with
        none, and the previous function's offset -> register map would otherwise
        match a local of this one. */
-    whale_pinned_regs = 0;
-    whale_pin_n = 0;
+    if (getenv("WHALE_PIN_DBG"))
+        fprintf(stderr, "[pin] RESET for fn=%s (had n=%d)\n",
+                get_tok_str(sym->v, NULL), whale_pin_n);
+    /* A pinned register lives as long as its scope, not as long as one C
+       function. The JIT generator emits two C functions per JS function - the
+       core and a wrapper around it - and they share the locals, so resetting at
+       each one discarded the core's map before the wrapper was even written. The
+       reads then fell back to the frame slot, which the store path never writes
+       because it keeps the value in the register, so a pinned loop counter read a
+       value that never changed and the loop never ended.
+       The generator claims the map with JS_WhalePinEnter() first, and that call is
+       the reset. */
+    if (!whale_pin_scope) {
+        whale_pinned_regs = 0;
+        whale_pin_n = 0;
+    }
     nocode_wanted = 0;
     ind = cur_text_section->data_offset;
     /* NOTE: we patch the symbol size later */
