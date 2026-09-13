@@ -101,3 +101,21 @@ else in this area is touched.
 
 Next: grep what emits the bitwise `|`, `&`, `<<`, `>>` for a value expression and
 see which `JS_OP_*` it asks for. That is the missing half.
+## <51> Correction: the operator table was never wrong
+
+`<50>` is retracted. `optok[]` has 17 entries and matches `JS_OP_*` exactly;
+`TOK_LAND` has been in it since well before `32dcd44`. The "missing entry" came
+from a truncated `Select-String` line - the entry was cut off in the listing, not
+absent from the array. `bitops` is 60479 on a clean tree, matching node.
+
+What survives from that round is the observation that bitwise operators are spelled
+as literals at whale_jit.c:3099 while `<<`/`>>` go through `wt_op` at 3121, so only
+one of the two spellings consults the table.
+
+What is still real and unexplained is the empty `()`:
+
+    function f(n) { var s = 1.0; for (var i = 0; i < n; i++) { s = s / 1.0; s = s - 0.0; } return s; }
+    -> L0 = (((L0) - ()));
+
+`s / 1.0` folds away correctly, so the algebraic-identity path runs; the `- 0.0` arm
+emits an empty operand. `notes/operator-table.md` now says this instead.

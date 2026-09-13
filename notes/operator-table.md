@@ -1,56 +1,70 @@
+# RETRACTED - the operator table is correct
 
-## The operator table was one entry short of its enum (found, not fixed)
+An earlier version of this file claimed `JS_WhaleTokOp`'s `optok[]` table was one
+entry shorter than `JS_OP_*`, that `JS_OP_AND` had no entry, and that `JS_OP_DOT`
+fell off the end. **That was wrong.**
 
-`JS_WhaleTokOp` (src/tcc/whale_tcc_iface.c) maps a `JS_OP_*` value to a token
-through a hand-written table:
+`optok[]` has 17 entries and has always matched the enum:
 
 ```c
 static const int optok[] = { '+', '-', '*', '/', TOK_LT, TOK_LE, TOK_GT, TOK_GE,
-                             TOK_EQ, TOK_NE, TOK_LOR,
-                             TOK_SHL, TOK_SAR, TOK_SHR, TOK_ARROW, '.' };
+                             TOK_EQ, TOK_NE, TOK_LOR, TOK_LAND,
+                             TOK_SHL, TOK_SAR, TOK_SHR,
+                             TOK_ARROW, '.' };
 ```
 
-That is 16 entries. `JS_OP_*` has 17: `JS_OP_AND` is missing. Everything from
-it on is therefore shifted by one, and the last value falls off the end:
+`TOK_LAND` is present in `32dcd44` and in every commit before it. The reading that
+started the claim came from a truncated line in a `Select-String` listing - the
+`TOK_LAND` entry was cut off, not missing. A fresh `xmake -r -y` on a clean tree
+gives `bitops` = 60479, matching node.
 
-| value | emitted | should be |
-| --- | --- | --- |
-| `JS_OP_AND` | `<<` | `&&` |
-| `JS_OP_SHL` | `>>` | `<<` |
-| `JS_OP_SAR` | `>>>` | `>>` |
-| `JS_OP_SHR` | `->` | `>>>` |
-| `JS_OP_ARROW` | `.` | `->` |
-| `JS_OP_DOT` | *(one past the end)* | `.` |
+Lesson, since this cost a round: when a grep result is the evidence for a claim
+about a table's *length*, print the whole table in one piece and count it. A
+`-First N` or a column-truncated line is not evidence about the end of an array.
 
-`JS_WhaleTokOp` bounds-checks with `o < sizeof(optok)/sizeof(optok[0])`, so
-`JS_OP_DOT` pushes **nothing** - the read never happens. That is where the empty
-parentheses in ident.js came from:
+## What is still true and still unexplained
+
+The empty parentheses are real, not a misreading. This:
+
+```js
+function f(n) { var s = 1.0; for (var i = 0; i < n; i++) { s = s / 1.0; s = s - 0.0; } return s; }
+```
+
+generates
 
 ```c
-L0 = ((((L0 / ()) - ()) + _ws.v[...]));
+L4: ... goto L20; L0 = (((L0) - ())); L1 = (L1 + 1); goto L4;
 ```
 
-Field access emits `->u` + `JS_OP_DOT` + `float64` (line 838), so a missing entry
-there leaves `->u float64`; it compiles because the `(` that opens the ternary arm
-and the `)` that closes it end up adjacent.
+`s - 0.0` should fold to `s` (the algebraic-identity path at whale_jit.c:1863) and
+instead emits `(L0) - ()`. Note that `s / 1.0` *did* fold - only the `- 0.0` arm is
+broken - so the identity logic does run, and the operand load inside it is what
+produces nothing.
 
-The reason all 24 cases still matched is that `JS_OP_OR` and `JS_OP_AND` are used
-**only as condition joiners** (lines 820-891, 2198-2482, 3159 - every one is inside
-an `if (...)`), and in a `?:` or `if` condition any non-zero value is as good as
-1, so `(x >= A) << (x <= B)` behaves like `(x >= A) && (x <= B)`.
+Two candidates checked and ruled out:
 
-### The attempted fix, and what it exposed
+- `fold_inline_expr` receiving `len == 0`: its counter reads 0 across all 24 cases.
+  But that counter was only exercised by the suite, never by an `-e` probe, so
+  re-check it with the probe that does show `()` before trusting this.
+- `JS_WhaleTokOp` bounds: the table is complete; nothing falls off the end.
 
-Adding the missing `TOK_LAND` entry (17 entries, everything aligned) does fix the
-emitted C - but `bitops` then reports `56575` where node says `60479`.
+## Still worth knowing
 
-So aligning the table is **not sufficient on its own**, and the remaining
-discrepancy is real: `bitops` exercises `^ << >> | & %` in one loop and one of
-those is still emitted wrongly. The operators are the place to look, not the table
-layout. Note also that an earlier attempt which *also* changed `JS_OP_OR`/`AND` to
-`'|'`/`'&'` made `bitops` come out **correct** (60479) - which is itself the clue:
-something in this path expects the bitwise spelling, and the condition sites expect
-the logical one. One enum value cannot serve both, so the joiner needs to be
-separate from `JS_OP_OR`/`JS_OP_AND` before the table is aligned.
+Bitwise operators do not go through `wt_op` at all - whale_jit.c:3099 writes the
+character directly:
 
-Reverted to `32dcd44`; all 24 case checks match node again.
+```c
+wt(op == OP_and ? '&' : op == OP_or ? '|' : '^');
+```
+
+while `<<`/`>>` do go through it (3117-3121), with `>>>` spelled as an `unsigned
+int` cast plus `>>`. So the generator spells the same operators two ways and only
+one of them consults the table. Not a bug today, but it is why a table change looks
+like it ought to matter and does not.
+
+## Next
+
+The identity path at 1863-1882. For `x - 0.0`, `id_keep == 0` calls
+`whale_load_emit(k1, i1, cv1)` - the left operand - so it should emit `L0`.
+Something is emitting zero tokens for a slot the identity path believes is loaded.
+Start by making `fold_inline_expr`'s counter reachable from an `-e` probe.
