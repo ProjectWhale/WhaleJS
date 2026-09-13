@@ -24,6 +24,7 @@ void JS_WhaleTokPush(int t, double val);
    linearised token stream to the parser through Commit() */
 void JS_WhaleTokSink(int *tok, double *num, int cap);
 int  JS_WhaleTokSinkLen(void);
+void JS_WhaleTokSinkTruncate(int n);
 void JS_WhaleTokCommit(int *tok, double *num, int n);
 extern int whale_tok_active;   /* owned by the TinyCC-side file */
 extern int whale_gen_ok;       /* set by whale_gen_cb, read by the interface */
@@ -1728,6 +1729,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleObjDefineValue"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(',');
         wk(JS_WK_INT); wt_id("atom"); wt(','); wk(JS_WK_INT); wt_id("val_slot"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleCpoolSlot"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("idx"); wt(',');
+        wk(JS_WK_INT); wt_id("k"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleBinopVal"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("op"); wt(',');
         wk(JS_WK_INT); wt_id("a_slot"); wt(','); wk(JS_WK_INT); wt_id("b_slot"); wt(',');
@@ -3186,7 +3190,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                             if (!whale_type_is_num(tk) && !WHALE_IS_SLOT(tk)) {
                                 whale_inline_nested = saved_nested;
-                                goto out;
+                                goto whale_call_fallback;
                             }
                         }
                         fm = fold_mark();
@@ -3196,13 +3200,46 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                             fprintf(stderr, "[inline] pos=%d argc=%d rtype=%d (num=%d slot=%d obj=%d)\n",
                                     pos, argc, rtype, rtype == WHALE_T_NUM,
                                     WHALE_IS_SLOT(rtype), WHALE_IS_OBJ(rtype));
-                        if (rtype < 0)
-                            goto out;
+                        if (rtype < 0) {
+                            /* the inliner could not expand this callee - it has
+                               locals, or holds something the inliner does not
+                               handle. Throw away whatever it managed to emit and
+                               take the general call path instead of abandoning the
+                               whole function. */
+                            JS_WhaleTokSinkTruncate(fm);
+                            goto whale_call_fallback;
+                        }
                         fold_commit(fm);
                         cur[var_count + func_slot] = (uint8_t)rtype;
                         sp = func_slot + 1;
                         break;
                     }
+                }
+                /* Inlining did not apply: the callee has locals, holds something
+                   the inliner does not handle, or takes an argument that is not a
+                   number or a slot. Abandoning the function here is what kept
+                   immutable_update and vnode_build out of the JIT entirely. The
+                   constant pool entry is a real JSFunction, so the general call
+                   path below can take it - move it into a slot and re-type this
+                   entry so that path accepts it. */
+            whale_call_fallback:
+                if (cur[var_count + func_slot] == WHALE_T_FN) {
+                    int fs;
+
+                    if (whale_objs >= WHALE_CALL_BASE)
+                        goto out;
+                    fs = whale_objs++;
+                    {
+                        int fm = fold_mark();
+
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleCpoolSlot"); wt('(');
+                        wt_id("ctx"); wt(','); wt_int(whale_slot_fn[func_slot]); wt(',');
+                        wt_int(fs); wt(')'); wt(')');
+                        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        fold_commit(fm);
+                    }
+                    cur[var_count + func_slot] = WHALE_VAL_T(fs);
                 }
                 if (cur[var_count + func_slot] != WHALE_T_SELF) {
                     /* Not this function, so it is a host call - a DOM write, a
@@ -3222,6 +3259,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     int nxt = pos + sz;
                     int ret_slot;
 
+                    if (getenv("WHALE_JIT_DUMP"))
+                        fprintf(stderr, "[call] pos=%d argc=%d tc=%d slot=%d callslots=%d\n",
+                                pos, argc, tc, WHALE_IS_SLOT(tc), WHALE_CALL_SLOTS);
                     if (!WHALE_IS_SLOT(tc))
                         goto out;
                     if (argc > WHALE_CALL_SLOTS)
@@ -3241,8 +3281,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     for (k = 0; k < argc; k++) {
                         int tk = cur[var_count + sp - argc + k];
 
-                        if (!whale_type_is_num(tk) && !WHALE_IS_VAL(tk) && !WHALE_IS_OBJ(tk))
+                        if (!whale_type_is_num(tk) && !WHALE_IS_VAL(tk) && !WHALE_IS_OBJ(tk)) {
+                            if (getenv("WHALE_JIT_DUMP"))
+                                fprintf(stderr, "[call] arg k=%d tk=%d rejected\n", k, tk);
                             goto out;
+                        }
                     }
                     fm = fold_mark();
                     for (k = 0; k < argc; k++) {
@@ -3840,6 +3883,7 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
         tcc_add_symbol(s, "JS_WhaleObjSlotAtom", (void *)JS_WhaleObjSlotAtom);
         tcc_add_symbol(s, "JS_WhaleObjDefineValue", (void *)JS_WhaleObjDefineValue);
         tcc_add_symbol(s, "JS_WhaleBinopVal", (void *)JS_WhaleBinopVal);
+        tcc_add_symbol(s, "JS_WhaleCpoolSlot", (void *)JS_WhaleCpoolSlot);
         tcc_add_symbol(s, "JS_WhaleObjNew", (void *)JS_WhaleObjNew);
         tcc_add_symbol(s, "JS_WhaleObjShape", (void *)JS_WhaleObjShape);
         tcc_add_symbol(s, "JS_WhaleObjFieldPtr", (void *)JS_WhaleObjFieldPtr);

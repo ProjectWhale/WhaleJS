@@ -100,6 +100,9 @@ int  JS_WhaleObjSlotAtom(JSContext *ctx, int atom, int k);
    exception, in which case the generated code must deopt. */
 JS_EXTERN int JS_WhaleBinopVal(JSContext *ctx, int op, int a_slot, int b_slot,
                                int out_slot);
+/* Move a callable from the constant pool into an object slot, so the general call
+   path can use a callee that inlining could not expand. */
+JS_EXTERN int JS_WhaleCpoolSlot(JSContext *ctx, int idx, int k);
 JSValue JS_WhaleObjGet(JSContext *ctx, int k);            /* read it back */
 /* Park a plain number in slot k, so it can be a call argument (JS_Call takes
    JSValues, and an argument has to stay visible to GC while the callee runs). */

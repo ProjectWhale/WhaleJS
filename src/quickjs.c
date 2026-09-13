@@ -3196,6 +3196,35 @@ int JS_WhaleCpoolFuncInfo(JSContext *ctx, const JSValue *cpool, int idx,
     return 1;
 }
 
+/* Park a callable taken from the constant pool in slot k.
+
+   A callee that this compilation can see is tracked as WHALE_T_FN, and the only
+   route to it used to be inlining: if whale_inline_body could not expand it - the
+   callee has locals, or contains an instruction the inliner does not handle - the
+   whole function was abandoned. The constant pool entry is a real JSFunction, so
+   the general call path can take it; this moves it into a slot so that path accepts
+   it. */
+int JS_WhaleCpoolSlot(JSContext *ctx, int idx, int slot)
+{
+    JSStackFrame *sf = ctx->rt->current_stack_frame;
+    JSFunctionBytecode *b;
+    JSValue v, f;
+
+    if (!sf || idx < 0)
+        return 0;
+    f = sf->cur_func;
+    if (!JS_IsFunction(ctx, f))
+        return 0;
+    b = JS_VALUE_GET_OBJ(f)->u.func.function_bytecode;
+    if (!b || idx >= b->cpool_count)
+        return 0;
+    v = b->cpool[idx];
+    if (!JS_IsFunction(ctx, v))
+        return 0;
+    JS_WhaleObjSlot(ctx, slot, js_dup(v));
+    return 1;
+}
+
 /* Park a number in slot k. Generated code needs this for a call argument: the
    argument has to be a JSValue in a slot (not a C double) because JS_Call reads
    JSValues and because the collector has to see it while the callee runs.

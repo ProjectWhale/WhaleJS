@@ -345,6 +345,17 @@ int JS_WhaleTokSinkLen(void)
     return whale_ws_len;
 }
 
+/* Drop everything appended since position n, leaving the workspace exactly as it
+   was at that point. An inline attempt can fail after having emitted tokens - the
+   callee turns out to have locals, or holds an instruction the inliner does not
+   handle - and the caller then has to fall back to a plain call, so the
+   half-emitted expansion has to go away. */
+void JS_WhaleTokSinkTruncate(int n)
+{
+    if (n >= 0 && n <= whale_ws_len)
+        whale_ws_len = n;
+}
+
 /* Publish the first n workspace tokens as the stream the parser reads. */
 void JS_WhaleTokCommit(int *tok, double *num, int n)
 {
