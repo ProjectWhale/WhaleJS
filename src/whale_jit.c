@@ -1510,6 +1510,9 @@ static int whale_prof_site_ok(unsigned off)
     if (off == 0 || whale_prof_now == NULL)
         return 0;
     n = JS_WhaleProfShapes(whale_prof_now, off, sh, 8);
+    if (getenv("WHALE_PROF_DBG"))
+        fprintf(stderr, "[site] off=%u n=%d %s\n", off, n,
+                (n == 0 || n == 1) ? "ok" : "REFUSED");
     return n == 0 || n == 1;
 }
 

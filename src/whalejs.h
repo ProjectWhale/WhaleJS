@@ -53,7 +53,13 @@ typedef struct JSWhaleContext {
    WHALE_PROFILE_SITES sites. Overflow makes the generator fall back to the general
    form, which is what it does today. */
 #ifndef WHALE_PROFILE_SITES
-#define WHALE_PROFILE_SITES 16
+/* 64 rather than 16: the table is direct-mapped on (offset >> 2), and a collision
+   disables BOTH sites involved, so a small table turns ordinary programs into
+   "polymorphic" ones. object alone has nine access sites and two of them collided in
+   a table of 16 (offset 29 and offset 93 both landed in slot 7), which made a stable
+   object look unstable. The table is only touched during the last few interpreted
+   calls, so the extra memory buys correctness cheaply. */
+#define WHALE_PROFILE_SITES 64
 #endif
 #ifndef WHALE_PROFILE_SHAPES
 #define WHALE_PROFILE_SHAPES 4
