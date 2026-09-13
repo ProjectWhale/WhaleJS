@@ -3787,8 +3787,23 @@ int JS_WhaleProfShapes(const void *prof, unsigned pc, const void **out, int max)
     if (!prof)
         return 0;
     s = &((const WhaleProfSite *)prof)[(pc >> 2) % WHALE_PROFILE_SITES];
-    if (s->n == 0 || s->n == 0xff || s->pc != pc)
+    /* Three states that used to collapse into one answer of 0, and must not:
+
+         0   never executed this site - no information either way. Tolerable: a
+             site the warm-up never reached says nothing about the shape, and
+             refusing it would throw away objects that are in fact stable.
+        -1   the site was observed and DISQUALIFIED - it held more shapes than the
+             table can keep, or its slot in the table belongs to another site
+             entirely. That is information, and it is bad: this must not be
+             mistaken for "no data".
+
+       A caller that treats both as 0 either refuses every stable object whose
+       access ran outside the sampling window, or - worse, the other way round -
+       trusts a site that was explicitly given up on. */
+    if (s->n == 0)
         return 0;
+    if (s->n == 0xff || s->pc != pc)
+        return -1;
     n = s->n < max ? s->n : max;
     for (i = 0; i < n; i++)
         out[i] = s->shape[i];

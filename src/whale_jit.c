@@ -1471,6 +1471,11 @@ static int whale_prof_one_shape(unsigned off)
     {
         int n = (off != 0 && whale_prof_now != NULL)
             ? JS_WhaleProfShapes(whale_prof_now, off, sh, 8) : 0;
+
+        /* negative means the site was observed and given up on - treat it as "not
+           monomorphic", which is what the caller is asking */
+        if (n < 0)
+            n = 2;
         static int dbg;
 
         if (getenv("WHALE_PROF_DBG") && dbg < 40) {
@@ -1487,6 +1492,25 @@ static int whale_prof_one_shape(unsigned off)
         }
         return n == 1;
     }
+}
+
+/* Is this field access site safe to build a fixed layout on?
+
+   Three answers, not two. A site the warm-up never reached returns 0 from the engine
+   and is accepted here - its silence says nothing about the shape, and refusing it
+   would discard objects that are in fact stable. A site observed holding one shape is
+   accepted. A site observed holding several, or given up on by the recorder, comes
+   back negative and is refused outright: that is the one case where the observation
+   actively says the layout is not fixed. */
+static int whale_prof_site_ok(unsigned off)
+{
+    const void *sh[8];
+    int n;
+
+    if (off == 0 || whale_prof_now == NULL)
+        return 0;
+    n = JS_WhaleProfShapes(whale_prof_now, off, sh, 8);
+    return n == 0 || n == 1;
 }
 
 static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
@@ -2598,7 +2622,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                    observed shapes, so a field only some of them carry still gets a
                    slot, because reserving eight bytes beats falling back. */
                 for (si = 0; mono && si < whale_field_sites_n; si++)
-                    if (!whale_prof_one_shape((unsigned)whale_field_sites[si]))
+                    if (!whale_prof_site_ok((unsigned)whale_field_sites[si]))
                         mono = 0;
                 if (whale_field_sites_n == 0)
                     mono = 0;
