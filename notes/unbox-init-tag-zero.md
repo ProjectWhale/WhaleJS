@@ -57,3 +57,28 @@ present-undefined and absent cases still read back as `undefined`.
 Once fields can hold references the same two words carry the reference-count answer: a
 field assigned `undefined` holds a value (nothing to free, but it is a value that was
 written); a field never assigned holds nothing at all. The tag word is what says which.
+
+
+## Follow-up: tag 3 is what MAKES the memset work (user)
+
+The tag being 3 rather than 0 is not a problem to work around - it is what allows
+the one-memset initialisation after all.
+
+The marker for "not a member" is an IDENTICAL value in both words: tag and value
+both equal to the undefined tag (3). A memset that writes that byte pattern across
+the data area therefore produces, for every field, a word pair that is exactly the
+unset pattern - no per-field store at all.
+
+    initialisation:   memset(data_area, 3, size)   /* or whatever fills both words */
+    membership test:  tag == value == JS_TAG_UNDEFINED  ->  NOT a member
+    real undefined:   tag == JS_TAG_UNDEFINED, value == 0  ->  a member
+    a number:         tag == JS_TAG_FLOAT64,    value == bits
+
+So the finished shape is: memset the data area, plus the two maps (atom -> offset
+for property access, index -> offset for array access). That is the layout the user
+described from the start, and it needs no per-field initialisation instruction.
+
+Note the exact pattern must be taken from the engine rather than assumed - the word
+boundaries and the tag width are things to read, not to remember. This section is
+about the structure, which is settled: both words carry the marker, so one memset
+is enough.
