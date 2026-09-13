@@ -1419,6 +1419,43 @@ static const void *whale_prof_now;
    One observed shape says the site behaved as a constant for a hundred calls. It is
    an observation, not a proof - a shape could still change later - but the general
    form is what handles that, and it is what runs when this returns false. */
+/* The union of the field atoms seen across this site's observed shapes, in a stable
+   order, or 0 when there is nothing to lay out.
+
+   The union rather than a single shape, because reserving a slot is cheap and missing
+   one is not: a field that only some of the observed shapes carry still gets its own
+   double and a presence flag, which costs eight bytes and keeps the access native
+   instead of dropping to a shape check plus a heap chase. That also covers the case
+   where the same variable is assigned quite different objects down different
+   branches - the layout simply covers both.
+
+   Fields are matched by atom, so the same property reached through two shapes is one
+   slot. `atoms` is filled in first-seen order, which is stable for a given
+   observation and therefore gives a fixed layout. */
+static int whale_struct_fields(unsigned off, int *atoms, int max)
+{
+    const void *shapes[8];
+    int n, i, j, k = 0;
+
+    if (off == 0 || whale_prof_now == NULL || max <= 0)
+        return 0;
+    n = JS_WhaleProfShapes(whale_prof_now, off, shapes, 8);
+    for (i = 0; i < n; i++) {
+        int fa[WHALE_STRUCT_FIELDS];
+        int fn = JS_WhaleShapeFields(shapes[i], fa, WHALE_STRUCT_FIELDS);
+
+        for (j = 0; j < fn; j++) {
+            int seen = 0, m;
+
+            for (m = 0; m < k; m++)
+                if (atoms[m] == fa[j]) { seen = 1; break; }
+            if (!seen && k < max)
+                atoms[k++] = fa[j];
+        }
+    }
+    return k;
+}
+
 static int whale_prof_one_shape(unsigned off)
 {
     /* 8 >= the engine cap on shapes per site, so the count it returns is exact */
@@ -1430,9 +1467,16 @@ static int whale_prof_one_shape(unsigned off)
         static int dbg;
 
         if (getenv("WHALE_PROF_DBG") && dbg < 40) {
+            int fa[WHALE_STRUCT_FIELDS];
+            int fn = whale_struct_fields(off, fa, WHALE_STRUCT_FIELDS);
+            int q;
+
             dbg++;
-            fprintf(stderr, "[prof] lookup off=%u prof=%p -> n=%d%s\n",
-                    off, whale_prof_now, n, (n == 1 ? " STABLE" : ""));
+            fprintf(stderr, "[prof] lookup off=%u prof=%p -> n=%d%s fields=%d [",
+                    off, whale_prof_now, n, (n == 1 ? " STABLE" : ""), fn);
+            for (q = 0; q < fn; q++)
+                fprintf(stderr, "%s%d", q ? "," : "", fa[q]);
+            fprintf(stderr, "]\n");
         }
         return n == 1;
     }
