@@ -1519,6 +1519,36 @@ static int whale_prof_site_ok(unsigned off)
 static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 {
     whale_prof_now = info->prof;
+    /* What JS_UNDEFINED actually looks like, measured rather than assumed. The tag
+       value, the word boundaries and the width are all things to read off the engine,
+       and guessing them has already cost several rounds. */
+    if (getenv("WHALE_UNDEF_DBG")) {
+        static int once;
+        union { JSValue v; unsigned char b[16]; } u;
+        int q;
+
+        if (!once) {
+            once = 1;
+            memset(&u, 0, sizeof u);
+            u.v = JS_UNDEFINED;
+            fprintf(stderr, "[undef] sizeof(JSValue)=%d bytes:", (int)sizeof(JSValue));
+            for (q = 0; q < (int)sizeof(JSValue) && q < 16; q++)
+                fprintf(stderr, " %02x", u.b[q]);
+            fprintf(stderr, "  <- JS_UNDEFINED\n");
+            memset(&u, 0, sizeof u);
+            u.v = JS_NULL;
+            fprintf(stderr, "[undef]                  ");
+            for (q = 0; q < (int)sizeof(JSValue) && q < 16; q++)
+                fprintf(stderr, " %02x", u.b[q]);
+            fprintf(stderr, "  <- JS_NULL\n");
+            memset(&u, 0, sizeof u);
+            u.v = JS_MKVAL(JS_TAG_FLOAT64, 7);
+            fprintf(stderr, "[undef]                  ");
+            for (q = 0; q < (int)sizeof(JSValue) && q < 16; q++)
+                fprintf(stderr, " %02x", u.b[q]);
+            fprintf(stderr, "  <- a float64\n");
+        }
+    }
     /* WHALE_JIT_DUMP identifies a compilation by arg_count/var_count/byte length,
        which is enough to tell one JS function from another: in objfields, make() is
        0/0 and run() is 1/1. The generated names (whale_jit_fn_N) are sequence
