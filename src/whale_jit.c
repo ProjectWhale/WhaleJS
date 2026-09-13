@@ -2444,6 +2444,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int tb = cur[var_count + sp - 1];
                 int atom = (int)whale_get_u32(pc + pos + 1);
 
+                if (getenv("WHALE_JIT_DUMP"))
+                    fprintf(stderr, "[put] pos=%d ta=%d slot=%d tb=%d isnum=%d fields=%d isobj=%d\n",
+                            pos, ta, WHALE_IS_SLOT(ta), tb, whale_type_is_num(tb),
+                            whale_fields, WHALE_IS_OBJ(ta));
                 if (!WHALE_IS_SLOT(ta) || !whale_type_is_num(tb))
                     goto out;
                 if (whale_fields >= WHALE_FIELD_CACHE)
