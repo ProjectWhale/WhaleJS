@@ -1372,6 +1372,13 @@ static int whale_prof_one_shape(unsigned off)
 static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 {
     whale_prof_now = info->prof;
+    /* WHALE_JIT_DUMP identifies a compilation by arg_count/var_count/byte length,
+       which is enough to tell one JS function from another: in objfields, make() is
+       0/0 and run() is 1/1. The generated names (whale_jit_fn_N) are sequence
+       numbers and say nothing about which function they are. */
+    if (getenv("WHALE_JIT_DUMP"))
+        fprintf(stderr, "[gen] argc=%d varc=%d len=%d prof=%p\n",
+                info->arg_count, info->var_count, info->byte_code_len, info->prof);
     whale_gen_self_ref = 0;
     {
         static int once;
@@ -3061,6 +3068,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         fm = fold_mark();
                         rtype = whale_inline_body(&ci, cur, var_count, sp - argc);
                         whale_inline_nested = saved_nested;
+                        if (getenv("WHALE_JIT_DUMP"))
+                            fprintf(stderr, "[inline] pos=%d argc=%d rtype=%d (num=%d slot=%d obj=%d)\n",
+                                    pos, argc, rtype, rtype == WHALE_T_NUM,
+                                    WHALE_IS_SLOT(rtype), WHALE_IS_OBJ(rtype));
                         if (rtype < 0)
                             goto out;
                         fold_commit(fm);
