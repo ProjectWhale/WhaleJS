@@ -1017,6 +1017,17 @@ void JS_WhalePinEnter(void)
     whale_pin_scope = 1;
 }
 
+/* Release it. Without this whale_pin_scope stays 1 forever, so the reset inside
+   gen_function never runs again and the map (keyed by stack offset) survives from
+   one compilation into the next - including compilations the generator did not
+   ask for. JS_WhalePinEnter's comment claims "that call is the reset", which is
+   only true while every compilation calls it. */
+void JS_WhalePinLeave(void);
+void JS_WhalePinLeave(void)
+{
+    whale_pin_scope = 0;
+}
+
 static int whale_pin_find(int loc)
 {
     int i;
