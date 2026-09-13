@@ -91,16 +91,36 @@ the loop is close.
 After unboxing, per field: 1 load (`v[i].depth`), no shape check, no tag branch, no
 pointer chase. 7 -> 1. Order of magnitude 3-4x, i.e. objfields 156ms -> 50-70ms.
 
-## Order of work, as I would do it
+## Order of work
 
 1. ~~Measure first.~~ Done, above. The direction is worth doing.
-2. Non-escaping, single-shape arrays whose elements are only ever touched through
-   integer indices and field accesses - the narrow case that covers vnode_build.
-3. Only then consider generalising.
+2. **Not a narrow scene.** An earlier draft of this said "non-escaping, single-shape
+   arrays only", which was a slide back into static analysis - and it is not needed.
+   The whole point of the observation machinery is that the JIT knows what actually
+   happened during the interpreted calls, so it specialises on that instead of proving
+   anything:
+
+   | observed during warm-up | generated |
+   | --- | --- |
+   | one shape for the elements | unboxed struct backing store |
+   | two to four shapes | one fast path per shape |
+   | more than that, or the array escaped | the general path, as now |
+
+   Escaping is observable too - the array being stored into another object, or handed
+   to a call the JIT cannot see through - so it does not have to be proved either. A
+   table that grows past its capacity is abandoned, exactly as `WHALE_PROFILE_SHAPES`
+   already does for property sites.
+3. Generalise only after the above runs on real cases.
+
+## What the observation table needs to grow into
+
+Today it records, per property access site, the shapes seen. The same record wants
+keeping per *array element store* - which shape was written. One table, one bound, one
+rule for giving up; just a second kind of entry in it.
 
 ## What this is not
 
-It is not a JSValue representation change. `JSValue` stays exactly as it is; the array
-that gets a struct backing store is one that the JIT has proven local and
-single-shaped, and it converts back the moment it might escape, exactly as an unboxed
-number does today.
+It is not a JSValue representation change. `JSValue` stays exactly as it is; an array
+gets a struct backing store only while its observed behaviour supports it, and it
+converts back the moment the observation stops holding, exactly as an unboxed number
+does today.
