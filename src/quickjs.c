@@ -3727,6 +3727,25 @@ static void whale_prof_maybe_arm(JSContext *ctx, JSFunctionBytecode *b)
         whale_prof_arm(ctx, b);
 }
 
+/* How many shapes this site was seen to hold, and which. Zero means the generator
+   should use its general form: nothing observed, a collision, a site that kept
+   growing, or a site whose accesses were all shadowed by a miss. */
+int JS_WhaleProfShapes(const void *prof, unsigned pc, const void **out, int max)
+{
+    const WhaleProfSite *s;
+    int i, n;
+
+    if (!prof)
+        return 0;
+    s = &((const WhaleProfSite *)prof)[(pc >> 2) % WHALE_PROFILE_SITES];
+    if (s->n == 0 || s->n == 0xff || s->pc != pc)
+        return 0;
+    n = s->n < max ? s->n : max;
+    for (i = 0; i < n; i++)
+        out[i] = s->shape[i];
+    return n;
+}
+
 static void whale_prof_arm(JSContext *ctx, JSFunctionBytecode *b)
 {
     if (!b->whale_prof) {
@@ -3822,6 +3841,7 @@ static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
         memset(&info, 0, sizeof(info));
         info.byte_code = b->byte_code_buf;
         info.byte_code_len = b->byte_code_len;
+        info.prof = b->whale_prof;
         info.is_normal = (b->func_kind == JS_FUNC_NORMAL);
         info.arg_count = b->arg_count;
         info.var_count = b->var_count;

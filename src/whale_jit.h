@@ -12,8 +12,18 @@
 
 #include "quickjs.h"
 
+/* Observed property-access shapes for the function being compiled, or NULL. Set by
+   the engine from the table it filled while the function was still interpreted.
+   Opaque here: the record itself stays in quickjs.c, where JSShape is known. This is
+   what replaces proving that an object's shape is stable - a call to something
+   opaque may or may not change a shape and there is no list of such functions worth
+   trusting, but the interpreted calls show what actually happened. */
+JS_EXTERN int JS_WhaleProfShapes(const void *prof, unsigned pc,
+                                 const void **out, int max);
+
 typedef struct JSWhaleFuncInfo {
     const uint8_t *byte_code;
+    const void *prof;   /* observed access shapes, or NULL */
     int byte_code_len;
     int is_normal;      /* func_kind == JS_FUNC_NORMAL */
     int arg_count;

@@ -1333,8 +1333,45 @@ static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
         whale_inline_argmap[i] = saved_argmap[i];
     return ret;
 }
+/* The observations for the function being generated: the generator compiles one
+   function at a time, so this does not need to travel through every call. */
+static const void *whale_prof_now;
+
+/* Did this site hold exactly one shape the whole way through the warm-up?
+
+   That is the evidence the static analysis cannot produce. `whale_shape_stable`
+   requires the function to make no calls at all, so a record built by a call -
+   `var o = make()` - fails it even when the shape never moves. And a failing site is
+   not merely a missed optimisation: the generated condition is
+   `fv[fc] != fver || fs[fc] != JS_WhaleObjShape(...)`, and _ws.fver is a global
+   version bumped by ANY shape change, so a function that creates an object per
+   iteration re-resolves on nearly every access.
+
+   One observed shape says the site behaved as a constant for a hundred calls. It is
+   an observation, not a proof - a shape could still change later - but the general
+   form is what handles that, and it is what runs when this returns false. */
+static int whale_prof_one_shape(unsigned off)
+{
+    /* 8 >= the engine cap on shapes per site, so the count it returns is exact */
+    const void *sh[8];
+
+    {
+        int n = (off != 0 && whale_prof_now != NULL)
+            ? JS_WhaleProfShapes(whale_prof_now, off, sh, 8) : 0;
+        static int dbg;
+
+        if (getenv("WHALE_PROF_DBG") && dbg < 40) {
+            dbg++;
+            fprintf(stderr, "[prof] lookup off=%u prof=%p -> n=%d%s\n",
+                    off, whale_prof_now, n, (n == 1 ? " STABLE" : ""));
+        }
+        return n == 1;
+    }
+}
+
 static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 {
+    whale_prof_now = info->prof;
     whale_gen_self_ref = 0;
     {
         static int once;
@@ -2420,7 +2457,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                        An object that came from a call is not one, so it always
                        keeps its shape check. */
                     fold_obj_field_resolve(WHALE_SLOT(ta), atom, fc,
-                                           whale_shape_stable && WHALE_IS_OBJ(ta));
+                                           (whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1))) && WHALE_IS_OBJ(ta));
                     fm = fold_mark();
                     /* the value is a double here, and the old one was a number too
                        (anything else deopted above) */
@@ -2448,7 +2485,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 fc = whale_fields++;
                 nm = whale_vserial++;
                 fold_obj_field_load(WHALE_SLOT(ta), atom, fc, nm,
-                                    whale_shape_stable && WHALE_IS_OBJ(ta));
+                                    (whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1))) && WHALE_IS_OBJ(ta));
                 whale_vname[sp] = nm;
                 whale_vmat[sp] = 1;
                 cur[var_count + sp] = WHALE_T_NUM;
@@ -2470,7 +2507,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 fc = whale_fields++;
                 nm = whale_vserial++;
                 fold_obj_field_load(WHALE_SLOT(ta), atom, fc, nm,
-                                    whale_shape_stable && WHALE_IS_OBJ(ta));
+                                    (whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1))) && WHALE_IS_OBJ(ta));
                 whale_vname[sp - 1] = nm;
                 whale_vmat[sp - 1] = 1;
                 cur[var_count + sp - 1] = WHALE_T_NUM;
