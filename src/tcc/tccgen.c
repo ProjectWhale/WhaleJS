@@ -7099,6 +7099,12 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
                 if (getenv("WHALE_PIN_DBG"))
                     fprintf(stderr, "[pin] alloc loc=%d -> reg=%d\n", (int)addr, pr);
                 if (pr >= 0) {
+                    /* Point the symbol at the register, AND keep VT_LVAL: a local is an
+                       lvalue, and inc()/vstore() check exactly that before accepting
+                       `i++` or an assignment. Dropping VT_LVAL here is what made every
+                       generated function fail with "lvalue expected" - the generator
+                       emits `i++` in every loop, and inc() calls test_lvalue(). */
+                    sym->r = (sym->r & ~VT_VALMASK) | pr | VT_LVAL;
                     sym->pin_reg = pr + 1;
                     if (whale_pin_n < 16) {
                         whale_pin_loc[whale_pin_n] = addr;
