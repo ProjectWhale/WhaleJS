@@ -119,3 +119,27 @@ What is still real and unexplained is the empty `()`:
 
 `s / 1.0` folds away correctly, so the algebraic-identity path runs; the `- 0.0` arm
 emits an empty operand. `notes/operator-table.md` now says this instead.
+## <52> `whale_pin_alloc` returns -1 because TinyCC runs out of float registers
+
+Full write-up in `notes/pinned-registers.md`. The short version:
+
+`whale_pin_alloc` scans 18..21 (`NB_REGS - 1` is 21), so four float registers can
+ever be pinned. With the generator's `nloops <= 1` limit lifted:
+
+    2 pins (lower bound 20):  correct, minmax 118ms
+    3 pins (lower bound 19):  hang
+    4 pins (lower bound 18):  hang
+
+A pinned register is invisible to `get_reg()`, which has no way to reclaim one, and
+when it finds nothing it returns -1 - which its callers treat as impossible. The
+lower bound of 18 was already a workaround for this, as its own comment admits.
+
+And even at the safe setting, pinning is slower: `bitops` 165ms -> 337ms. Pinning
+permanently takes registers away from TinyCC's expression evaluation and the frame
+slot access it saves is cheap. Same conclusion as the earlier `_ws` experiment.
+
+So the first real backend task is specific: **let `get_reg()` spill a pinned
+register under pressure** - write it back to its frame slot and update the map so
+later reads go to memory again. Until that exists, pinning is a claim the allocator
+cannot veto, and it is either unsafe or unprofitable. That is the precondition for
+any no-stack calling convention to be worth doing.
