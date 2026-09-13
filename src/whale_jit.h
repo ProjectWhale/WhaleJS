@@ -20,6 +20,8 @@
    trusting, but the interpreted calls show what actually happened. */
 JS_EXTERN int JS_WhaleProfShapes(const void *prof, unsigned pc,
                                  const void **out, int max);
+/* The property atoms of a shape, in layout order, for laying out an unboxed struct. */
+JS_EXTERN int JS_WhaleShapeFields(const void *shape, int *atoms, int max);
 
 typedef struct JSWhaleFuncInfo {
     const uint8_t *byte_code;

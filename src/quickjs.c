@@ -6650,6 +6650,32 @@ static inline JSShapeProperty *get_shape_prop(JSShape *sh)
     return (JSShapeProperty *)(void *)(sh->hash_table + sh->prop_hash_mask + 1);
 }
 
+/* The property atoms of a shape, in layout order.
+
+   The generator needs these to lay out an unboxed struct: the union of the observed
+   shapes' fields, with a slot for every field any of them has. A field that only some
+   of the shapes carry still gets its slot and a presence flag - reserving eight bytes
+   is cheap next to falling back to a shape check and a heap chase on every access.
+   Accessor properties are skipped: their value is not something a slot can hold. */
+int JS_WhaleShapeFields(const void *shape, int *atoms, int max)
+{
+    JSShape *sh = (JSShape *)shape;
+    JSShapeProperty *pr;
+    int i, n = 0;
+
+    if (!sh || !atoms || max <= 0)
+        return 0;
+    pr = get_shape_prop(sh);
+    for (i = 0; i < sh->prop_count && n < max; i++) {
+        if (pr[i].atom == JS_ATOM_NULL)                  /* a deleted property */
+            continue;
+        if ((pr[i].flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+            continue;
+        atoms[n++] = (int)pr[i].atom;
+    }
+    return n;
+}
+
 static inline void *get_alloc_from_shape(JSShape *sh)
 {
     return sh; /* shape sits at the allocation start */

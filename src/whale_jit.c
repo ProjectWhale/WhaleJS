@@ -3915,6 +3915,7 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
         tcc_add_symbol(s, "JS_WhaleBinopVal", (void *)JS_WhaleBinopVal);
         tcc_add_symbol(s, "JS_WhaleCpoolSlot", (void *)JS_WhaleCpoolSlot);
         tcc_add_symbol(s, "JS_WhaleObjStoreValue", (void *)JS_WhaleObjStoreValue);
+        tcc_add_symbol(s, "JS_WhaleShapeFields", (void *)JS_WhaleShapeFields);
         tcc_add_symbol(s, "JS_WhaleObjNew", (void *)JS_WhaleObjNew);
         tcc_add_symbol(s, "JS_WhaleObjShape", (void *)JS_WhaleObjShape);
         tcc_add_symbol(s, "JS_WhaleObjFieldPtr", (void *)JS_WhaleObjFieldPtr);
