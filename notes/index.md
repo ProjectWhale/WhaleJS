@@ -217,19 +217,24 @@ with `WHALE_TOK_MAX` (32768). While a loop body is open `whale_out_tok` points a
 has never been used for a loop-level pass - it is dead weight. `loop_begin` now
 returns 0, which is the "stack is full, emit straight through" path it already had.
 
-**2. `JS_NewArray` returns `{tag=-1, ptr=<valid>}` inside a JIT frame - open.**
-`JS_TAG_UNINITIALIZED` is not caught by `JS_IsException()`, so the value is parked in
-an object slot and handed to `JS_SetPropertyValue` as an object -> `objshape` and
-`nested2d` die with 0xC0000005 (835ms and 9ms interpreted, before). Ruled out by test,
-not by reasoning: the `cur_sp` live-range loan (setting it to NULL changes nothing),
-object slots in general (`object`/`objfields`/`array` all correct), the frame-ordering
-bug of <46>, `whale_frame_obj_slots`/`JS_WhaleObjSlot`/`JS_WhaleArrNew`, and "the
-fallback was never emitted".
+**2. The wiring corrupts memory, and the fault is in the emitted stream - open.**
+An earlier revision of this entry blamed `JS_NewArray` returning
+`JS_TAG_UNINITIALIZED` with a valid pointer inside a JIT frame. That is a symptom:
+adding one unrelated `JS_NewObject(ctx)` in the same function removes both the crash
+and the bad tag (`A check=66`, matching node). The reproducer is back and localised -
+see `notes/whale-step-repro.md`: the generator emits every label **exactly once**
+(`14`, `31`, `41`), the first real error is TinyCC's `pointer expected` immediately
+after the `get_field` fallback at pos=44, and `duplicate label 'L14'` is downstream of
+that parse failure, not a duplicate emission. The next tool is a working token-stream
+dump: `JS_WhaleTokDump()` is known broken for numeric literals, and the
+`WHALE_JIT_SRC` C dump cannot see this because it drops exactly the operators the
+parser receives.
 
-**State**: tree reverted to the last green commit plus the `loop_begin` fix; the full
-working diff is `temp/whale_step_work.patch` (58KB, uncommitted by design). The next
-question is specific and small: one test program calling `JS_NewArray` from a
-TCC-generated function reproduces #2 without any fallback machinery.
+**State**: tree left at the reproducing state (engine-side executor + generator wiring
++ diagnostics, **uncommitted**); `src/quickjs.c`, `src/whale_jit.c` and
+`src/whale_jit.h` are modified and `objshape`/`nested2d` still crash. `temp/` holds the
+patch (UTF-16 original plus an LF-converted copy), the two reproducer scripts
+(`w_h.js`, `w_a.js`), and the note that the saved patch **omits `whale_jit.h`**.
 
 `check`/`ms` are top-level locals (interpreted, not compiled), so the corruption comes
 from `build`/`scan`, which pin both `i` and the return variable `s`. That is the same
