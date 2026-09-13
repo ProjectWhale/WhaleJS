@@ -13,12 +13,19 @@ a real, present value.
 
 Each field is **128 bits**: a tag word and a value word, written together.
 
-    assigned undefined   tag = 0     value = 0        (a normal undefined JSValue)
-    never assigned       tag != 0    value = 0        (the unset pattern)
-    assigned a number    tag = <num> value = <bits>
+    assigned undefined   tag = undefined   value = 0        (exactly JS_UNDEFINED)
+    never assigned       tag = undefined   value != 0       (the unset pattern)
+    assigned a number    tag = <num>       value = <bits>
 
 The two words are set as one 128-bit store, which is what keeps them consistent - there
 is no window where the tag says one thing and the value another.
+
+Note that the tag is the SAME in the first two rows - both are `undefined`. What
+separates them is the value word: zero for a real JSValue, non-zero for the unset
+pattern. Membership is therefore:
+
+    (tag == undefined && value != 0)  ->  NOT a member
+    everything else                    ->  a member
 
 So there is **no memset shortcut**: a memset writes the same byte everywhere and cannot
 produce "tag non-zero, value zero". Initialisation is one 128-bit store per field. That
