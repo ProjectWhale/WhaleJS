@@ -125,7 +125,12 @@ function main() {
     if (opts.json) {
         process.stdout.write(JSON.stringify({ engines, cases: wanted, results }, null, 2) + '\n');
     } else {
-        const w = Math.max(12, ...engines.map(e => e.length + 2));
+        /* Wide enough for the longest case name as well as the engine columns - the case
+       column is the one that grows, and a long name like immutable_update used to
+       push every engine column out of line. */
+    const w = Math.max(12,
+        ...engines.map(e => e.length + 2),
+        ...wanted.map(c => c.length + 2));
         process.stdout.write(pad('case', w) + engines.map(e => pad(e, 12)).join('') + '\n');
         process.stdout.write('-'.repeat(w + 12 * engines.length) + '\n');
         for (const c of wanted) {
