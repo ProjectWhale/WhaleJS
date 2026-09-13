@@ -995,23 +995,24 @@ static void fold_commit(int mark)
     }
 }
 
-/* Start buffering a loop body. Returns 0 when the stack is full, in which case
-   the body is emitted straight through as before. */
+/* WhaleJS: the loop buffer is OFF.
+ *
+ * It was meant to hand a complete loop body to a loop-level pass, and no such
+ * pass was ever written - so all it did was cost memory and break silently:
+ * a body larger than WHALE_LOOP_BUF (4096) lost its tail, and the bound used
+ * when appending was WHALE_TOK_MAX (32768), so the same overflow wrote past the
+ * end of l->tok. Making loop bodies longer (which is what handing instructions
+ * to the engine does) exposes both at once.
+ *
+ * Returning 0 is the "stack is full" path this function already had: the body
+ * is emitted straight through into go_tok, which is the same bound the whole
+ * function is held to. whale_loop_depth stays 0, so loop_end() is never
+ * entered. Nothing is lost - no loop-level pass exists to receive the body. */
 static int loop_begin(int head_pos, int back_pos)
 {
-    WhaleLoop *l;
-
-    if (whale_loop_depth >= WHALE_LOOP_MAX)
-        return 0;
-    l = &whale_loops[whale_loop_depth];
-    l->len = 0;
-    l->head_pos = head_pos;
-    l->back_pos = back_pos;
-    whale_out_tok = l->tok;
-    whale_out_num = l->num;
-    whale_out_len = &l->len;
-    whale_loop_depth++;
-    return 1;
+    (void)head_pos;
+    (void)back_pos;
+    return 0;
 }
 
 /* Finish the innermost loop and hand its body on. This is where a loop-level

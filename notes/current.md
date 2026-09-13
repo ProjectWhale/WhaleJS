@@ -1161,3 +1161,18 @@ PARTIAL + PLAN
 4. **B2 寄存器保留**（收益最大但风险高）
 5. **C2 分块 JIT**（受众最广，但依赖 C5）
 6. **B3 SIMD**（特定场景爆发力强）
+# <55>: 混合编译（单指令 fallback）实施与止步：loop buffer 越界写 + `JS_NewArray` 在 JIT 帧内返回 UNINITIALIZED
+
+UNRESOLVED
+
+已按 notes/mixed-compilation-boundary.md 的设计把"通用 fallback"端到端做出来（引擎侧 `JS_WhaleOpArity`/`JS_WhaleStepCovers`/`JS_WhaleStepRun` 与 Push/Out/Clear 一组，生成器侧 `whale_step_emit` 接进 `default:` 和 5 个 case 的拒绝点）。覆盖确实变宽了：24 个 perftest case 的 `gen gave up` 从 **23 降到 10**，剩下 10 处指向引擎尚未执行的指令（`call2`/`call_method`/`return`/`add_loc`/`get_field2`）。
+
+但它踩出两件真问题：
+
+1. **loop buffer 越界写 + 静默丢代码（已修）**。`WHALE_LOOP_BUF`=4096，而 `fold_commit()` 与 `loop_end()` 都用 `*whale_out_len < WHALE_TOK_MAX`(32768) 作追加上限 —— 循环体打开时 `whale_out_tok` 指向 `WhaleLoop.tok[4096]`，于是超过 4096 token 的循环体**既越界写数组**，尾部又被 `loop_end()` 的 `min(l->len, WHALE_LOOP_BUF)` **无声丢掉**。该缓冲区从未被任何 loop 级优化使用（它是死重量）。修法是让 `loop_begin` 直接返回 0（走它本来就有的"缓冲满则直通"路径），`whale_loop_depth` 恒为 0，`loop_end` 永不进入。一个函数，无新机制；24 case 结果不变。
+
+2. **`JS_NewArray` 在 JIT 帧内返回 `{tag=-1, ptr=有效堆指针}`（= `JS_TAG_UNINITIALIZED`）**。`JS_IsException()` 不拦它，于是这个值被停进对象槽、又被当作对象交给 `JS_SetPropertyValue` → `objshape`/`nested2d` 运行期 0xC0000005。`JS_NewArray` 本身只有三行（`JS_NewObjectFromShape(ctx, js_dup_shape(ctx->array_shape), JS_CLASS_ARRAY, NULL)`），而同一进程里解释器调用它上百次都正常。
+
+   **已排除**（都是实测，不是推理）：`cur_sp` 借用（改成 NULL 结果完全一样）、对象槽机制本身（`object`/`objfields`/`array` 都正确且未变）、<46> 的帧尺寸顺序问题（`whale_jit_ready` 仍然在管）、`whale_frame_obj_slots`/`JS_WhaleObjSlot`/`JS_WhaleArrNew`（读写都正确）、以及"fallback 没被 emit"（`[emit] called op=72 pos=66 sp=3` 已确认执行）。**未解**。
+
+工作树已回退到最后绿色提交（`loop_begin` 的修复保留）；完整工作 diff 存于 `temp/whale_step_work.patch`（58KB，含引擎侧执行器 + 生成器接线 + 全部诊断）。详见 notes/whale-step-investigation.md。

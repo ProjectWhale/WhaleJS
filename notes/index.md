@@ -200,6 +200,37 @@ token streams are byte-identical - but:
 Read it first with nothing before, and it is right; touch anything else first and it
 is stale; multiply by 1 and it refreshes. A copy survives somewhere unrefreshed.
 
+## <55> Mixed compilation: the fallback was built and made 10 more cases compile - then hit `JS_NewArray` inside a JIT frame
+
+Detailed write-up in `notes/whale-step-investigation.md`, and `notes/current.md` <55>.
+The general fallback of `notes/mixed-compilation-boundary.md` was implemented end to
+end (engine-side `JS_WhaleStepRun` + `whale_step_emit`, wired into `default:` and the
+five refusals). `gen gave up` across the 24 perftest cases went from **23 to 10**.
+
+Two real problems came out of it, and only the first is fixed:
+
+**1. The loop buffer was writing out of bounds and losing code silently - fixed.**
+`WHALE_LOOP_BUF` is 4096, but `fold_commit()` and `loop_end()` both bound the append
+with `WHALE_TOK_MAX` (32768). While a loop body is open `whale_out_tok` points at
+`WhaleLoop.tok[4096]`, so a body past 4096 tokens wrote past the end of it, and
+`loop_end()` dropped the tail without a word. Nothing had hit it because the buffer
+has never been used for a loop-level pass - it is dead weight. `loop_begin` now
+returns 0, which is the "stack is full, emit straight through" path it already had.
+
+**2. `JS_NewArray` returns `{tag=-1, ptr=<valid>}` inside a JIT frame - open.**
+`JS_TAG_UNINITIALIZED` is not caught by `JS_IsException()`, so the value is parked in
+an object slot and handed to `JS_SetPropertyValue` as an object -> `objshape` and
+`nested2d` die with 0xC0000005 (835ms and 9ms interpreted, before). Ruled out by test,
+not by reasoning: the `cur_sp` live-range loan (setting it to NULL changes nothing),
+object slots in general (`object`/`objfields`/`array` all correct), the frame-ordering
+bug of <46>, `whale_frame_obj_slots`/`JS_WhaleObjSlot`/`JS_WhaleArrNew`, and "the
+fallback was never emitted".
+
+**State**: tree reverted to the last green commit plus the `loop_begin` fix; the full
+working diff is `temp/whale_step_work.patch` (58KB, uncommitted by design). The next
+question is specific and small: one test program calling `JS_NewArray` from a
+TCC-generated function reproduces #2 without any fallback machinery.
+
 `check`/`ms` are top-level locals (interpreted, not compiled), so the corruption comes
 from `build`/`scan`, which pin both `i` and the return variable `s`. That is the same
 shape 7d9247b fixed for the old condition ("returning the pinned one unconditionally
