@@ -1307,7 +1307,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     int *loc_slot = NULL;       /* per local: its own slot when it is reassigned */
     int *loop_back = NULL;      /* per position: the backward jump that closes it */
     uint8_t var_ref_used[4] = { 0, 0, 0, 0 };
-    uint16_t *assign_cnt = NULL;
+    unsigned *assign_cnt = NULL;   /* weighted access count */
+    uint8_t *induction = NULL;     /* the local is a for-loop counter */
     uint8_t lo_c[WHALE_JIT_MAX_SLOTS];
     double lo_cv[WHALE_JIT_MAX_SLOTS];
     int unreachable = 0;
@@ -1340,13 +1341,14 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     args_obj = calloc(1, arg_count > 0 ? arg_count : 1);
     arg_obj_slot = malloc(sizeof(int) * (arg_count > 0 ? arg_count : 1));
     loc_slot = malloc(sizeof(int) * (var_count > 0 ? var_count : 1));
-    assign_cnt = calloc(var_count > 0 ? var_count : 1, sizeof(uint16_t));
+    assign_cnt = calloc(var_count > 0 ? var_count : 1, sizeof(unsigned));
+    induction = calloc(var_count > 0 ? var_count : 1, 1);
     whale_vexpr = calloc(stack_size, sizeof(WhaleVExpr));
     whale_vmat = calloc(1, stack_size);
     whale_lmem = calloc(var_count > 0 ? var_count : 1, sizeof(WhaleLocal));
     loop_back = malloc((len + 1) * sizeof(*loop_back));
     if (!targets || !seen || !snap || !cur || !args_used || !assign_cnt ||
-        !whale_vexpr || !whale_vmat || !whale_lmem || !loop_back)
+        !whale_vexpr || !whale_vmat || !whale_lmem || !loop_back || !induction)
         goto out;
     for (i = 0; i <= len; i++)
         loop_back[i] = -1;
@@ -1399,10 +1401,16 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             if (m >= 0 && ln >= 0 && ln < var_count)
                 whale_loc_fn[ln] = m;
         } else if (op == OP_inc_loc || op == OP_dec_loc) {
-            {   /* these write a local too, so it is not a constant */
+            {   /* these write a local too, so it is not a constant.
+                   Recorded separately rather than folded into assign_cnt: an
+                   induction variable is the best thing to pin, but only one of
+                   them may be pinned per function. minmax has two (i and j) and
+                   pinning both hangs it, while pinning either one alone is fine. */
                 int a = (int)pc[pos + 1];
-                if (a < var_count)
-                    assign_cnt[a]++;
+                if (a < var_count) {
+                    assign_cnt[a] += 4;
+                    induction[a] = 1;
+                }
             }
         } else if (op >= OP_put_loc0 && op <= OP_put_loc3) {
             assign_cnt[op - OP_put_loc0]++;
@@ -1451,8 +1459,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
            temporary. */
         int k, nloops = 0;
 
+        /* loop_back[] is -1 for "no back edge", so a truth test counted every
+           entry: arith has one loop and reported 21, which made the
+           `whale_nloops <= 1` gate false for every function long enough to have
+           a loop. The pins were effectively off. */
         for (k = 0; k < len; k++)
-            if (loop_back[k])
+            if (loop_back[k] >= 0)
                 nloops++;
         whale_nloops = nloops;
     }
@@ -1648,10 +1660,35 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        call, and those return numbers, so nothing reads it. Every statement here
        is one TinyCC spills, on every call. */
     wt_id("JSValue"); wt_id("_cref"); wt(';');
-    for (i = 0; i < var_count; i++) {
-        if (!whale_has_call && whale_nloops <= 1)
-            wk(JS_WK_REGISTER);
-        wk(JS_WK_DOUBLE); wt_slot("L", i); wt('='); wt_int(0); wt(';');
+    /* Pin the hottest loop counter, and the hottest local that is not one.
+       One counter only: minmax has two nested loops, each with its own counter,
+       and pinning both makes it never terminate. Pinning either one alone is
+       fine, and every case that measured 25-30% faster has a single loop.
+       The second slot goes to the hottest non-counter - the accumulator shape.
+       Two rather than more because the allocator has about fourteen float
+       registers and a third pin already hangs on get_reg() exhaustion. */
+    {
+        int pin1 = -1, pin2 = -1, k;
+
+        if (!whale_has_call) {
+            for (k = 0; k < var_count; k++)
+                if (induction[k] && (pin1 < 0 || assign_cnt[k] > assign_cnt[pin1]))
+                    pin1 = k;
+            for (k = 0; k < var_count; k++) {
+                if (k == pin1 || induction[k] || assign_cnt[k] == 0)
+                    continue;
+                if (pin2 < 0 || assign_cnt[k] > assign_cnt[pin2])
+                    pin2 = k;
+            }
+        }
+        if (getenv("WHALE_PIN_DBG"))
+            fprintf(stderr, "[pin] var_count=%d pin1=L%d pin2=L%d\n",
+                    var_count, pin1, pin2);
+        for (i = 0; i < var_count; i++) {
+            if (i == pin1 || i == pin2)
+                wk(JS_WK_REGISTER);
+            wk(JS_WK_DOUBLE); wt_slot("L", i); wt('='); wt_int(0); wt(';');
+        }
     }
     /* All of the generator's scratch state in one zero-initialised block: the
        value slots (stack_size plus the spare names fold_materialize() hands out,

@@ -1064,10 +1064,15 @@ ST_FUNC void save_reg_upstack(int r, int n)
         return;
     if (nocode_wanted)
         return;
-    /* WhaleJS: a pinned register belongs to a `register` local, not to the value
-       stack, so nothing on the stack can force its value out. */
-    if (whale_pinned_regs & (1u << r))
-        return;
+    /* WhaleJS: a pinned register does get spilled. This function runs immediately
+       before every call, and every xmm is caller-saved, so a pinned value cannot be
+       trusted across one. Spill it to its frame slot and clear the bit - the bit is
+       the validity flag, and the shortcuts in gv()/vstore() only fire while it is
+       set, so the slot becomes authoritative until the next read reloads them.
+       Refusing to spill here (the previous behaviour) left the register holding live
+       data a call was free to destroy, and get_reg's own spill path then handed that
+       register out. */
+    whale_pinned_regs &= ~(1u << r);
 
     /* modify all stack values */
     saved = 0;
@@ -1422,6 +1427,13 @@ ST_FUNC int gv(int rc)
         if ((vtop->r & VT_VALMASK) == VT_LOCAL) {
             {
                 int pr = whale_pin_find((int)vtop->c.i);
+
+                /* the register is only usable while its validity bit is set: a call
+                   spills it and clears the bit, and the normal load path has to run
+                   again. */
+                if (pr >= 0)
+                    if ((whale_pinned_regs & (1u << pr)) == 0)
+                        pr = -1;
                 if (getenv("WHALE_PIN_DBG"))
                     fprintf(stderr, "[pin] read  loc=%d -> reg=%d\n", (int)vtop->c.i, pr);
                 if (pr >= 0) {
@@ -2297,6 +2309,9 @@ ST_FUNC void gen_op(int op)
             if ((vtop[wi].r & VT_VALMASK) == VT_LOCAL) {
                 int wp = whale_pin_find((int)vtop[wi].c.i);
 
+                if (wp >= 0)
+                    if ((whale_pinned_regs & (1u << wp)) == 0)
+                        wp = -1;
                 if (wp >= 0)
                     vtop[wi].r = (vtop[wi].r & ~(VT_VALMASK | VT_LVAL)) | wp;
             }
@@ -3347,6 +3362,11 @@ ST_FUNC void vstore(void)
             if ((vtop[-1].r & VT_VALMASK) == VT_LOCAL) {
                 int pr = whale_pin_find((int)vtop[-1].c.i);
 
+                /* same validity guard: after a call the register is stale, so the
+                   store has to go to the frame slot via the normal path */
+                if (pr >= 0)
+                    if ((whale_pinned_regs & (1u << pr)) == 0)
+                        pr = -1;
                 if (pr >= 0) {
                     if (r != pr)
                         move_reg(pr, r, vtop->type.t);
