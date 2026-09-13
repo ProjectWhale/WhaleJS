@@ -40,6 +40,25 @@ typedef struct JSWhaleContext {
 #define WHALE_JIT_HOT_THRESHOLD 100
 #endif
 
+/* Profiling window. A function is interpreted WHALE_JIT_HOT_THRESHOLD times before
+   it is compiled, and only the last WHALE_PROFILE_CALLS of those are recorded: the
+   first calls are still warming up, and measuring only the tail keeps the cost where
+   it is worth paying. A call that repeats its arguments teaches nothing new, so the
+   memo check skips those on its own. */
+#ifndef WHALE_PROFILE_CALLS
+#define WHALE_PROFILE_CALLS 8
+#endif
+/* Bounded on purpose - a script reaches tens of thousands of objects, so an access
+   site remembers at most WHALE_PROFILE_SHAPES shapes and a function at most
+   WHALE_PROFILE_SITES sites. Overflow makes the generator fall back to the general
+   form, which is what it does today. */
+#ifndef WHALE_PROFILE_SITES
+#define WHALE_PROFILE_SITES 16
+#endif
+#ifndef WHALE_PROFILE_SHAPES
+#define WHALE_PROFILE_SHAPES 4
+#endif
+
 /* 公开 API */
 JS_EXTERN void      JS_WhaleSetJitMode(JSContext *ctx, JSJitMode mode);
 JS_EXTERN JSJitMode JS_WhaleGetJitMode(JSContext *ctx);

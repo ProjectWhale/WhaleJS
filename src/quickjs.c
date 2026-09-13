@@ -857,6 +857,19 @@ typedef enum JSFunctionKindEnum {
     JS_FUNC_ASYNC_GENERATOR = (JS_FUNC_GENERATOR | JS_FUNC_ASYNC),
 } JSFunctionKindEnum;
 
+/* What an access site actually saw, while the function was still interpreted.
+   The generator cannot prove an object's shape stays put: a call to something
+   opaque like console.log may or may not change it, and there is no list of such
+   functions worth trusting. The first calls show what really happened instead, so
+   the decision is made from observation rather than from an analysis that could be
+   wrong. The site is identified by the bytecode offset of its operand, which is
+   what the generator is already iterating over. */
+typedef struct WhaleProfSite {
+    uint32_t pc;
+    uint8_t n;
+    JSShape *shape[WHALE_PROFILE_SHAPES];
+} WhaleProfSite;
+
 typedef struct JSFunctionBytecode {
     JSGCObjectHeader header; /* must come first */
     uint8_t is_strict_mode : 1;
@@ -911,6 +924,14 @@ void *whale_jit_entry2;    /* the other reading of a closure-slot call target */
        function that does not use them must not pay for that - it is per call,
        and fib-style recursion notices. */
     uint8_t whale_needs_obj;
+    /* Observation of this function's property accesses, filled during the last
+       WHALE_PROFILE_CALLS interpreted calls and read by the generator. Site lookup
+       is direct-mapped on the operand offset: a slot holding a different offset is
+       treated as a collision and disables that site, which is conservative and
+       costs nothing to detect. */
+    uint8_t whale_prof_on;      /* recording the call in progress */
+    uint8_t whale_prof_used;
+    WhaleProfSite *whale_prof;
 } JSFunctionBytecode;
 
 typedef struct JSBoundFunction {
@@ -3651,9 +3672,86 @@ static void whale_memo_insert(JSContext *ctx, WhaleMemo *m, int argc,
     m->entries[m->count++] = e;
 }
 
+/* WhaleJS: record what an access site saw. Direct-mapped on the operand offset, and
+   a slot claimed by a different offset is disabled rather than evicted - a wrong
+   entry here would mean the generator trusting a shape that does not hold.
+
+   The common case is a loop revisiting one site with one object, and that costs a
+   single load and compare against the last shape seen. Sites that keep growing are
+   disabled once they pass WHALE_PROFILE_SHAPES: memory has to stay bounded because
+   a script can reach tens of thousands of objects, and a site that has seen many
+   shapes is one the general form should handle anyway. */
+static void whale_prof_record(JSFunctionBytecode *b, uint32_t pc, JSShape *shape)
+{
+    WhaleProfSite *s;
+    int i;
+
+    s = &b->whale_prof[(pc >> 2) % WHALE_PROFILE_SITES];
+    if (s->n == 0) {
+        s->pc = pc;
+        s->shape[0] = shape;
+        s->n = 1;
+        return;
+    }
+    if (s->n == 0xff)
+        return;                                  /* already disabled */
+    if (s->pc != pc) {
+        s->n = 0xff;                             /* two offsets in one slot */
+        return;
+    }
+    if (s->shape[s->n - 1] == shape)
+        return;                                  /* the loop case */
+    for (i = 0; i < s->n; i++)
+        if (s->shape[i] == shape)
+            return;
+    if (s->n < WHALE_PROFILE_SHAPES) {
+        s->shape[s->n] = shape;
+        s->n++;
+    } else {
+        s->n = 0xff;                             /* too many: leave it to the general form */
+    }
+}
+
+static void whale_prof_arm(JSContext *ctx, JSFunctionBytecode *b)
+{
+    if (!b->whale_prof) {
+        b->whale_prof = js_mallocz(ctx, sizeof(WhaleProfSite) * WHALE_PROFILE_SITES);
+        if (!b->whale_prof)
+            return;
+    }
+    b->whale_prof_on = 1;
+}
+
+static void whale_prof_dump(JSFunctionBytecode *b)
+{
+    int i, ns = 0, npoly = 0;
+
+    if (!b->whale_prof) {
+        fprintf(stderr, "[prof] no table\n");
+        return;
+    }
+    for (i = 0; i < WHALE_PROFILE_SITES; i++) {
+        WhaleProfSite *s = &b->whale_prof[i];
+
+        if (s->n == 0)
+            continue;
+        if (s->n == 0xff)
+            npoly++;
+        else
+            ns++;
+    }
+    fprintf(stderr, "[prof] calls=%u sites_monomorphic=%d sites_disabled=%d\n",
+            b->whale_call_count, ns, npoly);
+}
+
 static void whale_memo_discard(JSRuntime *rt, JSFunctionBytecode *b)
 {
     WhaleMemo *m = b->whale_memo;
+
+    if (b->whale_prof) {
+        js_free_rt(rt, b->whale_prof);
+        b->whale_prof = NULL;
+    }
     int i;
 
     if (!m)
@@ -3682,11 +3780,22 @@ static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
 
     w->stat_requests++;
     b->whale_call_count++;
+    /* WhaleJS: the last few interpreted calls observe what the accesses really do.
+       This has to arm BEFORE the test below, because the compilation happens on the
+       very call that reaches the threshold - there is no window after it. Recording
+       the tail rather than the whole run keeps the cost bounded, and by then the
+       function is warm: the first calls are still settling. */
+    if (b->whale_call_count >= WHALE_JIT_HOT_THRESHOLD - WHALE_PROFILE_CALLS &&
+        b->whale_call_count < WHALE_JIT_HOT_THRESHOLD)
+        whale_prof_arm(ctx, b);
     if (b->whale_call_count < WHALE_JIT_HOT_THRESHOLD)
         return 0;
     if (b->whale_jit_entry || b->whale_jit_tried)
         return 0;
     b->whale_jit_tried = 1;
+    b->whale_prof_on = 0;
+    if (getenv("WHALE_PROF_DBG"))
+        whale_prof_dump(b);
     {
         static int whale_op_probe;
         if (!whale_op_probe && getenv("WHALE_JIT_DUMP")) {
@@ -19492,6 +19601,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 obj = sp[-1];
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                     p = JS_VALUE_GET_OBJ(obj);
+                    /* WhaleJS: only while this function is being profiled, which is
+                       the last few calls before it is compiled. pc has already moved
+                       past the atom operand, so pc - 4 is the site's offset - the
+                       same key the generator uses. */
+                    if (unlikely(b->whale_prof_on))
+                        whale_prof_record(b, (uint32_t)(pc - 4), p->shape);
                     for(;;) {
                         prs = find_own_property(&pr, p, atom);
                         if (prs) {
@@ -20831,6 +20946,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 obj = sp[-1];
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                     p = JS_VALUE_GET_OBJ(obj);
+                    /* WhaleJS: only while this function is being profiled, which is
+                       the last few calls before it is compiled. pc has already moved
+                       past the atom operand, so pc - 4 is the site's offset - the
+                       same key the generator uses. */
+                    if (unlikely(b->whale_prof_on))
+                        whale_prof_record(b, (uint32_t)(pc - 4), p->shape);
                     for(;;) {
                         prs = find_own_property(&pr, p, atom);
                         if (prs) {
@@ -20879,6 +21000,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 obj = sp[-1];
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                     p = JS_VALUE_GET_OBJ(obj);
+                    /* WhaleJS: only while this function is being profiled, which is
+                       the last few calls before it is compiled. pc has already moved
+                       past the atom operand, so pc - 4 is the site's offset - the
+                       same key the generator uses. */
+                    if (unlikely(b->whale_prof_on))
+                        whale_prof_record(b, (uint32_t)(pc - 4), p->shape);
                     for(;;) {
                         prs = find_own_property(&pr, p, atom);
                         if (prs) {
