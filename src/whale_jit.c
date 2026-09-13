@@ -186,18 +186,58 @@ static void wk(int w)
     JS_WhaleTokKw(w);
 }
 
+/* WhaleJS: with WHALE_JIT_SRC=<file> the generated C source is mirrored into that
+   file as it is emitted. The disassembled code section can only be counted, not
+   read - it is dumped before relocation, so objdump cannot name a single callee.
+   The token wrappers below, on the other hand, are handed the literal text, so
+   mirroring them reconstructs the source and makes it possible to see which helpers
+   sit inside a loop body. */
+static FILE *whale_src_fp;
+static int whale_src_tried;
+
+static void wsrc(const char *s)
+{
+    if (!whale_src_tried) {
+        const char *p = getenv("WHALE_JIT_SRC");
+
+        whale_src_tried = 1;
+        if (p && *p)
+            whale_src_fp = fopen(p, "w");
+    }
+    if (whale_src_fp)
+        fputs(s, whale_src_fp);
+}
+
 static void wt(int t)
 {
+    if (whale_src_fp || !whale_src_tried) {
+        char b[3];
+
+        b[0] = (char)t; b[1] = (t == ';' || t == '{' || t == '}') ? '\n' : ' '; b[2] = 0;
+        wsrc(b);
+    }
     JS_WhaleTokChar(t);          /* punctuation / single-character operators */
 }
 
 static void wt_id(const char *name)
 {
+    if (whale_src_fp || !whale_src_tried) {
+        char b[256];
+
+        snprintf(b, sizeof b, "%s ", name);
+        wsrc(b);
+    }
     JS_WhaleTokIdent2(name);
 }
 
 static void wt_slot(const char *prefix, int n)
 {
+    if (whale_src_fp || !whale_src_tried) {
+        char b[64];
+
+        snprintf(b, sizeof b, "%s%d ", prefix, n);
+        wsrc(b);
+    }
     JS_WhaleTokSlot(prefix, n);  /* L0 / v3 / A2 */
 }
 
@@ -219,11 +259,23 @@ static void wt_op(int o)
 
 static void wt_int(int v)
 {
+    if (whale_src_fp || !whale_src_tried) {
+        char b[32];
+
+        snprintf(b, sizeof b, "%d ", v);
+        wsrc(b);
+    }
     JS_WhaleTokInt(v);
 }
 
 static void wt_num(double v)
 {
+    if (whale_src_fp || !whale_src_tried) {
+        char b[64];
+
+        snprintf(b, sizeof b, "(double)%.17g ", v);
+        wsrc(b);
+    }
     JS_WhaleTokDouble(v);
 }
 
