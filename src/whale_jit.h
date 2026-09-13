@@ -73,6 +73,22 @@ typedef struct JSWhaleFuncInfo {
    from having to be built dynamically. */
 #define WHALE_STRUCT_SLOTS  4
 #define WHALE_STRUCT_FIELDS 16
+
+/* The unset marker for an unboxed field, and the shape of the initialisation.
+
+   A field is two words: value first, tag second (measured - sizeof(JSValue) is 16
+   and JS_UNDEFINED is value 0, tag 3). A fresh field must read as undefined and
+   must NOT look like a member of the object, and the two states differ only in
+   what those words hold:
+
+       never assigned   value = WHALE_STR_UNSET_VALUE, tag = WHALE_STR_UNSET_TAG
+       assigned undefined   value = 0, tag = JS_TAG_UNDEFINED
+       assigned a number    value = <bits>, tag = JS_TAG_FLOAT64
+
+   The marker is written as a macro rather than a literal at the point of use, so
+   the value is stated once and the initialisation loop stays a plain loop. */
+#define WHALE_STR_UNSET_TAG   JS_TAG_UNDEFINED
+#define WHALE_STR_UNSET_VALUE ((int64_t)JS_TAG_UNDEFINED)
 /* property names the generator can reason about (object literals only) */
 #define WHALE_ATOM_MAX 32
 /* direct calls the generator records, to see which loops contain one */
