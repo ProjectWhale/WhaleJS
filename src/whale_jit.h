@@ -142,6 +142,8 @@ void *JS_WhaleObjShape(JSContext *ctx, int slot);
 JSValue *JS_WhaleObjFieldPtr(JSContext *ctx, int slot, int atom, void **shape_io);
 /* Define a numeric property, for an object literal's initialisers. */
 int JS_WhaleObjDefineNum(JSContext *ctx, int slot, int atom, double v);
+/* Define a property from a parked value instead of a double. */
+JS_EXTERN int JS_WhaleObjDefineValue(JSContext *ctx, int slot, int atom, int val_slot);
 
 /* The cold branch of an inlined property read: sets *deopt and returns 0 when
    the value is neither an int32 nor a float64. */

@@ -1720,6 +1720,18 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        a tcc_add_symbol: without it TinyCC falls back to an implicit declaration
        and the call passes the arguments wrong, which looks like the code simply
        not working. */
+    wk(JS_WK_EXTERN); wk(JS_WK_VOID); wt_id("JS_WhaleObjSlotNull"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("k"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleObjSlotAtom"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("atom"); wt(',');
+        wk(JS_WK_INT); wt_id("k"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleObjDefineValue"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(',');
+        wk(JS_WK_INT); wt_id("atom"); wt(','); wk(JS_WK_INT); wt_id("val_slot"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleBinopVal"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("op"); wt(',');
+        wk(JS_WK_INT); wt_id("a_slot"); wt(','); wk(JS_WK_INT); wt_id("b_slot"); wt(',');
+        wk(JS_WK_INT); wt_id("out_slot"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleObjNew"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleObjDefineNum"); wt('(');
@@ -2521,8 +2533,27 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int tb = cur[var_count + sp - 1];
                 int atom = (int)whale_get_u32(pc + pos + 1);
 
-                if (!WHALE_IS_SLOT(ta) || !whale_type_is_num(tb))
+                if (!WHALE_IS_SLOT(ta))
                     goto out;
+                if (!whale_type_is_num(tb)) {
+                    /* { key: "a string" } - the value is opaque, so hand it to the
+                       engine rather than abandon the function. This is the last
+                       thing standing between vnode_build and compilation. */
+                    if (!WHALE_IS_VAL(tb))
+                        goto out;
+                    {
+                        int fm = fold_mark();
+
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjDefineValue"); wt('(');
+                        wt_id("ctx"); wt(','); wt_int(WHALE_SLOT(ta)); wt(','); wt_int(atom);
+                        wt(','); wt_int(WHALE_VAL_SLOT(tb)); wt(')'); wt(')');
+                        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        fold_commit(fm);
+                    }
+                    sp--;
+                    break;
+                }
                 {
                     int fm = fold_mark();
 
@@ -3805,6 +3836,10 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
         tcc_add_symbol(s, "JS_WhaleTAU8Get", (void *)JS_WhaleTAU8Get);
         tcc_add_symbol(s, "JS_WhaleTAU8Set", (void *)JS_WhaleTAU8Set);
         tcc_add_symbol(s, "JS_WhaleTAU8Ptr", (void *)JS_WhaleTAU8Ptr);
+        tcc_add_symbol(s, "JS_WhaleObjSlotNull", (void *)JS_WhaleObjSlotNull);
+        tcc_add_symbol(s, "JS_WhaleObjSlotAtom", (void *)JS_WhaleObjSlotAtom);
+        tcc_add_symbol(s, "JS_WhaleObjDefineValue", (void *)JS_WhaleObjDefineValue);
+        tcc_add_symbol(s, "JS_WhaleBinopVal", (void *)JS_WhaleBinopVal);
         tcc_add_symbol(s, "JS_WhaleObjNew", (void *)JS_WhaleObjNew);
         tcc_add_symbol(s, "JS_WhaleObjShape", (void *)JS_WhaleObjShape);
         tcc_add_symbol(s, "JS_WhaleObjFieldPtr", (void *)JS_WhaleObjFieldPtr);

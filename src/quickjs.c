@@ -7983,6 +7983,23 @@ int JS_WhaleObjDefineNum(JSContext *ctx, int slot, int atom, double v)
                                   JS_PROP_C_W_E) >= 0;
 }
 
+/* Define a property whose value is an opaque parked value - a string, a null, an
+   object. JS_WhaleObjDefineNum covers the numeric case and keeps the value inline;
+   this one takes a slot, because the value may have come from a call or from an
+   operator that already went through the engine. JS_DefinePropertyValue takes
+   ownership of the reference. */
+int JS_WhaleObjDefineValue(JSContext *ctx, int slot, int atom, int val_slot)
+{
+    JSValue o = whale_frame_obj_slots(ctx)[slot];
+    JSValue v = js_dup(whale_frame_obj_slots(ctx)[val_slot]);
+
+    if (JS_VALUE_GET_TAG(o) != JS_TAG_OBJECT) {
+        JS_FreeValue(ctx, v);
+        return 0;
+    }
+    return JS_DefinePropertyValue(ctx, o, atom, v, JS_PROP_C_W_E) >= 0;
+}
+
 /* The cold branch of an inlined property read: the generated code handles the
    int32 and float64 tags itself, so anything reaching here has to go back to
    the interpreter rather than be guessed at. */
