@@ -1,40 +1,40 @@
-# Unboxed struct initialisation: memoise the block and let tag 0 mean "unset"
+# Unboxed struct fields: undefined is all-zero, so "unset" needs its own 128-bit pattern
 
-Raised by the user, and it removes the per-field initialisation cost.
+Corrected by the user twice; the first version here had the tags the wrong way round.
 
-Every property of a fresh unboxed object reads as `undefined` when it was never
-assigned, which is what makes the behaviour match an ordinary object. The obvious way
-to get that is to write `undefined` into every field on creation - one store per field
-per object.
+## The fact that settles it
 
-Instead, **separate "never assigned" from "assigned the value undefined"**, and do it
-with the tag:
+**A normal `undefined` JSValue is zero** - tag 0 and value 0 together. That is what the
+engine uses, so an unboxed field cannot use "tag 0" to mean "nothing was ever stored
+here": tag 0 is exactly what a field holds after being assigned `undefined`, which is
+a real, present value.
 
-    tag == 0        never assigned      -> reads as undefined, `in` is FALSE
-    tag == <undef'> assigned undefined  -> reads as undefined, `in` is TRUE
-    tag == number   assigned a number   -> reads as the number
+## The layout
 
-Where the middle one is worth spelling out, because it is the part that is easy to get
-backwards: **an ordinary `undefined` JSValue has tag 0.** So tag 0 cannot mean "this
-field holds undefined" - it is the value the field has when nothing was ever stored.
-What a deliberately-assigned `undefined` needs is a *different* tag, which is what the
-`<undef'>` above is: the value `undefined` normally carries, re-tagged with one of the
-JSValue tag values that the engine does not otherwise use here.
+Each field is **128 bits**: a tag word and a value word, written together.
 
-Why that distinction has to exist: **the `in` operator**. `'x' in obj` is true exactly
-when the property was set, including when it was set to `undefined`. If both states
-shared tag 0, `in` could not tell them apart and a field that was explicitly cleared
-would report as missing. The engine's `in` for this object is then answered from the
-tag alone: non-zero means present.
+    assigned undefined   tag = 0     value = 0        (a normal undefined JSValue)
+    never assigned       tag != 0    value = 0        (the unset pattern)
+    assigned a number    tag = <num> value = <bits>
 
-It has the same shape once references exist: a field explicitly assigned `undefined`
-does hold a value, so a later write knows there is a previous value to release. A field
-that was never assigned holds nothing. tag 0 carries "nothing to release" with it.
+The two words are set as one 128-bit store, which is what keeps them consistent - there
+is no window where the tag says one thing and the value another.
 
-The all-zero block is therefore exactly the "no property set" state, which is what
-makes a single **memset** the whole initialisation - the same operation whether the
-layout has three fields or thirty.
+So there is **no memset shortcut**: a memset writes the same byte everywhere and cannot
+produce "tag non-zero, value zero". Initialisation is one 128-bit store per field. That
+is the price of keeping `undefined` and "unset" apart, and it is a small price - the
+store is a single instruction and only happens at creation.
 
-For the numeric-only first version this is about the tags alone, but the property is
-what makes the general version possible, so the layout should be built to keep the
-first 8 bytes of an unset field at zero from the start.
+(The earlier note in this file claimed a single memset would do it. That only works if
+"unset" is all-zero, which would make it indistinguishable from `undefined`.)
+
+## Why they must be kept apart: the `in` operator
+
+`'x' in obj` is true exactly when the property was set, **including when it was set to
+`undefined`**. With tag 0 alone the two states collide and an explicitly-cleared field
+would report as missing. With the pattern above, membership is "tag != 0", and both the
+present-undefined and absent cases still read back as `undefined`.
+
+Once fields can hold references the same two words carry the reference-count answer: a
+field assigned `undefined` holds a value (nothing to free, but it is a value that was
+written); a field never assigned holds nothing at all. The tag word is what says which.
