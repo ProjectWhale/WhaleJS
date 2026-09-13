@@ -444,12 +444,21 @@ static int whale_var_ref_feeds_call(const uint8_t *pc, int len, int pos, int sz)
     int k = pos + sz;
     int n = 0;
 
-    while (k < len && n < 12) {
+    /* The window has to be wide enough to see past a real argument list, or a
+       variable read as a call target gets mistaken for a number. 12 was not:
+       `createElement(i % 5, { id: i, cls: "c" + (i % 3) })` needs more, and when
+       this returned 0 the slot was typed WHALE_T_NUM - the value is a function, and
+       the call then gave up for wanting a slot. Erring the other way is harmless:
+       a number parked in a slot still works, it just costs a round trip. */
+    while (k < len && n < 48) {
         int o = (int)pc[k];
+        int s = whale_op_size_of(o);
 
         if (whale_is_call_op(o))
             return 1;
-        k += whale_op_size_of(o);
+        if (s <= 0)
+            return 0;
+        k += s;
         n++;
     }
     return 0;
