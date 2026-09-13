@@ -131,19 +131,39 @@ Start with the local object, because that is where the measured cost is.
    arrays only", which was a slide back into static analysis - and it is not needed.
    The whole point of the observation machinery is that the JIT knows what actually
    happened during the interpreted calls, so it specialises on that instead of proving
-   anything:
-
-   | observed during warm-up | generated |
-   | --- | --- |
-   | one shape for the elements | unboxed struct backing store |
-   | two to four shapes | one fast path per shape |
-   | more than that, or the array escaped | the general path, as now |
-
-   Escaping is observable too - the array being stored into another object, or handed
-   to a call the JIT cannot see through - so it does not have to be proved either. A
-   table that grows past its capacity is abandoned, exactly as `WHALE_PROFILE_SHAPES`
-   already does for property sites.
+   anything. Escaping is observable too - the array or object being stored elsewhere,
+   or handed to a call the JIT cannot see through - so it does not have to be proved
+   either.
 3. Generalise only after the above runs on real cases.
+
+## Reserve, do not retreat: properties that are only sometimes there
+
+Raised by the user, and it removes the main reason a multi-shape site would fall back.
+
+Shape A has `{tag, key, flags, depth}`, shape B has `{tag, key, flags}`. Treating that
+as "two shapes, too polymorphic, use the general path" throws away the whole gain over
+one missing field. Instead take the **union** of the observed shapes - the fields that
+appear in any of them - and lay the struct out over all of it:
+
+    struct { double tag, key, flags, depth; }   /* depth present, with a presence flag */
+
+A field that is only sometimes there gets its slot anyway:
+
+    double depth;  uint8_t has_depth;
+
+A slot costs 8 bytes (plus a flag byte). For a record with five fields at most, a
+generous union costs a few tens of bytes per object, and it buys keeping the code
+native instead of dropping to a shape check plus a heap chase on every access. The
+trade is obviously worth it; the whole quantitative argument above is that a field
+access is 7 memory operations and 4.6 cycles each.
+
+Reads of a field that is not present in the current shape need one branch on the flag,
+which is still far cheaper than the general path, and the branch is perfectly
+predictable for a site where the shape does not alternate every iteration.
+
+The user's framing is worth keeping: find the least common multiple of the observed
+shape set, not the greatest common divisor. Reserving is cheap; missing is expensive.
+
 
 ## What the observation table needs to grow into
 
