@@ -13,9 +13,21 @@ a real, present value.
 
 Each field is **128 bits**: a tag word and a value word, written together.
 
-    assigned undefined   tag = undefined   value = 0        (exactly JS_UNDEFINED)
-    never assigned       tag = undefined   value != 0       (the unset pattern)
-    assigned a number    tag = <num>       value = <bits>
+    assigned undefined   tag = JS_TAG_UNDEFINED (3)   value = 0
+    never assigned       tag = JS_TAG_UNDEFINED (3)   value != 0    (unset)
+    assigned a number    tag = JS_TAG_FLOAT64 (8)     value = <bits>
+
+The actual tag values, checked rather than assumed (quickjs.h:181-200):
+
+    JS_TAG_INT = 0, JS_TAG_BOOL = 1, JS_TAG_NULL = 2, JS_TAG_UNDEFINED = 3,
+    JS_TAG_UNINITIALIZED = 4, ..., JS_TAG_FLOAT64 = 8
+
+Two things fall out of that and both matter:
+
+* undefined is tag **3**, not 0 - so nothing here may be written from memory.
+* **a memset is not just imperfect, it is wrong**: zero bytes mean tag 0, which is
+  JS_TAG_INT, i.e. the integer 0. A block of zeros is a block of zeroes, not a
+  block of undefineds.
 
 The two words are set as one 128-bit store, which is what keeps them consistent - there
 is no window where the tag says one thing and the value another.
