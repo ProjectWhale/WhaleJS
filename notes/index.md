@@ -143,3 +143,39 @@ register under pressure** - write it back to its frame slot and update the map s
 later reads go to memory again. Until that exists, pinning is a claim the allocator
 cannot veto, and it is either unsafe or unprofitable. That is the precondition for
 any no-stack calling convention to be worth doing.
+## <53> Debugging discipline: 0 mismatches is not proof the JIT worked
+
+Full write-up in `notes/debugging-discipline.md`. Two rules came out of the
+`sym->r` revert, both worth more than the change was.
+
+**1. Check generation errors, not just checksums.** `070a5ee` reported "all 24 cases
+match node, timings unchanged". Both were true - and both were also true of a build
+where every JIT compilation failed and every benchmark fell back to the interpreter.
+0 mismatches means the answers were right, which the interpreter guarantees. The
+compiler's own errors are swallowed by the fallback. So every benchmark run needs:
+
+    whalejs case.js 2>&1 | Select-String "lvalue|invalid macro|: error|expected"
+
+`gen-errors=0/24` goes next to the mismatch count from now on.
+
+**2. Six patches on the same mechanism means the model is wrong, not the code.**
+The pinned-register work accumulated six special cases in tccgen.c (953, 1056, 1408,
+2276, 3331, 4277), one of them saying "Without this the pin did nothing but waste a
+register" - a description of the last hole rather than of the cause. The cause was
+that `sym->r` was never changed, so the symbol table thought the value lived in the
+frame slot while it lived in a register, and every access needed its own patch. Worse,
+the patches are load bearing *against* the fix: they set `vtop->r` to VT_LOCAL, which
+contradicts `sym->r` - which is why setting `sym->r` alone broke code generation.
+
+Auditing for this class:
+
+    Select-String -Path src/tcc/*.c -Pattern "WhaleJS:|without this|otherwise|work around|avoid"
+
+That finds the pin cluster and nothing else of comparable shape. The remaining WhaleJS
+changes in TCC are additive (a new allocator, a new reset hook), not corrections of
+existing behaviour.
+
+Still verified and still worth having: pinning pays 25-30% when the right locals are
+chosen, and two pins is the safe maximum (a third hangs on get_reg() exhaustion).
+Next: remove the six patches and make `sym->r` authoritative in one change, then
+weight inc_loc/dec_loc and lift the nloops restriction.
