@@ -3712,6 +3712,21 @@ static void whale_prof_record(JSFunctionBytecode *b, uint32_t pc, JSShape *shape
     }
 }
 
+/* Called from both heat paths before the threshold is reached, because the
+   compilation itself happens on the call or back edge that reaches it - there is no
+   window after. A loop-driven function crosses the threshold on a BACK EDGE, so
+   whale_note_backedge has to arm too: arming only in whale_on_call never fired for
+   one, which is why the table came back empty. */
+static void whale_prof_arm(JSContext *ctx, JSFunctionBytecode *b);
+
+static void whale_prof_maybe_arm(JSContext *ctx, JSFunctionBytecode *b)
+{
+    if (b->whale_prof_on || b->whale_jit_tried)
+        return;
+    if (b->whale_call_count + WHALE_PROFILE_CALLS >= WHALE_JIT_HOT_THRESHOLD)
+        whale_prof_arm(ctx, b);
+}
+
 static void whale_prof_arm(JSContext *ctx, JSFunctionBytecode *b)
 {
     if (!b->whale_prof) {
@@ -3785,9 +3800,7 @@ static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
        very call that reaches the threshold - there is no window after it. Recording
        the tail rather than the whole run keeps the cost bounded, and by then the
        function is warm: the first calls are still settling. */
-    if (b->whale_call_count >= WHALE_JIT_HOT_THRESHOLD - WHALE_PROFILE_CALLS &&
-        b->whale_call_count < WHALE_JIT_HOT_THRESHOLD)
-        whale_prof_arm(ctx, b);
+    whale_prof_maybe_arm(ctx, b);
     if (b->whale_call_count < WHALE_JIT_HOT_THRESHOLD)
         return 0;
     if (b->whale_jit_entry || b->whale_jit_tried)
@@ -3907,6 +3920,9 @@ static void whale_note_backedge(JSContext *ctx, JSFunctionBytecode *b)
 {
     if (b->whale_jit_tried)     /* compiled, or tried and gave up */
         return;
+    /* the back edge is what pushes a looping function to the threshold, so the
+       observation window has to open here as well as in whale_on_call */
+    whale_prof_maybe_arm(ctx, b);
     if (++b->whale_call_count >= WHALE_JIT_HOT_THRESHOLD)
         (void)whale_on_call(ctx, b);   /* a compile here only takes effect next call */
 }
