@@ -1668,6 +1668,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     whale_obj_pending = 0;
                 }
             }
+        } else if (op == OP_get_field || op == OP_get_field2 || op == OP_put_field) {
+            /* the offset the profile table is keyed by: the access site's operand,
+               which is the opcode offset plus one */
+            if (whale_field_sites_n < WHALE_ATOM_MAX)
+                whale_field_sites[whale_field_sites_n++] = pos + 1;
         } else if (op == OP_define_field) {
             int atom = (int)whale_get_u32(pc + pos + 1);
 
@@ -2575,6 +2580,31 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         case OP_object:
             {
                 int os;
+                int mono = 1, si;
+
+                /* Was every field access site in this function observed holding a
+                   single shape? If so, the objects built here have a settled layout
+                   and can be laid out as a struct: one load per field instead of the
+                   7-memory-operation sequence.
+
+                   Asked at the function level because per-object would need a
+                   provenance array kept in step with cur[] and snapshotted at every
+                   jump target. Both cases with a measurement behind them build
+                   exactly one object, so this covers them; a function with two
+                   objects of different shapes is refused, which is the conservative
+                   direction.
+
+                   The reservation rule applies inside: the layout is the union of the
+                   observed shapes, so a field only some of them carry still gets a
+                   slot, because reserving eight bytes beats falling back. */
+                for (si = 0; mono && si < whale_field_sites_n; si++)
+                    if (!whale_prof_one_shape((unsigned)whale_field_sites[si]))
+                        mono = 0;
+                if (whale_field_sites_n == 0)
+                    mono = 0;
+                if (getenv("WHALE_PROF_DBG"))
+                    fprintf(stderr, "[obj] pos=%d sites=%d mono=%d\n",
+                            pos, whale_field_sites_n, mono);
 
                 if (whale_objs >= WHALE_CALL_BASE)
                     goto out;
