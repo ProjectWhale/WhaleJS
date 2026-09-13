@@ -776,22 +776,18 @@ static void fold_toint32(int k, int is_i32, int is_iconst)
         wt_id("JS_WhaleToInt32"); wt('('); fold_inline(k); wt(')');
         return;
     }
-    wt('(');
-    /* The window is int64, not int32: for any double below 2^63 the C conversions
-       below give exactly ToInt32's result (truncate, then take the low 32 bits),
-       because long long holds it exactly. Testing against int32 instead made every
-       int32-wrapping value - an accumulator a loop has been adding to for a while,
-       say - take the helper on *every* operation, and the helper calls fmod. A
-       one-shot 5e6-iteration bitwise loop measured 165ms that way against 2ms when
-       the same work was split into 100 calls: the accumulator never left int32 in
-       the second case, so it never left the fast path. */
-    wt('('); fold_inline(k); wt_op(JS_OP_GE); wt_num(-4611686018427387904.0); wt(')');
-    wt_op(JS_OP_AND);
-    wt('('); fold_inline(k); wt_op(JS_OP_LE); wt_num(4611686018427387904.0); wt(')');
-    wt('?'); wt('('); wk(JS_WK_INT); wt(')'); wt('('); wk(JS_WK_LONG); wk(JS_WK_LONG); wt(')');
-    fold_inline(k);
-    wt(':'); wt_id("JS_WhaleToInt32"); wt('('); fold_inline(k); wt(')');
-    wt(')');
+    /* One conversion, no test and no helper. (int32_t)(long long)d is exactly
+       ToInt32(d) for every double: within 2^63 long long holds it, so the cast
+       truncates and the low 32 bits are the modulo-2^32 wrap; outside that range,
+       and for NaN and the infinities, x86's cvttsd2si yields INT64_MIN, whose low
+       32 bits are 0 - which is what ToInt32 gives for NaN, +/-Inf, and for any
+       float large enough to be a multiple of 2^32 (everything past 2^63 is).
+       The previous form tested the range and fell back to JS_WhaleToInt32 - which
+       calls fmod - so it cost three comparisons and a branch per bitwise operand.
+       Normal arithmetic just emits `+` and pays none of this, which is the whole
+       reason a bitwise loop ran 7x slower than the same loop with arithmetic. */
+    wt('('); wk(JS_WK_INT); wt(')'); wt('('); wk(JS_WK_LONG); wk(JS_WK_LONG); wt(')');
+    wt('('); fold_inline(k); wt(')');
 }
 
 /* Emit `a % b`. fmod() is a libm call and the operands here are usually small
