@@ -1,72 +1,64 @@
 # General fallback: where it stands
 
 The direction the user set early on: when an instruction cannot be compiled, dispatch
-that ONE instruction into the VM and keep the rest native. `goto out` abandoning the
-whole function is too blunt, and it is why whole classes of ordinary code never
-reached the JIT.
+that ONE instruction into the VM and keep the rest native, instead of abandoning the
+whole function. `goto out` was abandoning it.
 
-## What is done
+## Done, each verified at 24 cases / 0 generation errors / 0 mismatches
 
-`OP_null` and `OP_push_atom_value` (commits 6294592). Both used to abandon the
-function. They now park the value in an object slot as opaque:
+| instruction | handled by |
+| --- | --- |
+| `OP_null` | `JS_WhaleObjSlotNull(ctx, os)`, slot typed `WHALE_T_VAL` |
+| `OP_push_atom_value` | `JS_WhaleObjSlotAtom(ctx, atom, os)`, same |
+| binary ops with an opaque operand | `JS_WhaleBinopVal`, dispatching into the engine's existing `js_add_slow` / `js_binary_arith_slow` / `js_binary_logic_slow` / `js_relational_slow` / `js_eq_slow` |
+| `OP_define_field` with an opaque value | `JS_WhaleObjDefineValue(ctx, slot, atom, val_slot)` |
 
-    case OP_null:              JS_WhaleObjSlotNull(ctx, os)
-    case OP_push_atom_value:   JS_WhaleObjSlotAtom(ctx, atom, os)
+The mechanism: the value is parked in an object slot and its stack type is
+`WHALE_T_VAL`. Anything downstream that genuinely needs a number still refuses; the
+difference is that the refusal now happens at a specific instruction instead of at the
+first opaque value, and the fallback keeps moving forward through the function.
 
-followed by `cur[...] = WHALE_VAL_T(os)`. Two narrow engine helpers exist for this, so
-the generated C never needs to know about JS_NULL or the atom-to-value rules.
+## Two traps when adding the next one, both hit here
 
-The type byte is what makes this safe: WHALE_T_VAL is a slot, so a downstream
-instruction that needs a number looks at it with `whale_type_is_num` and refuses.
-That refusal is a `goto out`, so the current behaviour degrades to "abandon", not to
-"compute something wrong". Verified: 24 cases, 0 generation errors, 0 mismatches.
+1. **A generated call needs BOTH a prototype in the emitted C and a `tcc_add_symbol`.**
+   The comment above the existing prototypes in whale_jit.c says so, and it was not
+   read. Without them TinyCC falls back to an implicit declaration, passes arguments
+   wrong, and reports `undefined symbol` - nothing compiles at all.
+2. The generator-side helper must be a **macro**: `whale_objs`, `cur` and `var_count`
+   are locals of `whale_jit_gen`.
 
-## The mechanism to be clear about
+## The give-up list, shrinking
 
-Pushing an opaque value only moves the give-up point forward; it does not remove it.
-That is expected and it is the right order: each step makes the give-up land on a
-later, more specific instruction instead of the first one.
+    call2              <- immutable_update, vnode_build
+    get_array_el       <- list_reconcile, nested2d
+    call_method        <- arr_methods, string
+    get_length         <- array, arr_methods
+    return             <- fib
+    push_empty_string  <- stringcat
+    put_array_el       <- nested2d
+    put_field          <- objfields
 
-## Remaining give-up points, by how much they block
+`add` and `define_field` used to be on it and are gone.
 
-    add               <- fib, string, vnode_build      (3 cases)
-    get_array_el      <- list_reconcile, nested2d
-    get_length        <- array, arr_methods
-    put_field         <- objfields
-    define_field      <- vnode_build
-    push_empty_string <- stringcat
-    call2             <- immutable_update
-    call_method       <- arr_methods
-    put_array_el      <- nested2d
+## Next, in the order I would try them
 
-## Next step, concretely
-
-**Binary operators with an opaque operand.** `OP_add` and friends test
-`whale_type_is_num(ta) && whale_type_is_num(tb)` (whale_jit.c:3241) and give up
-otherwise. When one side is a WHALE_T_VAL the correct behaviour is not to give up but
-to call the engine and let it do the real JS operation - `JS_Add`, `JS_Sub`, and so on
-- storing the result in a fresh opaque slot.
-
-That single change covers `add` (3 cases) and is the pattern every remaining operator
-needs:
-
-1. engine helper: `int JS_WhaleBinopVal(JSContext *ctx, int op, JSValue a, JSValue b,
-   int out_slot)` - reads both slots, applies `JS_Add`/`JS_Sub`/..., parks the result.
-2. generator: in the `OP_add`/`OP_sub`/... case, when either side is a VAL, emit the
-   helper and set `cur[...] = WHALE_VAL_T(new_slot)` instead of `goto out`.
-3. `define_field` and `put_field` with an opaque value need the same treatment
-   (`JS_WhaleObjDefineValue`), which is what unblocks vnode_build.
+1. **`call2` with opaque arguments.** `JS_WhaleCallValue(ctx, func_slot, argc,
+   arg_base, ret_slot)` already exists and already parks a live result; what is missing
+   is parking opaque argument values before the call. This unblocks immutable_update
+   (572ms) and vnode_build (385ms) - the two slowest cases still uncompiled.
+2. **`get_length`** (array, arr_methods), then **`get_array_el` / `put_array_el`**
+   (list_reconcile, nested2d).
+3. **`call_method`** (arr_methods, string).
+4. **`push_empty_string`** (stringcat) - the same shape as OP_null.
 
 ## Two things the evidence does NOT support
 
-- **The general fallback is not needed to make objfields fast.** objfields is 166ms
-  and object is 147ms with the memo defeated; there was never a 27x gap. See
+- **The general fallback is not needed to make objfields fast.** objfields is 166ms and
+  object is 147ms with the memo defeated; there was never a 27x gap. See
   notes/correction-memo-and-giveup.md.
 - **`gen gave up` in the log is not proof a function is uncompiled.** whale_on_call
   compiles two readings (quickjs.c:3878/3887) and the second usually succeeds. Count
-  `whale_jit_fn_N -> ...` lines, not `gave up` lines. The five cases that genuinely
-  end up uncompiled are vnode_build, arr_methods, nested2d, string, stringcat - and
-  of those only vnode_build is slow (338ms).
+  `whale_jit_fn_N -> ...` lines, not `gave up` lines.
 
 ## Measurement warning, third occurrence
 
