@@ -179,3 +179,31 @@ Still verified and still worth having: pinning pays 25-30% when the right locals
 chosen, and two pins is the safe maximum (a third hangs on get_reg() exhaustion).
 Next: remove the six patches and make `sym->r` authoritative in one change, then
 weight inc_loc/dec_loc and lift the nloops restriction.
+## <54> Two pinning findings: whale_nloops was always wrong, and reading order changes the result
+
+`notes/pinning-findings.md` has the detail and the repro. Summary:
+
+**1. `whale_nloops` was never right.** `loop_back[]` holds -1 for "no back edge", and
+the count tested `if (loop_back[k])` - true for every entry. `arith` has one loop and
+reported 21, so `nloops <= 1` was effectively false for every function longer than a
+few bytes: **the pin gate was off, which is why no pin ever took effect inside a
+loop.** Fix is `>= 0`.
+
+**2. With pins on, the result now depends on read order.** Same generated code - the
+token streams are byte-identical - but:
+
+    console.log(check); console.log(check);        -> 2398830 / 2398830  OK
+    console.log(ms);    console.log(check);        -> 0 / 406            WRONG
+    console.log(check); console.log(ms);           -> 406 / 0            WRONG
+    console.log(check * 1); console.log(ms * 1);   -> 2398830 / 142      OK
+
+Read it first with nothing before, and it is right; touch anything else first and it
+is stale; multiply by 1 and it refreshes. A copy survives somewhere unrefreshed.
+
+`check`/`ms` are top-level locals (interpreted, not compiled), so the corruption comes
+from `build`/`scan`, which pin both `i` and the return variable `s`. That is the same
+shape 7d9247b fixed for the old condition ("returning the pinned one unconditionally
+left the caller reading a register the value was never in - `return s` came back as
+the loop counter"), reintroduced by pinning the return variable again.
+
+Reverted to 38579bc; both findings are recorded rather than half-fixed.
