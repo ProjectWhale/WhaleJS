@@ -3238,6 +3238,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                 ta = cur[var_count + sp - 2];
                 tb = cur[var_count + sp - 1];
+                if (getenv("WHALE_JIT_DUMP"))
+                    fprintf(stderr, "[binop] pos=%d op=%d opid=%d ta=%d tb=%d numa=%d numb=%d\n",
+                            pos, op, opid, ta, tb, whale_type_is_num(ta), whale_type_is_num(tb));
                 if (opid < 0 || !whale_type_is_num(ta) || !whale_type_is_num(tb))
                     goto out;
                 if (is_cmp) {
