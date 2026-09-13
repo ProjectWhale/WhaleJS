@@ -146,6 +146,12 @@ enum {
                          function (a call target) or a property that is not a
                          number. Only a call may consume it - arithmetic on it
                          deopts, and that is what keeps it safe. */
+    WHALE_T_STRUCT = 10, /* an object slot whose observed shape set is settled, held
+                            as a C struct instead of a JSValue: no shape check, no
+                            tag branch, no heap chase, one load per field. A field
+                            that is not in every observed shape keeps its slot and
+                            gets a presence flag - reserving eight bytes is cheap
+                            next to the access it replaces. */
 };
 
 /* The object slot a type carries, packed into the same byte as the type.
@@ -166,10 +172,20 @@ enum {
 #define WHALE_VAL_T(slot)  ((uint8_t)(WHALE_T_VAL | (((slot) + 1) << 4)))
 #define WHALE_IS_VAL(t)    (((t) & 0x0f) == WHALE_T_VAL)
 #define WHALE_VAL_SLOT(t)  ((int)((t) >> 4) - 1)
+/* an unboxed struct: the same slot numbering, a different thing living in it */
+#define WHALE_STRUCT_T(slot) ((uint8_t)(WHALE_T_STRUCT | (((slot) + 1) << 4)))
+#define WHALE_IS_STRUCT(t)   (((t) & 0x0f) == WHALE_T_STRUCT)
+#define WHALE_STRUCT_SLOT(t) ((int)((t) >> 4) - 1)
+
 /* Anything that carries an object slot - a plain object, a packed array, or an
    arbitrary value - encodes the slot the same way, so one accessor serves all
    three. WHALE_T_VAL only exists because a value from a call is not a literal
-   whose shape we can see; the slot mechanics are identical. */
+   whose shape we can see; the slot mechanics are identical.
+
+   WHALE_T_STRUCT is deliberately NOT in here. It carries a slot number like the
+   others, but what sits in that slot is a C struct and not a JSValue, so every
+   existing site that would treat it as a parked value has to refuse it instead.
+   Leaving it out of this test is what makes that happen without touching them. */
 #define WHALE_IS_SLOT(t)   (WHALE_IS_OBJ(t) || WHALE_IS_ARR(t) || WHALE_IS_VAL(t))
 #define WHALE_SLOT(t)      ((int)((t) >> 4) - 1)
 
