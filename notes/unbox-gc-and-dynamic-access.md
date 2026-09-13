@@ -47,15 +47,44 @@ And the behaviour stays that of an ordinary object: **fields start out as
 that was never assigned. The presence flags already in the layout (`_sp`) are what make
 that expressible - absent means `undefined`, not "garbage".
 
+## 3. Reference counts: the correctness point
+
+Raised by the user, and it is the one that turns a performance change into a possible
+crash. quickjs is reference counted, and the helpers already follow a clear convention:
+
+    JS_WhaleObjSlot(k, v):   JS_FreeValue(ctx, slots[k]);  slots[k] = v;
+                             /* release what was there, take over the caller's ref */
+    JS_WhaleObjGet(k):       return js_dup(...);           /* hand back an owned ref */
+    JS_WhaleObjStoreValue:   JS_FreeValue(ctx, *dst); *dst = v;
+
+The existing code is correct because the slot owns exactly one reference. Once a
+struct holds a JSValue field, the same obligation applies to a place the engine does
+not know about, and it has to be met at every point:
+
+- **storing** into a field releases the old value before taking over the new one, the
+  same shape as above
+- **releasing the struct** releases every JSValue field it holds, exactly once
+- a field that was never assigned reads as `undefined` (see `_sp`), which is a
+  non-owning constant and must not be freed
+
+Getting this wrong does not show up as a wrong answer, it shows up much later as a
+use-after-free or a leak, which is why it belongs in the design and not in a later
+cleanup pass.
+
+Numeric fields sidestep it entirely - a double carries no reference - which is another
+reason the first version starts with objfields.
+
 ## What actually constrains the first version
 
-Not "all fields numeric". The constraints are:
+The constraints are:
 
 1. Every field access on the slot was observed monomorphic (already the candidate
    test), so the layout is known.
 2. The offset map exists before any dynamic access can reach the object, or the object
    is not unboxed.
 3. Whatever is attached to the object is released with it.
+4. Every JSValue held in a struct field is owned and released exactly once - see above.
 
-Order: objfields first (all-numeric, no dynamic access - the simplest case that proves
-the mechanism), then the map, then non-numeric fields.
+Order: objfields first (all-numeric, no dynamic access, no refcount obligation - the
+simplest case that proves the mechanism), then the map, then non-numeric fields, which
+is where point 4 starts to bite.
