@@ -60,6 +60,19 @@ typedef struct JSWhaleFuncInfo {
 #define WHALE_CALL_SLOTS (WHALE_OBJ_SLOTS - WHALE_CALL_BASE)
 /* object-property inline-cache pairs the generated code can declare */
 #define WHALE_FIELD_CACHE 24
+
+/* Unboxed struct slots. A slot whose observed shape set is settled holds its fields
+   as plain doubles in the frame instead of a heap object with a shape: one load per
+   field, no shape check, no tag branch, no pointer chase. The layout is the UNION of
+   the observed shapes, and a field that is not present in every one of them keeps its
+   slot plus a presence flag - reserving eight bytes each is cheap next to the access
+   it replaces, which is the whole argument for doing this at all.
+
+   Flat arrays rather than a generated struct type: indexing a fixed base by a
+   compile-time constant is the same single load, and it keeps the frame declaration
+   from having to be built dynamically. */
+#define WHALE_STRUCT_SLOTS  4
+#define WHALE_STRUCT_FIELDS 16
 /* property names the generator can reason about (object literals only) */
 #define WHALE_ATOM_MAX 32
 /* direct calls the generator records, to see which loops contain one */

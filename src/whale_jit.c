@@ -1904,6 +1904,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wk(JS_WK_UNSIGNED); wt_id("char"); wt('*'); wt_id("op"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
         wk(JS_WK_DOUBLE); wt_id("on"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
         wk(JS_WK_INT); wt_id("oi"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
+        /* unboxed struct fields, and a presence flag each: a field that only some of
+           the observed shapes carry still gets its slot here */
+        wk(JS_WK_DOUBLE); wt_id("sv"); wt('['); wt_int(WHALE_STRUCT_SLOTS * WHALE_STRUCT_FIELDS); wt(']'); wt(';');
+        wk(JS_WK_UNSIGNED); wt_id("char"); wt_id("sp"); wt('['); wt_int(WHALE_STRUCT_SLOTS * WHALE_STRUCT_FIELDS); wt(']'); wt(';');
     wt('}'); wt_id("_ws"); wt('='); wt('{'); wt_int(0); wt('}'); wt(';');
     /* 1, because a cached fv[] of 0 (from that zero initialiser) must not look
        like the current generation. */
