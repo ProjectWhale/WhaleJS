@@ -94,6 +94,39 @@ pointer chase. 7 -> 1. Order of magnitude 3-4x, i.e. objfields 156ms -> 50-70ms.
 ## Order of work
 
 1. ~~Measure first.~~ Done, above. The direction is worth doing.
+
+### Which cases this actually helps - checked before writing code
+
+Counting array element stores across the perftest cases:
+
+    array            stores=1
+    list_reconcile   stores=1
+    nested2d         stores=2
+    sieve            stores=2
+    objfields        0
+    vnode_build      0
+
+**objfields and vnode_build do not store into arrays at all.** They build one object
+into a local (`var o = make()`) and update its fields. So unboxing array *elements*
+helps array, list_reconcile, nested2d and sieve - and does nothing for the two cases
+this line of work has been chasing.
+
+What those two need is the same idea applied to a **local object variable**:
+`var o = { tag: 0, ... }` becoming `struct { double tag, key, flags, depth; } o;` with
+the shape check and the pointer chase gone. No array involved. The observation
+question is identical - did this object ever hold more than one shape, did it escape -
+and the measurement above (7 memory operations per field access at 4.6 cycles each) is
+what says it is worth 3-4x.
+
+Two targets, one mechanism, one give-up rule:
+
+| target | cases | what unboxes |
+| --- | --- | --- |
+| local object variable | objfields, vnode_build | the object |
+| array elements | array, list_reconcile, nested2d, sieve | the element |
+
+Start with the local object, because that is where the measured cost is.
+
 2. **Not a narrow scene.** An earlier draft of this said "non-escaping, single-shape
    arrays only", which was a slide back into static analysis - and it is not needed.
    The whole point of the observation machinery is that the JIT knows what actually
