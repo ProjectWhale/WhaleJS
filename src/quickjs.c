@@ -19622,7 +19622,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        past the atom operand, so pc - 4 is the site's offset - the
                        same key the generator uses. */
                     if (unlikely(b->whale_prof_on))
-                        whale_prof_record(b, (uint32_t)(pc - 4), p->shape);
+                        whale_prof_record(b, (uint32_t)(pc - 4 - b->byte_code_buf), p->shape);
                     for(;;) {
                         prs = find_own_property(&pr, p, atom);
                         if (prs) {
@@ -20967,7 +20967,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        past the atom operand, so pc - 4 is the site's offset - the
                        same key the generator uses. */
                     if (unlikely(b->whale_prof_on))
-                        whale_prof_record(b, (uint32_t)(pc - 4), p->shape);
+                        whale_prof_record(b, (uint32_t)(pc - 4 - b->byte_code_buf), p->shape);
                     for(;;) {
                         prs = find_own_property(&pr, p, atom);
                         if (prs) {
@@ -21021,7 +21021,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        past the atom operand, so pc - 4 is the site's offset - the
                        same key the generator uses. */
                     if (unlikely(b->whale_prof_on))
-                        whale_prof_record(b, (uint32_t)(pc - 4), p->shape);
+                        whale_prof_record(b, (uint32_t)(pc - 4 - b->byte_code_buf), p->shape);
                     for(;;) {
                         prs = find_own_property(&pr, p, atom);
                         if (prs) {
