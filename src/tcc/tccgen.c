@@ -7099,6 +7099,15 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
                 if (getenv("WHALE_PIN_DBG"))
                     fprintf(stderr, "[pin] alloc loc=%d -> reg=%d\n", (int)addr, pr);
                 if (pr >= 0) {
+                    /* Point the symbol at the register, the same way the
+                       asm("reg") path at 7092 does. Without this the symbol
+                       table still believes the local lives in its frame slot
+                       while the value is actually in a register, and every
+                       access has to be patched by hand - which is how reads
+                       could be missed and quietly return a stale slot. Making
+                       sym->r authoritative is what lets TinyCC's own gv()/store
+                       handle it. */
+                    sym->r = (sym->r & ~(VT_VALMASK | VT_LVAL)) | pr;
                     sym->pin_reg = pr + 1;
                     if (whale_pin_n < 16) {
                         whale_pin_loc[whale_pin_n] = addr;
