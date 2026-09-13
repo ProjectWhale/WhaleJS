@@ -1161,7 +1161,7 @@ PARTIAL + PLAN
 4. **B2 寄存器保留**（收益最大但风险高）
 5. **C2 分块 JIT**（受众最广，但依赖 C5）
 6. **B3 SIMD**（特定场景爆发力强）
-# <55>: 混合编译（单指令 fallback）实施与止步：loop buffer 越界写 + `JS_NewArray` 在 JIT 帧内返回 UNINITIALIZED
+# <55>: 混合编译（单指令 fallback）实施与止步：loop buffer 越界写 + fallback 接线引入内存破坏
 
 UNRESOLVED
 
@@ -1173,6 +1173,8 @@ UNRESOLVED
 
 2. **`JS_NewArray` 在 JIT 帧内返回 `{tag=-1, ptr=有效堆指针}`（= `JS_TAG_UNINITIALIZED`）**。`JS_IsException()` 不拦它，于是这个值被停进对象槽、又被当作对象交给 `JS_SetPropertyValue` → `objshape`/`nested2d` 运行期 0xC0000005。`JS_NewArray` 本身只有三行（`JS_NewObjectFromShape(ctx, js_dup_shape(ctx->array_shape), JS_CLASS_ARRAY, NULL)`），而同一进程里解释器调用它上百次都正常。
 
-   **已排除**（都是实测，不是推理）：`cur_sp` 借用（改成 NULL 结果完全一样）、对象槽机制本身（`object`/`objfields`/`array` 都正确且未变）、<46> 的帧尺寸顺序问题（`whale_jit_ready` 仍然在管）、`whale_frame_obj_slots`/`JS_WhaleObjSlot`/`JS_WhaleArrNew`（读写都正确）、以及"fallback 没被 emit"（`[emit] called op=72 pos=66 sp=3` 已确认执行）。**未解**。
+   **已排除**（都是实测，不是推理）：`cur_sp` 借用（改成 NULL 结果完全一样）、对象槽机制本身（`object`/`objfields`/`array` 都正确且未变）、<46> 的帧尺寸顺序问题（`whale_jit_ready` 仍然在管）、`whale_frame_obj_slots`/`JS_WhaleObjSlot`/`JS_WhaleArrNew`（读写都正确）、以及"fallback 没被 emit"（`[emit] called op=72 pos=66 sp=3` 已确认执行）。
 
-工作树已回退到最后绿色提交（`loop_begin` 的修复保留）；完整工作 diff 存于 `temp/whale_step_work.patch`（58KB，含引擎侧执行器 + 生成器接线 + 全部诊断）。详见 notes/whale-step-investigation.md。
+   **⚠️ 结论修正**：上面那条 `JS_NewArray` 的"异常"是**症状，不是根因**。在 `JS_WhaleArrNew` 里加**一行无关的** `JS_NewObject(ctx)`，崩溃与错误 tag **一起消失**（`A check=66`，与 node 一致），去掉又回来 —— 这是内存破坏的指纹。另外 TinyCC 在接线状态下对三行复现报 `duplicate label 'L14'`，而**同一复现在基线上是干净的**（`h check=5`，与 node 一致）。所以要查的是 **`whale_step_emit` 周围的 emit 流与生成期状态**（它在 case 体里调 `fold_materialize()` 与 `fold_mark()/fold_commit()`，那里可能已经有 label 被 emit 过），不是引擎 helper。
+
+工作树已回退到最后绿色提交（`loop_begin` 的修复保留）；完整工作 diff 存于 `temp/whale_step_work.patch`（UTF-16 原始）与 `temp/whale_step_work_u8.patch`（转成 UTF-8，`git apply --check` 可解析；对 `86e5a52` 应用时只有两处已知冲突：`JS_WhaleArrNew` 的旧诊断块、`loop_begin` 的修复前版本）。详见 notes/whale-step-investigation.md。

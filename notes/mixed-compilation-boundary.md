@@ -30,18 +30,16 @@ understands.
 
 1. **The pc must be the bytecode offset of the instruction.** The generator is walking
    the bytecode and knows it.
-2. **The operand stack must agree.** The generated code models it in `_ws.v[]` and by
-   the compiler's own type tracking; the VM expects the live stack. Where the two
-   differ, the difference has to be settled at the boundary - either the values are in
-   the frame's stack area already, or they are written there before the call.
-3. **Locals must agree.** The generated code has its own names for locals; the VM reads
-   `var_buf`. Same question, same boundary.
-4. **The result must come back.** Whatever the instruction pushed has to be visible to
-   the code that follows, in the representation the generator tracks.
+2. **Nothing else.** The stack, the arguments and the locals are all on the frame,
+   in memory, and the generated code can reach all of it. There is no separate
+   representation to convert and nothing to write back: hand the engine the frame
+   pointer and let it run the instruction. (Corrected by the user - the earlier
+   version of this note proposed marshalling between two representations, which is
+   not how it works here.)
 
-Points 2 and 3 are where the work is, and they are worth settling before writing
-emission code, because getting them wrong produces exactly the class of bug this whole
-work has been fighting: a wrong answer that looks like a slow path.
+That is what makes the fallback cheap enough to be the default: the interpreter and
+the native code are looking at one set of values, so crossing between them is a
+pointer, not a copy.
 
 ## Order
 

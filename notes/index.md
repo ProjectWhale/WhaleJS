@@ -200,7 +200,7 @@ token streams are byte-identical - but:
 Read it first with nothing before, and it is right; touch anything else first and it
 is stale; multiply by 1 and it refreshes. A copy survives somewhere unrefreshed.
 
-## <55> Mixed compilation: the fallback was built and made 10 more cases compile - then hit `JS_NewArray` inside a JIT frame
+## <55> Mixed compilation: the fallback made 10 more cases compile - then its wiring corrupted memory
 
 Detailed write-up in `notes/whale-step-investigation.md`, and `notes/current.md` <55>.
 The general fallback of `notes/mixed-compilation-boundary.md` was implemented end to
