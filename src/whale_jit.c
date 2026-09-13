@@ -3057,6 +3057,21 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 goto out;
             {
                 int fm;
+                int pow2 = 0;
+
+                /* A divisor that is a compile-time power of two lets the whole
+                   modulo become a mask. The value is readable the same way
+                   fold_toint32 reads an iconst: a single-token expression that is
+                   not a named variable is a literal, and its value sits in gw_num.
+                   This is the shape `(a + i * 3) % 65536` has. */
+                if (tb == WHALE_T_ICONST && !whale_vmat[sp - 1] &&
+                    whale_vexpr[sp - 1].len == 1) {
+                    double bv = gw_num[whale_vexpr[sp - 1].off];
+
+                    if (bv > 0 && bv <= 2147483648.0 && bv == (double)(long long)bv &&
+                        (((long long)bv & ((long long)bv - 1)) == 0))
+                        pow2 = (int)bv;
+                }
 
                 /* The form fold_mod emits mentions each operand up to four times
                    (two range tests, the fast path, the fmod fallback), so give
@@ -3071,7 +3086,28 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 if (!whale_vmat[sp - 1])
                     fold_materialize(sp - 1);
                 fm = fold_mark();
-                fold_mod(sp - 2, sp - 1);
+                if (pow2 > 0) {
+                    /* `% 2^k` is `& (2^k - 1)`, and idiv is the slowest integer
+                       instruction there is - about 26 cycles against 1. The
+                       reduction only holds for a non-negative dividend: JS's %
+                       takes the sign of the dividend (-1 % 4 is -1) while the mask
+                       does not (-1 & 3 is 3), and -0 stays -0 rather than 0. So
+                       test `> 0` and leave fmod on the cold branch, exactly the
+                       guard fold_mod already uses.
+                       Measured before this: (a + i*3) % 65536 ran 113ms against
+                       node's 11ms. V8 reaches 11ms by doing precisely this, so the
+                       idiv was the whole gap - there was no boxing left to remove.
+                       Plain C shows the same thing: guarded idiv 1776ms, bare idiv
+                       1781ms, fmod 3028ms per 2e8 operations. The guard is free. */
+                    wt('('); fold_inline(sp - 2); wt_op(JS_OP_GT); wt_int(0); wt(')');
+                    wt('?'); wt('('); wk(JS_WK_DOUBLE); wt(')');
+                    wt('('); wt('('); wk(JS_WK_INT); wt(')'); fold_inline(sp - 2);
+                    wt('&'); wt_int(pow2 - 1); wt(')');
+                    wt(':'); wt_id("fmod"); wt('('); fold_inline(sp - 2);
+                    wt(','); wt_int(pow2); wt(')');
+                } else {
+                    fold_mod(sp - 2, sp - 1);
+                }
                 fold_set(sp - 2, fm);
             }
             cur[var_count + sp - 2] = WHALE_T_NUM;
