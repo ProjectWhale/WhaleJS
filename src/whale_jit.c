@@ -1738,6 +1738,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleObjDefineValue"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(',');
         wk(JS_WK_INT); wt_id("atom"); wt(','); wk(JS_WK_INT); wt_id("val_slot"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleObjStoreValue"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(',');
+        wk(JS_WK_INT); wt_id("atom"); wt(','); wk(JS_WK_INT); wt_id("val_slot"); wt(',');
+        wk(JS_WK_VOID); wt('*'); wt('*'); wt_id("shape_cache"); wt(',');
+        wk(JS_WK_VOID); wt('*'); wt('*'); wt_id("ptr_cache"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleCpoolSlot"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("idx"); wt(',');
         wk(JS_WK_INT); wt_id("k"); wt(')'); wt(';');
@@ -2592,9 +2597,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     fprintf(stderr, "[put] pos=%d ta=%d slot=%d tb=%d isnum=%d fields=%d isobj=%d\n",
                             pos, ta, WHALE_IS_SLOT(ta), tb, whale_type_is_num(tb),
                             whale_fields, WHALE_IS_OBJ(ta));
-                if (!WHALE_IS_SLOT(ta) || !whale_type_is_num(tb))
+                if (!WHALE_IS_SLOT(ta))
                     goto out;
                 if (whale_fields >= WHALE_FIELD_CACHE)
+                    goto out;
+                if (!whale_type_is_num(tb) && !WHALE_IS_VAL(tb))
                     goto out;
                 {
                     int fc = whale_fields++;
@@ -2607,11 +2614,25 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     fold_obj_field_resolve(WHALE_SLOT(ta), atom, fc,
                                            (whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1))) && WHALE_IS_OBJ(ta));
                     fm = fold_mark();
-                    /* the value is a double here, and the old one was a number too
-                       (anything else deopted above) */
-                    wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt('='); wt_int(8); wt(';');
-                    wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64"); wt('=');
-                    fold_inline(sp - 1); wt(';');
+                    if (whale_type_is_num(tb)) {
+                        /* the value is a double here, and the old one was a number
+                           too (anything else deopted above) */
+                        wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt('='); wt_int(8); wt(';');
+                        wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64"); wt('=');
+                        fold_inline(sp - 1); wt(';');
+                    } else {
+                        /* an opaque value - a string, a null, a value from a call.
+                           Hand the store to the engine rather than abandon the
+                           function; the cache pair is what the resolve above filled
+                           in for the numeric path too. */
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjStoreValue"); wt('(');
+                        wt_id("ctx"); wt(','); wt_int(WHALE_SLOT(ta)); wt(','); wt_int(atom); wt(',');
+                        wt_int(WHALE_VAL_SLOT(tb)); wt(',');
+                        wt('&'); wt_arr("fs", fc); wt(','); wt('&'); wt_arr("fp", fc);
+                        wt(')'); wt(')'); wt('{');
+                        wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    }
                     fold_commit(fm);
                 }
                 sp -= 2;
@@ -3893,6 +3914,7 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
         tcc_add_symbol(s, "JS_WhaleObjDefineValue", (void *)JS_WhaleObjDefineValue);
         tcc_add_symbol(s, "JS_WhaleBinopVal", (void *)JS_WhaleBinopVal);
         tcc_add_symbol(s, "JS_WhaleCpoolSlot", (void *)JS_WhaleCpoolSlot);
+        tcc_add_symbol(s, "JS_WhaleObjStoreValue", (void *)JS_WhaleObjStoreValue);
         tcc_add_symbol(s, "JS_WhaleObjNew", (void *)JS_WhaleObjNew);
         tcc_add_symbol(s, "JS_WhaleObjShape", (void *)JS_WhaleObjShape);
         tcc_add_symbol(s, "JS_WhaleObjFieldPtr", (void *)JS_WhaleObjFieldPtr);

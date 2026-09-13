@@ -8213,6 +8213,48 @@ int JS_WhaleObjStoreNum(JSContext *ctx, int slot, int atom, double v,
     return 1;
 }
 
+/* Store an opaque parked value into a property. JS_WhaleObjStoreNum is the numeric
+   twin and keeps the value inline as a float64; a record whose field holds a string
+   or a null needs this one. Without it the field store gave up and took the whole
+   function with it. The shape/pointer cache pair is the caller's, shared with the
+   resolve path. */
+int JS_WhaleObjStoreValue(JSContext *ctx, int slot, int atom, int val_slot,
+                          void **shape_cache, void **ptr_cache)
+{
+    JSValue *slots = whale_frame_obj_slots(ctx);
+    JSValue o = slots[slot];
+    JSObject *p;
+    JSValue *dst;
+
+    if (JS_VALUE_GET_TAG(o) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(o);
+    if (p->shape == *shape_cache) {
+        dst = *ptr_cache;
+    } else {
+        JSProperty *pr;
+        JSShapeProperty *prs;
+
+        if (p->class_id != JS_CLASS_OBJECT)
+            return 0;
+        prs = find_own_property(&pr, p, atom);
+        if (!prs)
+            return 0;
+        if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+            return 0;
+        dst = &pr->u.value;
+        *shape_cache = p->shape;
+        *ptr_cache = dst;
+    }
+    {
+        JSValue v = js_dup(slots[val_slot]);
+
+        JS_FreeValue(ctx, *dst);
+        *dst = v;
+    }
+    return 1;
+}
+
 /* Release a counted reference an open var_ref held on the coroutine
    (async function / generator / async generator) owning the frame it
    points into. */

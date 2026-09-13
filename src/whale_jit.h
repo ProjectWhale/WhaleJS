@@ -167,6 +167,8 @@ int JS_WhaleArrBind(JSContext *ctx, int slot, JSValue *args, int idx);
    the value is neither an int32 nor a float64. */
 double JS_WhaleObjFieldNum(JSContext *ctx, int slot, int atom,
                            void **shape_cache, void **ptr_cache, int *deopt);
+JS_EXTERN int JS_WhaleObjStoreValue(JSContext *ctx, int slot, int atom, int val_slot,
+                                    void **shape_cache, void **ptr_cache);
 int JS_WhaleObjStoreNum(JSContext *ctx, int slot, int atom, double v,
                         void **shape_cache, void **ptr_cache);
 
