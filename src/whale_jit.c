@@ -1608,6 +1608,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        and snapshotted at every jump target. */
     int whale_field_sites[WHALE_ATOM_MAX];
     int whale_field_sites_n = 0;
+    /* The layout of an unboxed struct: which atom sits in which column, plus the
+       object slot index it was laid out for. Filled when OP_object creates one, read
+       by every field access on that slot. */
+    int whale_str_atoms[WHALE_STRUCT_FIELDS];
+    int whale_str_n = 0;
+    int whale_str_slot = -1;
     int whale_nloops = 0;   /* backward jumps; more than one means nesting */
 
     if (!info->is_normal)
