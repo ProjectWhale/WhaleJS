@@ -1543,6 +1543,14 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     int whale_put_atoms_n = 0;
     int whale_call_pos[WHALE_CALL_MAX];
     int whale_call_n = 0;
+    /* every field access site in this function, as the offset the profile table is
+       keyed by (opcode offset + 1). The candidate test is asked at the FUNCTION
+       level - "was every field access here observed monomorphic" - rather than per
+       object, because both cases with a measurement behind them build exactly one
+       object, and per-object would need a provenance array kept in step with cur[]
+       and snapshotted at every jump target. */
+    int whale_field_sites[WHALE_ATOM_MAX];
+    int whale_field_sites_n = 0;
     int whale_nloops = 0;   /* backward jumps; more than one means nesting */
 
     if (!info->is_normal)
