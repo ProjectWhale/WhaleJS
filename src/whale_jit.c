@@ -1269,6 +1269,49 @@ static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
             }
             break;
 
+/* Hand a binary operation to the engine when one operand is opaque.
+
+   The generator refuses an operator as soon as a side is not a number, and that one
+   refusal used to cost the whole function - a vnode record keeps a string key, so it
+   never compiled at all. The engine has the real semantics in its js_*_slow
+   functions; the values are already parked in slots, so all that is missing is the
+   call. Numeric sides are materialised into a slot first, then the operation runs and
+   the result is parked, keeping the value opaque (WHALE_T_VAL) as it should be.
+
+   A macro rather than a function because whale_objs, cur and var_count are locals of
+   whale_jit_gen. `ok` is set to 0 when there is no room to park the values, and the
+   caller then falls back to giving up. */
+#define WHALE_EMIT_BINOP_VAL(op, ta, tb, ia, ib, ok)                      \
+    do {                                                                  \
+        int _sa, _sb, _os, _fm;                                           \
+        ok = 0;                                                           \
+        if (whale_objs + 3 <= WHALE_CALL_BASE) {                          \
+            _sa = WHALE_IS_VAL(ta) ? WHALE_VAL_SLOT(ta) : whale_objs++;   \
+            _sb = WHALE_IS_VAL(tb) ? WHALE_VAL_SLOT(tb) : whale_objs++;   \
+            _os = whale_objs++;                                           \
+            _fm = fold_mark();                                            \
+            if (!WHALE_IS_VAL(ta)) {                                      \
+                wt_id("JS_WhaleObjSlotNum"); wt('('); wt_id("ctx");       \
+                wt(','); wt_int(_sa); wt(',');                            \
+                fold_inline(ia); wt(')'); wt(';');                        \
+            }                                                             \
+            if (!WHALE_IS_VAL(tb)) {                                      \
+                wt_id("JS_WhaleObjSlotNum"); wt('('); wt_id("ctx");       \
+                wt(','); wt_int(_sb); wt(',');                            \
+                fold_inline(ib); wt(')'); wt(';');                        \
+            }                                                             \
+            wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleBinopVal");    \
+            wt('('); wt_id("ctx"); wt(','); wt_int(op); wt(',');          \
+            wt_int(_sa); wt(','); wt_int(_sb); wt(','); wt_int(_os);      \
+            wt(')'); wt(')'); wt('{');                                    \
+            wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');         \
+            wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');                \
+            fold_commit(_fm);                                             \
+            cur[var_count + ia] = WHALE_VAL_T(_os);                       \
+            ok = 1;                                                       \
+        }                                                                 \
+    } while (0)
+
         case OP_add: case OP_sub: case OP_mul: case OP_div:
             {
                 int opid = (op == OP_add) ? JS_OP_ADD : (op == OP_sub) ? JS_OP_SUB :
@@ -3238,11 +3281,23 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                 ta = cur[var_count + sp - 2];
                 tb = cur[var_count + sp - 1];
-                if (getenv("WHALE_JIT_DUMP"))
-                    fprintf(stderr, "[binop] pos=%d op=%d opid=%d ta=%d tb=%d numa=%d numb=%d\n",
-                            pos, op, opid, ta, tb, whale_type_is_num(ta), whale_type_is_num(tb));
-                if (opid < 0 || !whale_type_is_num(ta) || !whale_type_is_num(tb))
+                if (opid < 0)
                     goto out;
+                if (!whale_type_is_num(ta) || !whale_type_is_num(tb)) {
+                    /* One operand is opaque - a string, a null, a value from a call.
+                       That used to abandon the whole function; the engine can do the
+                       operation properly, so hand it over and carry on. This is what
+                       lets a vnode record, whose key is a string, stay compiled. */
+                    {
+                        int _okv;
+
+                        WHALE_EMIT_BINOP_VAL(op, ta, tb, sp - 2, sp - 1, _okv);
+                        if (!_okv)
+                            goto out;
+                    }
+                    sp--;
+                    break;
+                }
                 if (is_cmp) {
                     int fm = fold_mark();
 

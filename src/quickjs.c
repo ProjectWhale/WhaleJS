@@ -17693,6 +17693,59 @@ static no_inline int js_strict_eq_slow(JSContext *ctx, JSValue *sp,
     return 0;
 }
 
+/* WhaleJS: run a real JS binary operation on two parked values and park the result.
+   The generated code gives up on an operator as soon as one operand is opaque -
+   `!whale_type_is_num(ta) || !whale_type_is_num(tb)` - which is what kept a vnode
+   record (a string key) out of the JIT. The engine already has the semantics in its
+   js_*_slow functions; this is just the door into them from generated code.
+
+   Both inputs are taken by reference from their slots and released here; the slow
+   functions consume them and leave the result in sp[0]. */
+int JS_WhaleBinopVal(JSContext *ctx, int op, int a_slot, int b_slot, int out_slot)
+{
+    JSValue *slots = whale_frame_obj_slots(ctx);
+    JSValue v[2];
+    int rc;
+
+    v[0] = js_dup(slots[a_slot]);
+    v[1] = js_dup(slots[b_slot]);
+    switch (op) {
+    case OP_add:
+        rc = js_add_slow(ctx, v);
+        break;
+    case OP_sub: case OP_mul: case OP_div: case OP_mod: case OP_pow:
+        rc = js_binary_arith_slow(ctx, v, (OPCodeEnum)op);
+        break;
+    case OP_and: case OP_or: case OP_xor: case OP_shl: case OP_sar:
+    case OP_shr:
+        rc = js_binary_logic_slow(ctx, v, (OPCodeEnum)op);
+        break;
+    case OP_lt: case OP_lte: case OP_gt: case OP_gte:
+        rc = js_relational_slow(ctx, v, (OPCodeEnum)op);
+        break;
+    case OP_neq:
+        rc = js_eq_slow(ctx, v, 1);
+        break;
+    case OP_eq:
+        rc = js_eq_slow(ctx, v, 0);
+        break;
+    case OP_strict_neq:
+        rc = js_strict_eq_slow(ctx, v, 1);
+        break;
+    case OP_strict_eq:
+        rc = js_strict_eq_slow(ctx, v, 0);
+        break;
+    default:
+        JS_FreeValue(ctx, v[0]);
+        JS_FreeValue(ctx, v[1]);
+        return 0;
+    }
+    if (rc)
+        return 0;                       /* exception; the caller deopts */
+    JS_WhaleObjSlot(ctx, out_slot, v[0]);   /* takes ownership */
+    return 1;
+}
+
 static __exception int js_operator_in(JSContext *ctx, JSValue *sp)
 {
     JSValue op1, op2;

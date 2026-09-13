@@ -96,6 +96,10 @@ void JS_WhaleObjSlot(JSContext *ctx, int k, JSValue v);   /* park object in slot
    to abandon the whole function; these are the two instructions that do it most. */
 void JS_WhaleObjSlotNull(JSContext *ctx, int k);
 int  JS_WhaleObjSlotAtom(JSContext *ctx, int atom, int k);
+/* Apply a real JS binary operator to two parked values (see quickjs.c). Returns 0 on
+   exception, in which case the generated code must deopt. */
+JS_EXTERN int JS_WhaleBinopVal(JSContext *ctx, int op, int a_slot, int b_slot,
+                               int out_slot);
 JSValue JS_WhaleObjGet(JSContext *ctx, int k);            /* read it back */
 /* Park a plain number in slot k, so it can be a call argument (JS_Call takes
    JSValues, and an argument has to stay visible to GC while the callee runs). */
