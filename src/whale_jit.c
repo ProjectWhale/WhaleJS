@@ -1670,7 +1670,16 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     {
         int pin1 = -1, pin2 = -1, k;
 
-        if (!whale_has_call) {
+        /* DISABLED: pinning is correct now but not profitable. Measured with
+           temp/measure.ps1 (minimum of several runs): nested +11%,
+           immutable_update +9%, sieve +6%, loop_sum +5%, against minmax -4%
+           and array -5%. Two structural costs: every xmm is caller-saved so a
+           pinned value is spilled at every call and reloaded after, and each
+           pinned register is one less for TinyCC's own expression evaluation.
+           Kept because the mechanism and its fixes are real (see cb87bf1) and
+           because an ABI with non-volatile float registers would make it pay.
+           See notes/pinning-design.md. */
+        if (0) {
             for (k = 0; k < var_count; k++)
                 if (induction[k] && (pin1 < 0 || assign_cnt[k] > assign_cnt[pin1]))
                     pin1 = k;
