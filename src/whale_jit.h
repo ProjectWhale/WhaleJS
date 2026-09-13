@@ -92,6 +92,10 @@ int JS_WhaleOpSize(int op);   /* bytecode operand size, from the interpreter tab
    helper call (see WHALE_OBJ_SLOTS above). The engine implements these against
    the calling frame, so the generated code does not have to pass an address. */
 void JS_WhaleObjSlot(JSContext *ctx, int k, JSValue v);   /* park object in slot k */
+/* Park a null, or the value of an atom, in an object slot. Pushing a non-number used
+   to abandon the whole function; these are the two instructions that do it most. */
+void JS_WhaleObjSlotNull(JSContext *ctx, int k);
+int  JS_WhaleObjSlotAtom(JSContext *ctx, int atom, int k);
 JSValue JS_WhaleObjGet(JSContext *ctx, int k);            /* read it back */
 /* Park a plain number in slot k, so it can be a call argument (JS_Call takes
    JSValues, and an argument has to stay visible to GC while the callee runs). */

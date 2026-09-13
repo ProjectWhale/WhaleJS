@@ -3135,6 +3135,26 @@ void JS_WhaleObjSlot(JSContext *ctx, int k, JSValue v)
     slots[k] = v;
 }
 
+/* Park a non-numeric JSValue in an object slot. Every pushed value that is not a
+   number used to be a reason to abandon the function; these two are the common ones,
+   and they let the generator carry a string or a null through the value stack as an
+   opaque slot - which is exactly what the call path already does for a live result
+   it cannot do arithmetic on. Ownership transfers, like JS_WhaleObjSlot. */
+void JS_WhaleObjSlotNull(JSContext *ctx, int k)
+{
+    JS_WhaleObjSlot(ctx, k, JS_NULL);
+}
+
+int JS_WhaleObjSlotAtom(JSContext *ctx, int atom, int k)
+{
+    JSValue v = JS_AtomToValue(ctx, atom);
+
+    if (JS_IsException(v))
+        return 0;
+    JS_WhaleObjSlot(ctx, k, v);
+    return 1;
+}
+
 /* Read slot k back, adding a reference for the caller. */
 JSValue JS_WhaleObjGet(JSContext *ctx, int k)
 {

@@ -2421,6 +2421,56 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             }
             break;
 
+        /* The two instructions that push a value the generator cannot do arithmetic
+           on. Neither is a failure: the value is parked in an object slot as an
+           opaque JSValue, exactly as the call path already parks a live result, and
+           the type carries WHALE_T_VAL so anything downstream that does need a
+           number refuses instead of computing something wrong.
+
+           Abandoning the whole function over these is what kept vnode_build out of
+           the JIT entirely - a vnode record holds a string key and a null initial
+           value, so both instructions appear before the first field store. */
+        case OP_null:
+            {
+                int os;
+
+                if (whale_objs >= WHALE_CALL_BASE)
+                    goto out;
+                os = whale_objs++;
+                {
+                    int fm = fold_mark();
+
+                    wt_id("JS_WhaleObjSlotNull"); wt('('); wt_id("ctx"); wt(',');
+                    wt_int(os); wt(')'); wt(';');
+                    fold_commit(fm);
+                }
+                cur[var_count + sp] = WHALE_VAL_T(os);
+                sp++;
+            }
+            break;
+
+        case OP_push_atom_value:
+            {
+                int atom = (int)whale_get_u32(pc + pos + 1);
+                int os;
+
+                if (whale_objs >= WHALE_CALL_BASE)
+                    goto out;
+                os = whale_objs++;
+                {
+                    int fm = fold_mark();
+
+                    wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjSlotAtom"); wt('(');
+                    wt_id("ctx"); wt(','); wt_int(atom); wt(','); wt_int(os); wt(')'); wt(')');
+                    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    fold_commit(fm);
+                }
+                cur[var_count + sp] = WHALE_VAL_T(os);
+                sp++;
+            }
+            break;
+
         /* obj value -> obj */
         case OP_define_field:
             {
