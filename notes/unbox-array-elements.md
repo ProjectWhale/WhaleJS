@@ -61,11 +61,39 @@ So this extends the observation table from "property access sites" to "array ele
 types", and adds a code path that emits a struct-typed backing store plus indexed
 member access instead of the `_ws.fv/fs/fp` sequence.
 
+## The measurement, done (WHALE_JIT_SRC on objfields)
+
+The generated loop body, with the operators stripped out by the mirror (wt_op is not
+mirrored, so they show as blanks):
+
+    L5 : ( L1 <op> A0 ) ? 1 : 0 ... L68 ;        <- loop head
+    ( _ws.fv[0] <op> _ws.fver <op> _ws.fs[0] <op> JS_WhaleObjShape(ctx,2) ) {
+        _ws.fp[0] = JS_WhaleObjFieldPtr(ctx, 2, 682, &_ws.fs[0]);
+        _ws.fv[0] = _ws.fver;
+        ...
+    }
+    _ws.fp[0]->tag = 8;
+    _ws.fp[0]->u.float64 = _ws.v[2];
+
+Steady state, per field access:
+
+    3 loads  - _ws.fv[fc], _ws.fver, _ws.fs[fc]   (the shape check; JS_WhaleObjShape
+                                                   sits on the right of || and does
+                                                   not run on a hit)
+    2 loads  - _ws.fp[fc], twice, for tag and for u.float64
+    2 stores - tag, u.float64
+
+So ~7 memory operations per field, 4 fields, ~28 per iteration. At 156ms / 4M
+iterations that is ~130 cycles, or ~4.6 cycles per memory operation - which is what
+memory operations cost. The field-access sequence is the whole cost; nothing else in
+the loop is close.
+
+After unboxing, per field: 1 load (`v[i].depth`), no shape check, no tag branch, no
+pointer chase. 7 -> 1. Order of magnitude 3-4x, i.e. objfields 156ms -> 50-70ms.
+
 ## Order of work, as I would do it
 
-1. **Measure first.** Establish how much of objfields' 156ms is the field-access
-   sequence and how much is everything else. If the shape/version/pointer loads are
-   not the bulk, this direction is worth much less than it looks.
+1. ~~Measure first.~~ Done, above. The direction is worth doing.
 2. Non-escaping, single-shape arrays whose elements are only ever touched through
    integer indices and field accesses - the narrow case that covers vnode_build.
 3. Only then consider generalising.
