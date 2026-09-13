@@ -1679,7 +1679,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
            Kept because the mechanism and its fixes are real (see cb87bf1) and
            because an ABI with non-volatile float registers would make it pay.
            See notes/pinning-design.md. */
-        if (0) {
+        if (1) {
             for (k = 0; k < var_count; k++)
                 if (induction[k] && (pin1 < 0 || assign_cnt[k] > assign_cnt[pin1]))
                     pin1 = k;

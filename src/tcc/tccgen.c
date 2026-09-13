@@ -978,20 +978,27 @@ static int whale_pin_alloc(int t)
 
     if (!is_float(t))
         return -1;
-    /* Highest first: get_reg() scans upwards, so this stays out of its way.
-       Stop at 18 to leave xmm0/xmm1 free - TinyCC needs somewhere to put
-       constants and intermediate results, and pinning away every float
-       register leaves get_reg() with nothing to spill and returns -1, which
-       is how minmax (five locals, two nested loops) ended up looping for
-       ever with the counter never advancing. */
-    for (r = NB_REGS - 1; r >= 18; r--) {
-        if ((reg_classes[r] & RC_FLOAT) != 0) {
-            if ((whale_pinned_regs & (1u << r)) == 0) {
-                whale_pinned_regs |= 1u << r;
-                return r;
-            }
+#ifdef _WIN32
+    /* xmm6 and xmm7 (indices 22 and 23) are callee-saved on Windows x64 - the
+       register table says so in its own words. A value parked in one of them
+       survives every call with no instruction from us at all, which removes the
+       cost that made pinning unprofitable: on the caller-saved xmm2-xmm5 a pinned
+       value had to be spilled before every call and reloaded after, and the cases
+       whose timings regressed most were exactly the ones that call most.
+       Two registers only, but they cost nothing to hold. */
+    for (r = 23; r >= 22; r--) {
+        if ((whale_pinned_regs & (1u << r)) == 0) {
+            if (getenv("WHALE_PIN_DBG"))
+                fprintf(stderr, "[pin] alloc reg=%d (callee-saved xmm%d) fn=%s\n",
+                        r, r - 16, funcname ? funcname : "?");
+            whale_pinned_regs |= 1u << r;
+            return r;
         }
     }
+#endif
+    /* Everywhere else every float register is caller-saved, so a pinned value
+       would need a spill at each call - measured as a net loss. Compiled out
+       rather than left as a silent no-op. */
     return -1;
 }
 
