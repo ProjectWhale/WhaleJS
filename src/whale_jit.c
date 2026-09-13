@@ -245,6 +245,9 @@ static TCCState *whale_jit_state;
 static unsigned whale_jit_seq;
 /* TCC side of the pinned-register map: one scope per JIT compilation. */
 void JS_WhalePinEnter(void);
+/* WhaleJS: dump the finished code section so it can be disassembled. Defined in
+   tccgen.c, which is the only place text_section is in scope. */
+void JS_WhaleDumpCode(FILE *f);
 
 static char whale_core_name[40];
 static char whale_entry_name[40];
@@ -3622,6 +3625,22 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
     (void)src;
     if (!JS_WhaleCompileTokens(s, whale_gen_cb, NULL))
         goto fail;
+    /* Diagnostics: write the object out so the machine code TinyCC actually
+       produced can be disassembled (objdump -d). Everything so far has been read
+       from the generated C, which is one step removed from what runs. */
+    if (getenv("WHALE_JIT_OBJ")) {
+        char objbuf[256];
+        FILE *df;
+
+        /* fresh names per compile, so the sequence number identifies the unit */
+        snprintf(objbuf, sizeof(objbuf), "%s/whale_%u.bin", getenv("WHALE_JIT_OBJ"), whale_jit_seq);
+        df = fopen(objbuf, "wb");
+        if (df) {
+            JS_WhaleDumpCode(df);
+            fclose(df);
+            fprintf(stderr, "whale jit: wrote %s\n", objbuf);
+        }
+    }
     if (tcc_relocate(s, TCC_RELOCATE_AUTO) < 0)
         goto fail;
     fn = tcc_get_symbol(s, whale_entry_name);

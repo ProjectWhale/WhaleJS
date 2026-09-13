@@ -1002,6 +1002,14 @@ static int whale_pin_alloc(int t)
     return -1;
 }
 
+/* WhaleJS: write the finished code section out, so a JIT image can be disassembled
+   with objdump -D -b binary -m i386:x86-64. Kept here because this is the only
+   translation unit where text_section is in scope. Enabled by WHALE_JIT_OBJ=<dir>. */
+void JS_WhaleDumpCode(FILE *f)
+{
+    if (text_section && text_section->data)
+        fwrite(text_section->data, 1, text_section->data_offset, f);
+}
 /* Stack offset -> pinned register. A read has to recognise a pinned local
    without looking at SValue.sym: unary() sets sym when an identifier is read,
    but the initialiser of a declaration does not, and that mismatch had the
