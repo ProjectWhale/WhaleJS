@@ -2907,6 +2907,93 @@ void JS_FreeRuntime(JSRuntime *rt)
         abort();
 }
 
+/* =========================================================================
+ * WhaleJS: the C-struct object
+ *
+ * A second kind of object, alongside JS_CLASS_OBJECT rather than an extension of it.
+ * The two do not share a tag, so neither has to hold the other's storage - which is
+ * what a compiled function needs: an object whose properties live in a C struct it
+ * can address by pointer offset, with no call, no shape check and no lookup.
+ *
+ * JS still sees an ordinary object: same prototype chain, same syntax, same
+ * semantics. The interpreter (and anything the JIT did not compile) reaches the
+ * struct through the shape - the columns *are* the properties, in the shape's order,
+ * so the offset table is the shape itself and needs no separate bookkeeping. A name
+ * the shape does not carry goes to `dyn`, a plain object, so the type stays fully
+ * general; the struct is an optimisation, not a restriction.
+ *
+ * A column also records whether it was ever assigned. A shape-union layout reserves
+ * columns for properties a given object may never set, and the language distinguishes
+ * "property absent" from "property present and undefined": a plain read reports
+ * undefined for both, while `in` and hasOwnProperty tell them apart. That is what
+ * `set` is for.
+ * ====================================================================== */
+
+#define WHALE_STRUCT_MAGIC 0x57485354U   /* 'WHST' */
+
+typedef struct WhaleSlot {
+    double   v;
+    uint32_t set;      /* 1 once the property was assigned; `in` reads this */
+} WhaleSlot;
+
+typedef struct WhaleStruct {
+    uint32_t  magic;
+    uint32_t  nslots;
+    JSShape  *shape;               /* the columns, in this shape's order */
+    WhaleSlot slots[WHALE_STRUCT_FIELDS];
+    struct JSObject *dyn;          /* properties the shape does not name */
+} WhaleStruct;
+
+/* The C-struct part of an object of this class, or NULL. */
+static WhaleStruct *whale_struct_of(JSValueConst obj)
+{
+    JSObject *p;
+
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return NULL;
+    p = JS_VALUE_GET_OBJ(obj);
+    if (p->class_id != JS_CLASS_WHALE_STRUCT || !p->u.opaque)
+        return NULL;
+    if (((WhaleStruct *)p->u.opaque)->magic != WHALE_STRUCT_MAGIC)
+        return NULL;
+    return (WhaleStruct *)p->u.opaque;
+}
+
+static void js_whale_struct_finalizer(JSRuntime *rt, JSValue val)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(val);
+    WhaleStruct *ws = p->u.opaque;
+
+    if (ws && ws->magic == WHALE_STRUCT_MAGIC) {
+        if (ws->dyn) {
+            JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_OBJECT, ws->dyn));
+            ws->dyn = NULL;
+        }
+        js_free_rt(rt, ws);
+    }
+    p->u.opaque = NULL;
+}
+
+static const JSClassShortDef js_whale_struct_class_def[] = {
+    { JS_ATOM_Object, js_whale_struct_finalizer, NULL },  /* JS_CLASS_WHALE_STRUCT */
+};
+
+int JS_AddIntrinsicWhaleStruct(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+
+    if (!JS_IsRegisteredClass(rt, JS_CLASS_WHALE_STRUCT)) {
+        if (init_class_range(rt, js_whale_struct_class_def, JS_CLASS_WHALE_STRUCT,
+                             countof(js_whale_struct_class_def)) < 0)
+            return -1;
+        /* The prototype is Object.prototype: in JS this has to be an ordinary object,
+           and nothing about it may look unusual. */
+        ctx->class_proto[JS_CLASS_WHALE_STRUCT] =
+            JS_DupValue(ctx, ctx->class_proto[JS_CLASS_OBJECT]);
+    }
+    return 0;
+}
+
 JSContext *JS_NewContextRaw(JSRuntime *rt)
 {
     JSContext *ctx;
@@ -2971,6 +3058,7 @@ JSContext *JS_NewContext(JSRuntime *rt)
         JS_AddIntrinsicPromise(ctx) ||
         JS_AddIntrinsicWeakRef(ctx) ||
         JS_AddIntrinsicAToB(ctx) ||
+        JS_AddIntrinsicWhaleStruct(ctx) ||
         JS_AddPerformance(ctx)) {
         JS_FreeContext(ctx);
         return NULL;
