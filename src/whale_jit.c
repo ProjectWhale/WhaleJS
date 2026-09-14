@@ -2883,17 +2883,23 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     goto out;
                 os = whale_objs++;
                 /* A settled layout: hold the object as a C struct in the frame
-                   instead of a heap object with a shape.
+                   instead of a heap object with a shape, and let the four field
+                   access ops read and write its columns directly - one access, no
+                   shape check, no pointer chase, no tag branch.
 
-                   Off by default, and the measurement is the reason. With the
-                   accesses converted - the half fc44fa4 was missing - the struct
-                   form is still ~19x slower than node on the object case, where the
-                   shape-cache form is 3.7x *faster*. The access goes from seven
-                   memory operations to one and still loses, because the number of
-                   statements per access went up, and statement count is what decides
-                   TCC's output (notes/optimisation-directions.md). WHALE_UNBOX=1
-                   turns it on for anyone who wants to work that trade. */
-                if (getenv("WHALE_UNBOX") && mono && whale_str_n == 0) {
+                   On by default. An earlier revision had this off and recorded it
+                   as "19x slower than node"; that measurement was wrong. The struct
+                   was being created while the accesses still went through
+                   JS_WhaleObjFieldPtr, and on top of that a struct-typed local was
+                   still being materialised into a C variable - which emitted
+                   `L0 = ( )` and made the function fail to compile entirely, so the
+                   timing was the interpreter, not the struct. With both halves
+                   right:
+
+                       WHALE_NO_UNBOX=1   object 7ms   objshape 823ms
+                       default            object 4ms   objshape 563ms
+                       stock qjs          object 386ms objshape 1241ms */
+                if (!getenv("WHALE_NO_UNBOX") && mono && whale_str_n == 0) {
                     int fa[WHALE_STRUCT_FIELDS];
                     int fn = 0, si2;
 
@@ -3378,10 +3384,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 t = (idx >= 0 && idx < var_count) ? cur[idx] : WHALE_T_UNKNOWN;
                 if (t == WHALE_T_UNKNOWN)
                     goto out;
-                if (WHALE_IS_SLOT(t)) {
-                    /* An object is its slot number, which the type already
-                       carries - nothing to emit, the value is the same in every
-                       copy. Only the value path needs folding. */
+                if (WHALE_IS_SLOT(t) || WHALE_IS_STRUCT(t)) {
+                    /* An object - or a laid-out struct - is its slot number, which
+                       the type already carries. Nothing to emit: the value is the
+                       same in every copy, and a struct has no C variable to load
+                       from. Only the numeric path needs folding. */
                     cur[var_count + sp] = (uint8_t)t;
                     sp++;
                     break;
@@ -3414,6 +3421,25 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 t = cur[var_count + sp - 1];
                 if (t == WHALE_T_UNKNOWN || idx < 0 || idx >= var_count)
                     goto out;
+                if (getenv("WHALE_MEM_TRACE"))
+                    fprintf(stderr, "[put_loc] L%d t=%d is_struct=%d is_slot=%d\n",
+                            idx, t, WHALE_IS_STRUCT(t), WHALE_IS_SLOT(t));
+                if (WHALE_IS_STRUCT(t)) {
+                    /* A struct local carries the type and nothing else: the layout
+                       columns (_ws.sv / _ws.sp) are the storage, so there is no C
+                       variable and no object slot.
+
+                       This has to be tested *before* WHALE_IS_SLOT, which
+                       deliberately does not include structs. Placed inside that
+                       branch it is unreachable - and then the deferred-store path
+                       emits `L0 = ( )`, because a struct has no expression to
+                       inline. */
+                    local_forget(idx);
+                    cur[idx] = (uint8_t)t;
+                    lo_c[idx] = 0;
+                    sp--;
+                    break;
+                }
                 if (WHALE_IS_SLOT(t)) {
                     /* The value *is* a slot number, so this store is a type
                        change and nothing else - no deferred store and no fold
@@ -3437,6 +3463,20 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         fm = fold_mark();
                         wt_arr("oi", src); wt('='); wt_int(0); wt(';');
                         fold_commit(fm);
+                        local_forget(idx);
+                        cur[idx] = (uint8_t)t;
+                        lo_c[idx] = 0;
+                        sp--;
+                        break;
+                    }
+                    if (WHALE_IS_STRUCT(t)) {
+                        /* A struct is not a value at all - it is frame variables
+                           (_ws.sv / _ws.sp), and the local only carries the type.
+                           Nothing to emit, and nothing to unify either: there is
+                           one layout per function, so every assignment names the
+                           same slot. Emitting the local here is what produced
+                           `L0 = ( ( ) )` - an empty expression, because a struct
+                           has no C variable to read. */
                         local_forget(idx);
                         cur[idx] = (uint8_t)t;
                         lo_c[idx] = 0;
@@ -3497,6 +3537,15 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 t = cur[var_count + sp - 1];
                 if (t == WHALE_T_UNKNOWN || idx < 0 || idx >= var_count)
                     goto out;
+                if (WHALE_IS_STRUCT(t)) {
+                    /* See put_loc: a struct local carries the type and nothing
+                       else - the layout columns are the storage. The value stays
+                       on the stack, which is what set_loc is for. */
+                    local_forget(idx);
+                    cur[idx] = (uint8_t)t;
+                    lo_c[idx] = 0;
+                    break;
+                }
                 if (WHALE_IS_ARR(t)) {
                     /* An array keeps its own type - see the note in put_loc. */
                     local_forget(idx);
@@ -4532,8 +4581,14 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
     /* Drive TinyCC's parser with the tokens the generator pushed: no source
        text is parsed and no header is read. */
     (void)src;
-    if (!JS_WhaleCompileTokens(s, whale_gen_cb, NULL))
+    if (!JS_WhaleCompileTokens(s, whale_gen_cb, NULL)) {
+        /* Which side of the hand-off failed matters: the generator bailing on an
+           opcode is a different problem from the tokens not parsing or TinyCC
+           failing later. All of them end up here. */
+        if (getenv("WHALE_JIT_DUMP"))
+            fprintf(stderr, "whale jit: compile failed (gen_ok=%d)\n", whale_gen_ok);
         goto fail;
+    }
     /* Diagnostics: write the object out so the machine code TinyCC actually
        produced can be disassembled (objdump -d). Everything so far has been read
        from the generated C, which is one step removed from what runs. */
