@@ -1842,6 +1842,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     int whale_str_atoms[WHALE_STRUCT_FIELDS];
     int whale_str_n = 0;
     int whale_str_slot = -1;
+    /* The one object slot this layout is materialised into when it has to become a
+       real JSValue - as a call argument, say. One slot, not one per materialisation
+       site: two sites reaching the same jump target would otherwise carry different
+       slot numbers, meet as different types and merge to UNKNOWN, which throws the
+       whole function away. That is exactly what happened to immutable_update. */
+    int whale_str_obj_slot = -1;
     int whale_nloops = 0;   /* backward jumps; more than one means nesting */
 
     if (!info->is_normal)
@@ -4037,9 +4043,15 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                         if (!WHALE_IS_STRUCT(tk))
                             continue;
-                        if (whale_objs >= WHALE_CALL_BASE)
-                            goto out;
-                        ms = whale_objs++;
+                        /* One slot for the whole layout, reused by every
+                           materialisation site - see whale_str_obj_slot for why a
+                           fresh slot per site is not allowed. */
+                        if (whale_str_obj_slot < 0) {
+                            if (whale_objs >= WHALE_CALL_BASE)
+                                goto out;
+                            whale_str_obj_slot = whale_objs++;
+                        }
+                        ms = whale_str_obj_slot;
                         wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjNew"); wt('(');
                         wt_id("ctx"); wt(','); wt_int(ms); wt(')'); wt(')');
                         wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
