@@ -1371,7 +1371,18 @@ static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
                     goto done;
                 ta = cur[var_count + sp - 1];
                 fm = fold_mark();
-                if (WHALE_IS_SLOT(ta)) {
+                if (WHALE_IS_STRUCT(ta)) {
+                    /* The layout lives in this compilation's frame columns, and the
+                       caller is in the same compilation - so the result travels as
+                       the type itself. No copy into an object slot and no round trip
+                       through the heap: an inlined `make()` hands its object to the
+                       caller as the columns it was already written to.
+
+                       This is what lets an object that "came from another function"
+                       be laid out: after inlining there is no other function, and
+                       nothing in between can change a property table. */
+                    ret = ta;
+                } else if (WHALE_IS_SLOT(ta)) {
                     /* An object result cannot live in a double slot, so park it in
                        one of its own - the caller then sees a slot value, which is
                        what it would have seen from the compiled form. */
@@ -1475,6 +1486,34 @@ static int whale_str_col(const int *atoms, int n, int atom)
         if (atoms[i] == atom)
             return i;
     return -1;
+}
+
+/* The layout a settled object has: the union of the atoms its field-access sites
+   were observed to use, in first-seen order. Returns the number of columns.
+
+   The sites are the *access* sites (whale_field_sites), not a creation point -
+   what was observed is what the fields are, so it does not matter which function
+   created the object. That is what lets an object that arrives as a call's result
+   be laid out like one built here. */
+static int whale_layout_from_sites(const int *sites, int nsites, int *atoms, int max)
+{
+    int n = 0, s;
+
+    for (s = 0; s < nsites && n < max; s++) {
+        int one[WHALE_STRUCT_FIELDS];
+        int on = whale_struct_fields((unsigned)sites[s], one, WHALE_STRUCT_FIELDS);
+        int q;
+
+        for (q = 0; q < on; q++) {
+            int seen = 0, m;
+
+            for (m = 0; m < n; m++)
+                if (atoms[m] == one[q]) { seen = 1; break; }
+            if (!seen)
+                atoms[n++] = one[q];
+        }
+    }
+    return n;
 }
 
 static int whale_prof_one_shape(unsigned off)
@@ -1687,6 +1726,21 @@ static int whale_step_emit(int op, int pos, int *sp_io, uint8_t *cur, int var_co
     fold_commit(fm);
     sp += n_push - n_pop;
     *sp_io = sp;
+    return 1;
+}
+
+/* Was every field-access site in this function observed holding a single shape?
+   If so, the objects those sites touch have a settled layout. A function with no
+   sites at all answers no: nothing was observed, so nothing is settled. */
+static int whale_sites_mono(const int *sites, int nsites)
+{
+    int i;
+
+    if (nsites == 0)
+        return 0;
+    for (i = 0; i < nsites; i++)
+        if (!whale_prof_site_ok((unsigned)sites[i]))
+            return 0;
     return 1;
 }
 
@@ -2900,37 +2954,15 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                        default            object 4ms   objshape 563ms
                        stock qjs          object 386ms objshape 1241ms */
                 if (!getenv("WHALE_NO_UNBOX") && mono && whale_str_n == 0) {
-                    int fa[WHALE_STRUCT_FIELDS];
-                    int fn = 0, si2;
-
-                    /* The layout is the union of the atoms the field accesses were
-                       observed to use. The offset to ask about is the *access
-                       site's* (whale_field_sites), not this OP_object's: the profile
-                       is keyed by where the read or write happened, so passing the
-                       literal's own offset always came back empty - which is why the
-                       struct machinery looked dead. */
-                    for (si2 = 0;
-                         si2 < whale_field_sites_n && fn < WHALE_STRUCT_FIELDS; si2++) {
-                        int one[WHALE_STRUCT_FIELDS];
-                        int on = whale_struct_fields((unsigned)whale_field_sites[si2],
-                                                     one, WHALE_STRUCT_FIELDS);
-                        int q;
-
-                        for (q = 0; q < on; q++) {
-                            int seen = 0, m;
-
-                            for (m = 0; m < fn; m++)
-                                if (fa[m] == one[q]) { seen = 1; break; }
-                            if (!seen)
-                                fa[fn++] = one[q];
-                        }
-                    }
+                    int fn = whale_layout_from_sites(whale_field_sites,
+                                                     whale_field_sites_n,
+                                                     whale_str_atoms,
+                                                     WHALE_STRUCT_FIELDS);
 
                     if (fn > 0) {
                         int k, pfm = fold_mark();
 
                         for (k = 0; k < fn; k++) {
-                            whale_str_atoms[k] = fa[k];
                             /* sp is the presence flag: a field nobody assigned must
                                not read as a number. */
                             wt_arr("sp", k); wt('='); wt_int(0); wt(';');
@@ -3424,6 +3456,59 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 if (getenv("WHALE_MEM_TRACE"))
                     fprintf(stderr, "[put_loc] L%d t=%d is_struct=%d is_slot=%d\n",
                             idx, t, WHALE_IS_STRUCT(t), WHALE_IS_SLOT(t));
+                /* An object that arrived from elsewhere - a call's result, or an
+                   inlined body's return - gets a layout too, provided nothing in
+                   this function can change its property table behind our back. The
+                   conservative form of that: the function contains no call at all.
+                   Objects that do not qualify keep the shape-cache path, which is
+                   the "fall back to the map" this is allowed to do.
+
+                   Which function created the object is deliberately not part of the
+                   test: what was observed is what its fields are, and the
+                   observation is keyed by the access sites.
+
+                   The safety condition is "nothing after this point can change the
+                   object's property table", and the only thing that can is a call -
+                   a callee may add, delete or reorder properties. So the test is
+                   whether any call remains after this instruction, not whether the
+                   function has one at all: `run()` calls `make()` once at the top
+                   and then loops without calling anything, which is exactly the
+                   shape worth laying out. */
+                if (!getenv("WHALE_NO_UNBOX") && whale_str_n == 0 &&
+                    (whale_call_n == 0 || pos > whale_call_pos[whale_call_n - 1]) &&
+                    (WHALE_IS_OBJ(t) || WHALE_IS_VAL(t)) &&
+                    whale_sites_mono(whale_field_sites, whale_field_sites_n)) {
+                    int fn = whale_layout_from_sites(whale_field_sites,
+                                                     whale_field_sites_n,
+                                                     whale_str_atoms,
+                                                     WHALE_STRUCT_FIELDS);
+                    int slot = WHALE_SLOT(t);
+
+                    if (fn > 0) {
+                        int k, pfm = fold_mark();
+
+                        for (k = 0; k < fn; k++) {
+                            /* Read each field once, here, into the layout. The object
+                               itself is left alone - the columns are what the
+                               accesses below use. */
+                            wt_arr("sv", k); wt('='); wt_id("JS_WhaleObjFieldNum");
+                            wt('('); wt_id("ctx"); wt(','); wt_int(slot); wt(',');
+                            wt_int(whale_str_atoms[k]); wt(',');
+                            wt('&'); wt_arr("fs", WHALE_FIELD_CACHE - 1); wt(',');
+                            wt('&'); wt_arr("fp", WHALE_FIELD_CACHE - 1); wt(',');
+                            wt_id("deopt"); wt(')'); wt(';');
+                            wt_arr("sp", k); wt('='); wt_int(1); wt(';');
+                        }
+                        fold_commit(pfm);
+                        whale_str_n = fn;
+                        whale_str_slot = slot;
+                        local_forget(idx);
+                        cur[idx] = WHALE_STRUCT_T(slot);
+                        lo_c[idx] = 0;
+                        sp--;
+                        break;
+                    }
+                }
                 if (WHALE_IS_STRUCT(t)) {
                     /* A struct local carries the type and nothing else: the layout
                        columns (_ws.sv / _ws.sp) are the storage, so there is no C
