@@ -279,4 +279,9 @@ shape 7d9247b fixed for the old condition ("returning the pinned one uncondition
 left the caller reading a register the value was never in - `return s` came back as
 the loop counter"), reintroduced by pinning the return variable again.
 
-Reverted to 38579bc; both findings are recorded rather than half-fixed.
+Reverted to 38579bc; both findings are recorded rather than half-fixed.- `<56>` `notes/current.md` - five JIT fixes in one session: return-a-call's-result
+  (72ms -> 16ms), call-argument materialisation, one materialisation slot per layout,
+  `bail=N` diagnostics + a wider object-slot budget, and self-calls with a parked
+  object. Method that found them: stock qjs on the same case, then `bail=N`. Blocker
+  left in immutable_update: the jump-target merge treats two different object slots as
+  a conflict, because a slot's identity is its slot number.

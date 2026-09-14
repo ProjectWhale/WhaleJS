@@ -1178,3 +1178,53 @@ UNRESOLVED
    **⚠️ 结论修正**：上面那条 `JS_NewArray` 的"异常"是**症状，不是根因**。在 `JS_WhaleArrNew` 里加**一行无关的** `JS_NewObject(ctx)`，崩溃与错误 tag **一起消失**（`A check=66`，与 node 一致），去掉又回来 —— 这是内存破坏的指纹。另外 TinyCC 在接线状态下对三行复现报 `duplicate label 'L14'`，而**同一复现在基线上是干净的**（`h check=5`，与 node 一致）。所以要查的是 **`whale_step_emit` 周围的 emit 流与生成期状态**（它在 case 体里调 `fold_materialize()` 与 `fold_mark()/fold_commit()`，那里可能已经有 label 被 emit 过），不是引擎 helper。
 
 工作树已回退到最后绿色提交（`loop_begin` 的修复保留）；完整工作 diff 存于 `temp/whale_step_work.patch`（UTF-16 原始）与 `temp/whale_step_work_u8.patch`（转成 UTF-8，`git apply --check` 可解析；对 `86e5a52` 应用时只有两处已知冲突：`JS_WhaleArrNew` 的旧诊断块、`loop_begin` 的修复前版本）。详见 notes/whale-step-investigation.md。
+
+# <56>: five JIT fixes, and the slot identity that still blocks immutable_update
+TIPS
+
+## what changed (all committed, tree green, 24/24 correct)
+
+- `c114f05` a function that returns a call result can compile. OP_return accepted only
+  OBJ/ARR slots; a general call result is WHALE_T_VAL, so `var v = f(); return v;` threw
+  the whole function away. e2/e1: 72ms -> 16ms.
+- `5353954` a laid-out object used as a call argument is materialised into a real object
+  first (JS_WhaleObjNew + JS_WhaleObjDefineNum per column).
+- `3d426e9` one materialisation slot per layout, not one per site, so two sites cannot
+  meet at a jump target as different types.
+- `361a96b` whale_out_line: every `goto out` records `__LINE__` and the "gave up" line
+  prints `bail=N`. Also WHALE_OBJ_SLOTS 12->28, WHALE_CALL_BASE 8->20.
+- `6156b80` a self-call with a non-numeric argument takes the general route, which
+  learned to call the function's own entry (JS_WhaleCallSelfValue + `whale_self`).
+
+## the diagnosis that worked
+
+Stock qjs on the same case. An interpreted whalejs time sits almost exactly on the
+interpreter's - that is how e2/e1 were caught (72 vs 74, 71 vs 77, while compiled
+functions were 60x faster), and it reads a "not compiled" list off a full run:
+
+    immutable_update 550 vs qjs 573    <- interpreted
+    vnode_build      347 vs qjs 361    <- interpreted
+
+`bail=N` then names the exact line. Guessing from pos/op is worse: the position
+reported is usually a jump target, not the place that refused.
+
+## the blocker left in immutable_update
+
+It has two readings; one now compiles. The other stops at bail=2441, the jump-target
+type merge (whale_jit.c:2409-2441): one slot carrying two different KNOWN types on two
+edges into the same target drops the whole function.
+
+Both types are "a JSValue in a slot" - one from materialising a layout, one from a
+call's return value - but a slot's identity in this generator IS its slot number, so
+they compare unequal. I32/ICONST already merge above that test; OBJ/VAL do not.
+
+Fixing it needs an object type that does not name a slot, or a slot-number-to-variable
+map at the merge. Architecture, not a one-liner. That is where this stopped.
+
+## ruled out - do not re-tread
+
+- object-slot exhaustion: `[mat-arg] objs=1 callbase=20`, plenty free.
+- materialisation not running: it runs, `struct=1`, and the result is passed on.
+- code volume: fourfield and w_of2 dumps are line-for-line the same, binaries 2798 vs
+  2494 bytes, 685 vs 613 instructions - yet 65ms vs 3ms. Still unexplained. Not code
+  size, not the loop body, not the map path (JS_WhaleObjFieldPtr appears 0 times).
