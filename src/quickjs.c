@@ -19717,8 +19717,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
            A function whose code never parks an object has nothing to protect, so
            it skips all of this - the frame stays exactly as the interpreter
            would have left it. */
+        /* TEMPORARY EXPERIMENT: do not widen the frame's live range, to find out
+           whether the cur_sp loan is what confuses the allocation path. */
         if (b->whale_needs_obj)
-            sf->cur_sp = obj_slots + WHALE_OBJ_SLOTS;
+            sf->cur_sp = NULL;
         /* Two compilations of one function are possible: one reading a closure
            slot that feeds a call as this function, one reading it as an
            enclosing closure's value. *deopt == 3 is that entry check failing,
@@ -66558,4 +66560,312 @@ uintptr_t js_std_cmd(int cmd, ...) {
 int JS_WhaleOpSize(int op)
 {
     return short_opcode_info(op).size;
+}
+
+/* how many values an opcode pops and pushes, from the same table */
+void JS_WhaleOpArity(int op, int *n_pop, int *n_push)
+{
+    const JSOpCode *oi;
+
+    if (op < 0 || op >= OP_COUNT + (OP_TEMP_END - OP_TEMP_START)) {
+        if (n_pop)
+            *n_pop = -1;
+        if (n_push)
+            *n_push = -1;
+        return;
+    }
+    oi = &short_opcode_info(op);
+    if (n_pop)
+        *n_pop = oi->n_pop;
+    if (n_push)
+        *n_push = oi->n_push;
+}
+
+/* Opcodes the single-instruction fallback can actually run, so the generator
+   can tell at compile time whether handing this instruction over is an option.
+   This list and the switch in JS_WhaleStepRun are the same set - keep them in
+   step. Knowing it up front matters: a function that compiles and then deopts
+   at run time is worse than one that never compiled, because JS_CallInternal
+   drops the entry for good (quickjs.c, the whale_deopt branch). */
+#define WHALE_STEP_COVERED(op)                          \
+    ((op) == OP_push_empty_string ||                    \
+     (op) == OP_push_atom_value ||                      \
+     (op) == OP_get_field ||                            \
+     (op) == OP_get_length ||                           \
+     (op) == OP_put_field ||                            \
+     (op) == OP_get_array_el ||                         \
+     (op) == OP_put_array_el)
+
+int JS_WhaleStepCovers(int op)
+{
+    return WHALE_STEP_COVERED(op);
+}
+
+/* =========================================================================
+ * WhaleJS: mixed compilation - the single-instruction fallback
+ *
+ * An instruction the generator cannot lower no longer throws away the whole
+ * function: it hands that one instruction to the engine, and the code around it
+ * stays native. A new type or opcode is then a local, bounded loss instead of a
+ * global one.
+ *
+ * The reason this can be a call and not a marshalling exercise: the memory used
+ * here is the interpreter's own operand stack (sf->var_buf + b->var_count), on
+ * the frame JS_CallInternal already set up. The generator's values live in C
+ * doubles and object slots, so the values *this instruction* touches are
+ * converted on the way in and out - but that is a handful of values, not a
+ * second representation of the frame to keep in step.
+ *
+ * The operand stack is used from index 0 upwards over at most n_pop <= 3 slots,
+ * which is what keeps this clear of the object-slot area at the far end of the
+ * frame: there is no `sp` to share and no live range to widen.
+ * ========================================================================= */
+
+/* The operand stack of the frame that is running. The JIT entry point is called
+   directly by JS_CallInternal, so rt->current_stack_frame is that frame. */
+static JSValue *whale_step_stack(JSContext *ctx, JSFunctionBytecode **pb)
+{
+    JSStackFrame *sf = ctx->rt->current_stack_frame;
+    JSObject *fp;
+    JSFunctionBytecode *b;
+
+    if (!sf || JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
+        return NULL;
+    fp = JS_VALUE_GET_OBJ(sf->cur_func);
+    if (fp->class_id != JS_CLASS_BYTECODE_FUNCTION)
+        return NULL;
+    b = fp->u.func.function_bytecode;
+    if (pb)
+        *pb = b;
+    return sf->var_buf + b->var_count;
+}
+
+/* Operand-stack cell i, or NULL when there is no frame or i is out of range. */
+static JSValue *whale_step_cell(JSContext *ctx, int i, JSFunctionBytecode **pb)
+{
+    JSFunctionBytecode *b = NULL;
+    JSValue *stack = whale_step_stack(ctx, &b);
+
+    if (!stack || !b || i < 0 || i >= b->stack_size)
+        return NULL;
+    if (pb)
+        *pb = b;
+    return stack + i;
+}
+
+/* A number as a JSValue, the same way the generator boxes its results: an
+   in-range int32 stays an int, everything else is a float64. */
+static JSValue whale_step_box_num(double d)
+{
+    if (d >= INT32_MIN && d <= INT32_MAX) {
+        int32_t i = (int32_t)d;
+
+        if ((double)i == d)
+            return js_int32(i);
+    }
+    return js_float64(d);
+}
+
+int JS_WhaleStepPushNum(JSContext *ctx, int i, double v)
+{
+    JSValue *cell = whale_step_cell(ctx, i, NULL);
+
+    if (!cell)
+        return 0;
+    JS_FreeValue(ctx, *cell);   /* whatever the previous user left there */
+    *cell = whale_step_box_num(v);
+    return 1;
+}
+
+int JS_WhaleStepPushSlot(JSContext *ctx, int i, int slot)
+{
+    JSValue *cell = whale_step_cell(ctx, i, NULL);
+
+    if (!cell || slot < 0 || slot >= WHALE_OBJ_SLOTS)
+        return 0;
+    JS_FreeValue(ctx, *cell);
+    *cell = js_dup(whale_frame_obj_slots(ctx)[slot]);
+    if (getenv("WHALE_STEP_DBG"))
+        fprintf(stderr, "[step] pushSlot i=%d slot=%d src_tag=%d dst=%p\n",
+                i, slot, JS_VALUE_GET_TAG(whale_frame_obj_slots(ctx)[slot]),
+                (void *)cell);
+    return 1;
+}
+
+int JS_WhaleStepOutIsNum(JSContext *ctx, int i)
+{
+    JSValue *cell = whale_step_cell(ctx, i, NULL);
+    int tag;
+
+    if (!cell)
+        return 0;
+    tag = JS_VALUE_GET_TAG(*cell);
+    return tag == JS_TAG_INT || JS_TAG_IS_FLOAT64(tag);
+}
+
+double JS_WhaleStepOutNum(JSContext *ctx, int i)
+{
+    JSValue *cell = whale_step_cell(ctx, i, NULL);
+    int tag;
+
+    if (!cell)
+        return 0;
+    tag = JS_VALUE_GET_TAG(*cell);
+    if (tag == JS_TAG_INT)
+        return (double)JS_VALUE_GET_INT(*cell);
+    if (JS_TAG_IS_FLOAT64(tag))
+        return JS_VALUE_GET_FLOAT64(*cell);
+    return 0;
+}
+
+int JS_WhaleStepOutSlot(JSContext *ctx, int i, int slot)
+{
+    JSValue *cell = whale_step_cell(ctx, i, NULL);
+
+    if (!cell || slot < 0 || slot >= WHALE_OBJ_SLOTS)
+        return 0;
+    JS_WhaleObjSlot(ctx, slot, js_dup(*cell));
+    return 1;
+}
+
+void JS_WhaleStepClear(JSContext *ctx, int n)
+{
+    int i;
+
+    for (i = 0; i < n; i++) {
+        JSValue *cell = whale_step_cell(ctx, i, NULL);
+
+        if (!cell)
+            break;
+        JS_FreeValue(ctx, *cell);
+        *cell = JS_UNDEFINED;
+    }
+}
+
+/* Run the one instruction at pc_off. The n_pop inputs are already in operand
+   slots 0..n_pop-1; the n_push results are left in slots 0..n_push-1. Returns 0
+   to mean "no result to be trusted" - the engine threw, or this opcode is not
+   covered yet - and the generator must then deoptimise the whole call rather
+   than assume anything about the frame. */
+int JS_WhaleStepRun(JSContext *ctx, int pc_off, int n_pop, int n_push)
+{
+    JSFunctionBytecode *b = NULL;
+    JSValue *stack = whale_step_stack(ctx, &b);
+    JSStackFrame *sf = ctx->rt->current_stack_frame;
+    uint8_t *pc;   /* not const: sf->cur_pc has to point at it */
+    int op;
+
+    if (!stack || !b || pc_off < 0 || pc_off >= b->byte_code_len) {
+        if (getenv("WHALE_STEP_DBG"))
+            fprintf(stderr, "[step] no frame/range: pc=%d b=%p stack=%p\n",
+                    pc_off, (void *)b, (void *)stack);
+        return 0;
+    }
+    if (n_pop < 0 || n_push < 0 ||
+        n_pop > b->stack_size || n_push > b->stack_size) {
+        if (getenv("WHALE_STEP_DBG"))
+            fprintf(stderr, "[step] arity out of range: np=%d nu=%d ssize=%d\n",
+                    n_pop, n_push, b->stack_size);
+        return 0;
+    }
+    pc = b->byte_code_buf + pc_off;
+    op = *pc++;
+    /* The generator reads the arity from the same table; a disagreement means
+       one of the two is working from a different opcode, and guessing which is
+       how a wrong answer gets baked in. Refuse instead. */
+    if ((int)short_opcode_info(op).n_pop != n_pop ||
+        (int)short_opcode_info(op).n_push != n_push) {
+        if (getenv("WHALE_STEP_DBG"))
+            fprintf(stderr, "[step] arity mismatch: op=%d np=%d/%d nu=%d/%d\n",
+                    op, n_pop, (int)short_opcode_info(op).n_pop,
+                    n_push, (int)short_opcode_info(op).n_push);
+        return 0;
+    }
+    if (getenv("WHALE_STEP_DBG"))
+        fprintf(stderr, "[step] run pc=%d op=%d np=%d nu=%d ssize=%d\n",
+                pc_off, op, n_pop, n_push, b->stack_size);
+
+    switch (op) {
+    case OP_push_empty_string:
+        stack[0] = js_empty_string(ctx->rt);
+        break;
+    case OP_push_atom_value:
+        stack[0] = JS_AtomToValue(ctx, get_u32(pc));
+        break;
+    case OP_get_field:
+        {
+            JSAtom atom = get_u32(pc);
+            JSValue val;
+
+            sf->cur_pc = pc;
+            val = JS_GetPropertyInternal(ctx, stack[0], atom, stack[0], false);
+            if (JS_IsException(val))
+                return 0;
+            JS_FreeValue(ctx, stack[0]);
+            stack[0] = val;
+        }
+        break;
+    case OP_get_length:
+        {
+            JSValue val;
+
+            sf->cur_pc = pc;
+            val = JS_GetPropertyInternal(ctx, stack[0], JS_ATOM_length, stack[0],
+                                         false);
+            if (JS_IsException(val))
+                return 0;
+            JS_FreeValue(ctx, stack[0]);
+            stack[0] = val;
+        }
+        break;
+    case OP_put_field:
+        {
+            JSAtom atom = get_u32(pc);
+            int ret;
+
+            sf->cur_pc = pc;
+            ret = JS_SetPropertyInternal2(ctx, stack[0], atom, stack[1], stack[0],
+                                          JS_PROP_THROW_STRICT);
+            JS_FreeValue(ctx, stack[0]);
+            if (ret < 0)
+                return 0;
+        }
+        break;
+    case OP_get_array_el:
+        {
+            JSValue val;
+
+            sf->cur_pc = pc;
+            val = JS_GetPropertyValue(ctx, stack[0], stack[1]);
+            JS_FreeValue(ctx, stack[0]);
+            stack[0] = val;
+            if (JS_IsException(val))
+                return 0;
+        }
+        break;
+    case OP_put_array_el:
+        {
+            int ret;
+
+            if (getenv("WHALE_STEP_DBG"))
+                fprintf(stderr, "[step] put_array_el tags=%d/%d/%d stack=%p "
+                        "needs_obj=%d var_refs=%p objslots=%p var_buf=%p varc=%d\n",
+                        JS_VALUE_GET_TAG(stack[0]), JS_VALUE_GET_TAG(stack[1]),
+                        JS_VALUE_GET_TAG(stack[2]), (void *)stack,
+                        b->whale_needs_obj, (void *)sf->var_refs,
+                        (void *)whale_frame_obj_slots(ctx),
+                        (void *)sf->var_buf, b->var_count);
+            sf->cur_pc = pc;
+            /* takes over the value at stack[2], frees the object below it */
+            ret = JS_SetPropertyValue(ctx, stack[0], stack[1], stack[2],
+                                      JS_PROP_THROW_STRICT);
+            JS_FreeValue(ctx, stack[0]);
+            if (ret < 0)
+                return 0;
+        }
+        break;
+    default:
+        return 0;
+    }
+    return 1;
 }

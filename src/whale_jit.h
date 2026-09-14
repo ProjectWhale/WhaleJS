@@ -119,6 +119,37 @@ int JS_WhaleVarRefGetObj(JSContext *ctx, void *var_refs, int idx, int slot);
 int JS_WhaleCheckStack(JSContext *ctx);
 int JS_WhaleOpSize(int op);   /* bytecode operand size, from the interpreter table */
 
+/* ---- mixed compilation: the single-instruction fallback ----
+
+   An instruction the generator cannot lower is handed to the engine instead of
+   throwing the whole function away. The values it works on travel through the
+   frame's own operand stack - the memory the interpreter uses - so only the
+   values this one instruction touches are converted, not the whole frame.
+
+   Protocol for one instruction: push its n_pop inputs into operand slots
+   0..n_pop-1, run it, then read the n_push results back from slots 0..n_push-1.
+   Every call may return 0, and 0 always means "assume nothing" - the generator
+   then deoptimises the call. Control flow (goto, return, call, throw) is NOT
+   covered and must never be handed over: the generated code is structured and
+   cannot follow a branch it did not emit itself. */
+
+/* is this opcode one the fallback can run? ask before emitting, so a function
+   never compiles only to deopt at run time (which loses the entry for good) */
+int JS_WhaleStepCovers(int op);
+/* how many values an opcode pops / pushes; -1 when op is not an opcode */
+void JS_WhaleOpArity(int op, int *n_pop, int *n_push);
+/* put generator-side value i on the operand stack: a number, or a parked object */
+int JS_WhaleStepPushNum(JSContext *ctx, int i, double v);
+int JS_WhaleStepPushSlot(JSContext *ctx, int i, int slot);
+/* run the instruction at bytecode offset pc_off; 0 = engine threw or not covered */
+int JS_WhaleStepRun(JSContext *ctx, int pc_off, int n_pop, int n_push);
+/* read result i back: whether it is a number, its number, or park it in a slot */
+int JS_WhaleStepOutIsNum(JSContext *ctx, int i);
+double JS_WhaleStepOutNum(JSContext *ctx, int i);
+int JS_WhaleStepOutSlot(JSContext *ctx, int i, int slot);
+/* release the first n operand slots - they are only this instruction's stage */
+void JS_WhaleStepClear(JSContext *ctx, int n);
+
 /* Object slots: the GC-visible place for the JIT to keep an object across a
    helper call (see WHALE_OBJ_SLOTS above). The engine implements these against
    the calling frame, so the generated code does not have to pass an address. */

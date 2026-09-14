@@ -1517,6 +1517,166 @@ static int whale_prof_site_ok(unsigned off)
     return n == 0 || n == 1;
 }
 
+/* =========================================================================
+ * The general fallback: hand one instruction to the engine
+ *
+ * `goto out` abandons the whole function, which makes every new type or opcode
+ * an all-or-nothing change. This is the alternative: push this instruction's
+ * operands onto the frame's own operand stack, let the engine run that one
+ * instruction (the JS_WhaleStep* services), and take the results back into the
+ * double domain. The value representation stays what it is - only the handful
+ * of values this instruction touches are converted.
+ *
+ * Returns 1 when the instruction was emitted and `*sp_io` advanced, 0 when it
+ * cannot be. The caller's answer to 0 stays `goto out`: this widens what can be
+ * lowered, it does not promise anything.
+ *
+ * 0 comes back when the opcode is not covered, when an operand is something the
+ * operand stack cannot carry (an unboxed struct, or a value whose type the
+ * generator lost track of), when the extra variables would not fit, and for
+ * anything that is control flow - a branch the generated code did not emit
+ * itself is not one it can follow.
+ *
+ * A result that is not a number deoptimises the call rather than being tracked
+ * as an opaque value. The point of the fallback is to keep the function
+ * compiling; a surprising type still belongs to the interpreter.
+ * ========================================================================= */
+static int whale_step_is_control(int op)
+{
+    switch (op) {
+    case OP_goto: case OP_goto8: case OP_goto16:
+    case OP_if_false: case OP_if_false8:
+    case OP_if_true: case OP_if_true8:
+    case OP_gosub: case OP_ret:
+    case OP_return: case OP_return_undef: case OP_return_async:
+    case OP_throw: case OP_throw_error:
+    case OP_catch: case OP_nip_catch:
+    case OP_call: case OP_call0: case OP_call1: case OP_call2: case OP_call3:
+    case OP_tail_call: case OP_tail_call_method:
+    case OP_call_method: case OP_array_from: case OP_apply:
+    case OP_call_constructor: case OP_iterator_call: case OP_apply_eval:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int whale_step_emit(int op, int pos, int *sp_io, uint8_t *cur, int var_count,
+                           int stack_size)
+{
+    int n_pop = 0, n_push = 0, i, sp = *sp_io, fm;
+    int dbg = getenv("WHALE_STEP_DBG") != NULL;
+
+    /* Bisect switch: WHALE_STEP_OFF=<opcode> refuses that one opcode, so a single
+       hand-over can be turned off without touching the rest. It is how "object in
+       a value position" was isolated, and it stays for the next one. */
+    {
+        const char *off = getenv("WHALE_STEP_OFF");
+
+        if (off && atoi(off) == op)
+            return 0;
+    }
+
+    if (whale_step_is_control(op) || !JS_WhaleStepCovers(op)) {
+        if (dbg)
+            fprintf(stderr, "[emit] pos=%d op=%d REFUSE not-covered\n", pos, op);
+        return 0;
+    }
+    JS_WhaleOpArity(op, &n_pop, &n_push);
+    if (n_pop < 0 || n_push < 0 || n_pop > sp || n_push > 8) {
+        if (dbg)
+            fprintf(stderr, "[emit] pos=%d op=%d REFUSE arity np=%d nu=%d sp=%d\n",
+                    pos, op, n_pop, n_push, sp);
+        return 0;
+    }
+    for (i = 0; i < n_pop; i++) {
+        int t = cur[var_count + sp - n_pop + i];
+
+        /* Operand 0 of a property access is its receiver, and a parked object is
+           exactly what that wants to be. Every other operand has to be a number:
+           a parked object in a value position is what makes the generated code
+           come out wrong - `out[i] = t` crashes where `out[i] = 3` is fine, with
+           no difference visible on the engine side - so those keep `goto out`
+           until the cause is found. Object unboxing takes the object out of this
+           position anyway, which is why it is the right next step and not a
+           detour. See notes/whale-step-repro.md. */
+        if (i > 0 && !whale_type_is_num(t)) {
+            if (dbg)
+                fprintf(stderr, "[emit] pos=%d op=%d REFUSE object in value "
+                        "position slot=%d t=%d\n", pos, op, sp - n_pop + i, t);
+            return 0;
+        }
+        if (!whale_type_is_num(t) && !WHALE_IS_SLOT(t)) {
+            if (dbg)
+                fprintf(stderr, "[emit] pos=%d op=%d REFUSE type slot=%d t=%d\n",
+                        pos, op, sp - n_pop + i, t);
+            return 0;
+        }
+    }
+    /* room for the variables this names: one per operand that still needs a
+       materialisation, one per result */
+    if (whale_vserial + n_pop + n_push >= stack_size + WHALE_VSER_MAX) {
+        if (dbg)
+            fprintf(stderr, "[emit] pos=%d op=%d REFUSE vserial %d\n", pos, op,
+                    whale_vserial);
+        return 0;
+    }
+
+    fm = fold_mark();
+    /* The numeric operands have to be in variables before the pushes are
+       emitted: fold_materialize emits a statement of its own, which cannot land
+       in the middle of a call. */
+    for (i = 0; i < n_pop; i++) {
+        int k = sp - n_pop + i;
+
+        if (whale_type_is_num(cur[var_count + k]))
+            fold_materialize(k);
+    }
+    for (i = 0; i < n_pop; i++) {
+        int k = sp - n_pop + i;
+        int t = cur[var_count + k];
+
+        wk(JS_WK_IF); wt('('); wt('!');
+        if (whale_type_is_num(t)) {
+            wt_id("JS_WhaleStepPushNum"); wt('('); wt_id("ctx"); wt(','); wt_int(i);
+            wt(','); fold_inline(k); wt(')');
+        } else {
+            wt_id("JS_WhaleStepPushSlot"); wt('('); wt_id("ctx"); wt(','); wt_int(i);
+            wt(','); wt_int(WHALE_SLOT(t)); wt(')');
+        }
+        wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+        wt_id("JS_WhaleStepClear"); wt('('); wt_id("ctx"); wt(','); wt_int(n_pop); wt(')'); wt(';');
+        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+    }
+    wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleStepRun"); wt('('); wt_id("ctx");
+    wt(','); wt_int(pos); wt(','); wt_int(n_pop); wt(','); wt_int(n_push); wt(')'); wt(')');
+    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+    wt_id("JS_WhaleStepClear"); wt('('); wt_id("ctx"); wt(','); wt_int(n_pop); wt(')'); wt(';');
+    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+    for (i = 0; i < n_push; i++) {
+        int k = sp - n_pop + i, nm;
+
+        wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleStepOutIsNum"); wt('(');
+        wt_id("ctx"); wt(','); wt_int(i); wt(')'); wt(')'); wt('{');
+        wt_id("JS_WhaleStepClear"); wt('('); wt_id("ctx"); wt(','); wt_int(n_push); wt(')'); wt(';');
+        wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+        nm = whale_vserial++;
+        wt_arr("v", nm); wt('='); wt_id("JS_WhaleStepOutNum"); wt('('); wt_id("ctx");
+        wt(','); wt_int(i); wt(')'); wt(';');
+        whale_vname[k] = nm;
+        whale_vmat[k] = 1;   /* it is a real variable now */
+        cur[var_count + k] = WHALE_T_NUM;
+    }
+    if (n_push > 0) {
+        wt_id("JS_WhaleStepClear"); wt('('); wt_id("ctx"); wt(','); wt_int(n_push); wt(')'); wt(';');
+    }
+    fold_commit(fm);
+    sp += n_push - n_pop;
+    *sp_io = sp;
+    return 1;
+}
+
 static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 {
     whale_prof_now = info->prof;
@@ -1914,6 +2074,27 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("op"); wt(',');
         wk(JS_WK_INT); wt_id("a_slot"); wt(','); wk(JS_WK_INT); wt_id("b_slot"); wt(',');
         wk(JS_WK_INT); wt_id("out_slot"); wt(')'); wt(';');
+    /* the single-instruction fallback (see the block comment above
+       whale_step_emit): both a prototype here and a tcc_add_symbol, or TinyCC
+       declares it implicitly and passes the arguments wrong */
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleStepPushNum"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("i"); wt(',');
+        wk(JS_WK_DOUBLE); wt_id("v"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleStepPushSlot"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("i"); wt(',');
+        wk(JS_WK_INT); wt_id("slot"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleStepRun"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("pc_off"); wt(',');
+        wk(JS_WK_INT); wt_id("n_pop"); wt(','); wk(JS_WK_INT); wt_id("n_push"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleStepOutIsNum"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("i"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_DOUBLE); wt_id("JS_WhaleStepOutNum"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("i"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleStepOutSlot"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("i"); wt(',');
+        wk(JS_WK_INT); wt_id("slot"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_VOID); wt_id("JS_WhaleStepClear"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("n"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleObjNew"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleObjDefineNum"); wt('(');
@@ -2185,6 +2366,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             {
                 int fm = fold_mark();
 
+                if (getenv("WHALE_STEP_DBG"))
+                    fprintf(stderr, "[label] pos=%d\n", pos);
                 wt_slot("L", pos); wt(':');
                 fold_commit(fm);
             }
@@ -2559,6 +2742,14 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int tb = cur[var_count + sp - 1];
                 int os, nm, tk;
 
+                /* What makes either branch below refuse - an index that is not a
+                   number, or a container this generator does not know - becomes
+                   one instruction handed to the engine. */
+                if ((!whale_type_is_num(tb) ||
+                     (!WHALE_IS_ARR(ta) && !WHALE_IS_SLOT(ta))) &&
+                    whale_step_emit(OP_get_array_el, pos, &sp, cur, var_count,
+                                    stack_size))
+                    break;
                 /* A packed array: the elements are JSValue, so the value is read
                    inline exactly as an object field is. */
                 if (WHALE_IS_ARR(ta)) {
@@ -2795,6 +2986,15 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     fprintf(stderr, "[put] pos=%d ta=%d slot=%d tb=%d isnum=%d fields=%d isobj=%d\n",
                             pos, ta, WHALE_IS_SLOT(ta), tb, whale_type_is_num(tb),
                             whale_fields, WHALE_IS_OBJ(ta));
+                /* A store this generator cannot lower - an operand that is
+                   neither a number nor a parked value, or a shape it has no
+                   cache left for - is handed to the engine as one instruction
+                   instead of abandoning the function (see whale_step_emit). */
+                if ((!WHALE_IS_SLOT(ta) || whale_fields >= WHALE_FIELD_CACHE ||
+                     (!whale_type_is_num(tb) && !WHALE_IS_VAL(tb))) &&
+                    whale_step_emit(OP_put_field, pos, &sp, cur, var_count,
+                                    stack_size))
+                    break;
                 if (!WHALE_IS_SLOT(ta))
                     goto out;
                 if (whale_fields >= WHALE_FIELD_CACHE)
@@ -2867,6 +3067,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int atom = (int)whale_get_u32(pc + pos + 1);
                 int fc, nm;
 
+                /* Refusals below (the receiver is not an object slot, or the
+                   cache is full) become one instruction handed to the engine. */
+                if ((!WHALE_IS_SLOT(ta) || whale_fields >= WHALE_FIELD_CACHE) &&
+                    whale_step_emit(OP_get_field, pos, &sp, cur, var_count,
+                                    stack_size))
+                    break;
                 if (!WHALE_IS_SLOT(ta))
                     goto out;
                 if (whale_fields >= WHALE_FIELD_CACHE)
@@ -2915,6 +3121,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int ta = cur[var_count + sp - 1];
                 int os, nm;
 
+                /* A length that is not this generator's packed array: the
+                   engine knows how to ask, so hand it the one instruction
+                   rather than stopping compilation here. */
+                if (!WHALE_IS_ARR(ta) &&
+                    whale_step_emit(OP_get_length, pos, &sp, cur, var_count,
+                                    stack_size))
+                    break;
                 if (!WHALE_IS_ARR(ta))
                     goto out;
                 os = WHALE_OBJ_SLOT(ta);
@@ -2946,6 +3159,14 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int tc = cur[var_count + sp - 1];
                 int os, tk;
 
+                /* What makes either branch below refuse - a non-numeric index or
+                   value, or a container this generator does not know - becomes
+                   one instruction handed to the engine. */
+                if ((!whale_type_is_num(tb) || !whale_type_is_num(tc) ||
+                     (!WHALE_IS_ARR(ta) && !WHALE_IS_SLOT(ta))) &&
+                    whale_step_emit(OP_put_array_el, pos, &sp, cur, var_count,
+                                    stack_size))
+                    break;
                 if (WHALE_IS_ARR(ta)) {
                     if (!whale_type_is_num(tb) || !whale_type_is_num(tc))
                         goto out;
@@ -3893,6 +4114,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             }
             break;
         default:
+            /* Nothing here lowers this opcode. Hand the single instruction to
+               the engine and keep the rest of the function native - see
+               whale_step_emit. If even that cannot carry it, this function
+               keeps interpreting, as before. */
+            if (whale_step_emit(pc[pos], pos, &sp, cur, var_count, stack_size))
+                break;
             goto out; /* anything else: keep interpreting */
         }
         pos += sz;
@@ -4129,6 +4356,14 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
         tcc_add_symbol(s, "JS_WhaleArgGetObj", (void *)JS_WhaleArgGetObj);
         tcc_add_symbol(s, "JS_WhaleCallValue", (void *)JS_WhaleCallValue);
         tcc_add_symbol(s, "JS_WhaleExceptionValue", (void *)JS_WhaleExceptionValue);
+        /* the single-instruction fallback */
+        tcc_add_symbol(s, "JS_WhaleStepPushNum", (void *)JS_WhaleStepPushNum);
+        tcc_add_symbol(s, "JS_WhaleStepPushSlot", (void *)JS_WhaleStepPushSlot);
+        tcc_add_symbol(s, "JS_WhaleStepRun", (void *)JS_WhaleStepRun);
+        tcc_add_symbol(s, "JS_WhaleStepOutIsNum", (void *)JS_WhaleStepOutIsNum);
+        tcc_add_symbol(s, "JS_WhaleStepOutNum", (void *)JS_WhaleStepOutNum);
+        tcc_add_symbol(s, "JS_WhaleStepOutSlot", (void *)JS_WhaleStepOutSlot);
+        tcc_add_symbol(s, "JS_WhaleStepClear", (void *)JS_WhaleStepClear);
         whale_jit_state = s;
     }
     s = whale_jit_state;
