@@ -523,6 +523,36 @@ int JS_WhaleCompileTokens(TCCState *s, void (*emit)(void *), void *emit_ctx)
     whale_define_start = define_stack;
 
     if (setjmp(s->error_jmp_buf) != 0) {
+        /* WhaleJS: point at the token the parser was on when it failed. Without
+           this the only clue is "whale_jit.c:1: error: ...", and the position in
+           the token stream - the one piece of information that identifies which
+           emitted construct is malformed - is gone. */
+        {
+            int k, from = (whale_tok_pos > 8) ? whale_tok_pos - 8 : 0;
+
+            fprintf(stderr, "[tokerr] failed at token %d of %d:\n",
+                    whale_tok_pos, whale_tok_len);
+            for (k = from; k < whale_tok_len && k < whale_tok_pos + 4; k++) {
+                int t = whale_tok_buf[k];
+                const char *mark = (k + 1 == whale_tok_pos) ? " <<<" : "";
+
+                if (t == TOK_CINT)
+                    fprintf(stderr, "  %d%s: INT %d\n", k, mark,
+                            (int)whale_tok_num[k]);
+                else if (t == TOK_CDOUBLE)
+                    fprintf(stderr, "  %d%s: DBL %.17g\n", k, mark,
+                            whale_tok_num[k]);
+                else if (t > 0 && t < 256)
+                    fprintf(stderr, "  %d%s: '%c' (%d)\n", k, mark,
+                            (t >= 32 && t < 127) ? t : '?', t);
+                else {
+                    const char *nm = (t >= TOK_IDENT) ? get_tok_str(t, NULL) : NULL;
+
+                    fprintf(stderr, "  %d%s: %s (%d)\n", k, mark,
+                            nm ? nm : "?", t);
+                }
+            }
+        }
         /* tcc_error() longjmps straight here, so the teardown at the end of this
            function never runs. Do the same unwinding on this path: otherwise the
            symbol/label stacks keep this unit's entries and the next compile in

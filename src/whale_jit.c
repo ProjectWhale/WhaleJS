@@ -2586,13 +2586,18 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         /* int32 or float64 inline; anything else hands off */
                         wt_arr("v", nm); wt('=');
                         wt('('); wt_arr("ap", os); wt('['); wt('('); wk(JS_WK_INT); wt(')'); wt_arr("v", tk); wt(']');
-                        wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(8); wt(')');
+                        /* `ap[os][i]` is a JSValue - a value, not a pointer - so
+                           member access is `.`. Spelling it `->` is what TinyCC
+                           reports as "pointer expected", and it stopped every
+                           function that read an array element as a number from
+                           compiling at all. */
+                        wt_op(JS_OP_DOT); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(8); wt(')');
                         wt('?'); wt_arr("ap", os); wt('['); wt('('); wk(JS_WK_INT); wt(')'); wt_arr("v", tk); wt(']');
-                        wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64");
+                        wt_op(JS_OP_DOT); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64");
                         wt(':'); wt('('); wt_arr("ap", os); wt('['); wt('('); wk(JS_WK_INT); wt(')'); wt_arr("v", tk); wt(']');
-                        wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(0); wt(')');
+                        wt_op(JS_OP_DOT); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(0); wt(')');
                         wt('?'); wt('('); wk(JS_WK_DOUBLE); wt(')'); wt_arr("ap", os); wt('['); wt('('); wk(JS_WK_INT); wt(')'); wt_arr("v", tk); wt(']');
-                        wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("int32");
+                        wt_op(JS_OP_DOT); wt_id("u"); wt_op(JS_OP_DOT); wt_id("int32");
                         wt(':'); wt_id("JS_WhaleObjValueNum"); wt('('); wt_id("ctx"); wt(',');
                         wt('&'); wt_arr("ap", os); wt('['); wt('('); wk(JS_WK_INT); wt(')'); wt_arr("v", tk); wt(']'); wt(','); wt_id("deopt"); wt(')');
                         wt(';');
