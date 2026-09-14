@@ -1464,6 +1464,19 @@ static int whale_struct_fields(unsigned off, int *atoms, int max)
     return k;
 }
 
+/* The column a field atom occupies in a layout, or -1 when it is not in it.
+   Takes the layout explicitly because the layout itself lives in whale_jit_gen's
+   frame (whale_str_atoms / whale_str_n). */
+static int whale_str_col(const int *atoms, int n, int atom)
+{
+    int i;
+
+    for (i = 0; i < n; i++)
+        if (atoms[i] == atom)
+            return i;
+    return -1;
+}
+
 static int whale_prof_one_shape(unsigned off)
 {
     /* 8 >= the engine cap on shapes per site, so the count it returns is exact */
@@ -2869,6 +2882,62 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 if (whale_objs >= WHALE_CALL_BASE)
                     goto out;
                 os = whale_objs++;
+                /* A settled layout: hold the object as a C struct in the frame
+                   instead of a heap object with a shape.
+
+                   Off by default, and the measurement is the reason. With the
+                   accesses converted - the half fc44fa4 was missing - the struct
+                   form is still ~19x slower than node on the object case, where the
+                   shape-cache form is 3.7x *faster*. The access goes from seven
+                   memory operations to one and still loses, because the number of
+                   statements per access went up, and statement count is what decides
+                   TCC's output (notes/optimisation-directions.md). WHALE_UNBOX=1
+                   turns it on for anyone who wants to work that trade. */
+                if (getenv("WHALE_UNBOX") && mono && whale_str_n == 0) {
+                    int fa[WHALE_STRUCT_FIELDS];
+                    int fn = 0, si2;
+
+                    /* The layout is the union of the atoms the field accesses were
+                       observed to use. The offset to ask about is the *access
+                       site's* (whale_field_sites), not this OP_object's: the profile
+                       is keyed by where the read or write happened, so passing the
+                       literal's own offset always came back empty - which is why the
+                       struct machinery looked dead. */
+                    for (si2 = 0;
+                         si2 < whale_field_sites_n && fn < WHALE_STRUCT_FIELDS; si2++) {
+                        int one[WHALE_STRUCT_FIELDS];
+                        int on = whale_struct_fields((unsigned)whale_field_sites[si2],
+                                                     one, WHALE_STRUCT_FIELDS);
+                        int q;
+
+                        for (q = 0; q < on; q++) {
+                            int seen = 0, m;
+
+                            for (m = 0; m < fn; m++)
+                                if (fa[m] == one[q]) { seen = 1; break; }
+                            if (!seen)
+                                fa[fn++] = one[q];
+                        }
+                    }
+
+                    if (fn > 0) {
+                        int k, pfm = fold_mark();
+
+                        for (k = 0; k < fn; k++) {
+                            whale_str_atoms[k] = fa[k];
+                            /* sp is the presence flag: a field nobody assigned must
+                               not read as a number. */
+                            wt_arr("sp", k); wt('='); wt_int(0); wt(';');
+                            wt_arr("sv", k); wt('='); wt_int(0); wt(';');
+                        }
+                        fold_commit(pfm);
+                        whale_str_n = fn;
+                        whale_str_slot = os;
+                        cur[var_count + sp] = WHALE_STRUCT_T(os);
+                        sp++;
+                        break;
+                    }
+                }
                 {
                     int fm = fold_mark();
 
@@ -2940,6 +3009,24 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int tb = cur[var_count + sp - 1];
                 int atom = (int)whale_get_u32(pc + pos + 1);
 
+                /* The fields of an unboxed struct are frame variables, not
+                   properties: the literal's initialisers become direct stores into
+                   the layout's columns. */
+                if (WHALE_IS_STRUCT(ta)) {
+                    int col = whale_str_col(whale_str_atoms, whale_str_n, atom);
+
+                    if (col < 0 || !whale_type_is_num(tb))
+                        goto out;
+                    {
+                        int fm = fold_mark();
+
+                        wt_arr("sv", col); wt('='); fold_inline(sp - 1); wt(';');
+                        wt_arr("sp", col); wt('='); wt_int(1); wt(';');
+                        fold_commit(fm);
+                    }
+                    sp--;   /* the object stays on the stack */
+                    break;
+                }
                 if (!WHALE_IS_SLOT(ta))
                     goto out;
                 if (!whale_type_is_num(tb)) {
@@ -2982,6 +3069,24 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int tb = cur[var_count + sp - 1];
                 int atom = (int)whale_get_u32(pc + pos + 1);
 
+                /* A struct field is a frame variable: the store is one
+                   assignment - no shape check, no pointer chase, no tag branch.
+                   That is the whole point of laying the object out. */
+                if (WHALE_IS_STRUCT(ta)) {
+                    int col = whale_str_col(whale_str_atoms, whale_str_n, atom);
+
+                    if (col < 0 || !whale_type_is_num(tb))
+                        goto out;
+                    {
+                        int fm = fold_mark();
+
+                        wt_arr("sv", col); wt('='); fold_inline(sp - 1); wt(';');
+                        wt_arr("sp", col); wt('='); wt_int(1); wt(';');
+                        fold_commit(fm);
+                    }
+                    sp -= 2;
+                    break;
+                }
                 if (getenv("WHALE_JIT_DUMP"))
                     fprintf(stderr, "[put] pos=%d ta=%d slot=%d tb=%d isnum=%d fields=%d isobj=%d\n",
                             pos, ta, WHALE_IS_SLOT(ta), tb, whale_type_is_num(tb),
@@ -3045,6 +3150,30 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int atom = (int)whale_get_u32(pc + pos + 1);
                 int fc, nm;
 
+                /* The receiver stays on the stack under the value - that is what
+                   `get_field2` is for - so a struct receiver keeps its slot type
+                   and the field value is pushed above it. */
+                if (WHALE_IS_STRUCT(ta)) {
+                    int col = whale_str_col(whale_str_atoms, whale_str_n, atom);
+
+                    if (col < 0 || whale_vserial >= stack_size + WHALE_VSER_MAX)
+                        goto out;
+                    nm = whale_vserial++;
+                    {
+                        int fm = fold_mark();
+
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_arr("sp", col); wt(')'); wt('{');
+                        wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        wt_arr("v", nm); wt('='); wt_arr("sv", col); wt(';');
+                        fold_commit(fm);
+                        whale_vname[sp] = nm;
+                        whale_vmat[sp] = 1;
+                    }
+                    cur[var_count + sp] = WHALE_T_NUM;
+                    sp++;
+                    break;
+                }
                 if (!WHALE_IS_SLOT(ta))
                     goto out;
                 if (whale_fields >= WHALE_FIELD_CACHE)
@@ -3067,6 +3196,30 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int atom = (int)whale_get_u32(pc + pos + 1);
                 int fc, nm;
 
+                /* A struct field is a frame variable: one load, with a presence
+                   flag in place of a tag branch. The flag matters because a field
+                   the layout reserves but this object never assigned must not read
+                   as a number. */
+                if (WHALE_IS_STRUCT(ta)) {
+                    int col = whale_str_col(whale_str_atoms, whale_str_n, atom);
+
+                    if (col < 0)
+                        goto out;
+                    nm = whale_vserial++;
+                    {
+                        int fm = fold_mark();
+
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_arr("sp", col); wt(')'); wt('{');
+                        wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        wt_arr("v", nm); wt('='); wt_arr("sv", col); wt(';');
+                        fold_commit(fm);
+                        whale_vname[sp - 1] = nm;
+                        whale_vmat[sp - 1] = 1;
+                    }
+                    cur[var_count + sp - 1] = WHALE_T_NUM;
+                    break;
+                }
                 /* Refusals below (the receiver is not an object slot, or the
                    cache is full) become one instruction handed to the engine. */
                 if ((!WHALE_IS_SLOT(ta) || whale_fields >= WHALE_FIELD_CACHE) &&
