@@ -1870,6 +1870,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     int whale_put_atoms_n = 0;
     int whale_call_pos[WHALE_CALL_MAX];
     int whale_call_n = 0;
+    /* The innermost enclosing `catch` targets, innermost last. The bytecode already
+       says where each one goes, so this is compile-time information only - what the
+       generated code needs is "which label do I jump to". Empty means no handler is
+       open, and then there is nothing to catch: the operation deopts as before. */
+    int whale_catch_tgt[WHALE_CATCH_MAX];
+    int whale_catch_depth = 0;
     /* every field access site in this function, as the offset the profile table is
        keyed by (opcode offset + 1). The candidate test is asked at the FUNCTION
        level - "was every field access here observed monomorphic" - rather than per
@@ -2194,6 +2200,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        and the call passes the arguments wrong, which looks like the code simply
        not working. */
     wk(JS_WK_EXTERN); wk(JS_WK_VOID); wt_id("JS_WhaleObjSlotNull"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("k"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_VOID); wt_id("JS_WhaleObjSlotUndef"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("k"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_VOID); wt_id("JS_WhaleObjSlotEmptyString"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("k"); wt(')'); wt(';');
@@ -4747,6 +4755,76 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 }
             }
             break;
+
+        /* ---- exceptions -------------------------------------------------------
+           The handler is a compile-time stack: `catch` says where it goes and
+           `nip_catch` says when it stops being active. Nothing here touches the
+           normal path - a thrown value is the only thing that ever consults it. */
+        case OP_catch:
+            {
+                int tgt = pos + 1 + (int32_t)whale_get_u32(pc + pos + 1);
+
+                if (whale_catch_depth >= WHALE_CATCH_MAX)
+                    { whale_out_line = __LINE__; goto out; }
+                whale_catch_tgt[whale_catch_depth++] = tgt;
+                /* The catch block expects the exception value where it begins. On
+                   the path that reaches it without throwing, that is undefined; the
+                   throw path overwrites the same slot with the real value. */
+                if (whale_objs >= WHALE_CALL_BASE)
+                    { whale_out_line = __LINE__; goto out; }
+                {
+                    int os = whale_objs++;
+                    int fm = fold_mark();
+
+                    wt_id("JS_WhaleObjSlotUndef"); wt('('); wt_id("ctx"); wt(',');
+                    wt_int(os); wt(')'); wt(';');
+                    fold_commit(fm);
+                    cur[var_count + sp] = WHALE_VAL_T(os);
+                }
+                sp++;
+            }
+            break;
+        case OP_nip_catch:
+            if (whale_catch_depth <= 0)
+                { whale_out_line = __LINE__; goto out; }
+            whale_catch_depth--;
+            /* pops two, pushes one: the catch value stays on the stack */
+            if (sp < 2)
+                { whale_out_line = __LINE__; goto out; }
+            sp--;
+            break;
+        case OP_throw:
+            {
+                int tgt;
+
+                ta = cur[var_count + sp - 1];
+                if (whale_catch_depth <= 0)
+                    { whale_out_line = __LINE__; goto out; }
+                tgt = whale_catch_tgt[whale_catch_depth - 1];
+                {
+                    int fm = fold_mark();
+
+                    if (WHALE_IS_VAL(ta) || WHALE_IS_OBJ(ta)) {
+                        /* the slot holds the value; JS_WhaleObjGet duplicates it */
+                        wt_id("JS_WhaleThrow"); wt('('); wt_id("ctx"); wt(',');
+                        wt_id("JS_WhaleObjGet"); wt('('); wt_id("ctx"); wt(',');
+                        wt_int(WHALE_IS_VAL(ta) ? WHALE_VAL_SLOT(ta) : WHALE_OBJ_SLOT(ta));
+                        wt(')'); wt(')'); wt(';');
+                    } else if (whale_type_is_num(ta)) {
+                        wt_id("JS_WhaleThrow"); wt('('); wt_id("ctx"); wt(',');
+                        wt_id("whale_jit_box_num"); wt('('); wt_id("ctx"); wt(',');
+                        fold_inline(sp - 1); wt(')'); wt(')'); wt(';');
+                    } else {
+                        whale_out_line = __LINE__;
+                        goto out;
+                    }
+                    wk(JS_WK_GOTO); wt_slot("L", tgt); wt(';');
+                    fold_commit(fm);
+                }
+                unreachable = 1;
+                sp--;
+            }
+            break;
         case OP_return:
             {
                 int fm;
@@ -5012,6 +5090,8 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
         tcc_add_symbol(s, "JS_WhaleTAU8Ptr", (void *)JS_WhaleTAU8Ptr);
         tcc_add_symbol(s, "JS_WhaleObjSlotNull", (void *)JS_WhaleObjSlotNull);
         tcc_add_symbol(s, "JS_WhaleObjSlotEmptyString", (void *)JS_WhaleObjSlotEmptyString);
+        tcc_add_symbol(s, "JS_WhaleObjSlotUndef", (void *)JS_WhaleObjSlotUndef);
+        tcc_add_symbol(s, "JS_WhaleThrow", (void *)JS_WhaleThrow);
         tcc_add_symbol(s, "JS_WhaleObjSlotAtom", (void *)JS_WhaleObjSlotAtom);
         tcc_add_symbol(s, "JS_WhaleObjDefineValue", (void *)JS_WhaleObjDefineValue);
         tcc_add_symbol(s, "JS_WhaleBinopVal", (void *)JS_WhaleBinopVal);

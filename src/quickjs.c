@@ -3433,6 +3433,13 @@ void JS_WhaleObjSlotNull(JSContext *ctx, int k)
     JS_WhaleObjSlot(ctx, k, JS_NULL);
 }
 
+/* undefined, for OP_catch: a catch block finds the thrown value where it starts, and
+   on the path that reaches it without throwing, that value is undefined. */
+void JS_WhaleObjSlotUndef(JSContext *ctx, int k)
+{
+    JS_WhaleObjSlot(ctx, k, JS_UNDEFINED);
+}
+
 /* The empty string, for OP_push_empty_string. That opcode has no operand naming an
    atom, unlike push_atom_value, so the atom comes from here - the same interned one
    the interpreter uses. */

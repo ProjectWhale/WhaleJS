@@ -128,6 +128,10 @@ typedef struct JSWhaleFuncInfo {
 /* direct calls the generator records, to see which loops contain one */
 #define WHALE_CALL_MAX 32
 
+/* nested `catch` blocks the generator tracks, innermost last. Bounded like the
+   others: past it, `catch` makes the function give up rather than mis-track. */
+#define WHALE_CATCH_MAX 16
+
 /* Compile one function. Returns 1 and fills entry_out/handle_out on success;
    the caller owns both, and releases the handle with JS_WhaleJitRelease(). */
 int  JS_WhaleJitCompileFunction(JSContext *ctx, const JSWhaleFuncInfo *info,
@@ -192,6 +196,7 @@ void JS_WhaleObjSlot(JSContext *ctx, int k, JSValue v);   /* park object in slot
    to abandon the whole function; these are the two instructions that do it most. */
 void JS_WhaleObjSlotNull(JSContext *ctx, int k);
 void JS_WhaleObjSlotEmptyString(JSContext *ctx, int k);
+void JS_WhaleObjSlotUndef(JSContext *ctx, int k);
 int  JS_WhaleObjSlotAtom(JSContext *ctx, int atom, int k);
 /* Apply a real JS binary operator to two parked values (see quickjs.c). Returns 0 on
    exception, in which case the generated code must deopt. */
