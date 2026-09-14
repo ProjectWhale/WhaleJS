@@ -223,6 +223,11 @@ int JS_WhaleObjSlotNum(JSContext *ctx, int slot, double v);
    borrowed from their slots, which is what keeps them alive across the call. */
 int JS_WhaleCallValue(JSContext *ctx, int func_slot, int argc, int arg_base,
                       int ret_slot);
+/* `new F(...)`: the same slot arrangement as JS_WhaleCallValue, but through the
+   constructor path, so the result is a new object and the callee is its own
+   new.target. One call out is the whole cost - `new` does the prototype dance. */
+int JS_WhaleConstructValue(JSContext *ctx, int func_slot, int argc, int arg_base,
+                           int ret_slot);
 /* The same call, to this function itself, for arguments the double domain cannot
    carry: the self-recursion path packs its arguments into a double array, so a
    self-call that passes a parked object has to come through here instead. The

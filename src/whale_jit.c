@@ -357,6 +357,10 @@ static int whale_is_call_op(int op)
 {
     switch (op) {
     case OP_call: case OP_call0: case OP_call1: case OP_call2: case OP_call3:
+    /* `new F(...)` takes its callee the same way a call does: the slot read just
+       before it is a function, not a number. Leaving this out typed `Error` as a
+       number, and `throw new Error(m)` then refused the whole function. */
+    case OP_call_constructor:
         return 1;
     default:
         return 0;
@@ -442,9 +446,20 @@ static int whale_feeds_call_as_callee(const uint8_t *pc, int len, int pos, int s
         int o = (int)pc[k];
         int s;
 
+        if (getenv("WHALE_JIT_DUMP"))
+            fprintf(stderr, "[feeds] k=%d o=%d dup=%d push=%d\n",
+                    k, o, OP_dup, whale_is_push_op(o));
         if (whale_is_call_op(o))
             return 1;
-        if (!whale_is_push_op(o))
+        /* Two opcodes carry the callee or its arguments rather than starting
+           something new, and neither is in whale_is_push_op:
+             - `dup`: a constructor call is `get_var F; dup; <args>; call_constructor`,
+               the bytecode needing F twice - as the function and as new.target;
+             - `push_atom_value`: a string argument, exactly the case in
+               `throw new Error("negative")`.
+           Stopping at either typed the callee as a number, and the whole function
+           was then refused. */
+        if (o != OP_dup && o != OP_push_atom_value && !whale_is_push_op(o))
             return 0;
         s = whale_op_size_of(o);
         if (s <= 0)
@@ -1776,6 +1791,26 @@ static int whale_sites_mono(const int *sites, int nsites)
 static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 {
     whale_prof_now = info->prof;
+    /* A linear disassembly, as opcode numbers and offsets. The generator's own view
+       of the bytecode is the only one that matters when a case is refused, and
+       reading it back out of the switch is guesswork. */
+    if (getenv("WHALE_OP_DBG")) {
+        int k = 0;
+
+        fprintf(stderr, "[consts] if_false8=%d if_true8=%d goto8=%d if_false=%d goto=%d catch=%d throw=%d\n",
+                OP_if_false8, OP_if_true8, OP_goto8, OP_if_false, OP_goto, OP_catch, OP_throw);
+        fprintf(stderr, "[ops] len=%d:", info->byte_code_len);
+        while (k < info->byte_code_len && k < 60) {
+            int o = info->byte_code[k];
+            int s = whale_op_size_of(o);
+
+            fprintf(stderr, " %d:op%d", k, o);
+            if (s <= 0)
+                break;
+            k += s;
+        }
+        fprintf(stderr, "\n");
+    }
     /* The loops the compiler gave us. Printed here so the generator side of the
        hand-over can be checked without emitting anything yet. */
     if (getenv("WHALE_LOOP_DBG") && info->loop_count > 0) {
@@ -1948,15 +1983,29 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         if (op == OP_goto8 || op == OP_if_false8 || op == OP_if_true8) {
             int tgt = pos + 1 + (int8_t)pc[pos + 1];
 
+            if (getenv("WHALE_OP_DBG"))
+                fprintf(stderr, "[tgt8] pos=%d op=%d tgt=%d\n", pos, op, tgt);
             targets[tgt] = 1;
             if (tgt < pos)              /* backward jump: a loop back edge */
                 loop_back[tgt] = pos;
         } else if (op == OP_goto || op == OP_if_false || op == OP_if_true) {
             int tgt = pos + 1 + (int32_t)whale_get_u32(pc + pos + 1);
 
+            if (getenv("WHALE_OP_DBG"))
+                fprintf(stderr, "[tgt] pos=%d op=%d tgt=%d\n", pos, op, tgt);
             targets[tgt] = 1;
             if (tgt < pos)
                 loop_back[tgt] = pos;
+        } else if (op == OP_catch) {
+            /* `catch L` is a jump target too: it is where the handler starts. Without
+               this the label is never emitted and a `goto L` from a `throw` - or any
+               later op that jumps into the catch block - has nowhere to land. */
+            int ctgt = pos + 1 + (int32_t)whale_get_u32(pc + pos + 1);
+
+            if (getenv("WHALE_OP_DBG"))
+                fprintf(stderr, "[catch-tgt] pos=%d raw=%u tgt=%d\n",
+                        pos, (unsigned)whale_get_u32(pc + pos + 1), ctgt);
+            targets[ctgt] = 1;
         } else if (op >= OP_get_arg0 && op < OP_get_arg0 + 4) {
             args_used[op - OP_get_arg0] = 1;
             if (whale_next_is_field_read(pc, len, pos, sz))
@@ -2290,6 +2339,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wk(JS_WK_DOUBLE); wt_id("v"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_WhaleObjGet"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("k"); wt(')'); wt(';');
+    /* Raising. Without this prototype TinyCC declares it implicitly, the JSValue
+       argument is passed as an int, and the generated code fails to parse - which
+       is what an `implicit declaration of function 'JS_WhaleThrow'` warning next
+       to `identifier expected` means. */
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleThrow"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wt_id("JSValue"); wt_id("v"); wt(')'); wt(';');
     /* Packed arrays. Same warning as the object ones: a missing prototype here
        makes TinyCC declare the function implicitly, and then a double argument
        is passed as an int - the call still links and silently computes
@@ -2315,6 +2370,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("src"); wt(',');
         wk(JS_WK_INT); wt_id("dst"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleCallValue"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("func_slot"); wt(',');
+        wk(JS_WK_INT); wt_id("argc"); wt(','); wk(JS_WK_INT); wt_id("arg_base"); wt(',');
+        wk(JS_WK_INT); wt_id("ret_slot"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleConstructValue"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("func_slot"); wt(',');
         wk(JS_WK_INT); wt_id("argc"); wt(','); wk(JS_WK_INT); wt_id("arg_base"); wt(',');
         wk(JS_WK_INT); wt_id("ret_slot"); wt(')'); wt(';');
@@ -2498,6 +2557,15 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     }
 
     sp = 0;
+    if (getenv("WHALE_OP_DBG")) {
+        int k;
+
+        fprintf(stderr, "[targets] len=%d:", len);
+        for (k = 0; k < len; k++)
+            if (targets[k])
+                fprintf(stderr, " %d", k);
+        fprintf(stderr, "\n");
+    }
     for (pos = 0; pos < len; ) {
         int op = pc[pos];
         int sz = whale_op_size_of(op);
@@ -2580,18 +2648,29 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             sp = cur[state_len - 1];
             /* A basic-block boundary: every live stack slot has to become a real
                variable again, because the expressions that produced them belong
-               to the block that just ended. */
+               to the block that just ended. Slots that carry a value - an object, an
+               array, a parked value, a laid-out struct - are skipped: their "type"
+               is the slot number, there is no expression to materialise, and asking
+               for one emits `v[k] = () ;`, which TinyCC refuses. That is exactly the
+               shape a `catch` produces, since it parks undefined where the handler
+               will look for the exception. */
             {
                 int k;
 
-                for (k = 0; k < sp; k++)
+                for (k = 0; k < sp; k++) {
+                    int tk = cur[var_count + k];
+
+                    if (WHALE_IS_SLOT(tk) || WHALE_IS_STRUCT(tk))
+                        continue;
                     fold_materialize(k);
+                }
             }
             {
                 int fm = fold_mark();
 
-                if (getenv("WHALE_STEP_DBG"))
-                    fprintf(stderr, "[label] pos=%d\n", pos);
+                if (getenv("WHALE_OP_DBG"))
+                    fprintf(stderr, "[label] pos=%d depth=%d outlen=%d\n",
+                            pos, whale_loop_depth, *whale_out_len);
                 wt_slot("L", pos); wt(':');
                 fold_commit(fm);
             }
@@ -2922,39 +3001,114 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             }
             break;
 
-        /* `new Uint8Array(n)`. Stack is [ctor, new.target, args...]; only the
-           one-argument typed-array form is lowered, everything else deopts. */
+        /* `new F(...)`. Stack is [func, new.target, args...].
+
+           `new Uint8Array(n)` has its own lowering. Everything else goes through the
+           engine's constructor path: `new` does the whole prototype dance, and one
+           call out is the honest price for keeping the function compiling at all -
+           a single `throw new Error(...)` used to drop it back to the interpreter,
+           because this opcode was refused and the refusal was global. */
         case OP_call_constructor:
             {
                 int argc = (int)whale_get_u16(pc + pos + 1);
                 int fslot = sp - argc - 2;
-                int out;
+                int tc;
 
-                if (argc != 1 || fslot < 0)
+                if (fslot < 0 || argc < 0 || argc > WHALE_CALL_SLOTS)
                     { whale_out_line = __LINE__; goto out; }
-                /* new.target is deliberately not checked: for `new Uint8Array(n)`
-                   the bytecode passes the constructor itself as the target, and a
-                   target that is some other function cannot change what this
-                   construction makes. */
-                if (!WHALE_IS_OBJ(cur[var_count + fslot]) ||
-                    !whale_type_is_num(cur[var_count + sp - 1]))
-                    { whale_out_line = __LINE__; goto out; }
-                out = whale_objs++;
-                if (out >= WHALE_OBJ_SLOTS)
-                    { whale_out_line = __LINE__; goto out; }
-                {
-                    int fm = fold_mark();
+                tc = cur[var_count + fslot];
+                if (argc == 1 && WHALE_IS_OBJ(tc) &&
+                    whale_type_is_num(cur[var_count + sp - 1])) {
+                    /* new.target is deliberately not checked: for `new Uint8Array(n)`
+                       the bytecode passes the constructor itself as the target, and a
+                       target that is some other function cannot change what this
+                       construction makes. */
+                    int out = whale_objs++;
 
-                    wk(JS_WK_IF); wt('('); wt('!');
-                    wt_id("JS_WhaleNewU8Array"); wt('('); wt_id("ctx"); wt(',');
-                    wt_int(WHALE_OBJ_SLOT(cur[var_count + fslot])); wt(',');
-                    fold_inline(sp - 1); wt(','); wt_int(out); wt(')');
-                    wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
-                    fold_commit(fm);
+                    if (out >= WHALE_OBJ_SLOTS)
+                        { whale_out_line = __LINE__; goto out; }
+                    {
+                        int fm = fold_mark();
+
+                        wk(JS_WK_IF); wt('('); wt('!');
+                        wt_id("JS_WhaleNewU8Array"); wt('('); wt_id("ctx"); wt(',');
+                        wt_int(WHALE_OBJ_SLOT(tc)); wt(',');
+                        fold_inline(sp - 1); wt(','); wt_int(out); wt(')');
+                        wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        fold_commit(fm);
+                    }
+                    sp = fslot;
+                    cur[var_count + sp] = WHALE_OBJ_T(out);
+                    sp++;
+                    break;
                 }
-                sp = fslot;
-                cur[var_count + sp] = WHALE_OBJ_T(out);
-                sp++;
+                {
+                    int cc = -1, ret_slot, k, fm, nxt = pos + sz;
+
+                    /* The callee has to be reachable through a slot: the helper looks
+                       it up there. A function this compilation can see is parked from
+                       the constant pool; anything else must already be parked. */
+                    if (getenv("WHALE_JIT_DUMP"))
+                        fprintf(stderr, "[ctor] pos=%d argc=%d tc=%d fslot=%d sp=%d\n",
+                                pos, argc, tc, fslot, sp);
+                    if (WHALE_IS_VAL(tc) || WHALE_IS_OBJ(tc))
+                        cc = WHALE_IS_VAL(tc) ? WHALE_VAL_SLOT(tc) : WHALE_OBJ_SLOT(tc);
+                    else if (tc != WHALE_T_FN)
+                        { whale_out_line = __LINE__; goto out; }
+                    for (k = 0; k < argc; k++) {
+                        int tk = cur[var_count + sp - argc + k];
+
+                        if (!whale_type_is_num(tk) && !WHALE_IS_VAL(tk) && !WHALE_IS_OBJ(tk))
+                            { whale_out_line = __LINE__; goto out; }
+                    }
+                    /* Same rule as a general call: the result is either dead or it is
+                       parked as an opaque value. A number would deopt later, and that
+                       would run the constructor - and its side effects - twice. */
+                    if (nxt < len && (int)pc[nxt] == OP_drop) {
+                        ret_slot = -1;
+                    } else {
+                        if (whale_objs >= WHALE_CALL_BASE)
+                            { whale_out_line = __LINE__; goto out; }
+                        ret_slot = whale_objs++;
+                    }
+                    fm = fold_mark();
+                    if (cc < 0) {
+                        if (whale_objs >= WHALE_CALL_BASE)
+                            { whale_out_line = __LINE__; goto out; }
+                        cc = whale_objs++;
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleCpoolSlot"); wt('(');
+                        wt_id("ctx"); wt(','); wt_int(whale_slot_fn[fslot]); wt(',');
+                        wt_int(cc); wt(')'); wt(')');
+                        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    }
+                    for (k = 0; k < argc; k++) {
+                        int tk = cur[var_count + sp - argc + k];
+
+                        wk(JS_WK_IF); wt('('); wt('!');
+                        if (whale_type_is_num(tk)) {
+                            wt_id("JS_WhaleObjSlotNum"); wt('('); wt_id("ctx"); wt(',');
+                            wt_int(WHALE_CALL_BASE + k); wt(',');
+                            fold_inline(sp - argc + k); wt(')');
+                        } else {
+                            wt_id("JS_WhaleObjSlotCopy"); wt('('); wt_id("ctx"); wt(',');
+                            wt_int(WHALE_IS_VAL(tk) ? WHALE_VAL_SLOT(tk) : WHALE_OBJ_SLOT(tk)); wt(',');
+                            wt_int(WHALE_CALL_BASE + k); wt(')');
+                        }
+                        wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    }
+                    wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleConstructValue"); wt('(');
+                    wt_id("ctx"); wt(','); wt_int(cc); wt(','); wt_int(argc); wt(',');
+                    wt_int(WHALE_CALL_BASE); wt(','); wt_int(ret_slot); wt(')'); wt(')');
+                    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    fold_commit(fm);
+                    sp = fslot;
+                    cur[var_count + sp] = (ret_slot < 0)
+                        ? (uint8_t)WHALE_T_UNKNOWN : WHALE_VAL_T(ret_slot);
+                    sp++;
+                }
             }
             break;
 
@@ -4168,6 +4322,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                    than the arguments, so the engine must not memoise this
                    function. */
                 whale_gen_pure = 0;
+                if (getenv("WHALE_JIT_DUMP"))
+                    fprintf(stderr, "[getvar] pos=%d sz=%d atom=%d feeds_call=%d\n",
+                            pos, sz, atom, whale_feeds_call_as_callee(pc, len, pos, sz));
                 if (whale_feeds_call_as_callee(pc, len, pos, sz)) {
                     /* The value is about to be called, so it has to travel as
                        the JSValue it is. A slot is the only way the generated
@@ -4778,7 +4935,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                     wt_id("JS_WhaleObjSlotUndef"); wt('('); wt_id("ctx"); wt(',');
                     wt_int(os); wt(')'); wt(';');
-                    fold_commit(fm);
+                    /* fold_set, not fold_commit: the slot's fold state has to say it
+                       is materialised, or a later op inlining stack slot `sp` gets an
+                       empty expression - `v[0] = () ;`, which TinyCC refuses. */
+                    fold_set(sp, fm);
                     cur[var_count + sp] = WHALE_VAL_T(os);
                 }
                 sp++;
@@ -4795,12 +4955,14 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             break;
         case OP_throw:
             {
-                int tgt;
+                /* -1 when no handler is open: then the exception is not for this
+                   function to handle, it leaves on the return path. */
+                int tgt = (whale_catch_depth > 0)
+                    ? whale_catch_tgt[whale_catch_depth - 1] : -1;
 
                 ta = cur[var_count + sp - 1];
-                if (whale_catch_depth <= 0)
+                if (!WHALE_IS_VAL(ta) && !WHALE_IS_OBJ(ta) && !whale_type_is_num(ta))
                     { whale_out_line = __LINE__; goto out; }
-                tgt = whale_catch_tgt[whale_catch_depth - 1];
                 {
                     int fm = fold_mark();
 
@@ -4810,15 +4972,26 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         wt_id("JS_WhaleObjGet"); wt('('); wt_id("ctx"); wt(',');
                         wt_int(WHALE_IS_VAL(ta) ? WHALE_VAL_SLOT(ta) : WHALE_OBJ_SLOT(ta));
                         wt(')'); wt(')'); wt(';');
-                    } else if (whale_type_is_num(ta)) {
+                    } else {
                         wt_id("JS_WhaleThrow"); wt('('); wt_id("ctx"); wt(',');
                         wt_id("whale_jit_box_num"); wt('('); wt_id("ctx"); wt(',');
                         fold_inline(sp - 1); wt(')'); wt(')'); wt(';');
-                    } else {
-                        whale_out_line = __LINE__;
-                        goto out;
                     }
-                    wk(JS_WK_GOTO); wt_slot("L", tgt); wt(';');
+                    if (tgt >= 0) {
+                        /* a handler is open: the exception continues there */
+                        wk(JS_WK_GOTO); wt_slot("L", tgt); wt(';');
+                    } else {
+                        /* Nothing catches it in this function, so it leaves the way
+                           any exception does. *deopt == 2 is the engine's "a call
+                           inside the compiled body threw": the exception is already
+                           pending in ctx and the frame must NOT run again, because
+                           the throw may be a side effect (a DOM mutation). The return
+                           value is then unused, but the generated function still has
+                           to return something of its own type. */
+                        wt('*'); wt_id("deopt"); wt('='); wt_int(2); wt(';');
+                        wk(JS_WK_RETURN); wt_id("whale_jit_box_num");
+                        wt('('); wt_id("ctx"); wt(','); wt_int(0); wt(')'); wt(';');
+                    }
                     fold_commit(fm);
                 }
                 unreachable = 1;
@@ -5119,6 +5292,7 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
         tcc_add_symbol(s, "JS_WhaleArgGetObj", (void *)JS_WhaleArgGetObj);
         tcc_add_symbol(s, "JS_WhaleCallValue", (void *)JS_WhaleCallValue);
         tcc_add_symbol(s, "JS_WhaleCallSelfValue", (void *)JS_WhaleCallSelfValue);
+        tcc_add_symbol(s, "JS_WhaleConstructValue", (void *)JS_WhaleConstructValue);
         tcc_add_symbol(s, "JS_WhaleExceptionValue", (void *)JS_WhaleExceptionValue);
         /* the single-instruction fallback */
         tcc_add_symbol(s, "JS_WhaleStepPushNum", (void *)JS_WhaleStepPushNum);

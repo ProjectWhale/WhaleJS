@@ -3599,6 +3599,36 @@ int JS_WhaleCallValue(JSContext *ctx, int func_slot, int argc, int arg_base,
     return 1;
 }
 
+/* `new F(...)`. Same shape as JS_WhaleCallValue - the callee and every argument are
+   slots - but the call goes through the constructor path, so the result is a freshly
+   created object and the callee sees itself as new.target.
+
+   There is no cheaper route: `new` does the whole prototype dance, and doing it in
+   generated code would mean reimplementing JS_CallConstructorInternal in fragments.
+   One call out is the honest cost, and it keeps the function compiling - which is
+   the point, since a single `throw new Error(...)` used to drop the entire function
+   back to the interpreter. */
+int JS_WhaleConstructValue(JSContext *ctx, int func_slot, int argc, int arg_base,
+                           int ret_slot)
+{
+    JSValue *slots = whale_frame_obj_slots(ctx);
+    JSValue r;
+
+    if (func_slot < 0 || func_slot >= WHALE_OBJ_SLOTS)
+        return 0;
+    if (argc < 0 || arg_base < 0 || arg_base + argc > WHALE_OBJ_SLOTS)
+        return 0;
+    r = JS_CallConstructorInternal(ctx, slots[func_slot], slots[func_slot],
+                                   argc, slots + arg_base, 0);
+    if (JS_IsException(r))
+        return 0;
+    if (ret_slot >= 0 && ret_slot < WHALE_OBJ_SLOTS)
+        JS_WhaleObjSlot(ctx, ret_slot, r);   /* takes over the reference */
+    else
+        JS_FreeValue(ctx, r);
+    return 1;
+}
+
 /* The same call, but to this function itself, and with arguments the double domain
    cannot carry.
 
