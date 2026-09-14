@@ -243,30 +243,35 @@ property access) and requires every other operand to be a number. That is enough
 make the mechanism safe: all five reproducers agree with node, all 24 perftest cases
 produce correct output, and `gen gave up` falls from 23 to 14.
 
-**Unboxing: built, measured, and off by default (`ee56d3f`).** With the fallback in
-place I finished the half `fc44fa4` had withdrawn - `OP_object` lays a settled shape
-out as a frame struct, and the four field accesses read and write its columns
-directly. It is correct (24/24) and it is **slower**, by a lot:
+**Unboxing: built, measured, on by default (`e5a5eef`).** `OP_object` lays a settled
+shape out as a frame struct, and the four field access ops read and write its columns
+directly - one access, no shape check, no pointer chase, no tag branch.
 
-    the same binary, one environment variable apart
-      default          n=2000 0ms   n=20000 0ms   n=200000   8ms
-      WHALE_UNBOX=1    n=2000 6ms   n=20000 37ms  n=200000 400ms
-      node               2ms         3ms            21ms
+    WHALE_NO_UNBOX=1   object   7ms   objshape  823ms
+    default            object   4ms   objshape  563ms
+    stock qjs          object 386ms   objshape 1241ms
 
-Seven memory operations become one and it still loses 19-50x. The reason is not
-memory traffic: the statement count per access goes up, and TCC's output is decided by
-statement count (`notes/optimisation-directions.md`). The shape-cache form the default
-keeps is 3.7x *faster* than node. So the struct path stays behind `WHALE_UNBOX=1` and
-off by default - that is a measurement, not a retreat.
+**This entry previously said the opposite, and the mistake is worth keeping.** An
+earlier revision had unboxing off by default and recorded "19-50x slower than node",
+attributing it to statement count. That was wrong at every level:
 
-That also answers "why did the fallback not show a win": the win being chased was never
-the hand-over itself, and the unboxing it paved the way for is not a win on this
-backend either. **The lever here is statement count**, which points at the peephole
-work (`B1` in `notes/optimisation-directions.md`), not at more value representation.
+- the struct was being *created* while the accesses still went through
+  `JS_WhaleObjFieldPtr` - the half `fc44fa4` had withdrawn as useless on its own;
+- `WHALE_IS_STRUCT` is deliberately not part of `WHALE_IS_SLOT`, and the struct case
+  was placed *inside* the `WHALE_IS_SLOT` branch of `put_loc`, i.e. unreachable. The
+  deferred-store path then emitted `L0 = ( )` - a local assigned an empty expression -
+  and TinyCC refused the function (`identifier expected`, token 998). `get_loc` and
+  `set_loc` needed the same treatment;
+- so the timing was **the interpreter**. `temp/obj_ubx/` was empty: no machine code
+  was ever produced for that configuration.
 
-**State**: tree green at `ee56d3f`; 24/24 perftest correct with unboxing off;
-`temp/w_*.js` are the reproducers, and `WHALE_UNBOX=1` / `WHALE_STEP_OFF=<opcode>` are
-the switches.
+The general lesson is the one `notes/debugging-discipline.md` already states in
+another shape: **"slow" is not proof the JIT ran**, any more than "0 mismatches" is.
+The cheap check is stock qjs on the same case - an interpreted whalejs time sits
+almost exactly on top of it, so closeness to qjs means it never compiled.
+
+**State**: tree green at `e5a5eef`; 24/24 perftest correct; `WHALE_NO_UNBOX=1` and
+`WHALE_STEP_OFF=<opcode>` are the switches, and `temp/w_*.js` the reproducers.
 
 `check`/`ms` are top-level locals (interpreted, not compiled), so the corruption comes
 from `build`/`scan`, which pin both `i` and the return variable `s`. That is the same
