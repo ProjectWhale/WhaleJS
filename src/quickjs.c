@@ -3028,15 +3028,15 @@ static JSShapeProperty *find_own_property(JSProperty **ppr, JSObject *p, JSAtom 
    A column is a JSValue, so a value that is not a number is stored as it is and costs
    nothing special. The columns are the only storage; there is no second copy. */
 
-int JS_WhaleStructNew(JSContext *ctx, const int *atoms, int nslots, int *out_slot)
+int JS_WhaleStructNew(JSContext *ctx, const int *atoms, int nslots, int slot)
 {
     WhaleStruct *ws;
     JSValue obj;
     int k;
 
-    if (nslots <= 0 || nslots > WHALE_STRUCT_FIELDS || !out_slot || !atoms)
+    if (nslots <= 0 || nslots > WHALE_STRUCT_FIELDS || !atoms)
         return 0;
-    if (*out_slot < 0 || *out_slot >= WHALE_OBJ_SLOTS)
+    if (slot < 0 || slot >= WHALE_OBJ_SLOTS)
         return 0;
     obj = JS_NewObjectClass(ctx, JS_CLASS_WHALE_STRUCT);
     if (JS_IsException(obj))
@@ -3075,7 +3075,7 @@ int JS_WhaleStructNew(JSContext *ctx, const int *atoms, int nslots, int *out_slo
     ws->magic = WHALE_STRUCT_MAGIC;
     ws->nslots = (uint32_t)nslots;
     JS_VALUE_GET_OBJ(obj)->u.opaque = ws;
-    whale_frame_obj_slots(ctx)[*out_slot] = obj;   /* the slot takes the reference */
+    whale_frame_obj_slots(ctx)[slot] = obj;   /* the slot takes the reference */
     return 1;
 }
 
