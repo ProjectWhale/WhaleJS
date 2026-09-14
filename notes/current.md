@@ -1228,3 +1228,63 @@ map at the merge. Architecture, not a one-liner. That is where this stopped.
 - code volume: fourfield and w_of2 dumps are line-for-line the same, binaries 2798 vs
   2494 bytes, 685 vs 613 instructions - yet 65ms vs 3ms. Still unexplained. Not code
   size, not the loop body, not the map path (JS_WhaleObjFieldPtr appears 0 times).
+
+## <57> native control-flow compilation (for/if/while/switch) - preparation
+
+PLAN only, no code change this round. Full note: `notes/native-control-flow-plan.md`.
+
+**What the measurement changed.** `objfields` and the same loop body with the fields
+replaced by plain locals (`temp/w_of_split.js`) run at the same speed:
+
+    whalejs  OF 16/32/57/72ms   LOC 15/35/51/61ms   (~16 ns/iter)
+    node     OF  4/10/15/16ms   LOC  3/7/10/22ms    (~4  ns/iter)
+
+So object field access is NOT the bottleneck - the loop body as a whole is ~4x node.
+`WHALE_STR_STAT` also showed `StructNew` / `FieldNum` / `SetNum` / `col_lookup` are
+all called **zero** times on this case: no CStruct is built and no table is consulted.
+Both layout tables are complete (`cols=4 atoms=[tag,key,flags,depth]`, `mono=1`).
+
+**An older reading is withdrawn.** The previous note's "D plain locals 3ms vs C object
+fields 70ms, 23x" compared two *different* loop bodies; the gap was the modulo, not the
+object. Same body, same speed.
+
+**Modulo guards are not the target.** `fold_mod` already lowers to integer `idiv`, and
+the project's own measurement at `whale_jit.c:4519-4523` says
+`guarded idiv 1776ms, bare idiv 1781ms, fmod 3028ms / 2e8 ops - the guard is free`.
+Trimming them buys nothing; not done.
+
+**Where the change goes.** QuickJS has no `OP_for`/`OP_while` - for/while/do are
+`goto` + `if_false` in the bytecode, and the generator translates them 1:1 into C
+(`OP_if_*` at 4677, `OP_goto*` at 4700, with a `snap`/`seen` type snapshot per jump
+target, taken exactly once). "Native for" means recognising the loop shape in that
+goto graph and emitting a C `for` instead.
+
+**Predicted bugs, in order of likelihood** (detail in the plan note): the one-shot type
+snapshot is wrong if a slot's type changes across iterations; `deopt` inside a loop
+re-runs the frame and repeats side effects; `sp` must be identical at head and back
+edge; `unreachable`/DCE interacts with the back edge; nested `break`/`continue` need
+the C `break` scoping; labels may still be referenced from outside the loop.
+## <58> compiler-side loop table, attached to JSFunctionBytecode - done
+
+The generator no longer has to infer a loop from the opcode stream. QuickJS has no
+OP_for/OP_while, but its stack-size pass already computes every jump target, so a
+backward jump (`tgt < pos`) can be recorded there - deterministic, not inferred.
+
+Implemented (all in `src/quickjs.c`, no generator change yet):
+
+- `WhaleLoop { head, back, exit, kind }` + `WHALE_LOOP_MAX 64` (near WhaleProfSite).
+- `JSFunctionDef` carries the collected table.
+- `compute_stack_size`: `whale_note_loop(fd, pos, tgt, cond)` added to the `goto`/
+  `goto16`/`goto8` and `if_true*`/`if_false*` branches (~39021-39044).
+- `js_create_function`: memcpy into `JSFunctionBytecode` (inline array, so it stays out
+  of the GC and the clone path and needs no free).
+- `JSFunctionBytecode`: `uint16_t whale_loop_count; WhaleLoop whale_loops[64];`
+- Diagnostic `WHALE_LOOP_DBG=1`.
+
+Measured: `objfields` `blen=102 loops=1 {head=5 back=66 cond=0}`; `object`
+`{head=22 back=74}`; `sieve` 4 loops including a nested one; every case correct,
+`0 mismatches`, timing identical to baseline (pure collection).
+
+`cond` distinguishes a backward `if` (do/while test) from a backward `goto`
+(for(;;)/while). `exit` is still -1: it is the target the head's conditional jump
+leaves through, i.e. what `break` uses; second pass.

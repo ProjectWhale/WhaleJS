@@ -882,6 +882,10 @@ typedef struct WhaleProfSite {
     JSShape *shape[WHALE_PROFILE_SHAPES];
 } WhaleProfSite;
 
+/* WhaleLoop and WHALE_LOOP_MAX are defined in whale_jit.h, which this file
+   includes: the loop table crosses the engine/generator boundary, so the struct
+   lives in the shared header. */
+
 typedef struct JSFunctionBytecode {
     JSGCObjectHeader header; /* must come first */
     uint8_t is_strict_mode : 1;
@@ -944,6 +948,13 @@ void *whale_jit_entry2;    /* the other reading of a closure-slot call target */
     uint8_t whale_prof_on;      /* recording the call in progress */
     uint8_t whale_prof_used;
     WhaleProfSite *whale_prof;
+    /* The loops the compiler found in this function, in the order it walked them.
+       Filled by compute_stack_size (see WhaleLoop), read by the generator so it can
+       emit C `for`/`while` instead of inferring the loop from the goto structure.
+       Inline and bounded: a loop table is small, and inline keeps it out of the GC
+       and out of the clone path. */
+    uint16_t whale_loop_count;
+    WhaleLoopInfo whale_loops[WHALE_LOOP_TABLE_MAX];
 } JSFunctionBytecode;
 
 typedef struct JSBoundFunction {
@@ -3034,6 +3045,10 @@ int JS_WhaleStructNew(JSContext *ctx, const int *atoms, int nslots, int slot)
     JSValue obj;
     int k;
 
+    if (getenv("WHALE_STR_STAT")) {
+        static long n;
+        fprintf(stderr, "[str-stat] StructNew calls=%ld nslots=%d slot=%d\n", ++n, nslots, slot);
+    }
     if (nslots <= 0 || nslots > WHALE_STRUCT_FIELDS || !atoms)
         return 0;
     if (slot < 0 || slot >= WHALE_OBJ_SLOTS)
@@ -3087,6 +3102,12 @@ static int whale_struct_col(JSContext *ctx, WhaleStruct *ws, JSAtom name)
     JSValue v;
     int col;
 
+    if (getenv("WHALE_STR_STAT")) {
+        static long n;
+        n++;
+        if (n == 1 || (n & (n - 1)) == 0)
+            fprintf(stderr, "[str-stat] col_lookup calls=%ld\n", n);
+    }
     v = JS_GetProperty(ctx, ws->offset, name);
     if (JS_IsException(v)) {
         JS_FreeValue(ctx, v);
@@ -3110,6 +3131,12 @@ int JS_WhaleStructFieldNum(JSContext *ctx, int slot, JSAtom name, double *out)
     JSValue v;
     int col;
 
+    if (getenv("WHALE_STR_STAT")) {
+        static long n;
+        n++;
+        if (n == 1 || (n & (n - 1)) == 0)
+            fprintf(stderr, "[str-stat] FieldNum calls=%ld\n", n);
+    }
     if (slot < 0 || slot >= WHALE_OBJ_SLOTS)
         return 0;
     ws = whale_struct_of(whale_frame_obj_slots(ctx)[slot]);
@@ -3136,6 +3163,12 @@ int JS_WhaleStructSetNum(JSContext *ctx, int slot, JSAtom name, double d)
     WhaleStruct *ws;
     int col;
 
+    if (getenv("WHALE_STR_STAT")) {
+        static long n;
+        n++;
+        if (n == 1 || (n & (n - 1)) == 0)
+            fprintf(stderr, "[str-stat] SetNum calls=%ld\n", n);
+    }
     if (slot < 0 || slot >= WHALE_OBJ_SLOTS)
         return 0;
     ws = whale_struct_of(whale_frame_obj_slots(ctx)[slot]);
@@ -4201,6 +4234,10 @@ static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
         info.var_ref_count = b->var_ref_count;
         info.cpool_count = b->cpool_count;
         info.cpool = b->cpool;
+        /* The loops the compiler found (see WhaleLoop). Opaque to the generator,
+           which only reads head/back/exit/kind through the struct it shares. */
+        info.loops = b->whale_loops;
+        info.loop_count = b->whale_loop_count;
         /* A closure slot that feeds a call is either this very function
            (self-recursion) or an enclosing closure's value, and the bytecode
            does not say which - only the entry check does. So compile both
@@ -24516,6 +24553,12 @@ typedef struct JSFunctionDef {
     int source_len;
 
     JSModuleDef *module; /* != NULL when parsing a module */
+
+    /* Loops found by compute_stack_size, carried over to JSFunctionBytecode by
+       js_create_function. Stored here rather than returned because the stack-size
+       pass is where the graph is walked and a backward jump is recognised. */
+    uint16_t whale_loop_count;
+    WhaleLoopInfo whale_loops[WHALE_LOOP_TABLE_MAX];
 } JSFunctionDef;
 
 typedef struct JSToken {
@@ -38816,6 +38859,29 @@ typedef struct StackSizeState {
     int pc_stack_size;
 } StackSizeState;
 
+/* Record a loop when the stack-size pass walks across one. A jump whose target is
+   behind it is a back edge - that is the definition of a loop in this bytecode, and
+   the pass already computes the target for its own purposes. Doing it here means the
+   generator is told the loop rather than having to infer it from the opcode stream.
+
+   `is_cond` distinguishes a backward `if` (a `do`/`while` test at the bottom) from a
+   backward `goto` (a `for(;;)` or `while`'s unconditional jump back). */
+static void whale_note_loop(JSFunctionDef *fd, int pos, int tgt, int is_cond)
+{
+    WhaleLoopInfo *wl;
+
+    if (tgt >= pos)            /* forward jump: not a back edge */
+        return;
+    if (fd->whale_loop_count >= WHALE_LOOP_TABLE_MAX)
+        return;
+    wl = &fd->whale_loops[fd->whale_loop_count];
+    wl->head = tgt;
+    wl->back = pos;
+    wl->exit = -1;
+    wl->kind = (uint8_t)is_cond;
+    fd->whale_loop_count++;
+}
+
 /* 'op' is only used for error indication */
 static __exception int ss_check(JSContext *ctx, StackSizeState *s,
                                 int pos, int op, int stack_len, int catch_pos)
@@ -38941,24 +39007,29 @@ static __exception int compute_stack_size(JSContext *ctx,
         case OP_goto:
             diff = get_u32(bc_buf + pos + 1);
             pos_next = pos + 1 + diff;
+            whale_note_loop(fd, pos, pos_next, 0);
             break;
         case OP_goto16:
             diff = (int16_t)get_u16(bc_buf + pos + 1);
             pos_next = pos + 1 + diff;
+            whale_note_loop(fd, pos, pos_next, 0);
             break;
         case OP_goto8:
             diff = (int8_t)bc_buf[pos + 1];
             pos_next = pos + 1 + diff;
+            whale_note_loop(fd, pos, pos_next, 0);
             break;
         case OP_if_true8:
         case OP_if_false8:
             diff = (int8_t)bc_buf[pos + 1];
+            whale_note_loop(fd, pos, pos + 1 + diff, 1);
             if (ss_check(ctx, s, pos + 1 + diff, op, stack_len, catch_pos))
                 goto fail;
             break;
         case OP_if_true:
         case OP_if_false:
             diff = get_u32(bc_buf + pos + 1);
+            whale_note_loop(fd, pos, pos + 1 + diff, 1);
             if (ss_check(ctx, s, pos + 1 + diff, op, stack_len, catch_pos))
                 goto fail;
             break;
@@ -39210,6 +39281,24 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     memcpy(b->byte_code_buf, fd->byte_code.buf, fd->byte_code.size);
     js_free(ctx, fd->byte_code.buf);
     fd->byte_code.buf = NULL;
+
+    /* The loops compute_stack_size found while walking the bytecode. Carried over
+       here so the generator can read them off the function later. */
+    b->whale_loop_count = fd->whale_loop_count;
+    if (fd->whale_loop_count > 0) {
+        memcpy(b->whale_loops, fd->whale_loops,
+               sizeof(WhaleLoopInfo) * fd->whale_loop_count);
+        if (getenv("WHALE_LOOP_DBG")) {
+            int li;
+            fprintf(stderr, "[loop-dbg] blen=%d loops=%d:",
+                    b->byte_code_len, fd->whale_loop_count);
+            for (li = 0; li < fd->whale_loop_count; li++)
+                fprintf(stderr, " {head=%d back=%d cond=%d}",
+                        fd->whale_loops[li].head, fd->whale_loops[li].back,
+                        fd->whale_loops[li].kind);
+            fprintf(stderr, "\n");
+        }
+    }
 
     b->func_name = fd->func_name;
     if (fd->arg_count + fd->var_count > 0) {

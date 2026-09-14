@@ -1761,6 +1761,19 @@ static int whale_sites_mono(const int *sites, int nsites)
 static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 {
     whale_prof_now = info->prof;
+    /* The loops the compiler gave us. Printed here so the generator side of the
+       hand-over can be checked without emitting anything yet. */
+    if (getenv("WHALE_LOOP_DBG") && info->loop_count > 0) {
+        int li;
+
+        fprintf(stderr, "[gen-loops] blen=%d count=%d:", info->byte_code_len,
+                info->loop_count);
+        for (li = 0; li < info->loop_count; li++)
+            fprintf(stderr, " {head=%d back=%d exit=%d cond=%d}",
+                    info->loops[li].head, info->loops[li].back,
+                    info->loops[li].exit, info->loops[li].kind);
+        fprintf(stderr, "\n");
+    }
     /* What JS_UNDEFINED actually looks like, measured rather than assumed. The tag
        value, the word boundaries and the width are all things to read off the engine,
        and guessing them has already cost several rounds. */
@@ -1856,6 +1869,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     int whale_str_atoms[WHALE_STRUCT_FIELDS];
     int whale_str_n = 0;
     int whale_str_slot = -1;
+    /* Whether this function lays any object out. Decided once, from the scan pass's
+       access sites, before the prologue is emitted: the column variables have to be
+       declared - and pinned - in the prologue, but only a function that will use them
+       may have them, because an unused `register` variable still takes a register
+       away from TinyCC's expression evaluation. */
+    int whale_str_need = 0;
+    int whale_str_L[WHALE_STRUCT_FIELDS];
     int prev_op;    /* the opcode before the current one, in the scan pass */
     /* The one object slot this layout is materialised into when it has to become a
        real JSValue - as a call argument, say. One slot, not one per materialisation
@@ -2353,6 +2373,46 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             if (i == pin1 || i == pin2)
                 wk(JS_WK_REGISTER);
             wk(JS_WK_DOUBLE); wt_slot("L", i); wt('='); wt_int(0); wt(';');
+        }
+        /* Will this function lay an object out? That is exactly the question of
+           whether the layout the field accesses share has any columns, which the
+           access sites answer. Decided here, before the columns are declared, and
+           not at the first OP_object: a variable declaration is a prologue thing, and
+           a `register` one is only honoured there. */
+        whale_str_need = whale_sites_mono(whale_field_sites, whale_field_sites_n) &&
+                         whale_layout_from_sites(whale_field_sites, whale_field_sites_n,
+                                                 whale_str_atoms, WHALE_STRUCT_FIELDS) > 0;
+        if (getenv("WHALE_STR_DBG")) {
+            int cols = whale_layout_from_sites(whale_field_sites, whale_field_sites_n,
+                                               whale_str_atoms, WHALE_STRUCT_FIELDS);
+            int si;
+
+            fprintf(stderr, "[str-table] blen=%d sites=%d mono=%d need=%d cols=%d atoms=[",
+                    info->byte_code_len, whale_field_sites_n,
+                    whale_sites_mono(whale_field_sites, whale_field_sites_n),
+                    whale_str_need, cols);
+            for (si = 0; si < cols; si++)
+                fprintf(stderr, "%s%s", si ? "," : "",
+                        JS_AtomToCString(ctx, whale_str_atoms[si]));
+            fprintf(stderr, "] site_pos=[");
+            for (si = 0; si < whale_field_sites_n; si++)
+                fprintf(stderr, "%s%d", si ? "," : "", whale_field_sites[si]);
+            fprintf(stderr, "]\n");
+        }
+        /* The columns. Pinned, because a field access reads and writes them on every
+           iteration of the loop the layout exists for - and that loop, unlike the
+           rest of the function, contains no call, so the pinned value is never
+           spilled. */
+        if (whale_str_need) {
+            for (i = 0; i < WHALE_STRUCT_FIELDS; i++) {
+                whale_str_L[i] = var_count + i;
+                wk(JS_WK_REGISTER);
+                wk(JS_WK_DOUBLE); wt_slot("L", whale_str_L[i]);
+                wt('='); wt_int(0); wt(';');
+            }
+        } else {
+            for (i = 0; i < WHALE_STRUCT_FIELDS; i++)
+                whale_str_L[i] = var_count + i;
         }
     }
     /* All of the generator's scratch state in one zero-initialised block: the
@@ -3071,9 +3131,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                         for (k = 0; k < fn; k++) {
                             /* sp is the presence flag: a field nobody assigned must
-                               not read as a number. */
+                               not read as a number. The columns themselves were
+                               declared and zeroed in the prologue. */
                             wt_arr("sp", k); wt('='); wt_int(0); wt(';');
-                            wt_arr("sv", k); wt('='); wt_int(0); wt(';');
+                            wt_slot("L", whale_str_L[k]); wt('='); wt_int(0); wt(';');
                         }
                         fold_commit(pfm);
                         whale_str_n = fn;
@@ -3180,7 +3241,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     if (col >= 0 && whale_type_is_num(tb)) {
                         int fm = fold_mark();
 
-                        wt_arr("sv", col); wt('='); fold_inline(sp - 1); wt(';');
+                        wt_slot("L", whale_str_L[col]); wt('='); fold_inline(sp - 1); wt(';');
                         wt_arr("sp", col); wt('='); wt_int(1); wt(';');
                         fold_commit(fm);
                         sp--;   /* the object stays on the stack */
@@ -3220,7 +3281,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         for (m = 0; m < whale_str_n; m++) {
                             wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjDefineNum");
                             wt('('); wt_id("ctx"); wt(','); wt_int(ms); wt(',');
-                            wt_int(whale_str_atoms[m]); wt(','); wt_arr("sv", m); wt(')'); wt(')');
+                            wt_int(whale_str_atoms[m]); wt(',');
+                            wt_slot("L", whale_str_L[m]); wt(')'); wt(')');
                             wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
                             wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
                         }
@@ -3304,7 +3366,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     {
                         int fm = fold_mark();
 
-                        wt_arr("sv", col); wt('='); fold_inline(sp - 1); wt(';');
+                        wt_slot("L", whale_str_L[col]); wt('='); fold_inline(sp - 1); wt(';');
                         wt_arr("sp", col); wt('='); wt_int(1); wt(';');
                         fold_commit(fm);
                     }
@@ -3411,7 +3473,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         wk(JS_WK_IF); wt('('); wt('!'); wt_arr("sp", col); wt(')'); wt('{');
                         wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
                         wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
-                        wt_arr("v", nm); wt('='); wt_arr("sv", col); wt(';');
+                        wt_arr("v", nm); wt('='); wt_slot("L", whale_str_L[col]); wt(';');
                         fold_commit(fm);
                         whale_vname[sp] = nm;
                         whale_vmat[sp] = 1;
@@ -3481,7 +3543,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         wk(JS_WK_IF); wt('('); wt('!'); wt_arr("sp", col); wt(')'); wt('{');
                         wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
                         wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
-                        wt_arr("v", nm); wt('='); wt_arr("sv", col); wt(';');
+                        wt_arr("v", nm); wt('='); wt_slot("L", whale_str_L[col]); wt(';');
                         fold_commit(fm);
                         whale_vname[sp - 1] = nm;
                         whale_vmat[sp - 1] = 1;
@@ -3719,10 +3781,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         int k, pfm = fold_mark();
 
                         for (k = 0; k < fn; k++) {
-                            /* Read each field once, here, into the layout. The object
-                               itself is left alone - the columns are what the
-                               accesses below use. */
-                            wt_arr("sv", k); wt('='); wt_id("JS_WhaleObjFieldNum");
+                            /* Read each field once, into its column. The object
+                               itself is left alone - these are what the accesses
+                               below use. */
+                            wt_slot("L", whale_str_L[k]); wt('=');
+                            wt_id("JS_WhaleObjFieldNum");
                             wt('('); wt_id("ctx"); wt(','); wt_int(slot); wt(',');
                             wt_int(whale_str_atoms[k]); wt(',');
                             wt('&'); wt_arr("fs", WHALE_FIELD_CACHE - 1); wt(',');
@@ -4246,7 +4309,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         for (m = 0; m < whale_str_n; m++) {
                             wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjDefineNum");
                             wt('('); wt_id("ctx"); wt(','); wt_int(ms); wt(',');
-                            wt_int(whale_str_atoms[m]); wt(','); wt_arr("sv", m); wt(')'); wt(')');
+                            wt_int(whale_str_atoms[m]); wt(',');
+                            wt_slot("L", whale_str_L[m]); wt(')'); wt(')');
                             wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
                             wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
                         }

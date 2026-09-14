@@ -23,6 +23,33 @@ JS_EXTERN int JS_WhaleProfShapes(const void *prof, unsigned pc,
 /* The property atoms of a shape, in layout order, for laying out an unboxed struct. */
 JS_EXTERN int JS_WhaleShapeFields(const void *shape, int *atoms, int max);
 
+/* A loop, as the compiler saw it. QuickJS has no OP_for/OP_while: a loop is a
+   backward jump, and the compiler knows exactly which jumps those are while it
+   walks the graph for its own stack-size pass. Recording them there is
+   authoritative - the generator does not have to infer a loop from an opcode
+   stream, which is what makes the shape fragile.
+
+   `head` is the jump target and `back` the jump itself, so `back > head`. `kind`
+   says whether the backward jump is unconditional (a `for(;;)`/`do` back edge) or
+   conditional (`while`/`for` test at the bottom). `exit` is the target the loop's
+   head test jumps to when there is one, -1 otherwise: that is what `break` leaves
+   through.
+
+   Named WhaleLoopInfo, not WhaleLoop: the generator already has a WhaleLoop of its
+   own, the buffer a loop body is assembled in before it is emitted. */
+typedef struct WhaleLoopInfo {
+    int head;
+    int back;
+    int exit;
+    uint8_t kind;
+} WhaleLoopInfo;
+
+/* Bounded on purpose: a function with more loops than this keeps the first ones it
+   saw, which only means the generator falls back to the goto path for the rest.
+   Named ..._TABLE_MAX: the generator has its own WHALE_LOOP_MAX, the depth of its
+   loop-body buffer. */
+#define WHALE_LOOP_TABLE_MAX 64
+
 typedef struct JSWhaleFuncInfo {
     const uint8_t *byte_code;
     const void *prof;   /* observed access shapes, or NULL */
@@ -34,6 +61,13 @@ typedef struct JSWhaleFuncInfo {
     int var_ref_count;
     int cpool_count;
     const JSValue *cpool;
+    /* The loops the compiler found in this function, or NULL when it found none.
+       QuickJS has no OP_for/OP_while - a loop is a backward jump - and the pass that
+       computes the stack size walks every jump target, so it records a back edge
+       there. The generator is therefore told the loop instead of having to infer one
+       from the opcode stream. */
+    const WhaleLoopInfo *loops;
+    int loop_count;
 } JSWhaleFuncInfo;
 
 /* Number of JSValue slots the engine lends to a JIT-compiled function so it has
