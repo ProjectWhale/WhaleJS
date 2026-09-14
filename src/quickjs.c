@@ -3302,14 +3302,21 @@ int JS_WhaleCallValue(JSContext *ctx, int func_slot, int argc, int arg_base,
    The self-recursion fast path packs its arguments into a double array and calls the
    compiled core directly, which only works while every argument is a number. A
    self-call that passes a parked object - a laid-out one, or a call's result - has to
-   go through the engine instead. The generated code holds the function as a JSValue
-   (`whale_self`, the entry's own argument), so this needs no slot for the callee. */
-int JS_WhaleCallSelfValue(JSContext *ctx, JSValue self, int argc, int arg_base,
-                          int ret_slot)
-{
-    JSValue *slots = whale_frame_obj_slots(ctx);
-    JSValue r;
+   go through the engine instead.
 
+   The function comes from the frame rather than from the caller. The generated core is
+   a plain C function with its own signature and has no `whale_self` of its own; only
+   the entry has that. Passing it in would mean widening every core's signature for
+   this one call site. */
+int JS_WhaleCallSelfValue(JSContext *ctx, int argc, int arg_base, int ret_slot)
+{
+    JSStackFrame *sf = ctx->rt->current_stack_frame;
+    JSValue *slots = whale_frame_obj_slots(ctx);
+    JSValue self, r;
+
+    if (!sf)
+        return 0;
+    self = sf->cur_func;   /* borrowed: the frame running this generated code */
     if (argc < 0 || arg_base < 0 || arg_base + argc > WHALE_OBJ_SLOTS)
         return 0;
     r = JS_Call(ctx, self, JS_UNDEFINED, argc, slots + arg_base);

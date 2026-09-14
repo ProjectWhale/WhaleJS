@@ -177,10 +177,9 @@ int JS_WhaleCallValue(JSContext *ctx, int func_slot, int argc, int arg_base,
                       int ret_slot);
 /* The same call, to this function itself, for arguments the double domain cannot
    carry: the self-recursion path packs its arguments into a double array, so a
-   self-call that passes a parked object has to come through here instead. `self`
-   is the JSValue the generated entry was given. */
-int JS_WhaleCallSelfValue(JSContext *ctx, JSValue self, int argc, int arg_base,
-                          int ret_slot);
+   self-call that passes a parked object has to come through here instead. The
+   function itself comes from the running frame - see the definition. */
+int JS_WhaleCallSelfValue(JSContext *ctx, int argc, int arg_base, int ret_slot);
 /* Duplicate slot src into slot dst (moving an already-parked value into the
    contiguous scratch area a call needs). */
 int JS_WhaleObjSlotCopy(JSContext *ctx, int src, int dst);

@@ -2229,7 +2229,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wk(JS_WK_INT); wt_id("argc"); wt(','); wk(JS_WK_INT); wt_id("arg_base"); wt(',');
         wk(JS_WK_INT); wt_id("ret_slot"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleCallSelfValue"); wt('(');
-        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wt_id("JSValue"); wt_id("self"); wt(',');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(',');
         wk(JS_WK_INT); wt_id("argc"); wt(','); wk(JS_WK_INT); wt_id("arg_base"); wt(',');
         wk(JS_WK_INT); wt_id("ret_slot"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_WhaleExceptionValue"); wt('(');
@@ -3080,19 +3080,64 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 if (WHALE_IS_STRUCT(ta)) {
                     int col = whale_str_col(whale_str_atoms, whale_str_n, atom);
 
-                    if (col < 0 || !whale_type_is_num(tb))
-                        { whale_out_line = __LINE__; goto out; }
-                    {
+                    if (col >= 0 && whale_type_is_num(tb)) {
                         int fm = fold_mark();
 
                         wt_arr("sv", col); wt('='); fold_inline(sp - 1); wt(';');
                         wt_arr("sp", col); wt('='); wt_int(1); wt(';');
                         fold_commit(fm);
+                        sp--;   /* the object stays on the stack */
+                        break;
                     }
-                    sp--;   /* the object stays on the stack */
-                    break;
+                    /* The layout cannot hold this field, so the object cannot stay a
+                       layout:
+                         - the atom is not one of the columns (another site widened
+                           the layout), or
+                         - the value is one the double domain has no room for, such as
+                           the string vnode_build stores in `key`.
+
+                       Materialise the columns into a real object once, retype the
+                       object slot, and fall through to the engine path below - which
+                       already knows how to store an opaque value. Every column is
+                       rewritten from `sv`, so a later field of the same object
+                       rebuilds whatever an earlier one put there. Abandoning the
+                       function here is what kept vnode_build interpreting.
+
+                       This block exists at the call-argument case below as well. It is
+                       written out at both instead of factored out because the layout
+                       state it reads - whale_str_atoms, whale_str_n,
+                       whale_str_obj_slot - is local to this function. */
+                    if (whale_str_obj_slot < 0) {
+                        if (whale_objs >= WHALE_CALL_BASE)
+                            { whale_out_line = __LINE__; goto out; }
+                        whale_str_obj_slot = whale_objs++;
+                    }
+                    {
+                        int fm = fold_mark();
+                        int ms = whale_str_obj_slot, m;
+
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjNew"); wt('(');
+                        wt_id("ctx"); wt(','); wt_int(ms); wt(')'); wt(')');
+                        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        for (m = 0; m < whale_str_n; m++) {
+                            wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjDefineNum");
+                            wt('('); wt_id("ctx"); wt(','); wt_int(ms); wt(',');
+                            wt_int(whale_str_atoms[m]); wt(','); wt_arr("sv", m); wt(')'); wt(')');
+                            wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                            wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        }
+                        fold_commit(fm);
+                    }
+                    /* Both the tracked type and the local must be updated: the tests
+                       below read `ta`, not cur[]. */
+                    ta = cur[var_count + sp - 2] = (uint8_t)WHALE_OBJ_T(whale_str_obj_slot);
                 }
-                if (!WHALE_IS_SLOT(ta))
+                /* An object on the stack here is either a plain slot, a call's
+                   result, or the one the layout above was just materialised into.
+                   WHALE_IS_OBJ and WHALE_IS_VAL cover those, and WHALE_SLOT reads
+                   all three because the slot is encoded the same way in each. */
+                if (!WHALE_IS_SLOT(ta) && !WHALE_IS_OBJ(ta) && !WHALE_IS_VAL(ta))
                     { whale_out_line = __LINE__; goto out; }
                 if (!whale_type_is_num(tb)) {
                     /* { key: "a string" } - the value is opaque, so hand it to the
@@ -4128,11 +4173,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     }
                     wk(JS_WK_IF); wt('('); wt('!');
                     if (tc == WHALE_T_SELF) {
-                        /* WHALE_T_SELF is not a slot, so there is no JSValue to look up:
-                           call this function's own entry, which the generated code
-                           already holds as whale_self. */
+                        /* WHALE_T_SELF is not a slot, so there is no JSValue to look up
+                           in the frame; the helper takes the function from the frame
+                           itself. */
                         wt_id("JS_WhaleCallSelfValue"); wt('('); wt_id("ctx"); wt(',');
-                        wt_id("whale_self"); wt(',');
                     } else {
                         wt_id("JS_WhaleCallValue"); wt('('); wt_id("ctx"); wt(',');
                         wt_int(WHALE_IS_VAL(tc) ? WHALE_VAL_SLOT(tc) : WHALE_OBJ_SLOT(tc)); wt(',');
