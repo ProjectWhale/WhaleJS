@@ -197,6 +197,14 @@ int  JS_WhaleObjSlotAtom(JSContext *ctx, int atom, int k);
    exception, in which case the generated code must deopt. */
 JS_EXTERN int JS_WhaleBinopVal(JSContext *ctx, int op, int a_slot, int b_slot,
                                int out_slot);
+
+/* Exception handling. The handler targets live in the generator (the bytecode says
+   where a `catch` goes); the runtime raises and answers whether something was
+   raised. A generated function tests JS_WhaleStepFailed only after a helper that
+   can raise - never after plain arithmetic, a comparison or a local access. */
+JS_EXTERN int JS_WhaleStepFailed(JSContext *ctx);
+JS_EXTERN int JS_WhaleThrow(JSContext *ctx, JSValue v);
+JS_EXTERN JSValue JS_WhaleTakeException(JSContext *ctx);
 /* Move a callable from the constant pool into an object slot, so the general call
    path can use a callee that inlining could not expand. */
 JS_EXTERN int JS_WhaleCpoolSlot(JSContext *ctx, int idx, int k);

@@ -18438,6 +18438,48 @@ int JS_WhaleBinopVal(JSContext *ctx, int op, int a_slot, int b_slot, int out_slo
     return 1;
 }
 
+/* ---- exception handling ---------------------------------------------------
+
+   A compiled function follows the same rule as value synchronisation: the normal
+   path touches nothing, and the exception path is only looked at where an
+   exception can actually appear. Double arithmetic, comparisons and local loads
+   and stores never consult any of this; a helper that can raise - a call, a
+   property access, an operator on opaque values - is followed by one test.
+
+   The handler targets are a compile-time stack in the generator, because the
+   bytecode already says where a `catch` goes. The runtime only has to be able to
+   raise and to answer whether something was raised. */
+
+/* Was an exception raised and not yet consumed? A generated function asks this
+   after a helper that may have raised one, and jumps to its innermost catch. */
+int JS_WhaleStepFailed(JSContext *ctx)
+{
+    /* JSValue is a union, so "nothing pending" is a tag test, not a comparison.
+       JS_UNINITIALIZED is what the field is set to when the last exception was
+       consumed (see JS_CallInternal's return path). */
+    return JS_VALUE_GET_TAG(ctx->rt->current_exception) != JS_TAG_UNINITIALIZED;
+}
+
+/* Raise `v` as the pending exception. Ownership of v transfers. Returns 0 so the
+   generated code reads the same way as a helper call: `if
+   (!JS_WhaleThrow(ctx, v)) goto L_handler;`. */
+int JS_WhaleThrow(JSContext *ctx, JSValue v)
+{
+    ctx->rt->current_exception = v;
+    return 0;
+}
+
+/* Consume the pending exception, for a catch block's entry - where the
+   interpreter would have left the exception value on the operand stack. Leaves
+   the "nothing pending" marker behind. */
+JSValue JS_WhaleTakeException(JSContext *ctx)
+{
+    JSValue v = ctx->rt->current_exception;
+
+    ctx->rt->current_exception = JS_UNINITIALIZED;
+    return v;
+}
+
 static __exception int js_operator_in(JSContext *ctx, JSValue *sp)
 {
     JSValue op1, op2;
