@@ -38879,6 +38879,31 @@ static void whale_note_loop(JSFunctionDef *fd, int pos, int tgt, int is_cond)
     wl->back = pos;
     wl->exit = -1;
     wl->kind = (uint8_t)is_cond;
+    /* What `break` leaves through: the loop head's test. The head itself is where
+       the loop's condition starts computing, not the branch - `for (i = 0; i < n;
+       i++)` opens with `get_loc i` and the `if_false` comes a few bytes later. So
+       walk from the head to the first conditional jump, without running past the
+       back edge. -1 when there is none before the body repeats (`for(;;)`). */
+    {
+        const uint8_t *bc = fd->byte_code.buf;
+        int h = tgt, guard = 0;
+
+        while (h + 1 < fd->byte_code.size && h < pos && guard++ < 64) {
+            int hop = bc[h];
+
+            if (hop == OP_if_false8 || hop == OP_if_true8) {
+                wl->exit = h + 1 + (int8_t)bc[h + 1];
+                break;
+            }
+            if (hop == OP_if_false || hop == OP_if_true) {
+                wl->exit = h + 1 + (int32_t)get_u32(bc + h + 1);
+                break;
+            }
+            if (hop == 0 || hop >= OP_COUNT)
+                break;
+            h += short_opcode_info(hop).size;
+        }
+    }
     fd->whale_loop_count++;
 }
 
