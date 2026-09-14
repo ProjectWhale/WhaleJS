@@ -184,3 +184,54 @@ iteration and a GC pass later walks a slot that should be empty).
 
 How to reach the reproducer without editing this file: `WHALE_VALUE_OBJ=1` turns the
 value-position rule off. The rule itself is unchanged by default.
+
+---
+
+## Update 3: the argument path - the order question, and why it does not pay yet
+
+Raised by the user, and it is a real gap: an object laid out by one compiled function
+arrives in *another* new compilation as an ordinary JSObject, and it should be laid out
+there rather than degrade to a JSValue slot. Measured, same shape:
+
+    crossfn (object passed across a call)   159ms
+    objfields (object made in the same fn)   64ms
+    sv[] writes: 0        ObjFieldPtr: 13       ArgGetObj: 2
+
+`OP_get_arg0..3` parks such an argument as `WHALE_VAL_T(arg_obj_slot[idx])`, and the
+field accesses then go through `JS_WhaleObjFieldPtr` - the map path, ~7 memory
+operations per field. `args_obj[idx]` already records exactly the right condition (the
+argument is the receiver of a field access), and the shape-based read the user pointed
+at is `JS_WhaleObjFieldNum`, which is what `put_loc` already uses.
+
+Three things came out of trying it.
+
+**The order question was wrong.** I first reported that the layout could not be known at
+`get_arg` time because the site table fills up as the generator walks forward. It does
+not: `whale_jit_gen` has a preceding scan pass - it collects `field_sites`, `args_obj`,
+call positions, back edges - that finishes before the emit loop starts. So the layout is
+available at any point, and the "顺序障碍" I wrote last round should be struck out.
+
+**Pre-deriving the layout for the whole function breaks OP_object and put_loc.** Doing it
+right after the scan and setting `whale_str_n` makes both skip their blocks - and those
+blocks do more than derive the layout: they retype the local, drop the fold cache and
+commit the load. `objfields` went 64ms -> 168ms, with the object never retyped at all.
+Deriving it lazily inside the `get_arg` branch fixes that (`objfields` back to 75ms).
+
+**It is still a net loss in this shape.** With the lazy derivation in place:
+
+    crossfn              159ms -> 578ms
+    sv[] writes: 8       ObjFieldPtr: 2
+
+The layout does happen, and it is 3.6x slower. The reason is the boundary: `run()` calls
+`use(o, n)` once per loop iteration, and a struct cannot cross the call. `run`
+materialises it (8 x JS_WhaleObjDefineNum) and `use` lays it out again (8 x
+JS_WhaleObjFieldNum) - 16 engine calls per iteration, to save ~6 memory operations per
+field access in a loop that runs 200000 times. The trade is upside down here.
+
+So laying out an argument is correct but not sufficient on its own. It needs one of:
+
+- the callee inlined, so there is no boundary to cross, or
+- the laid-out form crossing the boundary as columns instead of through a JSObject.
+
+Until one of those exists, the JSValue path is the better number. Reverted; the tree is
+green at ebff5e4.
