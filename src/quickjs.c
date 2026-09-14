@@ -196,6 +196,18 @@ enum {
     JS_CLASS_CALL_SITE,
     JS_CLASS_RAWJSON,
 
+    /* WhaleJS: an object whose properties live in a C struct that compiled code can
+       address by pointer offset. A distinct class, not an extension of
+       JS_CLASS_OBJECT - the two do not share a tag, so neither has to accommodate the
+       other's storage. JS still sees an ordinary object: same prototype chain, same
+       syntax, `in` and enumeration included. The interpreter/code the JIT did not
+       compile reaches the struct through a per-shape offset map, and falls back to a
+       dynamic property map for anything that map does not name. The columns also
+       record whether a property was ever really set, which is what lets `in` tell
+       "defined as undefined" from "never defined" while a plain read reports
+       undefined for both, as the language requires. */
+    JS_CLASS_WHALE_STRUCT,
+
     JS_CLASS_INIT_COUNT, /* last entry for predefined classes */
 };
 
