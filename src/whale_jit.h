@@ -250,6 +250,14 @@ int JS_WhaleNativeEnsureSlot(JSContext *ctx, int slot, const int *atoms, int n);
 double JS_WhaleNativeSlotFieldNum(JSContext *ctx, int slot, int col, int *deopt);
 int JS_WhaleNativeSlotPutNum(JSContext *ctx, int slot, int col, int atom, double v);
 
+/* The C-struct object: a new kind of object whose property values live in flat columns
+   reached by a compile-time offset. The generated code calls these by slot, the way it
+   holds any object. New builds one and fills `slot`; the other two read and write one
+   column. See notes/whale-struct-object.md. */
+int JS_WhaleStructNew(JSContext *ctx, const int *atoms, int nslots, int slot);
+double JS_WhaleStructFieldNum(JSContext *ctx, int slot, int atom, double *out);
+int JS_WhaleStructSetNum(JSContext *ctx, int slot, int atom, double v);
+
 /* Compile-time only - never called by generated code. Does global `atom` name
    the Uint8Array constructor? Asking while emitting is what keeps each stack
    slot's held type a single compile-time fact. */
