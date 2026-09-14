@@ -2952,9 +2952,11 @@ void JS_FreeRuntime(JSRuntime *rt)
 typedef struct WhaleStruct {
     uint32_t  magic;
     uint32_t  nslots;
-    JSShape  *offset;          /* name -> column: the layout map */
-    struct JSObject *dynamic;  /* names the layout map does not cover */
-    JSValue  *data;            /* flat: nslots JSValues, in offset order */
+    /* The two maps are ordinary objects, held as values like anything else, so they
+       are freed and traced the ordinary way. */
+    JSValue   offset;          /* name -> column. A map object, and only a map */
+    JSValue   dynamic;         /* names the offset map does not cover */
+    JSValue  *data;            /* flat: nslots JSValues, in column order */
 } WhaleStruct;
 
 /* The C-struct part of an object of this class, or NULL. */
@@ -2981,15 +2983,13 @@ static void js_whale_struct_finalizer(JSRuntime *rt, JSValue val)
         uint32_t k;
 
         /* The values are flat JSValues owned by this struct, so they go first, then
-           the array itself, then the dynamic map - which is an ordinary object and
-           holds its own values. */
+           the array itself, then the two maps. Each map is an ordinary object holding
+           its own values, so freeing the value is all it takes. */
         for (k = 0; k < ws->nslots; k++)
             JS_FreeValueRT(rt, ws->data[k]);
         js_free_rt(rt, ws->data);
-        if (ws->dynamic) {
-            JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_OBJECT, ws->dynamic));
-            ws->dynamic = NULL;
-        }
+        JS_FreeValueRT(rt, ws->offset);
+        JS_FreeValueRT(rt, ws->dynamic);
         js_free_rt(rt, ws);
     }
     p->u.opaque = NULL;
@@ -3028,13 +3028,13 @@ static JSShapeProperty *find_own_property(JSProperty **ppr, JSObject *p, JSAtom 
    A column is a JSValue, so a value that is not a number is stored as it is and costs
    nothing special. The columns are the only storage; there is no second copy. */
 
-int JS_WhaleStructNew(JSContext *ctx, int nslots, int *out_slot)
+int JS_WhaleStructNew(JSContext *ctx, const int *atoms, int nslots, int *out_slot)
 {
     WhaleStruct *ws;
     JSValue obj;
     int k;
 
-    if (nslots <= 0 || nslots > WHALE_STRUCT_FIELDS || !out_slot)
+    if (nslots <= 0 || nslots > WHALE_STRUCT_FIELDS || !out_slot || !atoms)
         return 0;
     if (*out_slot < 0 || *out_slot >= WHALE_OBJ_SLOTS)
         return 0;
@@ -3047,7 +3047,16 @@ int JS_WhaleStructNew(JSContext *ctx, int nslots, int *out_slot)
         return 0;
     }
     ws->data = js_mallocz(ctx, sizeof(JSValue) * nslots);
-    if (!ws->data) {
+    ws->offset = JS_NewObject(ctx);
+    ws->dynamic = JS_NewObject(ctx);
+    if (!ws->data || JS_IsException(ws->offset) || JS_IsException(ws->dynamic)) {
+        if (ws->data) {
+            for (k = 0; k < nslots; k++)
+                JS_FreeValue(ctx, ws->data[k]);
+            js_free(ctx, ws->data);
+        }
+        JS_FreeValue(ctx, ws->offset);
+        JS_FreeValue(ctx, ws->dynamic);
         js_free(ctx, ws);
         JS_FreeValue(ctx, obj);
         return 0;
@@ -3059,27 +3068,37 @@ int JS_WhaleStructNew(JSContext *ctx, int nslots, int *out_slot)
            property really is undefined. So a reserved column costs nothing and claims
            nothing. */
         ws->data[k] = JS_MKPTR(JS_TAG_UNDEFINED, (void *)(intptr_t)1);
+        /* And the offset map names the column. A map, and nothing else: the values
+           stay in `data`, never in here. */
+        JS_SetProperty(ctx, ws->offset, atoms[k], js_int32(k));
     }
     ws->magic = WHALE_STRUCT_MAGIC;
     ws->nslots = (uint32_t)nslots;
-    ws->offset = NULL;
-    ws->dynamic = NULL;
     JS_VALUE_GET_OBJ(obj)->u.opaque = ws;
     whale_frame_obj_slots(ctx)[*out_slot] = obj;   /* the slot takes the reference */
     return 1;
 }
 
-/* The column a name maps to, or -1. The layout map is the shape, so this is the
-   ordinary own-property lookup; the name is not in it when the object never got that
-   property, which is exactly what `in` needs to mean. */
-static int whale_struct_col(JSObject *p, JSAtom name)
+/* The column a name maps to, or -1. This is the offset map: a map from name to column,
+   and nothing else - it holds no values. A name that is not in it never was a column of
+   this object. The shape plays no part here; it belongs to the dynamic properties. */
+static int whale_struct_col(JSContext *ctx, WhaleStruct *ws, JSAtom name)
 {
-    JSProperty *pr;
-    JSShapeProperty *prs = find_own_property(&pr, p, name);
+    JSValue v;
+    int col;
 
-    if (!prs)
+    v = JS_GetProperty(ctx, ws->offset, name);
+    if (JS_IsException(v)) {
+        JS_FreeValue(ctx, v);
         return -1;
-    return (int)(pr - p->prop);
+    }
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_INT) {   /* not a column of this object */
+        JS_FreeValue(ctx, v);
+        return -1;
+    }
+    col = JS_VALUE_GET_INT(v);
+    JS_FreeValue(ctx, v);
+    return col;
 }
 
 /* Read a column as a number. 0 means "not a plain number here", and the caller keeps
@@ -3088,7 +3107,6 @@ static int whale_struct_col(JSObject *p, JSAtom name)
 int JS_WhaleStructFieldNum(JSContext *ctx, int slot, JSAtom name, double *out)
 {
     WhaleStruct *ws;
-    JSObject *p;
     JSValue v;
     int col;
 
@@ -3097,8 +3115,7 @@ int JS_WhaleStructFieldNum(JSContext *ctx, int slot, JSAtom name, double *out)
     ws = whale_struct_of(whale_frame_obj_slots(ctx)[slot]);
     if (!ws || !out)
         return 0;
-    p = JS_VALUE_GET_OBJ(whale_frame_obj_slots(ctx)[slot]);
-    col = whale_struct_col(p, name);
+    col = whale_struct_col(ctx, ws, name);
     if (col < 0 || (uint32_t)col >= ws->nslots)
         return 0;
     v = ws->data[col];
@@ -3117,7 +3134,6 @@ int JS_WhaleStructFieldNum(JSContext *ctx, int slot, JSAtom name, double *out)
 int JS_WhaleStructSetNum(JSContext *ctx, int slot, JSAtom name, double d)
 {
     WhaleStruct *ws;
-    JSObject *p;
     int col;
 
     if (slot < 0 || slot >= WHALE_OBJ_SLOTS)
@@ -3125,8 +3141,7 @@ int JS_WhaleStructSetNum(JSContext *ctx, int slot, JSAtom name, double d)
     ws = whale_struct_of(whale_frame_obj_slots(ctx)[slot]);
     if (!ws)
         return 0;
-    p = JS_VALUE_GET_OBJ(whale_frame_obj_slots(ctx)[slot]);
-    col = whale_struct_col(p, name);
+    col = whale_struct_col(ctx, ws, name);
     if (col < 0 || (uint32_t)col >= ws->nslots)
         return 0;
     JS_FreeValue(ctx, ws->data[col]);
