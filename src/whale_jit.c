@@ -759,6 +759,10 @@ static uint8_t whale_loc_obj[WHALE_JIT_MAX_SLOTS];
 static int whale_obj_pending;
 /* Which line bailed. Every goto out sets it, so the diagnostic at out: can name the exact place instead of making the reader guess from pos/op - the position reported is often a jump target, not the reason. */
 static int whale_out_line;
+/* Whether the current call has an argument that is not a plain number. A self-call
+   with one cannot take the self-recursion path, because that path packs its
+   arguments into a double array. Set just before the call routes. */
+static int whale_call_obj_arg;
 static int whale_slot_fn[WHALE_JIT_MAX_SLOTS];
 static int whale_vserial;                     /* next unused name number */
 
@@ -2222,6 +2226,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wk(JS_WK_INT); wt_id("dst"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleCallValue"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("func_slot"); wt(',');
+        wk(JS_WK_INT); wt_id("argc"); wt(','); wk(JS_WK_INT); wt_id("arg_base"); wt(',');
+        wk(JS_WK_INT); wt_id("ret_slot"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleCallSelfValue"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wt_id("JSValue"); wt_id("self"); wt(',');
         wk(JS_WK_INT); wt_id("argc"); wt(','); wk(JS_WK_INT); wt_id("arg_base"); wt(',');
         wk(JS_WK_INT); wt_id("ret_slot"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_WhaleExceptionValue"); wt('(');
@@ -4042,7 +4050,19 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     }
                     fold_commit(fm);
                 }
-                if (cur[var_count + func_slot] != WHALE_T_SELF) {
+                /* A self-call whose arguments are all numbers takes the self-recursion
+                   path below: arguments into a double array, straight into the compiled
+                   core. One that passes a parked object cannot - a double array has no
+                   room for it - so those go through the general route, which now also
+                   covers calling this function's own entry. */
+                whale_call_obj_arg = 0;
+                for (k = 0; k < argc; k++) {
+                    int tk0 = cur[var_count + sp - argc + k];
+
+                    if (!whale_type_is_num(tk0))
+                        whale_call_obj_arg = 1;
+                }
+                if (cur[var_count + func_slot] != WHALE_T_SELF || whale_call_obj_arg) {
                     /* Not this function, so it is a host call - a DOM write, a
                        logging call. Compile it as a single call into the engine
                        and carry on, which is what stops a function that is
@@ -4063,7 +4083,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     if (getenv("WHALE_JIT_DUMP"))
                         fprintf(stderr, "[call] pos=%d argc=%d tc=%d slot=%d callslots=%d\n",
                                 pos, argc, tc, WHALE_IS_SLOT(tc), WHALE_CALL_SLOTS);
-                    if (!WHALE_IS_SLOT(tc))
+                    if (!WHALE_IS_SLOT(tc) && tc != WHALE_T_SELF)
                         { whale_out_line = __LINE__; goto out; }
                     if (argc > WHALE_CALL_SLOTS)
                         { whale_out_line = __LINE__; goto out; }
@@ -4106,9 +4126,17 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
                         wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
                     }
-                    wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleCallValue"); wt('(');
-                    wt_id("ctx"); wt(',');
-                    wt_int(WHALE_IS_VAL(tc) ? WHALE_VAL_SLOT(tc) : WHALE_OBJ_SLOT(tc)); wt(',');
+                    wk(JS_WK_IF); wt('('); wt('!');
+                    if (tc == WHALE_T_SELF) {
+                        /* WHALE_T_SELF is not a slot, so there is no JSValue to look up:
+                           call this function's own entry, which the generated code
+                           already holds as whale_self. */
+                        wt_id("JS_WhaleCallSelfValue"); wt('('); wt_id("ctx"); wt(',');
+                        wt_id("whale_self"); wt(',');
+                    } else {
+                        wt_id("JS_WhaleCallValue"); wt('('); wt_id("ctx"); wt(',');
+                        wt_int(WHALE_IS_VAL(tc) ? WHALE_VAL_SLOT(tc) : WHALE_OBJ_SLOT(tc)); wt(',');
+                    }
                     wt_int(argc); wt(','); wt_int(WHALE_CALL_BASE); wt(',');
                     wt_int(ret_slot); wt(')'); wt(')');
                     wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(2); wt(';');
@@ -4715,6 +4743,7 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
         tcc_add_symbol(s, "JS_WhaleObjSlotCopy", (void *)JS_WhaleObjSlotCopy);
         tcc_add_symbol(s, "JS_WhaleArgGetObj", (void *)JS_WhaleArgGetObj);
         tcc_add_symbol(s, "JS_WhaleCallValue", (void *)JS_WhaleCallValue);
+        tcc_add_symbol(s, "JS_WhaleCallSelfValue", (void *)JS_WhaleCallSelfValue);
         tcc_add_symbol(s, "JS_WhaleExceptionValue", (void *)JS_WhaleExceptionValue);
         /* the single-instruction fallback */
         tcc_add_symbol(s, "JS_WhaleStepPushNum", (void *)JS_WhaleStepPushNum);

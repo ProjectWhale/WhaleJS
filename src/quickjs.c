@@ -3296,6 +3296,32 @@ int JS_WhaleCallValue(JSContext *ctx, int func_slot, int argc, int arg_base,
     return 1;
 }
 
+/* The same call, but to this function itself, and with arguments the double domain
+   cannot carry.
+
+   The self-recursion fast path packs its arguments into a double array and calls the
+   compiled core directly, which only works while every argument is a number. A
+   self-call that passes a parked object - a laid-out one, or a call's result - has to
+   go through the engine instead. The generated code holds the function as a JSValue
+   (`whale_self`, the entry's own argument), so this needs no slot for the callee. */
+int JS_WhaleCallSelfValue(JSContext *ctx, JSValue self, int argc, int arg_base,
+                          int ret_slot)
+{
+    JSValue *slots = whale_frame_obj_slots(ctx);
+    JSValue r;
+
+    if (argc < 0 || arg_base < 0 || arg_base + argc > WHALE_OBJ_SLOTS)
+        return 0;
+    r = JS_Call(ctx, self, JS_UNDEFINED, argc, slots + arg_base);
+    if (JS_IsException(r))
+        return 0;
+    if (ret_slot >= 0 && ret_slot < WHALE_OBJ_SLOTS)
+        JS_WhaleObjSlot(ctx, ret_slot, r);   /* takes over the reference */
+    else
+        JS_FreeValue(ctx, r);
+    return 1;
+}
+
 /* The pending exception as a value the generated code can return. JS_EXCEPTION
    is a macro with no linkable address, so it cannot appear in emitted code; this
    gives it one. */
