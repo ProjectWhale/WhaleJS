@@ -255,8 +255,8 @@ int JS_WhaleNativeSlotPutNum(JSContext *ctx, int slot, int col, int atom, double
    holds any object. New builds one and fills `slot`; the other two read and write one
    column. See notes/whale-struct-object.md. */
 int JS_WhaleStructNew(JSContext *ctx, const int *atoms, int nslots, int slot);
-double JS_WhaleStructFieldNum(JSContext *ctx, int slot, int atom, double *out);
-int JS_WhaleStructSetNum(JSContext *ctx, int slot, int atom, double v);
+double JS_WhaleStructFieldNum(JSContext *ctx, int slot, JSAtom atom, double *out);
+int JS_WhaleStructSetNum(JSContext *ctx, int slot, JSAtom atom, double v);
 
 /* Compile-time only - never called by generated code. Does global `atom` name
    the Uint8Array constructor? Asking while emitting is what keeps each stack
