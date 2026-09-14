@@ -356,3 +356,25 @@ problem this note has been circling. Inlining is still valuable, but it is not t
 through - that was my framing error, not a fact.
 
 Nothing from the argument-path attempt is in the tree; it is reverted at fa1f6ac, green.
+
+### Correction to the design point: a union option, not a new field
+
+The paragraph above says the object "carries a pointer to a C struct", which reads as a new
+field in `JSObject` - and that would grow every object in the engine to save a check in one
+loop. The user corrected it: it is a new **option in the existing union**, so the object's
+size does not change at all. Confirmed in the source - `struct JSObject` (quickjs.c:1169)
+already ends in
+
+    union {
+        void *opaque;
+        struct JSBoundFunction *bound_function;   /* JS_CLASS_BOUND_FUNCTION */
+        ...
+        struct JSProxyData *proxy_data;           /* JS_CLASS_PROXY */
+        ...
+    } u;
+
+so the union is already 8 bytes wide and `void *opaque` is already there. Adding a
+`WhaleNative *native` member, or reusing `opaque`, costs nothing: same layout, same object
+size, no growth for objects that never take the native form. The class_id (or a flag) says
+whether the member is live, and the interpreter finds out with one comparison it was going
+to make anyway.
