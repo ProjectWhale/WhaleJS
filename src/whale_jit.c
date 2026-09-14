@@ -1651,14 +1651,17 @@ static int whale_step_emit(int op, int pos, int *sp_io, uint8_t *cur, int var_co
         int t = cur[var_count + sp - n_pop + i];
 
         /* Operand 0 of a property access is its receiver, and a parked object is
-           exactly what that wants to be. Every other operand has to be a number:
-           a parked object in a value position is what makes the generated code
-           come out wrong - `out[i] = t` crashes where `out[i] = 3` is fine, with
-           no difference visible on the engine side - so those keep `goto out`
-           until the cause is found. Object unboxing takes the object out of this
-           position anyway, which is why it is the right next step and not a
-           detour. See notes/whale-step-repro.md. */
-        if (i > 0 && !whale_type_is_num(t)) {
+           exactly what that wants to be. Operand 1+ used to be refused when it was
+           not a number, because `out[i] = t` was said to generate code TinyCC would
+           not parse where `out[i] = 3` was fine.
+
+           That is not what is happening. With the rule off, TinyCC accepts the
+           generated code and the failure is a run-time access violation once the
+           first call has returned - no compile error at all. See
+           notes/whale-step-repro.md. The rule stays default-on while that is being
+           found; WHALE_VALUE_OBJ=1 turns it off, which is how the reproducer is
+           reached without editing this file. */
+        if (i > 0 && !whale_type_is_num(t) && !getenv("WHALE_VALUE_OBJ")) {
             if (dbg)
                 fprintf(stderr, "[emit] pos=%d op=%d REFUSE object in value "
                         "position slot=%d t=%d\n", pos, op, sp - n_pop + i, t);

@@ -148,3 +148,39 @@ Next instruments, in order of directness:
 
 Nothing from this was committed: the fence was reverted and the tree is green at
 `b5cfe16`.
+
+### Update 2: the reproducer, shrunk, and one more thing ruled out
+
+Two calls are enough - no for-loop, no closure, no warm-up:
+
+    function h(n) {
+        var out = [];
+        var t = { v: 1 };
+        for (var i = 0; i < n; i++) out[i & 7] = t;
+        return out[0].v;
+    }
+    var c = 0;
+    c = h(N);
+    c = h(N);
+
+    N <= 64   -> exit 0
+    N >= 300  -> exit 0xC0000005
+
+A threshold between 64 and 300, on a loop that writes only 8 array slots - so this is
+the same object stored over and over, and the count at which it breaks has the shape of
+a GC threshold rather than a fixed-size overflow. The second call is not special in
+itself; it is that the count crosses the line there.
+
+Also ruled out since Update 1:
+
+- **the slot write.** `get_loc` on an object takes `JS_WhaleObjSlotCopy`, and that does
+  `js_dup` before `JS_WhaleObjSlot` takes the reference over - balanced, and only when
+  `src != dst`, which is right.
+
+So the suspect list is now: the per-iteration store itself (`JS_SetPropertyValue`
+taking over `stack[2]`, which was a `js_dup` - if the array does not in fact take that
+reference, or takes it and the value is also freed, the count drifts by one per
+iteration and a GC pass later walks a slot that should be empty).
+
+How to reach the reproducer without editing this file: `WHALE_VALUE_OBJ=1` turns the
+value-position rule off. The rule itself is unchanged by default.
