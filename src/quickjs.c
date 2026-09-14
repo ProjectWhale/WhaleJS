@@ -2931,17 +2931,30 @@ void JS_FreeRuntime(JSRuntime *rt)
 
 #define WHALE_STRUCT_MAGIC 0x57485354U   /* 'WHST' */
 
-typedef struct WhaleSlot {
-    double   v;
-    uint32_t set;      /* 1 once the property was assigned; `in` reads this */
-} WhaleSlot;
-
+/* The C-struct object's storage: three pointers, not a data structure.
+ *
+ *   offset   name -> byte offset into data. In this engine the shape *is* that map:
+ *            it already carries the names, their order and their flags, so there is
+ *            no second table to keep in step.
+ *   dynamic  names the offset map does not cover, in an ordinary object.
+ *   data     the values, flat - one JSValue per column, 16 bytes, in offset order.
+ *
+ * "Struct" is only a way of thinking about it. In generated code a property access is
+ * the data pointer plus a compile-time offset: two constants and a load.
+ *
+ * A column that was never assigned holds tag=3 (undefined) with a nonzero payload; a
+ * column assigned undefined holds tag=3 with a zero payload. A plain read reports
+ * undefined for either, which is what the language requires, and `in` consults the
+ * offset map rather than the value - so a reserved-but-unset column costs nothing and
+ * never says something it should not. That is why there is no separate `set` flag: the
+ * payload already carries the distinction, and a field would break up the flat array
+ * for no gain. */
 typedef struct WhaleStruct {
     uint32_t  magic;
     uint32_t  nslots;
-    JSShape  *shape;               /* the columns, in this shape's order */
-    WhaleSlot slots[WHALE_STRUCT_FIELDS];
-    struct JSObject *dyn;          /* properties the shape does not name */
+    JSShape  *offset;          /* name -> column: the layout map */
+    struct JSObject *dynamic;  /* names the layout map does not cover */
+    JSValue  *data;            /* flat: nslots JSValues, in offset order */
 } WhaleStruct;
 
 /* The C-struct part of an object of this class, or NULL. */
@@ -2965,9 +2978,17 @@ static void js_whale_struct_finalizer(JSRuntime *rt, JSValue val)
     WhaleStruct *ws = p->u.opaque;
 
     if (ws && ws->magic == WHALE_STRUCT_MAGIC) {
-        if (ws->dyn) {
-            JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_OBJECT, ws->dyn));
-            ws->dyn = NULL;
+        uint32_t k;
+
+        /* The values are flat JSValues owned by this struct, so they go first, then
+           the array itself, then the dynamic map - which is an ordinary object and
+           holds its own values. */
+        for (k = 0; k < ws->nslots; k++)
+            JS_FreeValueRT(rt, ws->data[k]);
+        js_free_rt(rt, ws->data);
+        if (ws->dynamic) {
+            JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_OBJECT, ws->dynamic));
+            ws->dynamic = NULL;
         }
         js_free_rt(rt, ws);
     }
