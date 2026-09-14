@@ -4381,11 +4381,18 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int fm;
 
                 t = cur[var_count + sp - 1];
-                if (WHALE_IS_ARR(t) || WHALE_IS_OBJ(t)) {
+                if (WHALE_IS_ARR(t) || WHALE_IS_OBJ(t) || WHALE_IS_VAL(t)) {
                     /* The slot holds the reference; hand a duplicate of it to
                        the caller through ret_obj so the two do not compete for
                        the same reference count. A function that returns both a
-                       number and an object is refused - one return shape only. */
+                       number and an object is refused - one return shape only.
+
+                       WHALE_T_VAL belongs here because that is what a general
+                       call's result is: `var v = f(); return v;` parks the
+                       result in a slot as an opaque value, and refusing it here
+                       is what made every function that returns a call's result
+                       fall back to the interpreter. Slot numbers are encoded the
+                       same way for all three, so WHALE_OBJ_SLOT reads it. */
                     if (ret_is_bool != -1)
                         goto out;
                     whale_ret_obj = 1;
