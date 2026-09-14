@@ -3433,6 +3433,14 @@ void JS_WhaleObjSlotNull(JSContext *ctx, int k)
     JS_WhaleObjSlot(ctx, k, JS_NULL);
 }
 
+/* The empty string, for OP_push_empty_string. That opcode has no operand naming an
+   atom, unlike push_atom_value, so the atom comes from here - the same interned one
+   the interpreter uses. */
+void JS_WhaleObjSlotEmptyString(JSContext *ctx, int k)
+{
+    JS_WhaleObjSlot(ctx, k, JS_AtomToValue(ctx, JS_ATOM_empty_string));
+}
+
 int JS_WhaleObjSlotAtom(JSContext *ctx, int atom, int k)
 {
     JSValue v = JS_AtomToValue(ctx, atom);

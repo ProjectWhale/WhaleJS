@@ -191,6 +191,7 @@ void JS_WhaleObjSlot(JSContext *ctx, int k, JSValue v);   /* park object in slot
 /* Park a null, or the value of an atom, in an object slot. Pushing a non-number used
    to abandon the whole function; these are the two instructions that do it most. */
 void JS_WhaleObjSlotNull(JSContext *ctx, int k);
+void JS_WhaleObjSlotEmptyString(JSContext *ctx, int k);
 int  JS_WhaleObjSlotAtom(JSContext *ctx, int atom, int k);
 /* Apply a real JS binary operator to two parked values (see quickjs.c). Returns 0 on
    exception, in which case the generated code must deopt. */

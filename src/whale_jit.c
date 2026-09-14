@@ -2195,6 +2195,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        not working. */
     wk(JS_WK_EXTERN); wk(JS_WK_VOID); wt_id("JS_WhaleObjSlotNull"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("k"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_VOID); wt_id("JS_WhaleObjSlotEmptyString"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("k"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleObjSlotAtom"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("atom"); wt(',');
         wk(JS_WK_INT); wt_id("k"); wt(')'); wt(';');
@@ -3182,7 +3184,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
            Abandoning the whole function over these is what kept vnode_build out of
            the JIT entirely - a vnode record holds a string key and a null initial
            value, so both instructions appear before the first field store. */
-        case OP_null:
+        case OP_null: case OP_push_empty_string:
             {
                 int os;
 
@@ -3192,7 +3194,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 {
                     int fm = fold_mark();
 
-                    wt_id("JS_WhaleObjSlotNull"); wt('('); wt_id("ctx"); wt(',');
+                    /* The empty string has no operand to name an atom, so it has its
+                       own helper; everything else about the two is the same. */
+                    wt_id(op == OP_null ? "JS_WhaleObjSlotNull"
+                                        : "JS_WhaleObjSlotEmptyString");
+                    wt('('); wt_id("ctx"); wt(',');
                     wt_int(os); wt(')'); wt(';');
                     fold_commit(fm);
                 }
@@ -5005,6 +5011,7 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
         tcc_add_symbol(s, "JS_WhaleTAU8Set", (void *)JS_WhaleTAU8Set);
         tcc_add_symbol(s, "JS_WhaleTAU8Ptr", (void *)JS_WhaleTAU8Ptr);
         tcc_add_symbol(s, "JS_WhaleObjSlotNull", (void *)JS_WhaleObjSlotNull);
+        tcc_add_symbol(s, "JS_WhaleObjSlotEmptyString", (void *)JS_WhaleObjSlotEmptyString);
         tcc_add_symbol(s, "JS_WhaleObjSlotAtom", (void *)JS_WhaleObjSlotAtom);
         tcc_add_symbol(s, "JS_WhaleObjDefineValue", (void *)JS_WhaleObjDefineValue);
         tcc_add_symbol(s, "JS_WhaleBinopVal", (void *)JS_WhaleBinopVal);
