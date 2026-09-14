@@ -3053,9 +3053,11 @@ int JS_WhaleStructNew(JSContext *ctx, int nslots, int *out_slot)
         return 0;
     }
     for (k = 0; k < nslots; k++) {
-        /* Never assigned: undefined with a nonzero payload. A plain read reports it as
-           undefined, and `in` does not see it - `in` reads the layout map, not the
-           value - so a reserved column costs nothing and claims nothing. */
+        /* Reserved, never set: undefined with a nonzero value. A plain read reports
+           undefined, which is what the language requires. `in` reads this value: a
+           nonzero value is the "never set" marker, while a zero value means the
+           property really is undefined. So a reserved column costs nothing and claims
+           nothing. */
         ws->data[k] = JS_MKPTR(JS_TAG_UNDEFINED, (void *)(intptr_t)1);
     }
     ws->magic = WHALE_STRUCT_MAGIC;
