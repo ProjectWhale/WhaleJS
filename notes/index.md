@@ -243,17 +243,30 @@ property access) and requires every other operand to be a number. That is enough
 make the mechanism safe: all five reproducers agree with node, all 24 perftest cases
 produce correct output, and `gen gave up` falls from 23 to 14.
 
-**Performance did not move, and that is expected.** A handed-over instruction costs
-about five helper calls (three operand pushes, the run, the clear) against one
-dispatch plus the instruction body in the interpreter - so the instruction itself gets
-*slower*. What improves is the function around it: it stays compiled instead of
-falling back entirely. On these 24 cases the two roughly cancel. The win being chased
-is unboxing (`notes/unbox-*.md`), which removes objects from the value position in the
-first place - so this landing is its foundation, not its substitute.
+**Unboxing: built, measured, and off by default (`ee56d3f`).** With the fallback in
+place I finished the half `fc44fa4` had withdrawn - `OP_object` lays a settled shape
+out as a frame struct, and the four field accesses read and write its columns
+directly. It is correct (24/24) and it is **slower**, by a lot:
 
-**State**: tree green at `9b8481a`; all 24 perftest cases correct; the reproducers in
-`temp/w_*.js` agree with node. The value-position restriction is the next thing to
-remove, and `WHALE_STEP_OFF=<opcode>` exists to bisect it.
+    the same binary, one environment variable apart
+      default          n=2000 0ms   n=20000 0ms   n=200000   8ms
+      WHALE_UNBOX=1    n=2000 6ms   n=20000 37ms  n=200000 400ms
+      node               2ms         3ms            21ms
+
+Seven memory operations become one and it still loses 19-50x. The reason is not
+memory traffic: the statement count per access goes up, and TCC's output is decided by
+statement count (`notes/optimisation-directions.md`). The shape-cache form the default
+keeps is 3.7x *faster* than node. So the struct path stays behind `WHALE_UNBOX=1` and
+off by default - that is a measurement, not a retreat.
+
+That also answers "why did the fallback not show a win": the win being chased was never
+the hand-over itself, and the unboxing it paved the way for is not a win on this
+backend either. **The lever here is statement count**, which points at the peephole
+work (`B1` in `notes/optimisation-directions.md`), not at more value representation.
+
+**State**: tree green at `ee56d3f`; 24/24 perftest correct with unboxing off;
+`temp/w_*.js` are the reproducers, and `WHALE_UNBOX=1` / `WHALE_STEP_OFF=<opcode>` are
+the switches.
 
 `check`/`ms` are top-level locals (interpreted, not compiled), so the corruption comes
 from `build`/`scan`, which pin both `i` and the return variable `s`. That is the same
