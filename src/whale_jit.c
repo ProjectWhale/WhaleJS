@@ -2175,6 +2175,17 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     wk(JS_WK_EXTERN); wk(JS_WK_DOUBLE); wt_id("JS_WhaleObjValueNum"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wt_id("JSValue"); wt('*'); wt_id("v"); wt(',');
         wk(JS_WK_INT); wt('*'); wt_id("deopt"); wt(')'); wt(';');
+    /* The layout unpack calls this once per column. The prototype was missing, so
+       TinyCC declared it implicitly and took the double result for an int - the
+       call still linked and happened to be right only because the fields in the
+       cases at hand were small integers. Exactly the trap the block below warns
+       about; this one slipped through. */
+    wk(JS_WK_EXTERN); wk(JS_WK_DOUBLE); wt_id("JS_WhaleObjFieldNum"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(',');
+        wk(JS_WK_INT); wt_id("atom"); wt(',');
+        wk(JS_WK_VOID); wt('*'); wt('*'); wt_id("shape_cache"); wt(',');
+        wk(JS_WK_VOID); wt('*'); wt('*'); wt_id("ptr_cache"); wt(',');
+        wk(JS_WK_INT); wt('*'); wt_id("deopt"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_WhaleObjGet"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("k"); wt(')'); wt(';');
     /* Packed arrays. Same warning as the object ones: a missing prototype here
