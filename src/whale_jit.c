@@ -718,7 +718,13 @@ static int    *whale_out_len = &go_len;
  * not been handed on already. Nesting uses a small stack.
  */
 #define WHALE_LOOP_MAX 4
-#define WHALE_LOOP_BUF 4096
+/* The body buffer has to be as large as the output it stands in for. It was 4096,
+   and the append itself was bounded by WHALE_TOK_MAX (32768), so a body of more
+   than 4096 tokens ran off the end of l->tok - which is why this was switched off.
+   Same bound as go_tok is the only value that is safe by construction: while a body
+   is being built, whale_out_tok points here and every writer still checks against
+   WHALE_TOK_MAX. */
+#define WHALE_LOOP_BUF WHALE_TOK_MAX
 
 typedef struct WhaleLoop {
     int     tok[WHALE_LOOP_BUF];
@@ -1006,24 +1012,33 @@ static void fold_commit(int mark)
     }
 }
 
-/* WhaleJS: the loop buffer is OFF.
+/* WhaleJS: the loop buffer is ON.
  *
- * It was meant to hand a complete loop body to a loop-level pass, and no such
- * pass was ever written - so all it did was cost memory and break silently:
- * a body larger than WHALE_LOOP_BUF (4096) lost its tail, and the bound used
- * when appending was WHALE_TOK_MAX (32768), so the same overflow wrote past the
- * end of l->tok. Making loop bodies longer (which is what handing instructions
- * to the engine does) exposes both at once.
+ * It hands a complete loop body to a loop-level pass, and that pass now exists -
+ * this is where the native `for`/`while` gets built, from the loop table the
+ * compiler produced (JSWhaleFuncInfo.loops) rather than from the goto structure.
  *
- * Returning 0 is the "stack is full" path this function already had: the body
- * is emitted straight through into go_tok, which is the same bound the whole
- * function is held to. whale_loop_depth stays 0, so loop_end() is never
- * entered. Nothing is lost - no loop-level pass exists to receive the body. */
+ * Two things had to be fixed before it could be switched back on: WHALE_LOOP_BUF
+ * was 4096 while every writer bounds itself by WHALE_TOK_MAX, so a longer body ran
+ * past the end of l->tok; the buffer is now WHALE_TOK_MAX, which is safe by
+ * construction. The returned 0 path is kept for a real overflow - too deep, or the
+ * buffer is somehow full - and then the body is emitted straight into go_tok, which
+ * is the bound the whole function is held to anyway. */
 static int loop_begin(int head_pos, int back_pos)
 {
-    (void)head_pos;
-    (void)back_pos;
-    return 0;
+    WhaleLoop *l;
+
+    if (whale_loop_depth >= WHALE_LOOP_MAX)
+        return 0;                       /* too deep: emit straight through */
+    l = &whale_loops[whale_loop_depth];
+    l->len = 0;
+    l->head_pos = head_pos;
+    l->back_pos = back_pos;
+    whale_loop_depth++;
+    whale_out_tok = l->tok;
+    whale_out_num = l->num;
+    whale_out_len = &l->len;
+    return 1;
 }
 
 /* Finish the innermost loop and hand its body on. This is where a loop-level
