@@ -93,3 +93,58 @@ that `whale_step_emit` calls `fold_materialize()` - which emits a **statement** 
 from inside a position where the surrounding generator code still has an
 expression open, so the statement lands mid-expression. The `pointer expected`
 message is what that looks like from TinyCC's side.
+
+---
+
+## Update: the fence taken down, and what it was really hiding
+
+The "a value position must be a number" rule in whale_step_emit - the `i > 0 &&
+!whale_type_is_num(t)` test - was removed to see the real failure. Its stated reason no
+longer described the code: only numeric operands are materialised there now, and a
+non-numeric one is copied across by slot number, so the fence had gone stale.
+
+Result: **TinyCC accepts the generated code.** The failure is at *run time*.
+`temp/w_step.js` (the first reproducer above) and `perftest/cases/nested2d.js` both die
+with exit 0xC0000005, and in the reproducer that happens after the first call has
+returned - not during it. So the guess in "The next tool to build" above is not what
+this is: a statement landing in an open expression would be a compile error, and there
+is none. The damage is in the run-time hand-over.
+
+With `WHALE_STEP_DBG=1` the reproducer prints:
+
+    [step] pushSlot i=0 slot=0 src_tag=-1 dst=...df20
+    [step] pushSlot i=2 slot=2 src_tag=-1 dst=...df40
+    [step] run pc=36 op=72 np=3 nu=0 ssize=3
+    [step] put_array_el tags=-1/0/-1 stack=...df20 needs_obj=1
+           var_refs=...e110 objslots=...df50 var_buf=...def0 varc=3
+
+Ruled out, with the evidence that ruled each out:
+
+- **cell mapping.** whale_step_cell returns `stack + i`, and whale_step_stack returns
+  `sf->var_buf + b->var_count` = `def0 + 3`. var_buf is `JSValue *`, so that is
+  16 * 3 = 48 bytes, i.e. `df20`. `i=2` landing on `df40` is correct.
+- **operand layout.** stack[0..2] occupy `df20..df50`; the object-slot area starts at
+  `df50`. No overlap, and 3 operands is the documented maximum for this path.
+- **the operands themselves.** Tags are object / int / object - exactly what
+  `out[i & 7] = t` should have.
+- **the call.** `JS_SetPropertyValue` is declared `(ctx, this_obj, prop, val, flags)`
+  and the call matches it.
+- **the hand-over on its face.** `JS_WhaleStepPushSlot` does `js_dup`, and
+  `JS_WhaleStepClear` frees exactly that, so it is balanced as written.
+
+What is left is the hand-over itself. The reproducer survives its first call (300
+iterations) and dies once the second begins, which is the shape of an accumulating
+corruption rather than one bad access - so the suspect is an ownership mistake that only
+bites when a value is stored and something else frees it later.
+
+Next instruments, in order of directness:
+
+1. Build the MinGW target with `-fsanitize=address` if a build can be arranged. It names
+   the faulting access instead of leaving it to inference, and this is the class of bug
+   it is good at.
+2. Otherwise instrument the single instruction: log every js_dup and JS_FreeValue on
+   stack[0..3] and on the object slot the value came from, across two calls, and look for
+   a tag that dies once too often.
+
+Nothing from this was committed: the fence was reverted and the tree is green at
+`b5cfe16`.

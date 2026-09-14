@@ -285,3 +285,4 @@ Reverted to 38579bc; both findings are recorded rather than half-fixed.- `<56>` 
   object. Method that found them: stock qjs on the same case, then `bail=N`. Blocker
   left in immutable_update: the jump-target merge treats two different object slots as
   a conflict, because a slot's identity is its slot number.
+- Update to `whale-step-repro.md`: taking the value-position fence down shows the failure is at RUN TIME, not in TinyCC (exit 0xC0000005, after the first call returns). Cell mapping, operand layout, tags and the JS_SetPropertyValue call are all ruled out with evidence; the remaining suspect is an ownership mistake in the hand-over that only bites on the second call. Use ASan if a build can be arranged.
