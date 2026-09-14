@@ -3015,6 +3015,123 @@ int JS_AddIntrinsicWhaleStruct(JSContext *ctx)
     return 0;
 }
 
+/* Two helpers the functions below need that are defined later in this file. */
+static JSValue *whale_frame_obj_slots(JSContext *ctx);
+static JSShapeProperty *find_own_property(JSProperty **ppr, JSObject *p, JSAtom atom);
+
+/* ---- constructing and using one ---------------------------------------------------
+   The generated code gets an object of this class and then works on it by offset: it
+   never sees the columns' names and never looks anything up. The interpreter - and any
+   code the JIT did not compile - comes through here, which finds the column from the
+   object's own layout map.
+
+   A column is a JSValue, so a value that is not a number is stored as it is and costs
+   nothing special. The columns are the only storage; there is no second copy. */
+
+int JS_WhaleStructNew(JSContext *ctx, int nslots, int *out_slot)
+{
+    WhaleStruct *ws;
+    JSValue obj;
+    int k;
+
+    if (nslots <= 0 || nslots > WHALE_STRUCT_FIELDS || !out_slot)
+        return 0;
+    if (*out_slot < 0 || *out_slot >= WHALE_OBJ_SLOTS)
+        return 0;
+    obj = JS_NewObjectClass(ctx, JS_CLASS_WHALE_STRUCT);
+    if (JS_IsException(obj))
+        return 0;
+    ws = js_mallocz(ctx, sizeof(WhaleStruct));
+    if (!ws) {
+        JS_FreeValue(ctx, obj);
+        return 0;
+    }
+    ws->data = js_mallocz(ctx, sizeof(JSValue) * nslots);
+    if (!ws->data) {
+        js_free(ctx, ws);
+        JS_FreeValue(ctx, obj);
+        return 0;
+    }
+    for (k = 0; k < nslots; k++) {
+        /* Never assigned: undefined with a nonzero payload. A plain read reports it as
+           undefined, and `in` does not see it - `in` reads the layout map, not the
+           value - so a reserved column costs nothing and claims nothing. */
+        ws->data[k] = JS_MKPTR(JS_TAG_UNDEFINED, (void *)(intptr_t)1);
+    }
+    ws->magic = WHALE_STRUCT_MAGIC;
+    ws->nslots = (uint32_t)nslots;
+    ws->offset = NULL;
+    ws->dynamic = NULL;
+    JS_VALUE_GET_OBJ(obj)->u.opaque = ws;
+    whale_frame_obj_slots(ctx)[*out_slot] = obj;   /* the slot takes the reference */
+    return 1;
+}
+
+/* The column a name maps to, or -1. The layout map is the shape, so this is the
+   ordinary own-property lookup; the name is not in it when the object never got that
+   property, which is exactly what `in` needs to mean. */
+static int whale_struct_col(JSObject *p, JSAtom name)
+{
+    JSProperty *pr;
+    JSShapeProperty *prs = find_own_property(&pr, p, name);
+
+    if (!prs)
+        return -1;
+    return (int)(pr - p->prop);
+}
+
+/* Read a column as a number. 0 means "not a plain number here", and the caller keeps
+   to the ordinary path - the column may hold a string, or the name may not be a column
+   at all. */
+int JS_WhaleStructFieldNum(JSContext *ctx, int slot, JSAtom name, double *out)
+{
+    WhaleStruct *ws;
+    JSObject *p;
+    JSValue v;
+    int col;
+
+    if (slot < 0 || slot >= WHALE_OBJ_SLOTS)
+        return 0;
+    ws = whale_struct_of(whale_frame_obj_slots(ctx)[slot]);
+    if (!ws || !out)
+        return 0;
+    p = JS_VALUE_GET_OBJ(whale_frame_obj_slots(ctx)[slot]);
+    col = whale_struct_col(p, name);
+    if (col < 0 || (uint32_t)col >= ws->nslots)
+        return 0;
+    v = ws->data[col];
+    if (JS_VALUE_GET_TAG(v) == JS_TAG_FLOAT64) {
+        *out = JS_VALUE_GET_FLOAT64(v);
+        return 1;
+    }
+    if (JS_VALUE_GET_TAG(v) == JS_TAG_INT) {
+        *out = (double)JS_VALUE_GET_INT(v);
+        return 1;
+    }
+    return 0;
+}
+
+/* Write a column from a number. */
+int JS_WhaleStructSetNum(JSContext *ctx, int slot, JSAtom name, double d)
+{
+    WhaleStruct *ws;
+    JSObject *p;
+    int col;
+
+    if (slot < 0 || slot >= WHALE_OBJ_SLOTS)
+        return 0;
+    ws = whale_struct_of(whale_frame_obj_slots(ctx)[slot]);
+    if (!ws)
+        return 0;
+    p = JS_VALUE_GET_OBJ(whale_frame_obj_slots(ctx)[slot]);
+    col = whale_struct_col(p, name);
+    if (col < 0 || (uint32_t)col >= ws->nslots)
+        return 0;
+    JS_FreeValue(ctx, ws->data[col]);
+    ws->data[col] = js_float64(d);
+    return 1;
+}
+
 JSContext *JS_NewContextRaw(JSRuntime *rt)
 {
     JSContext *ctx;
