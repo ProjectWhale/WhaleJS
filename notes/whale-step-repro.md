@@ -235,3 +235,43 @@ So laying out an argument is correct but not sufficient on its own. It needs one
 
 Until one of those exists, the JSValue path is the better number. Reverted; the tree is
 green at ebff5e4.
+
+---
+
+## Correction to Update 3 (the user was right on both counts)
+
+**The 578ms was the interpreter, not a boundary cost.** The user suspected it and the qjs
+control confirms it:
+
+    qjs (pure interpreter)   crossfn   584ms
+    whalejs (reverted)       crossfn   163ms
+    whalejs (with the change) crossfn  578ms   <- level with qjs
+
+Update 3 attributed it to "16 engine calls per iteration to save 6 memory operations",
+which was a story invented from the wrong premise. I did not run the qjs control before
+writing it, which is the exact mistake this file exists to prevent.
+
+**What it actually is: the change made the function give up compiling.**
+
+    [mod] pos=10 sp=3 ta=26 tb=7 struct=1/0
+    gen gave up at pos=10 op=155 (mod) bail=4319
+    compile failed (gen_ok=0)
+
+`ta=26` is WHALE_T_STRUCT - so `op=155 (mod)` found the laid-out object where it expected
+the operands of `i % 7`. OP_mod refuses a non-numeric operand with `goto out`, and one
+refusal drops the whole function to the interpreter. With WHALE_NO_UNBOX=1 the same
+function compiles (`whale_jit_fn_1`), which pins it on the unboxing.
+
+So the argument path is not "correct but not worth it". It is **broken**: laying an
+argument out changes what sits at `sp-2` for the next instruction, and the generator's
+stack accounting for that instruction was written assuming the JSValue form. The stack
+position the struct takes is not where the following opcode looks for its operand.
+
+**And the user's second point stands too:** a materialisation at a compiled-to-compiled
+boundary makes no sense. The laid-out form should cross as columns (or through a single
+accessor that serves both the struct and a JSObject), not round-trip through a JSObject.
+Update 3's framing of that as an inherent trade-off was wrong.
+
+Next: find where the argument's struct perturbs `sp`/`cur` that the next opcode reads, and
+fix the accounting rather than the symptom. The `[mod]` diagnostic that produced the line
+above is worth keeping while that is done.
