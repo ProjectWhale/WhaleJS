@@ -235,18 +235,25 @@ Three separate things came out of this, in the order they were found:
   real lines. `JS_WhaleCompileTokens()`'s `setjmp` path now prints `whale_tok_pos`
   and the surrounding tokens, which is what located the `->`.
 
-Still open: with the wiring in place, `obj_slots[0]` is observed to change identity
-between two iterations of the same loop (`class_id` 2 then 0), and `objshape` /
-`nested2d` crash - **not** inside `JS_WhaleStepRun`, which by then was refusing a
-non-object receiver and would have deoptimised instead. So the fault is in the emitted
-JIT code, most probably in how `whale_step_emit`'s `sp` / `whale_vname[]` bookkeeping
-interacts with the surrounding generator state. `WHALE_JIT_SRC` cannot see it (it drops
-exactly the operators the parser receives); the new `[tokerr]` print can.
+**Resolved as a restriction, and the fallback is in the tree (`9b8481a`).** The fault
+is specific: a **parked object in a value position**. `out[i] = t` dies with
+0xC0000005 where `out[i] = 3` is fine, with nothing different on the engine side - so
+`whale_step_emit` now accepts a parked object only as operand 0 (the receiver of a
+property access) and requires every other operand to be a number. That is enough to
+make the mechanism safe: all five reproducers agree with node, all 24 perftest cases
+produce correct output, and `gen gave up` falls from 23 to 14.
 
-**State**: tree green at `e01fe97`; all 24 perftest cases produce correct output;
-`whale api test: ok`. The mixed-compilation work is **not** in the tree and is **not**
-lost: `temp/whale_full.patch` (LF, plain ASCII, all four files including
-`whale_jit.h`) reproduces it, and `temp/w_h.js` / `temp/w_a.js` are the reproducers.
+**Performance did not move, and that is expected.** A handed-over instruction costs
+about five helper calls (three operand pushes, the run, the clear) against one
+dispatch plus the instruction body in the interpreter - so the instruction itself gets
+*slower*. What improves is the function around it: it stays compiled instead of
+falling back entirely. On these 24 cases the two roughly cancel. The win being chased
+is unboxing (`notes/unbox-*.md`), which removes objects from the value position in the
+first place - so this landing is its foundation, not its substitute.
+
+**State**: tree green at `9b8481a`; all 24 perftest cases correct; the reproducers in
+`temp/w_*.js` agree with node. The value-position restriction is the next thing to
+remove, and `WHALE_STEP_OFF=<opcode>` exists to bisect it.
 
 `check`/`ms` are top-level locals (interpreted, not compiled), so the corruption comes
 from `build`/`scan`, which pin both `i` and the return variable `s`. That is the same
