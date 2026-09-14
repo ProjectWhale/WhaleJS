@@ -8252,6 +8252,146 @@ bad:
     return 0;
 }
 
+/* =========================================================================
+ * WhaleJS: the native form of an object
+ *
+ * An object created by compiled code has two views of one thing. The JSObject is
+ * what the interpreter, the getters and every existing path see - shape,
+ * properties, prototype, exactly as before, same class, same size. The native form
+ * is a C struct the generated machine code works on directly: plain doubles, one
+ * load per field, no shape check, no tag branch, no pointer chase.
+ *
+ * It is not a copy that has to be synchronised at boundaries. The struct hangs off
+ * the object itself, in `u.opaque`, which a plain JS_CLASS_OBJECT does not
+ * otherwise use - so nothing about JSObject changes and no object grows. It is
+ * filled once, when the object is made, and it travels with the object: nothing has
+ * to be materialised when it crosses into another compiled function or comes back
+ * out again. That is the entire point of this design, and the reason
+ * notes/whale-step-repro.md kept running into trouble - a scheme that rebuilds the
+ * layout at every boundary is fighting a problem that does not exist here.
+ *
+ * The properties stay authoritative. The native form records the shape it was
+ * filled for; a write through property syntax, or an added or removed property,
+ * bumps the shape, so every read through the native form checks it once and falls
+ * back to the ordinary path when it no longer matches. A value that is not a number
+ * has no column and refuses the same way. Writes go to both, so the interpreter
+ * never sees a stale value.
+ * ====================================================================== */
+
+#define WHALE_NATIVE_MAGIC 0x57484c4eU   /* 'WHLN'; guards u.opaque */
+
+typedef struct WhaleNative {
+    uint32_t magic;                  /* WHALE_NATIVE_MAGIC while this is live */
+    uint32_t n;                      /* live columns */
+    void *shape;                     /* the shape these columns came from */
+    double vals[WHALE_STRUCT_FIELDS];
+} WhaleNative;
+
+/* The native form of an object, or NULL. Safe on any value: non-objects, non-plain
+   objects, and objects whose u.opaque belongs to something else are all NULL -
+   the magic is what decides. */
+WhaleNative *JS_WhaleNativeGet(JSValueConst obj)
+{
+    JSObject *p;
+
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return NULL;
+    p = JS_VALUE_GET_OBJ(obj);
+    if (p->class_id != JS_CLASS_OBJECT)
+        return NULL;
+    if (p->u.opaque && ((WhaleNative *)p->u.opaque)->magic == WHALE_NATIVE_MAGIC)
+        return (WhaleNative *)p->u.opaque;
+    return NULL;
+}
+
+/* Give this object a native form, filling each column from its property. Returns
+   NULL when it cannot carry one: a non-object, a non-plain class, a property that
+   is not a plain number or is an accessor, or a live native form for another
+   layout. */
+WhaleNative *JS_WhaleNativeMake(JSContext *ctx, JSValueConst obj, const int *atoms,
+                                int n)
+{
+    JSObject *p;
+    WhaleNative *wn;
+    int k;
+
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return NULL;
+    p = JS_VALUE_GET_OBJ(obj);
+    if (p->class_id != JS_CLASS_OBJECT)
+        return NULL;
+    if (n <= 0 || n > WHALE_STRUCT_FIELDS)
+        return NULL;
+    wn = JS_WhaleNativeGet(obj);
+    if (!wn) {
+        if (p->u.opaque)
+            return NULL;    /* u.opaque belongs to something else */
+        wn = js_mallocz(ctx, sizeof(WhaleNative));
+        if (!wn)
+            return NULL;
+        wn->magic = WHALE_NATIVE_MAGIC;
+        wn->n = (uint32_t)n;
+        p->u.opaque = wn;
+    }
+    if ((int)wn->n != n)
+        return NULL;
+    for (k = 0; k < n; k++) {
+        JSProperty *pr;
+        JSShapeProperty *prs;
+        JSValue *v;
+
+        prs = find_own_property(&pr, p, atoms[k]);
+        if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+            return NULL;    /* absent, or an accessor would have side effects */
+        v = &pr->u.value;
+        if (JS_VALUE_GET_TAG(*v) == JS_TAG_FLOAT64)
+            wn->vals[k] = v->u.float64;
+        else if (JS_VALUE_GET_TAG(*v) == JS_TAG_INT)
+            wn->vals[k] = (double)v->u.int32;
+        else
+            return NULL;
+    }
+    wn->shape = p->shape;
+    return wn;
+}
+
+/* Column `col`, if the native form is present and still current. 1 on success. */
+int JS_WhaleNativeReadNum(JSValueConst obj, int col, double *out)
+{
+    WhaleNative *wn = JS_WhaleNativeGet(obj);
+
+    if (!wn || col < 0 || (uint32_t)col >= wn->n)
+        return 0;
+    if ((void *)JS_VALUE_GET_OBJ(obj)->shape != wn->shape)
+        return 0;   /* a property changed the shape since this was filled */
+    *out = wn->vals[col];
+    return 1;
+}
+
+/* Write column `col`, and the property with it. The property stays the record the
+   rest of the engine reads - a native write that skipped it would be invisible to
+   the interpreter and to any getter. */
+int JS_WhaleNativeWriteNum(JSContext *ctx, JSValueConst obj, int col, int atom,
+                           double v)
+{
+    WhaleNative *wn = JS_WhaleNativeGet(obj);
+    JSObject *p;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+
+    if (!wn || col < 0 || (uint32_t)col >= wn->n)
+        return 0;
+    p = JS_VALUE_GET_OBJ(obj);
+    if ((void *)p->shape != wn->shape)
+        return 0;
+    prs = find_own_property(&pr, p, atom);
+    if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+        return 0;
+    set_value(ctx, &pr->u.value, js_float64(v));
+    wn->vals[col] = v;
+    return 1;
+}
+
 /* Store `v` into property `atom` of the object in `slot`, using the same shape
    cache. The value is always written as a float64: the generated code only
    reaches here for numbers, and a property that held a reference would have
@@ -8551,6 +8691,14 @@ static void free_object(JSRuntime *rt, JSObject *p)
     finalizer = rt->class_array[p->class_id].finalizer;
     if (finalizer)
         (*finalizer)(rt, JS_MKPTR(JS_TAG_OBJECT, p));
+
+    /* WhaleJS: the native form lives in u.opaque, so it goes with the object. A
+       plain object does not use that member, but the class check and the magic are
+       what make this safe to state unconditionally - another class' opaque is not
+       read at all. */
+    if (p->class_id == JS_CLASS_OBJECT && p->u.opaque &&
+        ((WhaleNative *)p->u.opaque)->magic == WHALE_NATIVE_MAGIC)
+        js_free_rt(rt, p->u.opaque);
 
     /* fail safe */
     p->class_id = 0;
