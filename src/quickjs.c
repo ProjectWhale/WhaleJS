@@ -11069,6 +11069,31 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
         p = JS_VALUE_GET_OBJ(obj);
     }
 
+    /* WhaleJS: an object built by compiled code keeps its values in its own flat
+       columns, and the offset map names them. Read from there. A column that reads
+       undefined is returned as undefined either way - set to undefined, or reserved and
+       never set. A name the offset map does not cover lives in the dynamic map. The
+       offset map decides which column; the value is what `in` reads, further down. */
+    if (p->class_id == JS_CLASS_WHALE_STRUCT) {
+        WhaleStruct *ws = whale_struct_of(JS_MKPTR(JS_TAG_OBJECT, p));
+
+        if (ws) {
+            int col = whale_struct_col(ctx, ws, prop);
+
+            if (col >= 0 && (uint32_t)col < ws->nslots) {
+                JSValue v = ws->data[col];
+
+                if (JS_VALUE_GET_TAG(v) == JS_TAG_UNDEFINED)
+                    return JS_UNDEFINED;
+                return js_dup(v);
+            }
+            if (!JS_IsUndefined(ws->dynamic))
+                return JS_GetPropertyInternal(ctx, ws->dynamic, prop, ws->dynamic,
+                                              throw_ref_error);
+            return JS_UNDEFINED;
+        }
+    }
+
     for(;;) {
         prs = find_own_property(&pr, p, prop);
         if (prs) {
@@ -11788,6 +11813,31 @@ int JS_HasProperty(JSContext *ctx, JSValueConst obj, JSAtom prop)
     if (unlikely(JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT))
         return false;
     p = JS_VALUE_GET_OBJ(obj);
+    /* WhaleJS: for an object built by compiled code, `in` reads the VALUE. A column
+       reading undefined with a nonzero value is the reserved marker - never set - so the
+       property is not there. Undefined with a zero value is a property that was set to
+       undefined, and is there. Any other value is there. This is the only place the two
+       are told apart; a plain read reports undefined for both, as it must. */
+    if (p->class_id == JS_CLASS_WHALE_STRUCT) {
+        WhaleStruct *ws = whale_struct_of(obj);
+
+        if (ws) {
+            int col = whale_struct_col(ctx, ws, prop);
+
+            if (col >= 0 && (uint32_t)col < ws->nslots) {
+                JSValue v = ws->data[col];
+
+                if (JS_VALUE_GET_TAG(v) == JS_TAG_UNDEFINED &&
+                    JS_VALUE_GET_PTR(v) != NULL)
+                    return false;      /* reserved, never set */
+                return true;
+            }
+            if (!JS_IsUndefined(ws->dynamic))
+                return JS_HasProperty(ctx, ws->dynamic, prop);
+            return false;
+        }
+    }
+
     for(;;) {
         if (p->is_exotic) {
             const JSClassExoticMethods *em = ctx->rt->class_array[p->class_id].exotic;
