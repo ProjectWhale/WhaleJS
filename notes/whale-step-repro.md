@@ -275,3 +275,43 @@ Update 3's framing of that as an inherent trade-off was wrong.
 Next: find where the argument's struct perturbs `sp`/`cur` that the next opcode reads, and
 fix the accounting rather than the symptom. The `[mod]` diagnostic that produced the line
 above is worth keeping while that is done.
+
+---
+
+## Update 4: the argument path, second attempt - one real bug fixed, another exposed
+
+Two things came out of trying again, and only one of them is a keeper.
+
+**`cur[idx]` is not the argument's local slot - it is the argument *number*.** The first
+attempt retyped `cur[idx]` along with the stack copy, on the assumption that index i in
+`cur` is where argument i lives. It is not. In `use(o, n)` the local `i` also sits at
+index 0, so the write retyped an unrelated local as a struct, the following `mod` found a
+struct where it expected a number, and `goto out` dropped the whole function to the
+interpreter - which is what the 578-604ms was, and why `WHALE_NO_UNBOX=1` made it go away.
+Retyping only the stack copy removes the give-up entirely. **This part is correct and
+worth keeping.**
+
+**But the answer is then wrong, and that is worse.** With the give-up gone:
+
+    [arglay] pos=7 idx=0 slot=0 n=4 sp=0
+    crossfn 433ms check=0
+    node    20ms check=4799933
+
+Every field reads back as 0. Either `JS_WhaleObjFieldNum` returns 0 without the caller
+being told (its `*deopt`) and the layout is silently zeros, or the `sp[]` presence flag is
+not being interpreted the way the field reads expect. This is a silent wrong answer, so
+the whole change is reverted rather than left in - a function that used to be slow and
+right is now fast and wrong.
+
+**The remaining shape of the job**, for whoever picks it up:
+
+- `cur[idx]` must not be written; only the value on the stack may be retyped (done, kept
+  in this note).
+- `JS_WhaleObjFieldNum`'s failure path has to be checked at the call site: if it can fail
+  without setting deopt, the layout fills with zeros and the reads return them.
+- 433ms against 163ms says re-laying-out the argument on every `get_arg` is still too
+  expensive even when it compiles - which is the trade the user rejected anyway: a struct
+  should cross the boundary as columns, not be rebuilt on each read.
+
+The `[arglay]` and `[mod]` diagnostics (both gated on WHALE_JIT_DUMP) stayed in during this
+work and are what produced the two lines above.
