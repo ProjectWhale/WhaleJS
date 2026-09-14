@@ -50,13 +50,13 @@ typedef struct JSWhaleFuncInfo {
    Borrowing them costs nothing at run time: the JIT keeps every intermediate
    value in C doubles and never uses the JS operand stack, which is the region
    these slots sit right behind. */
-#define WHALE_OBJ_SLOTS 12
+#define WHALE_OBJ_SLOTS 28
 /* The slots from WHALE_CALL_BASE up are the scratch a compiled call needs: the
    arguments have to sit in JSValues the collector can see for as long as the
    callee runs, and slots are the only such place the generated code has. Object
    literals and arrays take slots from 0, so they must stay below the base - the
    generator refuses a function that allocates past it. */
-#define WHALE_CALL_BASE 8
+#define WHALE_CALL_BASE 20
 #define WHALE_CALL_SLOTS (WHALE_OBJ_SLOTS - WHALE_CALL_BASE)
 /* object-property inline-cache pairs the generated code can declare */
 #define WHALE_FIELD_CACHE 24
