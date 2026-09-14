@@ -315,3 +315,44 @@ right is now fast and wrong.
 
 The `[arglay]` and `[mod]` diagnostics (both gated on WHALE_JIT_DUMP) stayed in during this
 work and are what produced the two lines above.
+
+---
+
+## Update 5: (2) checked - JS_WhaleObjFieldNum's failure path is fine; and the design point
+
+**The failure path is correct.** `JS_WhaleObjFieldNum` ends with `bad: *deopt = 1; return 0;`
+and every refusal jumps there - wrong tag, wrong class_id, property not found, an accessor
+(which would have side effects). So the caller *is* told. `check=0` is not a swallowed
+failure.
+
+**The shared shape cache was ruled out by measurement, not argument.** The next theory was
+that `*shape_cache`/`*ptr_cache` hold "shape X, some field at Y" rather than a per-atom
+result, so giving four atoms the same cache slot would make the last three read field 0.
+That does not happen:
+
+    { a: 11, b: 22, c: 33, d: 44 }   whalejs 110 / node 110 / qjs 110
+
+and `put_loc`'s existing layout (whale_jit.c:3565) uses exactly that shared slot
+(`&_ws.fs[WHALE_FIELD_CACHE - 1]`) and is correct on `objfields` too. So the cache is not
+the cause of `check=0` either, and the same mistake in the argument path would not have
+produced it. Whatever made the argument-path run return 0 is something else - the nearest
+candidate is the interaction between `arg_obj_slot` and when the layout is filled relative
+to `sp[]`, not the read itself.
+
+**The design point, which supersedes "3" from the last round.** I described the boundary
+problem as though a laid-out struct had to be rebuilt at every read - "correct but not
+sufficient" - and the user corrected it: that is not a constraint, it is a choice, and the
+wrong one. The intended shape is:
+
+- the object stays a `JSObject`; it is one object with one identity, exactly as now
+- that object carries a pointer to a C struct - the native form - inside it
+- the JIT's machine code operates on that struct directly
+- the interpreter, getters and everything else keep seeing the `JSObject` and pay one
+  extra check to notice a native form exists
+
+One object, two views, no materialisation and no re-derivation at any boundary. Extending
+`JSObject` with the native pointer is the user's proposal and it removes the entire class of
+problem this note has been circling. Inlining is still valuable, but it is not the only way
+through - that was my framing error, not a fact.
+
+Nothing from the argument-path attempt is in the tree; it is reverted at fa1f6ac, green.
