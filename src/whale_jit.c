@@ -757,6 +757,11 @@ static int whale_loc_fn[WHALE_JIT_MAX_SLOTS];
    depends on the field accesses that come later. */
 static uint8_t whale_loc_obj[WHALE_JIT_MAX_SLOTS];
 static int whale_obj_pending;
+/* Whether this function hands an object back. If it does, the objects it builds have to
+   be real ones - they leave, and another compilation will meet them. If it does not, the
+   frame-column path stays, which needs no allocation and is already fast. Set by the scan
+   pass, read when an object literal is compiled. */
+static int whale_ret_obj_g;
 /* Which line bailed. Every goto out sets it, so the diagnostic at out: can name the exact place instead of making the reader guess from pos/op - the position reported is often a jump target, not the reason. */
 static int whale_out_line;
 /* Whether the current call has an argument that is not a plain number. A self-call
@@ -1851,6 +1856,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     int whale_str_atoms[WHALE_STRUCT_FIELDS];
     int whale_str_n = 0;
     int whale_str_slot = -1;
+    int prev_op;    /* the opcode before the current one, in the scan pass */
     /* The one object slot this layout is materialised into when it has to become a
        real JSValue - as a call argument, say. One slot, not one per materialisation
        site: two sites reaching the same jump target would otherwise carry different
@@ -1889,6 +1895,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     memset(lo_cv, 0, sizeof(lo_cv));
 
     /* pass 1: jump targets + which arguments are read */
+    /* The previous opcode, for the one shallow test this pass makes about a return
+       (see OP_return below). */
+    prev_op = -1;
     for (pos = 0; pos < len; ) {
         int op = pc[pos];
         int sz = whale_op_size_of(op);
@@ -1989,6 +1998,18 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
             if (whale_put_atoms_n < WHALE_ATOM_MAX)
                 whale_put_atoms[whale_put_atoms_n++] = atom;
+        } else if (op == OP_return) {
+            /* Does this function hand an object back? If so, the objects it builds have
+               to be real ones - they leave, and another compilation will meet them. A
+               function that returns a number keeps the frame-column path, which needs
+               no allocation and is already fast.
+
+               The test is deliberately shallow: the opcode just before the return, and
+               whether that local is known to hold an object. That is the shape a factory
+               has, and it is all this pass can see. */
+            if (prev_op >= OP_get_loc0 && prev_op <= OP_get_loc3 &&
+                whale_loc_obj[prev_op - OP_get_loc0])
+                whale_ret_obj_g = 1;
         } else if (op == OP_call || (op >= OP_call0 && op <= OP_call3)) {
             whale_has_call = 1;
         } else if (op >= OP_get_var_ref0 && op < OP_get_var_ref0 + 4) {
@@ -2007,6 +2028,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 whale_gen_self_ref = 1;
             }
         }
+        prev_op = op;
         pos += sz;
     }
 
@@ -3003,6 +3025,41 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                        WHALE_NO_UNBOX=1   object 7ms   objshape 823ms
                        default            object 4ms   objshape 563ms
                        stock qjs          object 386ms objshape 1241ms */
+                /* A function that hands an object back builds a real one: a
+                   JS_CLASS_WHALE_STRUCT with its own columns. It leaves this compilation
+                   and the next one meets it as it is - nothing is materialised on the way
+                   out or rebuilt on the way in. A function that keeps its object to
+                   itself stays on the frame-column path below, which allocates nothing
+                   and is already fast. */
+                if (!getenv("WHALE_NO_UNBOX") && mono && whale_str_n == 0 &&
+                    whale_ret_obj_g) {
+                    int fn = whale_layout_from_sites(whale_field_sites,
+                                                     whale_field_sites_n,
+                                                     whale_str_atoms,
+                                                     WHALE_STRUCT_FIELDS);
+
+                    if (fn > 0) {
+                        int k;
+
+                        for (k = 0; k < fn; k++) {
+                            wt_arr("wa", k); wt('='); wt_int(whale_str_atoms[k]); wt(';');
+                        }
+                        {
+                            int afm = fold_mark();
+
+                            wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleStructNew");
+                            wt('('); wt_id("ctx"); wt(',');
+                            wt_id("_ws"); wt('.'); wt_id("wa"); wt(',');
+                            wt_int(fn); wt(','); wt_int(os); wt(')'); wt(')');
+                            wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                            wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                            fold_commit(afm);
+                        }
+                        cur[var_count + sp] = WHALE_OBJ_T(os);
+                        sp++;
+                        break;
+                    }
+                }
                 if (!getenv("WHALE_NO_UNBOX") && mono && whale_str_n == 0) {
                     int fn = whale_layout_from_sites(whale_field_sites,
                                                      whale_field_sites_n,
@@ -3097,6 +3154,23 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int tb = cur[var_count + sp - 1];
                 int atom = (int)whale_get_u32(pc + pos + 1);
 
+                /* A real (C-struct) object keeps its fields in its own columns, so a
+                   literal's initialiser is a store into a column. The helper finds the
+                   column from the object's offset map, and the write goes through to the
+                   property as well, so the interpreter sees the same value. */
+                if (whale_ret_obj_g && WHALE_IS_OBJ(ta) && whale_type_is_num(tb)) {
+                    int fm = fold_mark();
+
+                    fold_materialize(sp - 1);
+                    wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleStructSetNum");
+                    wt('('); wt_id("ctx"); wt(','); wt_int(WHALE_OBJ_SLOT(ta)); wt(',');
+                    wt_int(atom); wt(','); fold_inline(sp - 1); wt(')'); wt(')');
+                    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    fold_commit(fm);
+                    sp--;   /* the object stays on the stack */
+                    break;
+                }
                 /* The fields of an unboxed struct are frame variables, not
                    properties: the literal's initialisers become direct stores into
                    the layout's columns. */
@@ -3202,6 +3276,23 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int tb = cur[var_count + sp - 1];
                 int atom = (int)whale_get_u32(pc + pos + 1);
 
+                /* A real (C-struct) object's field is one column of its own storage, so
+                   the store is one call that finds the column from the object's offset
+                   map. Same code whether the object was built here or handed in by
+                   another compiled function - the columns travel with it. */
+                if (whale_ret_obj_g && WHALE_IS_OBJ(ta) && whale_type_is_num(tb)) {
+                    int fm = fold_mark();
+
+                    fold_materialize(sp - 1);
+                    wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleStructSetNum");
+                    wt('('); wt_id("ctx"); wt(','); wt_int(WHALE_OBJ_SLOT(ta)); wt(',');
+                    wt_int(atom); wt(','); fold_inline(sp - 1); wt(')'); wt(')');
+                    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    fold_commit(fm);
+                    sp -= 2;
+                    break;
+                }
                 /* A struct field is a frame variable: the store is one
                    assignment - no shape check, no pointer chase, no tag branch.
                    That is the whole point of laying the object out. */
@@ -3283,6 +3374,28 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int atom = (int)whale_get_u32(pc + pos + 1);
                 int fc, nm;
 
+                /* A real (C-struct) receiver: the receiver keeps its slot and the column
+                   is pushed above it. The helper finds the column from the object's
+                   offset map, so this is the same code whether the object was built here
+                   or handed in by another compiled function. */
+                if (whale_ret_obj_g && WHALE_IS_OBJ(ta)) {
+                    nm = whale_vserial++;
+                    {
+                        int fm = fold_mark();
+
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleStructFieldNum");
+                        wt('('); wt_id("ctx"); wt(','); wt_int(WHALE_OBJ_SLOT(ta)); wt(',');
+                        wt_int(atom); wt(','); wt('&'); wt_arr("v", nm); wt(')'); wt(')');
+                        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        fold_commit(fm);
+                    }
+                    whale_vname[sp] = nm;
+                    whale_vmat[sp] = 1;
+                    cur[var_count + sp] = WHALE_T_NUM;
+                    sp++;
+                    break;
+                }
                 /* The receiver stays on the stack under the value - that is what
                    `get_field2` is for - so a struct receiver keeps its slot type
                    and the field value is pushed above it. */
@@ -3329,6 +3442,29 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int atom = (int)whale_get_u32(pc + pos + 1);
                 int fc, nm;
 
+                /* A real (C-struct) object's field is one column of its own storage: one
+                   call that finds the column from the object's offset map and reads it.
+                   A reserved column reads undefined; the helper refuses anything that is
+                   not a plain number, and the ordinary path below takes over then. The
+                   same code whether the object was built here or handed in by another
+                   compiled function. */
+                if (whale_ret_obj_g && WHALE_IS_OBJ(ta)) {
+                    nm = whale_vserial++;
+                    {
+                        int fm = fold_mark();
+
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleStructFieldNum");
+                        wt('('); wt_id("ctx"); wt(','); wt_int(WHALE_OBJ_SLOT(ta)); wt(',');
+                        wt_int(atom); wt(','); wt('&'); wt_arr("v", nm); wt(')'); wt(')');
+                        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        fold_commit(fm);
+                    }
+                    whale_vname[sp - 1] = nm;
+                    whale_vmat[sp - 1] = 1;
+                    cur[var_count + sp - 1] = WHALE_T_NUM;
+                    break;
+                }
                 /* A struct field is a frame variable: one load, with a presence
                    flag in place of a tag branch. The flag matters because a field
                    the layout reserves but this object never assigned must not read
