@@ -217,24 +217,36 @@ with `WHALE_TOK_MAX` (32768). While a loop body is open `whale_out_tok` points a
 has never been used for a loop-level pass - it is dead weight. `loop_begin` now
 returns 0, which is the "stack is full, emit straight through" path it already had.
 
-**2. The wiring corrupts memory, and the fault is in the emitted stream - open.**
-An earlier revision of this entry blamed `JS_NewArray` returning
-`JS_TAG_UNINITIALIZED` with a valid pointer inside a JIT frame. That is a symptom:
-adding one unrelated `JS_NewObject(ctx)` in the same function removes both the crash
-and the bad tag (`A check=66`, matching node). The reproducer is back and localised -
-see `notes/whale-step-repro.md`: the generator emits every label **exactly once**
-(`14`, `31`, `41`), the first real error is TinyCC's `pointer expected` immediately
-after the `get_field` fallback at pos=44, and `duplicate label 'L14'` is downstream of
-that parse failure, not a duplicate emission. The next tool is a working token-stream
-dump: `JS_WhaleTokDump()` is known broken for numeric literals, and the
-`WHALE_JIT_SRC` C dump cannot see this because it drops exactly the operators the
-parser receives.
+**2. The wiring widens what compiles, and that walked into latent bugs - closed for now.**
+Three separate things came out of this, in the order they were found:
 
-**State**: tree left at the reproducing state (engine-side executor + generator wiring
-+ diagnostics, **uncommitted**); `src/quickjs.c`, `src/whale_jit.c` and
-`src/whale_jit.h` are modified and `objshape`/`nested2d` still crash. `temp/` holds the
-patch (UTF-16 original plus an LF-converted copy), the two reproducer scripts
-(`w_h.js`, `w_a.js`), and the note that the saved patch **omits `whale_jit.h`**.
+- **My own misreading.** An earlier revision blamed `JS_NewArray` returning
+  `JS_TAG_UNINITIALIZED`. There is no such thing here: `JS_TAG_OBJECT` **is** `-1`
+  (quickjs.c:188), so `tag = -1` was a perfectly good object all along. That whole
+  line of investigation was a wrong turn, and it cost most of a day.
+- **A real latent generator bug - fixed and committed (`e01fe97`).** The
+  array-element unboxing in `OP_get_array_el` spelled member access `->` where the
+  operand is a `JSValue` (a value, not a pointer). TinyCC reported `pointer expected`
+  and refused every function that read an array element as a number. The baseline
+  never emitted that path - the reproducer does not compile there at all - so it is
+  latent, and widening what compiles is what walks into it.
+- **A real gap in the diagnostics - fixed and committed (`e01fe97`).** TinyCC's
+  errors always said `whale_jit.c:1`, because the unit is fed as tokens and has no
+  real lines. `JS_WhaleCompileTokens()`'s `setjmp` path now prints `whale_tok_pos`
+  and the surrounding tokens, which is what located the `->`.
+
+Still open: with the wiring in place, `obj_slots[0]` is observed to change identity
+between two iterations of the same loop (`class_id` 2 then 0), and `objshape` /
+`nested2d` crash - **not** inside `JS_WhaleStepRun`, which by then was refusing a
+non-object receiver and would have deoptimised instead. So the fault is in the emitted
+JIT code, most probably in how `whale_step_emit`'s `sp` / `whale_vname[]` bookkeeping
+interacts with the surrounding generator state. `WHALE_JIT_SRC` cannot see it (it drops
+exactly the operators the parser receives); the new `[tokerr]` print can.
+
+**State**: tree green at `e01fe97`; all 24 perftest cases produce correct output;
+`whale api test: ok`. The mixed-compilation work is **not** in the tree and is **not**
+lost: `temp/whale_full.patch` (LF, plain ASCII, all four files including
+`whale_jit.h`) reproduces it, and `temp/w_h.js` / `temp/w_a.js` are the reproducers.
 
 `check`/`ms` are top-level locals (interpreted, not compiled), so the corruption comes
 from `build`/`scan`, which pin both `i` and the return variable `s`. That is the same
