@@ -4025,6 +4025,35 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                             goto out;
                         ret_slot = whale_objs++;
                     }
+                    /* A laid-out object used as an argument has to become a real
+                       JSValue first: the callee is outside this compilation, so it
+                       sees a heap object with a shape, not the caller's frame
+                       columns. Materialise it here - once per call, not once per
+                       access, which is the trade the layout makes. */
+                    fm = fold_mark();
+                    for (k = 0; k < argc; k++) {
+                        int tk = cur[var_count + sp - argc + k];
+                        int ms, m;
+
+                        if (!WHALE_IS_STRUCT(tk))
+                            continue;
+                        if (whale_objs >= WHALE_CALL_BASE)
+                            goto out;
+                        ms = whale_objs++;
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjNew"); wt('(');
+                        wt_id("ctx"); wt(','); wt_int(ms); wt(')'); wt(')');
+                        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        for (m = 0; m < whale_str_n; m++) {
+                            wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjDefineNum");
+                            wt('('); wt_id("ctx"); wt(','); wt_int(ms); wt(',');
+                            wt_int(whale_str_atoms[m]); wt(','); wt_arr("sv", m); wt(')'); wt(')');
+                            wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                            wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        }
+                        cur[var_count + sp - argc + k] = WHALE_OBJ_T(ms);
+                    }
+                    fold_commit(fm);
                     for (k = 0; k < argc; k++) {
                         int tk = cur[var_count + sp - argc + k];
 
