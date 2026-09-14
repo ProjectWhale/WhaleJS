@@ -8392,6 +8392,38 @@ int JS_WhaleNativeWriteNum(JSContext *ctx, JSValueConst obj, int col, int atom,
     return 1;
 }
 
+/* ---- the same, addressed by frame slot ------------------------------------------
+   The generated code holds an object as a slot number, not as a JSValue - that is
+   what an object slot is. These are the forms it can call without converting first,
+   and they are what the field paths in the generator use when the object has a
+   native form. */
+
+int JS_WhaleNativeEnsureSlot(JSContext *ctx, int slot, const int *atoms, int n)
+{
+    if (slot < 0 || slot >= WHALE_OBJ_SLOTS)
+        return 0;
+    return JS_WhaleNativeMake(ctx, whale_frame_obj_slots(ctx)[slot], atoms, n) != NULL;
+}
+
+double JS_WhaleNativeSlotFieldNum(JSContext *ctx, int slot, int col, int *deopt)
+{
+    double v;
+
+    if (slot < 0 || slot >= WHALE_OBJ_SLOTS ||
+        !JS_WhaleNativeReadNum(whale_frame_obj_slots(ctx)[slot], col, &v)) {
+        *deopt = 1;
+        return 0;
+    }
+    return v;
+}
+
+int JS_WhaleNativeSlotPutNum(JSContext *ctx, int slot, int col, int atom, double v)
+{
+    if (slot < 0 || slot >= WHALE_OBJ_SLOTS)
+        return 0;
+    return JS_WhaleNativeWriteNum(ctx, whale_frame_obj_slots(ctx)[slot], col, atom, v);
+}
+
 /* Store `v` into property `atom` of the object in `slot`, using the same shape
    cache. The value is always written as a float64: the generated code only
    reaches here for numbers, and a property that held a reference would have

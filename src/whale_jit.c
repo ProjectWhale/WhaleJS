@@ -2201,6 +2201,16 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wk(JS_WK_VOID); wt('*'); wt('*'); wt_id("shape_cache"); wt(',');
         wk(JS_WK_VOID); wt('*'); wt('*'); wt_id("ptr_cache"); wt(',');
         wk(JS_WK_INT); wt('*'); wt_id("deopt"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleNativeEnsureSlot"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(',');
+        wk(JS_WK_INT); wt('*'); wt_id("atoms"); wt(','); wk(JS_WK_INT); wt_id("n"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_DOUBLE); wt_id("JS_WhaleNativeSlotFieldNum"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(',');
+        wk(JS_WK_INT); wt_id("col"); wt(','); wk(JS_WK_INT); wt('*'); wt_id("deopt"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleNativeSlotPutNum"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(',');
+        wk(JS_WK_INT); wt_id("col"); wt(','); wk(JS_WK_INT); wt_id("atom"); wt(',');
+        wk(JS_WK_DOUBLE); wt_id("v"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_WhaleObjGet"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("k"); wt(')'); wt(';');
     /* Packed arrays. Same warning as the object ones: a missing prototype here
@@ -4785,6 +4795,9 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
         tcc_add_symbol(s, "JS_WhaleArrNew", (void *)JS_WhaleArrNew);
         tcc_add_symbol(s, "JS_WhaleArrSetNum", (void *)JS_WhaleArrSetNum);
         tcc_add_symbol(s, "JS_WhaleObjFieldNum", (void *)JS_WhaleObjFieldNum);
+        tcc_add_symbol(s, "JS_WhaleNativeEnsureSlot", (void *)JS_WhaleNativeEnsureSlot);
+        tcc_add_symbol(s, "JS_WhaleNativeSlotFieldNum", (void *)JS_WhaleNativeSlotFieldNum);
+        tcc_add_symbol(s, "JS_WhaleNativeSlotPutNum", (void *)JS_WhaleNativeSlotPutNum);
         tcc_add_symbol(s, "JS_WhaleObjStoreNum", (void *)JS_WhaleObjStoreNum);
         tcc_add_symbol(s, "JS_WhaleObjSlotNum", (void *)JS_WhaleObjSlotNum);
         tcc_add_symbol(s, "JS_WhaleObjSlotCopy", (void *)JS_WhaleObjSlotCopy);

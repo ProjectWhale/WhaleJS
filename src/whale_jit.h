@@ -239,6 +239,17 @@ JS_EXTERN int JS_WhaleObjStoreValue(JSContext *ctx, int slot, int atom, int val_
 int JS_WhaleObjStoreNum(JSContext *ctx, int slot, int atom, double v,
                         void **shape_cache, void **ptr_cache);
 
+/* The native form of an object - a second view of the same thing, which travels with
+   the object instead of being rebuilt at every boundary. See the definitions in
+   quickjs.c for the design, and notes/whale-step-repro.md for what it replaces.
+
+   The ...Slot forms take an object slot, which is how generated code holds an object.
+   Field/Put are what the field paths use when a native form is present; they refuse
+   (deopt) when it is absent or the shape has moved on, and the caller falls back. */
+int JS_WhaleNativeEnsureSlot(JSContext *ctx, int slot, const int *atoms, int n);
+double JS_WhaleNativeSlotFieldNum(JSContext *ctx, int slot, int col, int *deopt);
+int JS_WhaleNativeSlotPutNum(JSContext *ctx, int slot, int col, int atom, double v);
+
 /* Compile-time only - never called by generated code. Does global `atom` name
    the Uint8Array constructor? Asking while emitting is what keeps each stack
    slot's held type a single compile-time fact. */
