@@ -1,4 +1,4 @@
-/*
+﻿/*
  * WhaleJS: JIT code generation (TinyCC backend)
  *
  * This is the whole code generator, kept in its own translation unit so that
@@ -1803,7 +1803,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             int o = info->byte_code[k];
             int s = whale_op_size_of(o);
 
-            fprintf(stderr, " %d:op%d", k, o);
+            fprintf(stderr, " %d:%s", k, whale_op_name(o));
             if (s <= 0)
                 break;
             k += s;
@@ -2646,6 +2646,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     if (sv == WHALE_T_UNKNOWN) {
                         snap[base + k] = cv; /* optimistic merge */
                     } else if (cv != WHALE_T_UNKNOWN) {
+                        if (getenv("WHALE_MERGE_DBG"))
+                            fprintf(stderr, "[merge] pos=%d slot=%d (of %d) "
+                                    "prev=%d now=%d\n", pos, k, live, sv, cv);
                         differ = 1;
                         break;
                     }
