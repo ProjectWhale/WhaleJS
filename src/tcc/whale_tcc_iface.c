@@ -565,6 +565,12 @@ static void whale_render_one(WhaleText *t, int tok, double num)
 
 /* Render a whole finished stream. Returns the length and stores a malloc'd,
    NUL-terminated buffer in *out for the caller to free. */
+/* Release a buffer JS_WhaleRenderStream returned: it comes from the compiler's
+   own allocator, so it has to go back to that one. */
+void JS_WhaleRenderFree(char *p)
+{
+    tcc_free(p);
+}
 int JS_WhaleRenderStream(const int *tok, const double *num, int n, char **out)
 {
     WhaleText t;

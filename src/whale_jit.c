@@ -10,6 +10,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <stdarg.h>
 
 #include "quickjs.h"
@@ -5492,6 +5495,30 @@ static const WhaleHostSym whale_host_syms[] = {
 #define WHALE_HOST_SYM_COUNT \
     ((int)(sizeof(whale_host_syms) / sizeof(whale_host_syms[0])))
 
+/* The token stream names identifiers by TinyCC's own ident index, so the ident
+   table has to exist before anything can be rendered back to text - the gcc
+   backend included. That is not a coupling that can be designed away: the table
+   is where the names live. Created once and shared; the symbols registered with
+   it are what the TinyCC path resolves generated calls against. */
+static int whale_jit_state_ensure(void)
+{
+    TCCState *s;
+
+    if (whale_jit_state)
+        return 1;
+    s = tcc_new();
+    if (!s)
+        return 0;
+    tcc_set_lib_path(s, WHALE_JIT_TCC_DIR);
+    tcc_add_include_path(s, WHALE_JIT_TCC_DIR "/include");
+    tcc_add_include_path(s, WHALE_JIT_SRC_DIR);
+    tcc_add_library_path(s, WHALE_JIT_TCC_DIR "/lib");
+    tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
+    for (int i = 0; i < WHALE_HOST_SYM_COUNT; i++)
+        tcc_add_symbol(s, whale_host_syms[i].name, whale_host_syms[i].addr);
+    whale_jit_state = s;
+    return 1;
+}
 static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, void **handle_out)
 {
     TCCState *s;
@@ -5510,20 +5537,8 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
        once, every later compile is just another file inside it, and it lives
        until process exit. The generated names carry a counter because the code
        accumulates in this one state. */
-    if (!whale_jit_state) {
-        s = tcc_new();
-        if (!s)
-            return 0;
-
-        tcc_set_lib_path(s, WHALE_JIT_TCC_DIR);
-        tcc_add_include_path(s, WHALE_JIT_TCC_DIR "/include");
-        tcc_add_include_path(s, WHALE_JIT_SRC_DIR);
-        tcc_add_library_path(s, WHALE_JIT_TCC_DIR "/lib");
-        tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
-        for (int i = 0; i < WHALE_HOST_SYM_COUNT; i++)
-            tcc_add_symbol(s, whale_host_syms[i].name, whale_host_syms[i].addr);
-        whale_jit_state = s;
-    }
+    if (!whale_jit_state_ensure())
+        return 0;
     s = whale_jit_state;
 
     /* fresh names per compile: the code accumulates in this one state */
@@ -5580,6 +5595,242 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
     return 0;
 }
 
+/* ---- the gcc backend ------------------------------------------------------
+   A second consumer of the same token stream. TinyCC parses those tokens inside
+   this process; a gcc driver only reads text, so the stream is rendered with
+   JS_WhaleRenderStream - the function the WHALE_JIT_SRC dump already uses - and
+   handed to the driver's stdin pipe, which keeps the source in memory. What
+   comes back is a shared object, and the loader loads that from a file, so it
+   is written under %TEMP% for exactly as long as it takes to map, then removed.
+
+   The host functions the generated code calls are resolved at link time, so the
+   executable has to export them (whale_host_syms) and dlltool has to turn that
+   export table into an import library. The library does not depend on the
+   function being compiled, so it is built once and cached.
+   ------------------------------------------------------------------------ */
+/* Rendered on the TinyCC side, which is a separate translation unit: the token
+   spellings are TinyCC's, so that is where the renderer lives. */
+int JS_WhaleRenderStream(const int *tok, const double *num, int n, char **out);
+void JS_WhaleRenderFree(char *p);
+#define WHALE_CC_PATH 640
+
+static char whale_gcc_module[WHALE_CC_PATH];
+
+/* The plain name of the running executable. The import library records it, and
+   that is what the loader looks for when the shared object is mapped, so a path
+   would not do. */
+static void whale_cc_basename(const char *path, char *out, int out_size)
+{
+    const char *b = path, *p;
+
+    for (p = path; *p; p++) {
+        if (strchr("\\/", *p))
+            b = p + 1;
+    }
+    snprintf(out, out_size, "%s", b);
+}
+
+/* Where gendef and dlltool are: part of the same MinGW as the driver, and not
+   necessarily on PATH. */
+static void whale_cc_dir(const char *path, char *out, int out_size)
+{
+    const char *b = path, *p;
+    int n;
+
+    for (p = path; *p; p++) {
+        if (strchr("\\/", *p))
+            b = p;
+    }
+    n = (int)(b - path);
+    if (n >= out_size)
+        n = out_size - 1;
+    memcpy(out, path, n);
+    out[n] = '\0';
+}
+
+/* gendef names its output after its input - <basename>.def in the current
+   directory - so the name it will use is derived the same way. */
+static void whale_cc_defname(const char *exe_path, char *out, int out_size)
+{
+    char base[WHALE_CC_PATH];
+    char *dot;
+
+    whale_cc_basename(exe_path, base, sizeof(base));
+    dot = strrchr(base, '.');
+    if (dot)
+        *dot = '\0';
+    snprintf(out, out_size, "%s.def", base);
+}
+static int whale_gcc_prepare(const char *cc, char *lib_out, int lib_size)
+{
+    char bin[WHALE_CC_PATH], dir[WHALE_CC_PATH], exe[WHALE_CC_PATH];
+    char def[WHALE_CC_PATH], lib[WHALE_CC_PATH], modname[WHALE_CC_PATH];
+    char defname[WHALE_CC_PATH];
+    char cmd[WHALE_CC_PATH * 4];
+    const char *tmp = getenv("TEMP");
+
+    if (!tmp)
+        return 0;
+    if (!*tmp)
+        return 0;
+    whale_cc_dir(cc, bin, sizeof(bin));
+    snprintf(dir, sizeof(dir), "%s\\whalejs_jit", tmp);
+    snprintf(lib, sizeof(lib), "%s\\libwhalejs.a", dir);
+    snprintf(lib_out, lib_size, "%s", lib);
+    if (!GetModuleFileNameA(NULL, exe, sizeof(exe)))
+        return 0;
+    if (!whale_gcc_module[0]) {
+        whale_cc_basename(exe, modname, sizeof(modname));
+        snprintf(whale_gcc_module, sizeof(whale_gcc_module), "%s", modname);
+    }
+    CreateDirectoryA(dir, NULL);
+    if (GetFileAttributesA(lib) != INVALID_FILE_ATTRIBUTES)
+        return 1;
+    /* Built here rather than at build time, because the export list is whatever
+       the running binary actually has. */
+    /* gendef has no output-path option, so it is run from the directory the
+       .def belongs in, and it names that file after its input. */
+    whale_cc_defname(exe, defname, sizeof(defname));
+    snprintf(def, sizeof(def), "%s\\%s", dir, defname);
+    snprintf(cmd, sizeof(cmd), "cd /d \"%s\" & \"%s\\gendef.exe\" \"%s\" >nul 2>nul", dir, bin, exe);
+    /* The exit status is not a reliable signal here - gendef reports progress on
+       stderr and does not consistently exit zero - so what is checked is the
+       product. */
+    (void)system(cmd);
+    if (GetFileAttributesA(def) == INVALID_FILE_ATTRIBUTES) {
+        if (getenv("WHALE_JIT_DUMP"))
+            fprintf(stderr, "whale gcc: gendef produced no .def\n");
+        return 0;
+    }
+    /* Wrapped in an outer pair of quotes: cmd.exe strips the first and last
+       quote when a command begins with one, which is how `C:\Program Files\...`
+       ends up being read as the program `C:\Program`. */
+    snprintf(cmd, sizeof(cmd), "\"\"%s\\dlltool.exe\" -d \"%s\" -l \"%s\" -D %s\"",
+             bin, def, lib, whale_gcc_module);
+    (void)system(cmd);
+    if (GetFileAttributesA(lib) == INVALID_FILE_ATTRIBUTES) {
+        if (getenv("WHALE_JIT_DUMP"))
+            fprintf(stderr, "whale gcc: dlltool produced no import library\n");
+        return 0;
+    }
+    return 1;
+}
+
+static int whale_gcc_compile(JSContext *ctx, const char *src, void **entry_out, void **handle_out)
+{
+    const char *cc = getenv("WHALE_JIT_CC");
+    const char *tmp = getenv("TEMP");
+    const char *extra;
+    char *text = NULL;
+    char obj[WHALE_CC_PATH], lib[WHALE_CC_PATH], cmd[WHALE_CC_PATH * 4];
+    FILE *pipe;
+    HMODULE mod;
+    void *fn;
+    int n, ok = 0;
+
+    (void)src;
+    if (!cc)
+        return 0;
+    if (!*cc)
+        return 0;
+    if (!tmp)
+        return 0;
+    if (!*tmp)
+        return 0;
+    if (!whale_gcc_prepare(cc, lib, sizeof(lib)))
+        return 0;
+    /* For the ident table only: rendering the stream back to text is what turns
+       TinyCC's ident indices into the names the C has to carry. */
+    if (!whale_jit_state_ensure())
+        return 0;
+
+    JS_WhalePinEnter();
+    snprintf(whale_core_name, sizeof(whale_core_name), "whale_jit_core_%u", ++whale_jit_seq);
+    snprintf(whale_entry_name, sizeof(whale_entry_name), "whale_jit_fn_%u", whale_jit_seq);
+
+    /* The generator alone: TinyCC's parser is not driven, because the consumer
+       on this path reads text. The tokens are already in final order in
+       go_tok/go_num when it returns. */
+    if (!whale_jit_gen(ctx, whale_gen_info))
+        return 0;
+    n = JS_WhaleRenderStream(go_tok, go_num, go_len, &text);
+    if (!text)
+        return 0;
+    if (n <= 0)
+        goto done;
+
+    snprintf(obj, sizeof(obj), "%s\\whale_jit_%u.dll", tmp, whale_jit_seq);
+    DeleteFileA(obj);
+    /* `-x c -` takes the source from stdin, so it is never written out; the
+       `-x none` hands the import library back to the linker. */
+    /* -fno-strict-aliasing is not optional: the generated code reaches through
+       casts the compiler cannot see the provenance of, and -O2 is entitled to
+       assume otherwise. TinyCC does not care, so this only shows up here.
+       WHALE_JIT_CFLAGS replaces the default flags, which is how the crash was
+       narrowed down without rebuilding each time. */
+    extra = getenv("WHALE_JIT_CFLAGS");
+    if (!extra)
+        extra = "";
+    /* The outer quotes are for cmd.exe, which otherwise strips the driver's own
+       quotes - same reason as the dlltool call above. */
+    snprintf(cmd, sizeof(cmd),
+             "\"\"%s\" -x c - -x none \"%s\" -shared -w -fno-strict-aliasing "
+             "-Wno-error=incompatible-pointer-types %s -o \"%s\"\"",
+             cc, lib, *extra ? extra : "-O2", obj);
+    if (getenv("WHALE_JIT_DUMP"))
+        fprintf(stderr, "whale gcc: %s\n", cmd);
+    pipe = _popen(cmd, "w");
+    if (!pipe) {
+        if (getenv("WHALE_JIT_DUMP"))
+            fprintf(stderr, "whale gcc: cannot start the driver\n");
+        goto done;
+    }
+    fwrite(text, 1, n, pipe);
+    if (_pclose(pipe) != 0) {
+        if (getenv("WHALE_JIT_DUMP"))
+            fprintf(stderr, "whale gcc: driver failed\n");
+        goto done;
+    }
+    mod = LoadLibraryA(obj);
+    if (!mod) {
+        if (getenv("WHALE_JIT_DUMP"))
+            fprintf(stderr, "whale gcc: LoadLibrary failed (%lu)\n", GetLastError());
+        goto done;
+    }
+    fn = (void *)GetProcAddress(mod, whale_entry_name);
+    if (!fn) {
+        if (getenv("WHALE_JIT_DUMP"))
+            fprintf(stderr, "whale gcc: %s not found\n", whale_entry_name);
+        FreeLibrary(mod);
+        goto done;
+    }
+    *entry_out = fn;
+    *handle_out = (void *)mod;
+    /* The image stays valid without its directory entry, so the file can go.
+       WHALE_JIT_KEEP holds it back for a post-mortem: the machine code gcc
+       produced is the only account of what actually ran. */
+    if (getenv("WHALE_JIT_KEEP")) {
+        fprintf(stderr, "whale gcc: kept %s\n", obj);
+    } else {
+        DeleteFileA(obj);
+    }
+    ok = 1;
+  done:
+    JS_WhaleRenderFree(text);
+    return ok;
+}
+
+static void whale_gcc_release(void *handle)
+{
+    if (handle)
+        FreeLibrary((HMODULE)handle);
+}
+
+static JSWhaleJitBackend whale_backend_gcc = {
+    "gcc",
+    whale_gcc_compile,
+    whale_gcc_release,
+};
 static void whale_tcc_release(void *handle)
 {
     /* the single TCCState is process-wide and must outlive the functions it
@@ -5614,6 +5865,26 @@ int JS_WhaleJitCompileFunction(JSContext *ctx, const JSWhaleFuncInfo *info,
         fprintf(stderr, "whale tcc internal probe: vstack cap=%d\n", JS_WhaleTccProbe());
     }
 
+    /* Off unless the environment names a driver. The gcc path needs a MinGW
+       toolchain and builds an import library on first use, so it is opt-in
+       rather than the default; the variable carries the driver because there is
+       nothing sensible to guess about where it lives. */
+    {
+        static int chosen;
+        const char *cc;
+
+        if (!chosen) {
+            chosen = 1;
+            cc = getenv("WHALE_JIT_CC");
+            if (cc) {
+                if (*cc) {
+                    whale_jit_backend = &whale_backend_gcc;
+                    if (getenv("WHALE_JIT_DUMP"))
+                        fprintf(stderr, "whale jit: backend gcc (%s)\n", cc);
+                }
+            }
+        }
+    }
     if (!whale_jit_backend->compile(ctx, NULL, &entry, &handle))
         return 0;
 
