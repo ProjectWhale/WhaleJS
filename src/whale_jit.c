@@ -876,49 +876,39 @@ static void fold_inline(int k)
    is a plain variable or a short expression, which is exactly the shape the
    bitwise operators see. Without this, every bitwise operand paid a helper
    call whose fmod() dominated the loop. */
-static void fold_toint32(int k, int is_i32, int is_iconst)
+static void fold_toint32(int k, int is_num, int is_iconst)
 {
-    int repeat;
-
-    /* A literal already in range needs the cast and nothing else - no range
-       test, no helper, and about fifteen tokens less than the general form.
-       Bitwise code is full of these. */
-    if (is_iconst) {
-        if (!whale_vmat[k]) {
-            if (whale_vexpr[k].len == 1) {
-                wt('('); wk(JS_WK_INT); wt(')');
-                wt_int((int)gw_num[whale_vexpr[k].off]);
-                return;
-            }
-        }
-    }
-
-    /* Already an in-range int32: the range test and the helper call both fall
-       away, leaving a plain cast. Only when the operand is already a variable -
-       inlining an un-materialised operand copies a whole pending expression,
-       which measured slower than the helper it replaced. */
-    repeat = whale_vmat[k] || whale_vexpr[k].len <= 8;
-    if (is_i32 && repeat) {
-        wt('('); wk(JS_WK_INT); wt(')'); wt('('); fold_inline(k); wt(')');
+    /* A literal already in range needs the cast and nothing else. Bitwise code is
+       full of these. */
+    if (is_iconst && !whale_vmat[k] && whale_vexpr[k].len == 1) {
+        wt('('); wk(JS_WK_INT); wt(')');
+        wt_int((int)gw_num[whale_vexpr[k].off]);
         return;
     }
 
-    if (!repeat) {
-        wt_id("JS_WhaleToInt32"); wt('('); fold_inline(k); wt(')');
-        return;
-    }
-    /* One conversion, no test and no helper. (int32_t)(long long)d is exactly
+    /* A number already known to be a double. (int32_t)(long long)d is exactly
        ToInt32(d) for every double: within 2^63 long long holds it, so the cast
        truncates and the low 32 bits are the modulo-2^32 wrap; outside that range,
        and for NaN and the infinities, x86's cvttsd2si yields INT64_MIN, whose low
        32 bits are 0 - which is what ToInt32 gives for NaN, +/-Inf, and for any
        float large enough to be a multiple of 2^32 (everything past 2^63 is).
-       The previous form tested the range and fell back to JS_WhaleToInt32 - which
-       calls fmod - so it cost three comparisons and a branch per bitwise operand.
-       Normal arithmetic just emits `+` and pays none of this, which is the whole
-       reason a bitwise loop ran 7x slower than the same loop with arithmetic. */
-    wt('('); wk(JS_WK_INT); wt(')'); wt('('); wk(JS_WK_LONG); wk(JS_WK_LONG); wt(')');
-    wt('('); fold_inline(k); wt(')');
+
+       The cast names the operand exactly once, so the `repeat` guard that used to
+       live here - which exists to stop a long pending expression being inlined
+       several times - does not apply. That guard was the whole reason `bitops`
+       called the helper: the left operand of `&` in `(acc + v % 7) & 0xffff` is a
+       plain NUM, and a long expression was refused the cast and sent to
+       JS_WhaleToInt32. That helper calls fmod, so a bitwise loop came out 10x
+       slower than the equivalent C. */
+    if (is_num) {
+        wt('('); wk(JS_WK_INT); wt(')'); wt('('); wk(JS_WK_LONG); wk(JS_WK_LONG); wt(')');
+        wt('('); fold_inline(k); wt(')');
+        return;
+    }
+
+    /* Not a number at all - a string, an object, a parked value. ToNumber is the
+       engine's job. */
+    wt_id("JS_WhaleToInt32"); wt('('); fold_inline(k); wt(')');
 }
 
 /* Emit `a % b`. fmod() is a libm call and the operands here are usually small
@@ -4771,10 +4761,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int fm = fold_mark();
 
                 wt('('); wk(JS_WK_DOUBLE); wt(')'); wt('(');
-                fold_toint32(sp - 2, cur[var_count + sp - 2] == WHALE_T_I32,
+                fold_toint32(sp - 2, whale_type_is_num(cur[var_count + sp - 2]),
                      cur[var_count + sp - 2] == WHALE_T_ICONST);
                 wt(op == OP_and ? '&' : op == OP_or ? '|' : '^');
-                fold_toint32(sp - 1, cur[var_count + sp - 1] == WHALE_T_I32,
+                fold_toint32(sp - 1, whale_type_is_num(cur[var_count + sp - 1]),
                          cur[var_count + sp - 1] == WHALE_T_ICONST);
                 wt(')');
                 fold_set(sp - 2, fm);
@@ -4792,11 +4782,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                 wt('('); wk(JS_WK_DOUBLE); wt(')'); wt('(');
                 if (op == OP_shr) { wk(JS_WK_UNSIGNED); wk(JS_WK_INT); wt(')'); }   /* >>> is logical */
-                fold_toint32(sp - 2, cur[var_count + sp - 2] == WHALE_T_I32,
+                fold_toint32(sp - 2, whale_type_is_num(cur[var_count + sp - 2]),
                      cur[var_count + sp - 2] == WHALE_T_ICONST);
                 /* one token, not two '<' - there is no lexer to join them */
                 wt_op(op == OP_shl ? JS_OP_SHL : JS_OP_SAR);
-                wt('('); fold_toint32(sp - 1, cur[var_count + sp - 1] == WHALE_T_I32,
+                wt('('); fold_toint32(sp - 1, whale_type_is_num(cur[var_count + sp - 1]),
                          cur[var_count + sp - 1] == WHALE_T_ICONST); wt('&'); wt_int(31); wt(')');
                 wt(')');
                 fold_set(sp - 2, fm);
@@ -4845,7 +4835,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             {
                 int fm = fold_mark();
 
-                wt('('); wk(JS_WK_DOUBLE); wt(')'); wt('~'); fold_toint32(sp - 1, cur[var_count + sp - 1] == WHALE_T_I32,
+                wt('('); wk(JS_WK_DOUBLE); wt(')'); wt('~'); fold_toint32(sp - 1, whale_type_is_num(cur[var_count + sp - 1]),
                          cur[var_count + sp - 1] == WHALE_T_ICONST);
                 fold_set(sp - 1, fm);
             }
