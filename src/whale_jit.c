@@ -374,7 +374,22 @@ static char whale_core_name[40];
 static char whale_entry_name[40];
 
 
-static JSValue whale_jit_box_num(JSContext *ctx, double d)
+/* quickjs.h declares these as static inline, so they have no external linkage
+   and nothing outside this translation unit can resolve them - which a shared
+   object loaded at run time must. Generated code calls them, so they get
+   wrappers that do have linkage, and the emitted prototype names the wrapper.
+   Registering the wrapper in whale_host_syms is what keeps TinyCC resolving the
+   same name, because both backends read that one table. */
+JSValue JS_WhaleNewFloat64(JSContext *ctx, double d)
+{
+    return JS_NewFloat64(ctx, d);
+}
+
+JSValue JS_WhaleNewBool(JSContext *ctx, int b)
+{
+    return JS_NewBool(ctx, b);
+}
+JSValue whale_jit_box_num(JSContext *ctx, double d)
 {
     if (d >= -2147483648.0 && d <= 2147483647.0) {
         int i = (int)d;
@@ -386,7 +401,7 @@ static JSValue whale_jit_box_num(JSContext *ctx, double d)
 }
 
 /* returns 1 and stores the value when v is a number */
-static int whale_jit_unbox_num(JSContext *ctx, JSValue v, double *out)
+int whale_jit_unbox_num(JSContext *ctx, JSValue v, double *out)
 {
     int t = JS_VALUE_GET_TAG(v);
 
@@ -2298,9 +2313,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("whale_jit_unbox_num"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wt_id("JSValue"); wt_id("v"); wt(',');
         wk(JS_WK_DOUBLE); wt('*'); wt_id("dst"); wt(')'); wt(';');
-    wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_NewFloat64"); wt('(');
+    wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_WhaleNewFloat64"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_DOUBLE); wt_id("d"); wt(')'); wt(';');
-    wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_NewBool"); wt('(');
+    wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_WhaleNewBool"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("b"); wt(')'); wt(';');
     /* typed-array helpers (WHALE_T_OBJ). Declared like everything else: with no
        prototype TinyCC applies the C89 implicit declaration, a `double` argument
@@ -5314,7 +5329,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wk(JS_WK_RETURN); wt_id("_ret"); wt(';');
     }
     if (ret_is_bool == 1) {
-        wk(JS_WK_RETURN); wt_id("JS_NewBool"); wt('('); wt_id("ctx"); wt(','); wt_id("_r"); wt_op(JS_OP_NE); wt_int(0); wt(')'); wt(';');
+        wk(JS_WK_RETURN); wt_id("JS_WhaleNewBool"); wt('('); wt_id("ctx"); wt(','); wt_id("_r"); wt_op(JS_OP_NE); wt_int(0); wt(')'); wt(';');
     } else {
         wk(JS_WK_RETURN); wt_id("whale_jit_box_num"); wt('('); wt_id("ctx"); wt(','); wt_id("_r"); wt(')'); wt(';');
     }
@@ -5419,8 +5434,8 @@ static const WhaleHostSym whale_host_syms[] = {
     WHALE_HOST_SYM(JS_WhaleCheckStack),
     WHALE_HOST_SYM(whale_jit_box_num),
     WHALE_HOST_SYM(whale_jit_unbox_num),
-    WHALE_HOST_SYM(JS_NewFloat64),
-    WHALE_HOST_SYM(JS_NewBool),
+    WHALE_HOST_SYM(JS_WhaleNewFloat64),
+    WHALE_HOST_SYM(JS_WhaleNewBool),
     WHALE_HOST_SYM(JS_WhaleToInt32),
     WHALE_HOST_SYM(JS_WhaleDeoptNote),
     WHALE_HOST_SYM(JS_WhaleGetGlobalNum),

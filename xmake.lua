@@ -51,7 +51,7 @@ local engine_sources = {
 -- Windows/MinGW 链接参数对齐 quickjs-ng 的 cmake MINGW 分支
 local function link_whale()
     if is_win() then
-        add_ldflags("-static", "-static-libgcc", "-Wl,--stack,8388608", { force = true })
+        add_ldflags("-static", "-static-libgcc", "-Wl,--stack,8388608", "-Wl,--export-all-symbols", { force = true })
         add_syslinks("pthread")
     else
         add_syslinks("m", "pthread", "dl")
