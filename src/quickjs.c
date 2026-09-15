@@ -3389,6 +3389,31 @@ int JS_WhaleCheckStack(JSContext *ctx)
     return 1;
 }
 
+/* Diagnostic: how a compiled call actually ended.
+
+   The entry wrapper calls this with the `deopt` flag once the core has returned.
+   0 means the compiled body ran to the end; anything else means the caller throws
+   the compiled result away and interprets this frame instead. A function that
+   compiles cleanly but always reports non-zero is the case this exists to catch:
+   its generated code looks right, is never used, and the time measured is the
+   interpreter's.
+
+   Behind WHALE_DEOPT_DBG, one line per call - the benchmarks here call a function
+   in the low tens of times, so that is cheap and readable. */
+extern char *getenv(const char *);
+void JS_WhaleDeoptNote(JSContext *ctx, int flag)
+{
+    static long by_flag[8];
+    static long total;
+
+    (void)ctx;
+    if (flag >= 0 && flag < 8)
+        by_flag[flag]++;
+    total++;
+    if (getenv("WHALE_DEOPT_DBG"))
+        fprintf(stderr, "[deopt] call=%ld flag=%d\n", total, flag);
+}
+
 /* ---- JIT object slots -----------------------------------------------------
  *
  * The generated code is an ordinary C function: no JSStackFrame, and GC does

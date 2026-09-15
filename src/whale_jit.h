@@ -155,6 +155,7 @@ int JS_WhaleVarRefSetNum(JSContext *ctx, void *var_refs, int idx, double v);
    function (self-recursion) or an enclosing closure's function. */
 int JS_WhaleVarRefGetObj(JSContext *ctx, void *var_refs, int idx, int slot);
 int JS_WhaleCheckStack(JSContext *ctx);
+void JS_WhaleDeoptNote(JSContext *ctx, int flag);   /* WHALE_DEOPT_DBG: did this call really run compiled? */
 int JS_WhaleOpSize(int op);   /* bytecode operand size, from the interpreter table */
 
 /* ---- mixed compilation: the single-instruction fallback ----

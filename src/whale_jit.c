@@ -5161,6 +5161,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         }
     }
     wt_id("_r"); wt('='); wt_id(whale_core_name); wt('('); wt_id("ctx"); wt(','); wt_id("args"); wt(','); wt_id("An"); wt(','); wt_id("deopt"); wt(','); wt('&'); wt_id("_ret"); wt(','); wt_id("whale_var_refs"); wt(')'); wt(';');
+    /* Report how the call ended, before the flag is acted on. A non-zero flag here
+       means the caller drops this result and interprets the frame, so a function
+       that always reports one is compiled but never run - see JS_WhaleDeoptNote. */
+    wt_id("JS_WhaleDeoptNote"); wt('('); wt_id("ctx"); wt(','); wt('*'); wt_id("deopt"); wt(')'); wt(';');
     /* *deopt == 2 is not "reinterpret this frame", it is "a host call inside
        the compiled body threw". The exception is already pending in ctx and the
        callee must not run a second time - it is exactly the kind of thing (a
@@ -5297,6 +5301,7 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
         tcc_add_symbol(s, "JS_NewFloat64", (void *)JS_NewFloat64);
         tcc_add_symbol(s, "JS_NewBool", (void *)JS_NewBool);
         tcc_add_symbol(s, "JS_WhaleToInt32", (void *)JS_WhaleToInt32);
+        tcc_add_symbol(s, "JS_WhaleDeoptNote", (void *)JS_WhaleDeoptNote);
         tcc_add_symbol(s, "JS_WhaleGetGlobalNum", (void *)JS_WhaleGetGlobalNum);
         /* object slots: the GC-visible place to keep an object across a call */
         tcc_add_symbol(s, "JS_WhaleObjSlot", (void *)JS_WhaleObjSlot);
