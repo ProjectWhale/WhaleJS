@@ -27,15 +27,59 @@ const fs = require('fs');
 const path = require('path');
 
 const CASES_DIR = path.join(__dirname, 'cases');
+const CNATIVE_DIR = path.join(__dirname, 'c_native');
+const CBIN_DIR = path.join(__dirname, '..', 'temp', 'cbench');
 const ALL_ENGINES = ['node', 'qjs', 'whalejs'];
 const DEFAULT_TIMEOUT = 300; /* seconds */
+const C_OPTS = ['O0', 'O1', 'O2'];
+
+/* The native ceiling. For each case with a c_native/<case>.c, compile it at
+   -O0/-O1/-O2 and expose it as an engine column. Without this there is nothing to
+   compare the JIT's time against: "already at the C ceiling" and "the codegen is
+   doing extra work" look the same when every reference is another interpreter.
+
+   Returns a Map from engine name to binary path. A case with no equivalent C is
+   simply absent, and shows as `--` rather than a made-up number. */
+function buildCNative() {
+    const map = new Map();
+
+    if (!fs.existsSync(CNATIVE_DIR))
+        return map;
+    fs.mkdirSync(CBIN_DIR, { recursive: true });
+
+    for (const f of fs.readdirSync(CNATIVE_DIR)) {
+        if (!f.endsWith('.c'))
+            continue;
+        const name = f.slice(0, -2);
+
+        for (const o of C_OPTS) {
+            const exe = path.join(CBIN_DIR,
+                `${name}-${o}${process.platform === 'win32' ? '.exe' : ''}`);
+            const src = path.join(CNATIVE_DIR, f);
+
+            /* Rebuild only when the source is newer, so a run does not pay for
+               three compiles per case every time. */
+            if (fs.existsSync(exe) && fs.statSync(exe).mtimeMs >= fs.statSync(src).mtimeMs)
+                { map.set(`c-${name}-${o}`, exe); continue; }
+
+            const r = spawnSync('gcc', [`-${o}`, src, '-o', exe, '-lm'],
+                                { stdio: 'ignore', windowsHide: true });
+            if (!r.error && r.status === 0)
+                map.set(`c-${name}-${o}`, exe);
+            else
+                process.stderr.write(`c-baseline: gcc -${o} ${f} failed - skipped\n`);
+        }
+    }
+    return map;
+}
 
 function parseArgs(argv) {
-    const opts = { cases: [], engines: ALL_ENGINES, repeat: 1, timeout: DEFAULT_TIMEOUT, json: false, list: false };
+    const opts = { cases: [], engines: ALL_ENGINES, repeat: 1, timeout: DEFAULT_TIMEOUT, json: false, list: false, c: false };
 
     for (const a of argv) {
         if (a === '--list') opts.list = true;
         else if (a === '--json') opts.json = true;
+        else if (a === '--c') opts.c = true;
         else if (a.startsWith('--engines=')) opts.engines = a.slice(10).split(',').map(s => s.trim()).filter(Boolean);
         else if (a.startsWith('--repeat=')) opts.repeat = Math.max(1, parseInt(a.slice(9), 10) || 1);
         else if (a.startsWith('--timeout=')) opts.timeout = Math.max(1, parseFloat(a.slice(10)) || DEFAULT_TIMEOUT);
@@ -81,6 +125,7 @@ function pad(s, n) {
 function main() {
     const opts = parseArgs(process.argv.slice(2));
     const available = listCases();
+    const cnative = opts.c ? buildCNative() : new Map();
 
     if (opts.list) {
         process.stdout.write(available.join('\n') + '\n');
@@ -97,10 +142,16 @@ function main() {
     }
 
     const engines = opts.engines.filter(e => {
+        if (cnative.has(e)) return true;      /* a built C baseline */
         if (probe(e)) return true;
         process.stderr.write(`engine '${e}' not found on PATH - skipped\n`);
         return false;
     });
+    /* A C baseline belongs to one case only, so it is added to that case's column
+       list rather than to the shared one. */
+    for (const e of cnative.keys())
+        if (!engines.includes(e))
+            engines.push(e);
     if (!engines.length) {
         process.stderr.write('no engines available\n');
         process.exitCode = 3;
@@ -111,10 +162,18 @@ function main() {
     for (const c of wanted) {
         results[c] = {};
         for (const e of engines) {
+            /* A case with no equivalent C has no cell for that column; leaving it
+               empty keeps the table rectangular and avoids inventing a number. */
+            if (e.startsWith('c-') && !e.startsWith(`c-${c}-`))
+                continue;
             const file = path.join(CASES_DIR, `${c}.js`);
+            /* A C binary ignores the argument: it has its own loop and prints the
+               same result line. */
+            const cmd = cnative.has(e) ? cnative.get(e) : e;
             let best = null;
+
             for (let i = 0; i < opts.repeat; i++) {
-                const r = run(e, file, opts.timeout);
+                const r = run(cmd, file, opts.timeout);
                 if (r.error) { best = r; break; }
                 if (!best || r.ms < best.ms) best = r;
             }
@@ -136,6 +195,8 @@ function main() {
         for (const c of wanted) {
             const cells = engines.map(e => {
                 const r = results[c][e];
+
+                if (!r) return pad('--', 12);
                 return pad(r.error ? `-- ${r.error}` : `${r.ms} ms`, 12);
             });
             process.stdout.write(pad(c, w) + cells.join('') + '\n');
@@ -145,9 +206,9 @@ function main() {
     /* correctness gate: the checksum must agree across engines */
     let mismatch = false;
     for (const c of wanted) {
-        const vals = engines.map(e => results[c][e].check).filter(v => v !== undefined);
+        const vals = engines.map(e => (results[c][e] || {}).check).filter(v => v !== undefined);
         if (vals.length > 1 && new Set(vals).size > 1) {
-            process.stderr.write(`CHECK MISMATCH ${c}: ` + engines.map(e => `${e}=${results[c][e].check ?? '-'}`).join(' ') + '\n');
+            process.stderr.write(`CHECK MISMATCH ${c}: ` + engines.map(e => `${e}=${(results[c][e] || {}).check ?? '-'}`).join(' ') + '\n');
             mismatch = true;
         }
     }
