@@ -816,8 +816,16 @@ static int fold_mark(void)
 
 /* A value whose expression grows past this many tokens is materialised right
    away. Without a ceiling, inlining a value used many times (a comparison
-   inlined three times, say) could grow the function exponentially. */
-#define WHALE_EXPR_MAX 24
+   inlined three times, say) could grow the function exponentially.
+
+   A variable rather than a constant, because the right ceiling depends on the
+   shape of the function. 24 was picked while measuring pinned registers, where a
+   long expression competes with the pinned set for TinyCC's evaluation stack. A
+   function with no object work at all - `bitops` is nothing but int32 arithmetic
+   - has nothing to compete with, and a ceiling that low there only forces every
+   intermediate through memory: with 24 the bitops loop stored and reloaded for
+   each of its five operations. */
+static int whale_expr_max = 24;
 
 static void fold_materialize(int k);
 static void fold_commit(int mark);
@@ -828,7 +836,7 @@ static void fold_set(int k, int mark)
     whale_vexpr[k].off = mark;
     whale_vexpr[k].len = JS_WhaleTokSinkLen() - mark;
     whale_vmat[k] = 0;
-    if (whale_vexpr[k].len > WHALE_EXPR_MAX)
+    if (whale_vexpr[k].len > whale_expr_max)
         fold_materialize(k);
 }
 
@@ -1175,7 +1183,7 @@ static void local_set(int d, int mark)
     m->used = 0;
     if (getenv("WHALE_MEM_TRACE"))
         fprintf(stderr, "[set] L%d off=%d len=%d\n", d, m->expr.off, m->expr.len);
-    if (m->expr.len > WHALE_EXPR_MAX)
+    if (m->expr.len > whale_expr_max)
         local_materialize(d);
 }
 
@@ -2555,6 +2563,22 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             arg_obj_slot[i] = whale_objs++;
         }
     }
+
+    /* How long an expression may grow before it is forced into a variable.
+
+       It was tempting to raise this for functions with no object work, on the
+       theory that they have no pinned registers to compete with. Measured: 32
+       against 24 gives bitops 143ms against 157, but nested 92 against 84 and
+       locals 104 against 98 - a wash, and 48 is worse than both. TinyCC spills at
+       every statement, so a longer expression is not free. The ceiling stays where
+       it was measured. */
+    whale_expr_max = 24;
+    if (getenv("WHALE_EXPR_MAX"))
+        whale_expr_max = atoi(getenv("WHALE_EXPR_MAX"));
+    if (getenv("WHALE_EXPR_DBG"))
+        fprintf(stderr, "[expr] blen=%d sites=%d call=%d max=%d\n",
+                info->byte_code_len, whale_field_sites_n, whale_has_call,
+                whale_expr_max);
 
     sp = 0;
     if (getenv("WHALE_OP_DBG")) {
