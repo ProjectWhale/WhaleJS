@@ -4948,9 +4948,15 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             if (whale_catch_depth <= 0)
                 { whale_out_line = __LINE__; goto out; }
             whale_catch_depth--;
-            /* pops two, pushes one: the catch value stays on the stack */
+            /* pops two, pushes one: the exception goes, the value that was above it
+               drops into its place. Just decrementing `sp` leaves the exception in
+               the slot the code above reads - which is how `return x*2` inside a
+               `try` came back as the catch block's undefined. */
             if (sp < 2)
                 { whale_out_line = __LINE__; goto out; }
+            cur[var_count + sp - 2] = cur[var_count + sp - 1];
+            whale_vexpr[sp - 2] = whale_vexpr[sp - 1];
+            whale_vmat[sp - 2] = whale_vmat[sp - 1];
             sp--;
             break;
         case OP_throw:
@@ -4985,12 +4991,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                            any exception does. *deopt == 2 is the engine's "a call
                            inside the compiled body threw": the exception is already
                            pending in ctx and the frame must NOT run again, because
-                           the throw may be a side effect (a DOM mutation). The return
-                           value is then unused, but the generated function still has
-                           to return something of its own type. */
+                           the throw may be a side effect (a DOM mutation). The value
+                           is unused either way, and the core returns a double - so 0
+                           is the only thing this can return. Returning a JSValue
+                           here is what made TinyCC say "invalid aggregate type for
+                           register load". */
                         wt('*'); wt_id("deopt"); wt('='); wt_int(2); wt(';');
-                        wk(JS_WK_RETURN); wt_id("whale_jit_box_num");
-                        wt('('); wt_id("ctx"); wt(','); wt_int(0); wt(')'); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';');
                     }
                     fold_commit(fm);
                 }
@@ -5003,6 +5010,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int fm;
 
                 t = cur[var_count + sp - 1];
+                if (getenv("WHALE_OP_DBG"))
+                    fprintf(stderr, "[ret] pos=%d sp=%d t=%d num=%d\n",
+                            pos, sp, t, whale_type_is_num(t));
                 if (WHALE_IS_ARR(t) || WHALE_IS_OBJ(t) || WHALE_IS_VAL(t)) {
                     /* The slot holds the reference; hand a duplicate of it to
                        the caller through ret_obj so the two do not compete for

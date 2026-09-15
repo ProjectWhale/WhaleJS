@@ -532,6 +532,27 @@ int JS_WhaleCompileTokens(TCCState *s, void (*emit)(void *), void *emit_ctx)
 
             fprintf(stderr, "[tokerr] failed at token %d of %d:\n",
                     whale_tok_pos, whale_tok_len);
+            /* Every identifier that looks like a label, with its position. A
+               "duplicate label" is only diagnosable if both definitions are visible,
+               and the 8-token window below shows at most one of them. */
+            if (getenv("WHALE_OP_DBG")) {
+                for (k = 0; k < whale_tok_len; k++) {
+                    int t = whale_tok_buf[k];
+                    const char *nm;
+
+                    if (t < TOK_IDENT)
+                        continue;
+                    nm = get_tok_str(t, NULL);
+                    if (nm && nm[0] == 'L' && nm[1] >= '0' && nm[1] <= '9') {
+                        int b;
+
+                        fprintf(stderr, "  [L] %d: %s  ctx:", k, nm);
+                        for (b = (k > 4) ? k - 4 : 0; b < k + 3 && b < whale_tok_len; b++)
+                            fprintf(stderr, " %d", whale_tok_buf[b]);
+                        fprintf(stderr, "\n");
+                    }
+                }
+            }
             for (k = from; k < whale_tok_len && k < whale_tok_pos + 4; k++) {
                 int t = whale_tok_buf[k];
                 const char *mark = (k + 1 == whale_tok_pos) ? " <<<" : "";
