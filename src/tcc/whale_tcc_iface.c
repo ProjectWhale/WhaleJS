@@ -414,6 +414,64 @@ int JS_WhaleTokIdent(const char *name)
     return whale_tok_ident(name);
 }
 
+/* The generated-source mirror (WHALE_JIT_SRC).
+
+   This is where the token stream is consumed by TinyCC, in its final order and
+   with its final contents, so it is the only place a faithful text rendering can
+   be taken. The mirror used to be written from the emitter helpers instead
+   (wt/wt_id/wt_int/...), which records an expression while it is still pending in
+   the fold sink: fold_commit() moves it into the output afterwards, so the text
+   came out in the wrong order, and anything pushed straight to the sink by
+   fold_inline_expr() - which bypasses the helpers entirely - did not appear at
+   all. Reading that file as if it were the C gave `return` with no `return`, `a b`
+   where the code was `a + b`, and `= ( )` where a whole folded expression stood. */
+static FILE *whale_mirror_fp;
+static int whale_mirror_tried;
+
+static void whale_mirror_write(int t, double num)
+{
+    if (!whale_mirror_tried) {
+        const char *p = getenv("WHALE_JIT_SRC");
+
+        whale_mirror_tried = 1;
+        if (p && *p)
+            whale_mirror_fp = fopen(p, "w");
+    }
+    if (!whale_mirror_fp)
+        return;
+    if (t == TOK_EOF)
+        return;                 /* the end marker is not C */
+    /* Order matters: TOK_IDENT (256) and the CINT/CDOUBLE pseudo-tokens sit
+       ABOVE 128, so they have to be recognised before the 128..255 range. */
+    if (t == TOK_CINT)
+        fprintf(whale_mirror_fp, "%d ", (int)num);
+    else if (t == TOK_CDOUBLE)
+        fprintf(whale_mirror_fp, "%.17g ", num);
+    else if (t >= TOK_IDENT) {
+        const char *nm = get_tok_str(t, NULL);
+
+        fprintf(whale_mirror_fp, "%s ", nm ? nm : "?");
+    } else if (t >= 128) {
+        /* Values 128..255 name TinyCC's multi-character tokens: the relational,
+           logical and shift operators, and the arrow. They are NOT bytes -
+           writing them with fputc() put raw bytes in the file, which is how
+           `L1 <= A0` came out as `L1 <9c> A0`. get_tok_str() renders them by
+           walking the compiler's own tok_two_chars table and stops at its
+           terminating zero, so it is both authoritative and in-bounds. */
+        const char *nm = get_tok_str(t, NULL);
+
+        if (nm && nm[0])
+            fprintf(whale_mirror_fp, "%s ", nm);
+        else
+            fprintf(whale_mirror_fp, "T%d ", t);
+    } else if (t > 0) {
+        fputc(t, whale_mirror_fp);
+        fputc((t == ';' || t == '{' || t == '}') ? '\n' : ' ', whale_mirror_fp);
+    } else
+        fprintf(whale_mirror_fp, "T%d ", t);
+    fflush(whale_mirror_fp);
+}
+
 /* called by next_nomacro() in place of the lexer */
 void whale_next_token(void)
 {
@@ -424,6 +482,7 @@ void whale_next_token(void)
         tokc.i = (int)whale_tok_num[whale_tok_pos];
     else if (tok == TOK_CDOUBLE)
         tokc.d = whale_tok_num[whale_tok_pos];
+    whale_mirror_write(tok, whale_tok_num[whale_tok_pos]);
     whale_tok_pos++;
     tok_flags = 0;
 }

@@ -1,4 +1,4 @@
-﻿/*
+/*
  * WhaleJS: JIT code generation (TinyCC backend)
  *
  * This is the whole code generator, kept in its own translation unit so that
@@ -189,6 +189,27 @@ enum {
 #define WHALE_IS_SLOT(t)   (WHALE_IS_OBJ(t) || WHALE_IS_ARR(t) || WHALE_IS_VAL(t))
 #define WHALE_SLOT(t)      ((int)((t) >> 4) - 1)
 
+/* Every type that carries an object slot in its high nibble, structs included.
+
+   WHALE_IS_SLOT above leaves structs out on purpose: a frame-column struct keeps
+   its values in the columns, so a site that would treat the slot as a parked
+   JSValue must refuse it. But the question "which slot is this object in" has the
+   same answer for all four, and so does "may this leave the function" and "can two
+   edges meet here". Asking those with the three-of-four predicate is how a run of
+   separate bugs happened, each one a site that had forgotten about structs:
+
+     - `return` enumerated ARR/OBJ/VAL by hand instead of using a predicate, so a
+       function returning a laid-out object was refused outright;
+     - put_field and get_field tested `!WHALE_IS_SLOT(ta)` before their struct arm,
+       so every read and write on an unboxed object went to the engine instead;
+     - put_loc and set_loc each handled a struct without registering its object slot
+       in loc_slot[], so the entry edge and the back edge of a loop disagreed about
+       which slot held the variable.
+
+   Use this predicate for those questions. Use WHALE_IS_SLOT where the point is
+   "this is a JSValue in a slot" - that is what it is for. */
+#define WHALE_IS_OBJLIKE(t)  (WHALE_IS_SLOT(t) || WHALE_IS_STRUCT(t))
+
 /* ------------------------------------------------------------------------
  * Token emitters.
  *
@@ -198,8 +219,27 @@ enum {
  * nothing can be mistaken for an identifier or collide with a TinyCC keyword.
  * ---------------------------------------------------------------------- */
 /* wk = keyword (JS_WK_*), wt = punctuation / single-char operator */
+static void wsrc(const char *s);   /* the generated-source mirror, defined below */
+
 static void wk(int w)
 {
+    /* Mirror the keyword as well. JS_WhaleTokKw pushes a TinyCC token straight
+       through, so the WHALE_JIT_SRC dump used to be missing every keyword - a
+       `return` read as an absent `return`, and `if (...) { ... }` read as a bare
+       block. Both sent this session's debugging after things that were not there.
+       The order matches JS_WhaleTokKw's table. */
+    static const char *const kwname[] = {
+        "int", "char", "void", "long", "unsigned", "float",
+        "double", "static", "extern", "typedef", "struct", "return",
+        "if", "else", "while", "for", "do", "break", "continue",
+        "goto", "switch", "case", "default", "sizeof", "register",
+        "union", "enum", "short",
+    };
+
+    if (w >= 0 && w < (int)(sizeof(kwname) / sizeof(kwname[0]))) {
+        wsrc(kwname[w]);
+        wsrc(" ");
+    }
     JS_WhaleTokKw(w);
 }
 
@@ -214,15 +254,12 @@ static int whale_src_tried;
 
 static void wsrc(const char *s)
 {
-    if (!whale_src_tried) {
-        const char *p = getenv("WHALE_JIT_SRC");
-
-        whale_src_tried = 1;
-        if (p && *p)
-            whale_src_fp = fopen(p, "w");
-    }
-    if (whale_src_fp)
-        fputs(s, whale_src_fp);
+    /* The generated-source mirror lives in whale_next_token() now, where the token
+       stream is consumed in its final order. Mirroring here recorded an expression
+       while it was still pending in the fold sink, so the text was out of order and
+       folded expressions were absent. This stays as the one call site it was, kept
+       so the emit helpers do not all have to change. */
+    (void)s;
 }
 
 static void wt(int t)
@@ -271,6 +308,21 @@ static void wt_arr(const char *field, int n)
 
 static void wt_op(int o)
 {
+    /* Mirror the operator as well. wt() mirrors single characters, but every
+       multi-character operator comes through here and goes straight to TinyCC, so
+       the generated-source dump used to show `a b` where the code was `a + b`.
+       That is what made a correct `st.a = st.a + st.e` read as an assignment of
+       nothing, and sent this session after a bug that was not there. The order
+       matches JS_WhaleTokOp's table. */
+    static const char *const opname[] = {
+        "+", "-", "*", "/", "<", "<=", ">", ">=", "==", "!=", "||", "&&",
+        "<<", ">>", ">>>", "->", ".",
+    };
+
+    if (o >= 0 && o < (int)(sizeof(opname) / sizeof(opname[0]))) {
+        wsrc(opname[o]);
+        wsrc(" ");
+    }
     JS_WhaleTokOp(o);
 }
 
@@ -785,6 +837,19 @@ static int whale_obj_pending;
 static int whale_ret_obj_g;
 /* Which line bailed. Every goto out sets it, so the diagnostic at out: can name the exact place instead of making the reader guess from pos/op - the position reported is often a jump target, not the reason. */
 static int whale_out_line;
+/* An opcode this pass cannot lower does not have to sink the whole function.
+   whale_step_emit hands that single instruction to the engine's step path and
+   the rest of the function stays native; only if even that refuses does the
+   function fall back to interpreting, as before. Control-flow opcodes are
+   refused inside whale_step_emit itself, so the hand-over is wired in at every
+   bail site instead of each site having to ask first. */
+#define WHALE_STEP_INSTEAD_OF_BAILING()                                    \
+    do {                                                                   \
+        if (whale_step_emit(op, pos, &sp, cur, var_count, stack_size))      \
+            goto whale_next_op;                                             \
+        whale_out_line = __LINE__;                                          \
+        goto out;                                                           \
+    } while (0)
 /* Whether the current call has an argument that is not a plain number. A self-call
    with one cannot take the self-recursion path, because that path packs its
    arguments into a double array. Set just before the call routes. */
@@ -2096,11 +2161,22 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                The test is deliberately shallow: the opcode just before the return, and
                whether that local is known to hold an object. That is the shape a factory
                has, and it is all this pass can see. */
-            if (prev_op >= OP_get_loc0 && prev_op <= OP_get_loc3 &&
-                whale_loc_obj[prev_op - OP_get_loc0])
+            if ((prev_op >= OP_get_loc0 && prev_op <= OP_get_loc3 &&
+                 whale_loc_obj[prev_op - OP_get_loc0]) ||
+                prev_op == OP_define_field || prev_op == OP_object)
                 whale_ret_obj_g = 1;
         } else if (op == OP_call || (op >= OP_call0 && op <= OP_call3)) {
             whale_has_call = 1;
+            /* Where this call is, for the "nothing after this point may call"
+               gate the layout arms test. That gate reads whale_call_pos[last] and
+               was written against an array nothing ever filled - whale_call_n
+               stayed 0, so `whale_call_n == 0` short-circuited every time and the
+               protection never ran. A local that is laid out and then reassigned
+               from a call is what it exists to prevent: `st` in immutable_update
+               was laid out at pos 0 with setField() called at pos 44, and the
+               columns went stale on the first iteration. */
+            if (whale_call_n < WHALE_CALL_MAX)
+                whale_call_pos[whale_call_n++] = pos;
         } else if (op >= OP_get_var_ref0 && op < OP_get_var_ref0 + 4) {
             /* Only a slot used as a call target has to be this very function; an
                enclosing closure's variable is read as a number instead. */
@@ -2201,6 +2277,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wt_id("JSValueUnion"); wt_id("u"); wt(';');
         wk(JS_WK_LONG); wk(JS_WK_LONG); wt_id("tag"); wt(';');
     wt('}'); wt_id("JSValue"); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_VOID); wt_id("JS_WhaleDeoptNote"); wt('(');
+    wt_id("void"); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("flag"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleVarRefGetNum"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_VOID); wt('*'); wt_id("var_refs"); wt(',');
         wk(JS_WK_INT); wt_id("idx"); wt(','); wk(JS_WK_DOUBLE); wt('*'); wt_id("out"); wt(')'); wt(';');    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleVarRefGetObj"); wt('(');
@@ -2505,6 +2583,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        a short function spent nearly all of its time in its own prologue. */
     wk(JS_WK_STRUCT); wt('{');
         wk(JS_WK_DOUBLE); wt_id("v"); wt('['); wt_int(stack_size + WHALE_VSER_MAX); wt(']'); wt(';');
+        /* the atoms of the layout being built, handed to JS_WhaleStructNew */
+        wk(JS_WK_INT); wt_id("wa"); wt('['); wt_int(WHALE_STRUCT_FIELDS); wt(']'); wt(';');
         wk(JS_WK_VOID); wt('*'); wt_id("fs"); wt('['); wt_int(WHALE_FIELD_CACHE); wt(']'); wt(';');
         wt_id("JSValue"); wt('*'); wt_id("fp"); wt('['); wt_int(WHALE_FIELD_CACHE); wt(']'); wt(';');
         wk(JS_WK_INT); wt_id("fver"); wt(';');
@@ -2642,6 +2722,32 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                             snap[base + k] = WHALE_T_NUM;
                             continue;
                         }
+                    }
+                    /* Two object-like types in the very same slot: the object is
+                       the one the slot holds either way, and the only thing that
+                       can disagree is whether the layout columns still describe it.
+                       A struct on one edge means they were read from the object
+                       that edge had; a plain value on the other means a new object
+                       was stored over it. The columns are stale then, so the merge
+                       has to keep the non-struct reading - which is exactly the
+                       "fall back to the map" path, and correct.
+
+                       This is the shape of `st = setField(st, i % 11)`: the entry
+                       edge lays `st` out in slot 0 (`var st = {a:0,...}`), the back
+                       edge stores setField's result in the same slot, and the two
+                       meet as STRUCT(0) against VAL(0). Treating that as a conflict
+                       is what refused `step` - twice over, before the object slots
+                       were unified and after. */
+                    if (WHALE_IS_OBJLIKE(sv) && WHALE_IS_OBJLIKE(cv) &&
+                        WHALE_SLOT(sv) == WHALE_SLOT(cv)) {
+                        if (WHALE_IS_STRUCT(sv) && !WHALE_IS_STRUCT(cv))
+                            snap[base + k] = cv;
+                        else if (!WHALE_IS_STRUCT(sv) && WHALE_IS_STRUCT(cv))
+                            snap[base + k] = sv;
+                        if (getenv("WHALE_MERGE_DBG"))
+                            fprintf(stderr, "[merge-obj] pos=%d slot=%d prev=%d now=%d -> %d\n",
+                                    pos, k, sv, cv, snap[base + k]);
+                        continue;
                     }
                     if (sv == WHALE_T_UNKNOWN) {
                         snap[base + k] = cv; /* optimistic merge */
@@ -2937,11 +3043,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int ct, fm;
 
                 if (idx < 0 || idx >= info->cpool_count)
-                    { whale_out_line = __LINE__; goto out; }
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 c = info->cpool[idx];
                 ct = JS_VALUE_GET_TAG(c);
                 if (ct != JS_TAG_INT && !JS_TAG_IS_FLOAT64(ct))
-                    { whale_out_line = __LINE__; goto out; } /* strings / bigints / objects: not our shape */
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); } /* strings / bigints / objects: not our shape */
                 fm = fold_mark();
                 if (ct == JS_TAG_INT)
                     wt_int((int)JS_VALUE_GET_INT(c));
@@ -2980,7 +3086,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         case OP_to_propkey:
         case OP_to_propkey2:
             if (!whale_type_is_num(cur[var_count + sp - 1]))
-                { whale_out_line = __LINE__; goto out; }
+                { WHALE_STEP_INSTEAD_OF_BAILING(); }
             break;
 
         /* Is the value undefined or null? Every value the JIT can hold is a
@@ -3033,7 +3139,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int tc;
 
                 if (fslot < 0 || argc < 0 || argc > WHALE_CALL_SLOTS)
-                    { whale_out_line = __LINE__; goto out; }
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 tc = cur[var_count + fslot];
                 if (argc == 1 && WHALE_IS_OBJ(tc) &&
                     whale_type_is_num(cur[var_count + sp - 1])) {
@@ -3044,7 +3150,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     int out = whale_objs++;
 
                     if (out >= WHALE_OBJ_SLOTS)
-                        { whale_out_line = __LINE__; goto out; }
+                        { WHALE_STEP_INSTEAD_OF_BAILING(); }
                     {
                         int fm = fold_mark();
 
@@ -3072,12 +3178,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     if (WHALE_IS_VAL(tc) || WHALE_IS_OBJ(tc))
                         cc = WHALE_IS_VAL(tc) ? WHALE_VAL_SLOT(tc) : WHALE_OBJ_SLOT(tc);
                     else if (tc != WHALE_T_FN)
-                        { whale_out_line = __LINE__; goto out; }
+                        { WHALE_STEP_INSTEAD_OF_BAILING(); }
                     for (k = 0; k < argc; k++) {
                         int tk = cur[var_count + sp - argc + k];
 
                         if (!whale_type_is_num(tk) && !WHALE_IS_VAL(tk) && !WHALE_IS_OBJ(tk))
-                            { whale_out_line = __LINE__; goto out; }
+                            { WHALE_STEP_INSTEAD_OF_BAILING(); }
                     }
                     /* Same rule as a general call: the result is either dead or it is
                        parked as an opaque value. A number would deopt later, and that
@@ -3086,13 +3192,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         ret_slot = -1;
                     } else {
                         if (whale_objs >= WHALE_CALL_BASE)
-                            { whale_out_line = __LINE__; goto out; }
+                            { WHALE_STEP_INSTEAD_OF_BAILING(); }
                         ret_slot = whale_objs++;
                     }
                     fm = fold_mark();
                     if (cc < 0) {
                         if (whale_objs >= WHALE_CALL_BASE)
-                            { whale_out_line = __LINE__; goto out; }
+                            { WHALE_STEP_INSTEAD_OF_BAILING(); }
                         cc = whale_objs++;
                         wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleCpoolSlot"); wt('(');
                         wt_id("ctx"); wt(','); wt_int(whale_slot_fn[fslot]); wt(',');
@@ -3263,7 +3369,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                             pos, whale_field_sites_n, mono);
 
                 if (whale_objs >= WHALE_CALL_BASE)
-                    { whale_out_line = __LINE__; goto out; }
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 os = whale_objs++;
                 /* A settled layout: hold the object as a C struct in the frame
                    instead of a heap object with a shape, and let the four field
@@ -3296,11 +3402,21 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                                                      WHALE_STRUCT_FIELDS);
 
                     if (fn > 0) {
-                        int k;
+                        int k, wfm = fold_mark();
 
+                        /* The offset map has to be named before it is built, and
+                           these four statements have to be *committed*: the emitters
+                           push into the fold sink, and only fold_commit() moves a
+                           range into the output. Taking the mark after them (as this
+                           did) left them in the sink for good - the generated code
+                           built its offset map from `_ws.wa` while `_ws.wa` was
+                           still all zeros, so every field lookup by column failed
+                           and every field read came back 0. `setField` in
+                           immutable_update answered 0 for exactly that. */
                         for (k = 0; k < fn; k++) {
                             wt_arr("wa", k); wt('='); wt_int(whale_str_atoms[k]); wt(';');
                         }
+                        fold_commit(wfm);
                         {
                             int afm = fold_mark();
 
@@ -3317,7 +3433,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         break;
                     }
                 }
-                if (!getenv("WHALE_NO_UNBOX") && mono && whale_str_n == 0) {
+                if (!getenv("WHALE_NO_UNBOX") && mono && whale_str_n == 0 &&
+                    (whale_call_n == 0 || pos > whale_call_pos[whale_call_n - 1])) {
                     int fn = whale_layout_from_sites(whale_field_sites,
                                                      whale_field_sites_n,
                                                      whale_str_atoms,
@@ -3369,7 +3486,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int os;
 
                 if (whale_objs >= WHALE_CALL_BASE)
-                    { whale_out_line = __LINE__; goto out; }
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 os = whale_objs++;
                 {
                     int fm = fold_mark();
@@ -3393,7 +3510,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int os;
 
                 if (whale_objs >= WHALE_CALL_BASE)
-                    { whale_out_line = __LINE__; goto out; }
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 os = whale_objs++;
                 {
                     int fm = fold_mark();
@@ -3468,7 +3585,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                        whale_str_obj_slot - is local to this function. */
                     if (whale_str_obj_slot < 0) {
                         if (whale_objs >= WHALE_CALL_BASE)
-                            { whale_out_line = __LINE__; goto out; }
+                            { WHALE_STEP_INSTEAD_OF_BAILING(); }
                         whale_str_obj_slot = whale_objs++;
                     }
                     {
@@ -3498,13 +3615,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                    WHALE_IS_OBJ and WHALE_IS_VAL cover those, and WHALE_SLOT reads
                    all three because the slot is encoded the same way in each. */
                 if (!WHALE_IS_SLOT(ta) && !WHALE_IS_OBJ(ta) && !WHALE_IS_VAL(ta))
-                    { whale_out_line = __LINE__; goto out; }
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 if (!whale_type_is_num(tb)) {
                     /* { key: "a string" } - the value is opaque, so hand it to the
                        engine rather than abandon the function. This is the last
                        thing standing between vnode_build and compilation. */
                     if (!WHALE_IS_VAL(tb))
-                        { whale_out_line = __LINE__; goto out; }
+                        { WHALE_STEP_INSTEAD_OF_BAILING(); }
                     {
                         int fm = fold_mark();
 
@@ -3563,7 +3680,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     int col = whale_str_col(whale_str_atoms, whale_str_n, atom);
 
                     if (col < 0 || !whale_type_is_num(tb))
-                        { whale_out_line = __LINE__; goto out; }
+                        { WHALE_STEP_INSTEAD_OF_BAILING(); }
                     {
                         int fm = fold_mark();
 
@@ -3674,7 +3791,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     int col = whale_str_col(whale_str_atoms, whale_str_n, atom);
 
                     if (col < 0 || whale_vserial >= stack_size + WHALE_VSER_MAX)
-                        { whale_out_line = __LINE__; goto out; }
+                        { WHALE_STEP_INSTEAD_OF_BAILING(); }
                     nm = whale_vserial++;
                     {
                         int fm = fold_mark();
@@ -3692,9 +3809,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     break;
                 }
                 if (!WHALE_IS_SLOT(ta))
-                    { whale_out_line = __LINE__; goto out; }
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 if (whale_fields >= WHALE_FIELD_CACHE)
-                    { whale_out_line = __LINE__; goto out; }
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 fc = whale_fields++;
                 nm = whale_vserial++;
                 fold_obj_field_load(WHALE_SLOT(ta), atom, fc, nm,
@@ -3745,7 +3862,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     int fm;
 
                     if (col < 0)
-                        { whale_out_line = __LINE__; goto out; }
+                        { WHALE_STEP_INSTEAD_OF_BAILING(); }
                     /* The presence flag is a statement, so it is emitted on its own,
                        closed off with a commit. It also has to come first: it reads
                        sp[col], which nothing in the expression below touches. */
@@ -3801,9 +3918,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int os;
 
                 if (argc != 0)
-                    { whale_out_line = __LINE__; goto out; }           /* only the empty literal `[]` */
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }           /* only the empty literal `[]` */
                 if (whale_objs >= WHALE_CALL_BASE)
-                    { whale_out_line = __LINE__; goto out; }
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 os = whale_objs++;
                 {
                     int fm = fold_mark();
@@ -3928,7 +4045,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                           op - OP_get_loc0;
                 t = (idx >= 0 && idx < var_count) ? cur[idx] : WHALE_T_UNKNOWN;
                 if (t == WHALE_T_UNKNOWN)
-                    { whale_out_line = __LINE__; goto out; }
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 if (WHALE_IS_SLOT(t) || WHALE_IS_STRUCT(t)) {
                     /* An object - or a laid-out struct - is its slot number, which
                        the type already carries. Nothing to emit: the value is the
@@ -3965,7 +4082,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                 t = cur[var_count + sp - 1];
                 if (t == WHALE_T_UNKNOWN || idx < 0 || idx >= var_count)
-                    { whale_out_line = __LINE__; goto out; }
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 if (getenv("WHALE_MEM_TRACE"))
                     fprintf(stderr, "[put_loc] L%d t=%d is_struct=%d is_slot=%d\n",
                             idx, t, WHALE_IS_STRUCT(t), WHALE_IS_SLOT(t));
@@ -4037,8 +4154,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                        branch it is unreachable - and then the deferred-store path
                        emits `L0 = ( )`, because a struct has no expression to
                        inline. */
+                    if (loc_slot[idx] < 0)
+                        loc_slot[idx] = WHALE_SLOT(t);
                     local_forget(idx);
-                    cur[idx] = (uint8_t)t;
+                    cur[idx] = WHALE_STRUCT_T(loc_slot[idx]);
                     lo_c[idx] = 0;
                     sp--;
                     break;
@@ -4089,7 +4208,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     {
                         if (loc_slot[idx] < 0) {
                             if (whale_objs >= WHALE_CALL_BASE)
-                                { whale_out_line = __LINE__; goto out; }
+                                { WHALE_STEP_INSTEAD_OF_BAILING(); }
                             loc_slot[idx] = whale_objs++;
                         }
                         if (src != loc_slot[idx]) {
@@ -4139,13 +4258,15 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                 t = cur[var_count + sp - 1];
                 if (t == WHALE_T_UNKNOWN || idx < 0 || idx >= var_count)
-                    { whale_out_line = __LINE__; goto out; }
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 if (WHALE_IS_STRUCT(t)) {
                     /* See put_loc: a struct local carries the type and nothing
                        else - the layout columns are the storage. The value stays
                        on the stack, which is what set_loc is for. */
+                    if (loc_slot[idx] < 0)
+                        loc_slot[idx] = WHALE_SLOT(t);
                     local_forget(idx);
-                    cur[idx] = (uint8_t)t;
+                    cur[idx] = WHALE_STRUCT_T(loc_slot[idx]);
                     lo_c[idx] = 0;
                     break;
                 }
@@ -4170,7 +4291,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                     if (loc_slot[idx] < 0) {
                         if (whale_objs >= WHALE_CALL_BASE)
-                            { whale_out_line = __LINE__; goto out; }
+                            { WHALE_STEP_INSTEAD_OF_BAILING(); }
                         loc_slot[idx] = whale_objs++;
                     }
                     if (src != loc_slot[idx]) {
@@ -4208,9 +4329,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                 t = cur[var_count + sp - 1];
                 if (t == WHALE_T_UNKNOWN || idx < 0 || idx >= var_count)
-                    { whale_out_line = __LINE__; goto out; }
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 if (!whale_type_is_num(cur[idx]) || !whale_type_is_num(t))
-                    { whale_out_line = __LINE__; goto out; }
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 /* Folds to one expression as well. The left operand is the
                    current value, which may itself still be pending, so that is
                    written out first - before the new range is marked. */
@@ -4225,7 +4346,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             break;
         case OP_get_loc0_loc1:
             if (var_count < 2 || cur[0] == WHALE_T_UNKNOWN || cur[1] == WHALE_T_UNKNOWN)
-                { whale_out_line = __LINE__; goto out; }
+                { WHALE_STEP_INSTEAD_OF_BAILING(); }
             {
                 int fm = fold_mark();
 
@@ -4246,7 +4367,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int fm;
 
                 if (idx < 0 || idx >= arg_count)
-                    { whale_out_line = __LINE__; goto out; }
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 if (arg_obj_slot[idx] >= 0) {
                     /* This argument is the receiver of a property access, so it
                        travels as the JSValue parked in its slot. */
@@ -4302,7 +4423,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     int fmb;
 
                     if (slot >= WHALE_CALL_BASE)
-                        { whale_out_line = __LINE__; goto out; }
+                        { WHALE_STEP_INSTEAD_OF_BAILING(); }
                     whale_gen_pure = 0;   /* depends on captured state */
                     fmb = fold_mark();
                     wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleVarRefGetObj"); wt('(');
@@ -4334,7 +4455,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int fm;
 
                 if (!whale_type_is_num(cur[var_count + sp - 1]))
-                    { whale_out_line = __LINE__; goto out; }
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 whale_gen_pure = 0;   /* writes captured state */
                 fm = fold_mark();
                 wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleVarRefSetNum"); wt('(');
@@ -4376,7 +4497,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     int fm2;
 
                     if (slot >= WHALE_CALL_BASE)
-                        { whale_out_line = __LINE__; goto out; }
+                        { WHALE_STEP_INSTEAD_OF_BAILING(); }
                     fm2 = fold_mark();
                     wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleGetGlobalObj"); wt('(');
                     wt_id("ctx"); wt(','); wt_int(atom); wt(','); wt_int(slot); wt(')'); wt(')');
@@ -4395,7 +4516,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     int nm;
 
                     if (slot >= WHALE_CALL_BASE)
-                        { whale_out_line = __LINE__; goto out; }
+                        { WHALE_STEP_INSTEAD_OF_BAILING(); }
                     nm = whale_vserial++;
                     wk(JS_WK_IF); wt('('); wt('!');
                     wt_id("JS_WhaleGetGlobalObj"); wt('('); wt_id("ctx"); wt(','); wt_int(atom); wt(','); wt_int(slot); wt(')');
@@ -4432,7 +4553,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int k, fm;
 
                 if (func_slot < 0)
-                    { whale_out_line = __LINE__; goto out; }
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 if (cur[var_count + func_slot] == WHALE_T_FN && !whale_inline_nested) {
                     /* A callee this compilation can see through: expand it in
                        place instead of crossing into the engine. */
@@ -4484,7 +4605,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     int fs;
 
                     if (whale_objs >= WHALE_CALL_BASE)
-                        { whale_out_line = __LINE__; goto out; }
+                        { WHALE_STEP_INSTEAD_OF_BAILING(); }
                     fs = whale_objs++;
                     {
                         int fm = fold_mark();
@@ -4525,7 +4646,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                                     whale_objs, WHALE_CALL_BASE);
                         if (whale_str_obj_slot < 0) {
                             if (whale_objs >= WHALE_CALL_BASE)
-                                { whale_out_line = __LINE__; goto out; }
+                                { WHALE_STEP_INSTEAD_OF_BAILING(); }
                             whale_str_obj_slot = whale_objs++;
                         }
                         ms = whale_str_obj_slot;
@@ -4579,9 +4700,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         fprintf(stderr, "[call] pos=%d argc=%d tc=%d slot=%d callslots=%d\n",
                                 pos, argc, tc, WHALE_IS_SLOT(tc), WHALE_CALL_SLOTS);
                     if (!WHALE_IS_SLOT(tc) && tc != WHALE_T_SELF)
-                        { whale_out_line = __LINE__; goto out; }
+                        { WHALE_STEP_INSTEAD_OF_BAILING(); }
                     if (argc > WHALE_CALL_SLOTS)
-                        { whale_out_line = __LINE__; goto out; }
+                        { WHALE_STEP_INSTEAD_OF_BAILING(); }
                     /* Either the result is dead - the bytecode drops it right
                        after - or it is parked in a slot as an opaque value. A
                        result that is neither is refused: needing a number from
@@ -4591,7 +4712,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         ret_slot = -1;
                     } else {
                         if (whale_objs >= WHALE_CALL_BASE)
-                            { whale_out_line = __LINE__; goto out; }
+                            { WHALE_STEP_INSTEAD_OF_BAILING(); }
                         ret_slot = whale_objs++;
                     }
                     /* The arguments were materialised above, before this branch. */
@@ -4601,7 +4722,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         if (!whale_type_is_num(tk) && !WHALE_IS_VAL(tk) && !WHALE_IS_OBJ(tk)) {
                             if (getenv("WHALE_JIT_DUMP"))
                                 fprintf(stderr, "[call] arg k=%d tk=%d rejected\n", k, tk);
-                            { whale_out_line = __LINE__; goto out; }
+                            { WHALE_STEP_INSTEAD_OF_BAILING(); }
                         }
                     }
                     fm = fold_mark();
@@ -4643,7 +4764,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 }
                 for (k = 0; k < argc; k++) {
                     if (!whale_type_is_num(cur[var_count + sp - argc + k]))
-                        { whale_out_line = __LINE__; goto out; }
+                        { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 }
                 fm = fold_mark();
                 wt('{'); wk(JS_WK_DOUBLE); wt_id("_an"); wt('['); wt_int(argc > 0 ? argc : 1); wt(']'); wt(';'); wk(JS_WK_DOUBLE); wt_id("_r"); wt('='); wt_int(0); wt(';'); wk(JS_WK_INT); wt_id("_dd"); wt('='); wt_int(0); wt(';');
@@ -4680,7 +4801,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 ta = cur[var_count + sp - 2];
                 tb = cur[var_count + sp - 1];
                 if (opid < 0)
-                    { whale_out_line = __LINE__; goto out; }
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 if (!whale_type_is_num(ta) || !whale_type_is_num(tb)) {
                     /* One operand is opaque - a string, a null, a value from a call.
                        That used to abandon the whole function; the engine can do the
@@ -4691,7 +4812,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                         WHALE_EMIT_BINOP_VAL(op, ta, tb, sp - 2, sp - 1, _okv);
                         if (!_okv)
-                            { whale_out_line = __LINE__; goto out; }
+                            { WHALE_STEP_INSTEAD_OF_BAILING(); }
                     }
                     sp--;
                     break;
@@ -4716,7 +4837,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             ta = cur[var_count + sp - 2];
             tb = cur[var_count + sp - 1];
             if (!whale_type_is_num(ta) || !whale_type_is_num(tb))
-                { whale_out_line = __LINE__; goto out; }
+                { WHALE_STEP_INSTEAD_OF_BAILING(); }
             {
                 int fm;
                 int pow2 = 0;
@@ -4783,7 +4904,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             ta = cur[var_count + sp - 2];
             tb = cur[var_count + sp - 1];
             if (!whale_type_is_num(ta) || !whale_type_is_num(tb))
-                { whale_out_line = __LINE__; goto out; }
+                { WHALE_STEP_INSTEAD_OF_BAILING(); }
             {
                 int fm = fold_mark();
 
@@ -4803,7 +4924,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             ta = cur[var_count + sp - 2];
             tb = cur[var_count + sp - 1];
             if (!whale_type_is_num(ta) || !whale_type_is_num(tb))
-                { whale_out_line = __LINE__; goto out; }
+                { WHALE_STEP_INSTEAD_OF_BAILING(); }
             {
                 int fm = fold_mark();
 
@@ -4824,7 +4945,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             break;
         case OP_neg:
             if (!whale_type_is_num(cur[var_count + sp - 1]))
-                { whale_out_line = __LINE__; goto out; }
+                { WHALE_STEP_INSTEAD_OF_BAILING(); }
             {
                 int fm = fold_mark();
 
@@ -4836,7 +4957,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         case OP_plus:
             /* +x on a number is the identity */
             if (!whale_type_is_num(cur[var_count + sp - 1]))
-                { whale_out_line = __LINE__; goto out; }
+                { WHALE_STEP_INSTEAD_OF_BAILING(); }
             cur[var_count + sp - 1] = WHALE_T_NUM;
             break;
         /* QuickJS has two different operators here: `lnot` is the logical
@@ -4844,7 +4965,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
            every `~x` in a JIT'd function return 0 or 1. */
         case OP_lnot:
             if (!whale_type_is_num(cur[var_count + sp - 1]))
-                { whale_out_line = __LINE__; goto out; }
+                { WHALE_STEP_INSTEAD_OF_BAILING(); }
             {
                 int fm = fold_mark();
 
@@ -4858,7 +4979,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             break;
         case OP_not:
             if (!whale_type_is_num(cur[var_count + sp - 1]))
-                { whale_out_line = __LINE__; goto out; }
+                { WHALE_STEP_INSTEAD_OF_BAILING(); }
             {
                 int fm = fold_mark();
 
@@ -4870,7 +4991,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             break;
         case OP_inc: case OP_dec:
             if (!whale_type_is_num(cur[var_count + sp - 1]))
-                { whale_out_line = __LINE__; goto out; }
+                { WHALE_STEP_INSTEAD_OF_BAILING(); }
             {
                 int fm = fold_mark();
 
@@ -4885,7 +5006,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int fm;
 
                 if (idx < 0 || idx >= var_count || !whale_type_is_num(cur[idx]))
-                    { whale_out_line = __LINE__; goto out; }
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 /* `L++` folds like add_loc: the current value may still be a
                    pending expression, so it is written out first. */
                 local_materialize(idx);
@@ -4898,14 +5019,14 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             break;
         case OP_drop:
             if (sp <= 0)
-                { whale_out_line = __LINE__; goto out; }
+                { WHALE_STEP_INSTEAD_OF_BAILING(); }
             /* the value just disappears; its expression is never inlined and
                the slot is overwritten by the next push */
             sp--;
             break;
         case OP_dup:
             if (sp <= 0)
-                { whale_out_line = __LINE__; goto out; }
+                { WHALE_STEP_INSTEAD_OF_BAILING(); }
             /* both slots share the expression. It has no side effects, so
                inlining it twice is fine. */
             whale_vexpr[sp] = whale_vexpr[sp - 1];
@@ -4924,7 +5045,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                 t = cur[var_count + sp - 1];
                 if (!whale_type_is_num(t))
-                    { whale_out_line = __LINE__; goto out; }
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 fm = fold_mark();
                 wk(JS_WK_IF); wt('('); fold_inline(sp - 1); wt_op(is_true ? JS_OP_NE : JS_OP_EQ); wt_int(0); wt(')'); wk(JS_WK_GOTO); wt_slot("L", tgt); wt(';');
                 fold_commit(fm);
@@ -4963,13 +5084,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int tgt = pos + 1 + (int32_t)whale_get_u32(pc + pos + 1);
 
                 if (whale_catch_depth >= WHALE_CATCH_MAX)
-                    { whale_out_line = __LINE__; goto out; }
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 whale_catch_tgt[whale_catch_depth++] = tgt;
                 /* The catch block expects the exception value where it begins. On
                    the path that reaches it without throwing, that is undefined; the
                    throw path overwrites the same slot with the real value. */
                 if (whale_objs >= WHALE_CALL_BASE)
-                    { whale_out_line = __LINE__; goto out; }
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 {
                     int os = whale_objs++;
                     int fm = fold_mark();
@@ -4987,14 +5108,14 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             break;
         case OP_nip_catch:
             if (whale_catch_depth <= 0)
-                { whale_out_line = __LINE__; goto out; }
+                { WHALE_STEP_INSTEAD_OF_BAILING(); }
             whale_catch_depth--;
             /* pops two, pushes one: the exception goes, the value that was above it
                drops into its place. Just decrementing `sp` leaves the exception in
                the slot the code above reads - which is how `return x*2` inside a
                `try` came back as the catch block's undefined. */
             if (sp < 2)
-                { whale_out_line = __LINE__; goto out; }
+                { WHALE_STEP_INSTEAD_OF_BAILING(); }
             cur[var_count + sp - 2] = cur[var_count + sp - 1];
             whale_vexpr[sp - 2] = whale_vexpr[sp - 1];
             whale_vmat[sp - 2] = whale_vmat[sp - 1];
@@ -5009,7 +5130,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                 ta = cur[var_count + sp - 1];
                 if (!WHALE_IS_VAL(ta) && !WHALE_IS_OBJ(ta) && !whale_type_is_num(ta))
-                    { whale_out_line = __LINE__; goto out; }
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 {
                     int fm = fold_mark();
 
@@ -5054,7 +5175,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 if (getenv("WHALE_OP_DBG"))
                     fprintf(stderr, "[ret] pos=%d sp=%d t=%d num=%d\n",
                             pos, sp, t, whale_type_is_num(t));
-                if (WHALE_IS_ARR(t) || WHALE_IS_OBJ(t) || WHALE_IS_VAL(t)) {
+                if (WHALE_IS_OBJLIKE(t)) {
                     /* The slot holds the reference; hand a duplicate of it to
                        the caller through ret_obj so the two do not compete for
                        the same reference count. A function that returns both a
@@ -5064,27 +5185,35 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                        call's result is: `var v = f(); return v;` parks the
                        result in a slot as an opaque value, and refusing it here
                        is what made every function that returns a call's result
-                       fall back to the interpreter. Slot numbers are encoded the
-                       same way for all three, so WHALE_OBJ_SLOT reads it. */
+                       fall back to the interpreter.
+
+                       WHALE_T_STRUCT belongs here for the same reason, and it was
+                       spelled out as an enumeration of the other three instead of
+                       a predicate, which is how it came to be missing: an object
+                       this function laid out is still an object. `setField` in
+                       immutable_update is `return { a: o.a, ... }`, and refusing
+                       it left every caller of it on the interpreter. The slot is
+                       encoded the same way for all four, so WHALE_OBJ_SLOT reads
+                       it - and JS_WhaleObjGet hands the object back out of it. */
                     if (ret_is_bool != -1)
-                        { whale_out_line = __LINE__; goto out; }
+                        { WHALE_STEP_INSTEAD_OF_BAILING(); }
                     whale_ret_obj = 1;
                     fm = fold_mark();
                     wt('*'); wt_id("ret_obj"); wt('='); wt_id("JS_WhaleObjGet"); wt('(');
-                    wt_id("ctx"); wt(','); wt_int(WHALE_OBJ_SLOT(t)); wt(')'); wt(';');
+                    wt_id("ctx"); wt(','); wt_int(WHALE_SLOT(t)); wt(')'); wt(';');
                     wk(JS_WK_RETURN); wt_int(0); wt(';');
                     fold_commit(fm);
                     unreachable = 1;
                     break;
                 }
                 if (!whale_type_is_num(t))
-                    { whale_out_line = __LINE__; goto out; }
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 if (whale_ret_obj)
-                    { whale_out_line = __LINE__; goto out; } /* a numeric return after an object one: mixed */
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); } /* a numeric return after an object one: mixed */
                 if (ret_is_bool == -1)
                     ret_is_bool = (t == WHALE_T_BOOL);
                 else if (ret_is_bool != (t == WHALE_T_BOOL))
-                    { whale_out_line = __LINE__; goto out; } /* mixed number/boolean returns: not our shape */
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); } /* mixed number/boolean returns: not our shape */
                 fm = fold_mark();
                 wk(JS_WK_RETURN); fold_inline(sp - 1); wt(';');
                 fold_commit(fm);
@@ -5100,6 +5229,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 break;
             { whale_out_line = __LINE__; goto out; } /* anything else: keep interpreting */
         }
+        whale_next_op:
         pos += sz;
 
         /* the back edge of the innermost open loop closes its buffer */
