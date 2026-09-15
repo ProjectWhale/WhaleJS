@@ -295,4 +295,16 @@ Reverted to 38579bc; both findings are recorded rather than half-fixed.- `<56>` 
 
 - `<57>` `notes/current.md` - native control-flow compilation (for/if/while/switch) preparation: where the change goes, predicted bugs, verification plan, order of work. Key correction: objfields' bottleneck is not the object (same speed as the identical loop body with plain locals); the older 23x note is withdrawn. See notes/native-control-flow-plan.md
 - `<58>` `notes/current.md` - compiler-side loop table: compute_stack_size now records back edges (tgt < pos) into a WhaleLoop table on JSFunctionBytecode (inline array, WHALE_LOOP_MAX 64), so the generator is told the loop instead of inferring it. Verified: all perftest loops found (sieve 4 incl. nested), 0 mismatches, no perf change. See notes/native-control-flow-plan.md
-- `<59>` `notes/current.md` - try/catch now compiles and is correct (three bugs: core returning a JSValue, the catch slot's fold state, and nip_catch having to *move* a value rather than just drop one). Slower than not compiling (225ms vs its own interpreter's 156ms vs node's 5ms), so no win yet; the per-call costs and the direction are in notes/exception-optimisation.md, which also records the outstanding C-baseline (-O0/-O1) comparison that everything else should be judged against.
+- `<59>` `notes/current.md` - try/catch now compiles and is correct (three bugs: core returning a JSValue, the catch slot's fold state, and nip_catch having to *move* a value rather than just drop one). Slower than not compiling (225ms vs its own interpreter's 156ms vs node's 5ms), so no win yet; the per-call costs and the direction are in notes/exception-optimisation.md, which also records the outstanding C-baseline (-O0/-O1) comparison that everything else should be judged against.- `<60>` `notes/current.md` - immutable_update (a Redux reducer) was never compiled: it
+  reported 549ms with NO entry at all. Root mechanism found: `whale_ret_obj_g` in the
+  scan pass only recognises `return v` (a local), not `return {literal}`, so
+  `setField`'s returned object was laid out as frame columns and then left the
+  function. Six layers recorded: return refusing a struct; the `_ws.wa[]` field never
+  declared; the shallow return test; `OP_object`'s frame-column arm missing the
+  "no call after this point" gate that `put_loc` has; object slots not unified between
+  `put_loc` and `set_loc` (the user's "the graph is wrong", not a merge-policy
+  problem); and a struct vs plain object in the same slot. Reverted: after all six it
+  compiled and ran fast but gave `check=0` - a seventh layer puts the literal inside
+  the loop body. Baseline is correct-and-slow; correctness does not trade for speed.
+  Start again from the call gate + slot unification. Verified after revert:
+  0 mismatches over 25 cases, `whale api test: ok`.

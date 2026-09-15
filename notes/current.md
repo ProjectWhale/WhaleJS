@@ -1316,3 +1316,94 @@ instead of at `catch`; make the throw's preparation lazy; and the outstanding on
 **a hand-written C baseline compiled at -O0/-O1** per perftest case, without which
 "already at the native ceiling" and "the codegen is doing extra work" cannot be told
 apart.
+# <60> immutable_update: why a reducer never compiles, and six layers down
+
+`immutable_update.js` is the Redux shape - `setField(o, v) { return { a: o.a, ...,
+e: v }; }` and a loop that reassigns the result. It reported 549ms, and `entries`
+(committed this session) showed **no entry at all**: it was never compiled, so that
+number was the interpreter. Chasing it down found six layers, each hiding the next.
+The work is reverted - see the end for why - but the layers are the value here.
+
+## The mechanism that was missing
+
+`whale_ret_obj_g` (scan pass, `OP_return`) decides whether the objects a function
+builds are **real JSObjects** (it returns one, so it leaves and another compilation
+meets it) or **frame-column structs** (it keeps them, needs no allocation). The test
+was:
+
+    if (prev_op >= OP_get_loc0 && prev_op <= OP_get_loc3 &&
+        whale_loc_obj[prev_op - OP_get_loc0])
+        whale_ret_obj_g = 1;
+
+That only recognises `return v` where v is a local holding a built object.
+`setField` ends with `return { a: o.a, ... }`, whose opcode before `return` is
+`define_field`, so it was **not** recognised: the object it returns was laid out as a
+frame-column struct, and then left the function. Its caller could never reconcile the
+two, so both functions were refused and everything fell back to the interpreter.
+
+## The six layers
+
+1. **`return` refuses a struct.** The object-return arm is
+   `WHALE_IS_ARR(t) || WHALE_IS_OBJ(t) || WHALE_IS_VAL(t)`, which does not include
+   `WHALE_T_STRUCT` - deliberately, since a struct has no JSValue in a slot. But a
+   struct that is *returned* does have one. Adding `WHALE_IS_STRUCT(t)` made
+   `setField` compile for the first time.
+2. **`_ws.wa[]` is never declared.** The `whale_ret_obj_g` arm of `OP_object` emits
+   `_ws.wa[k]` and hands it to `JS_WhaleStructNew`. That arm had never been reached
+   by any case in this suite, so TinyCC reported `field not found: wa` the moment it
+   was. One declaration in the `_ws` struct fixes it. Latent bug, unrelated to the
+   reducer.
+3. **The "shallow test" misses `return {literal}`.** Fixed by accepting
+   `prev_op == OP_define_field || prev_op == OP_object` as well. Now `setField`
+   builds a real object, which is right.
+4. **`OP_object`'s frame-column arm has no call gate.** `put_loc`'s fill requires
+   `whale_call_n == 0 || pos > whale_call_pos[last]` - "nothing after this point can
+   call" - but the frame-column arm only required `mono && whale_str_n == 0`.
+   `step`'s `var st = {a:0,...}` sits at pos 0 with `setField` called at pos 44, so
+   the literal was laid out as columns and then reassigned from a call. Adding the
+   same gate stops that.
+5. **Object slots were not unified between `put_loc` and `set_loc`.** `set_loc`
+   already had a `loc_slot[]` mechanism (one slot per local, with
+   `JS_WhaleObjSlotCopy` when they differ), but its `WHALE_IS_STRUCT` arm skipped it
+   and `put_loc`'s struct arm never registered the slot. So the entry edge put `st`
+   in slot 0 and the back edge allocated slot 3 - the two met at the loop exit as
+   `STRUCT(0)` against `VAL(3)`, which is what `[merge]` reported.
+
+   This is the one the user's instinct was right about: "the same variable cannot
+   have two types, so the graph is wrong". It was not a merge-policy problem.
+
+   With `loc_slot` registered in both arms the slots agree (`[merge] prev=26
+   now=24`, both slot 0) and only the *kind* differs.
+6. **A struct and a plain object in the same slot.** Same object, stale columns -
+   the object was replaced by the assignment, so the columns must be re-read. A
+   re-fill at the merge point using `JS_WhaleStructFieldNum` fixed the conflict and
+   got the function compiling end to end. **But the answer was `check=0`.**
+
+## Why it is reverted
+
+After layer 6 both functions compile and run (`flag=0` on all 20 timed calls), and
+the result is **wrong**: `check=0` against node's 249985. The generated `step` shows
+the literal `{a:0,...}` emitted **inside the loop body** (`JS_WhaleObjNew` +
+`JS_WhaleObjDefineNum` with the column values `L2..L6`, right after `L34`), so every
+iteration rebuilds `st` and overwrites what `setField` returned. Its bytecode is at
+pos 0-31, before the loop head at 34, so the emission order is wrong too - that is a
+seventh layer, in the loop buffer or the block split, not in the type lattice.
+
+The baseline is *correct and slow* (interpreter, 549ms). Six layers of change turned
+that into *fast and wrong*. Correctness does not trade against speed, so it is
+reverted: `0 mismatches` over all 25 cases, `whale api test: ok`.
+
+## What to do next
+
+- Start **from layer 4 + 5 together** (the call gate on the frame-column arm, and
+  object-slot registration in all struct arms). Those two are independent of the
+  scan-pass change and of the merge re-fill; layer 4 alone stops the literal being
+  laid out at all, which may make layers 5-6 unnecessary.
+- Then find why the literal lands inside the loop body. Check `loop_back[]` and the
+  `loop_begin`/`loop_end` range against `native-control-flow-plan.md`.
+- Verify with `entries` (committed this session): `immutable_update` should go from
+  no entry at all to 21, and `check` must stay 249985 at every step.
+- Diagnostics that earned their keep, both now committed: `WHALE_MERGE_DBG` (prints
+  the conflicting types at a merge) and `[ops]` printing opcode names. Re-add
+  `WHALE_FOLD_DBG` and the `[fill-slot]`/`[setloc-slot]`/`[putloc-struct]` prints if
+  this is picked up again - they are what localised layers 5 and 6.
