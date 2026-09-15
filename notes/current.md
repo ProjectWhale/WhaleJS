@@ -1288,3 +1288,31 @@ Measured: `objfields` `blen=102 loops=1 {head=5 back=66 cond=0}`; `object`
 `cond` distinguishes a backward `if` (do/while test) from a backward `goto`
 (for(;;)/while). `exit` is still -1: it is the target the head's conditional jump
 leaves through, i.e. what `break` uses; second pass.
+## <59> try/catch native: works, but not yet a win
+
+Three bugs, each masking the next, all found by dumping the generated C:
+
+1. `return JS_WhaleExceptionValue(ctx)` was emitted inside the core, and the core
+   returns a **double**. TinyCC's "invalid aggregate type for register load" is
+   exactly that. The `*deopt == 2` path already means "exception pending, do not
+   re-run", so the value is unused: return 0.
+2. `OP_catch` parked undefined in a stack slot but left the fold state saying the slot
+   was not materialised, so a later op inlined an empty expression there.
+3. **The real one.** `OP_nip_catch` only did `sp--`. Its shape is
+   `catch; <value>; nip_catch`, and it removes the exception from *under* the value -
+   so the value has to move down into the slot the exception held. Missing that move,
+   `return x*2` inside the try read the catch block's undefined. A small probe looked
+   correct; a 1e6-iteration loop returned 0 for 999934 of them.
+
+Verified against node on four probes, and 0 mismatches over the 24 perftest cases.
+
+**Not a win yet**: 225ms compiled against the same function interpreted at 156ms and
+node at 5ms. Per call, on the normal path, the generated code does
+`JS_WhaleObjSlotUndef` (the catch slot), `JS_WhaleGetGlobalObj` (`Error`),
+`JS_WhaleObjSlotAtom` (the message) and `JS_WhaleConstructValue` - four helper calls
+for a path where nothing is thrown 99.99% of the time. Direction, in order of value,
+is in `notes/exception-optimisation.md`: initialise the catch slot at the handler
+instead of at `catch`; make the throw's preparation lazy; and the outstanding one -
+**a hand-written C baseline compiled at -O0/-O1** per perftest case, without which
+"already at the native ceiling" and "the codegen is doing extra work" cannot be told
+apart.
