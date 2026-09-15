@@ -1795,8 +1795,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     if (getenv("WHALE_OP_DBG")) {
         int k = 0;
 
-        fprintf(stderr, "[consts] if_false8=%d if_true8=%d goto8=%d if_false=%d goto=%d catch=%d throw=%d\n",
-                OP_if_false8, OP_if_true8, OP_goto8, OP_if_false, OP_goto, OP_catch, OP_throw);
+        fprintf(stderr, "[consts] if_false8=%d if_true8=%d goto8=%d if_false=%d goto=%d catch=%d throw=%d put_field=%d get_field=%d get_field2=%d mod=%d\n",
+                OP_if_false8, OP_if_true8, OP_goto8, OP_if_false, OP_goto, OP_catch, OP_throw,
+                OP_put_field, OP_get_field, OP_get_field2, OP_mod);
         fprintf(stderr, "[ops] len=%d:", info->byte_code_len);
         while (k < info->byte_code_len && k < 60) {
             int o = info->byte_code[k];
@@ -3578,8 +3579,16 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                    neither a number nor a parked value, or a shape it has no
                    cache left for - is handed to the engine as one instruction
                    instead of abandoning the function (see whale_step_emit). */
-                if ((!WHALE_IS_SLOT(ta) || whale_fields >= WHALE_FIELD_CACHE ||
-                     (!whale_type_is_num(tb) && !WHALE_IS_VAL(tb))) &&
+                /* A laid-out struct must not be handed to the engine here: its type is
+                   deliberately not part of WHALE_IS_SLOT (a struct has no JSValue in a
+                   slot), so `!WHALE_IS_SLOT(ta)` is true for it and this test used to
+                   take it - the step fallback ran before the struct branch below ever
+                   saw it. Every field store on an unboxed object went through the
+                   interpreter that way, which is why `objfields` was unboxed on paper
+                   and interpreted in practice. */
+                if ((!WHALE_IS_STRUCT(ta) &&
+                     (!WHALE_IS_SLOT(ta) || whale_fields >= WHALE_FIELD_CACHE ||
+                      (!whale_type_is_num(tb) && !WHALE_IS_VAL(tb)))) &&
                     whale_step_emit(OP_put_field, pos, &sp, cur, var_count,
                                     stack_size))
                     break;
@@ -3749,8 +3758,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     break;
                 }
                 /* Refusals below (the receiver is not an object slot, or the
-                   cache is full) become one instruction handed to the engine. */
-                if ((!WHALE_IS_SLOT(ta) || whale_fields >= WHALE_FIELD_CACHE) &&
+                   cache is full) become one instruction handed to the engine - but
+                   not a laid-out struct, whose type is deliberately outside
+                   WHALE_IS_SLOT. Same trap as the store: the step fallback came
+                   first and took every read on an unboxed object. */
+                if (!WHALE_IS_STRUCT(ta) &&
+                    (!WHALE_IS_SLOT(ta) || whale_fields >= WHALE_FIELD_CACHE) &&
                     whale_step_emit(OP_get_field, pos, &sp, cur, var_count,
                                     stack_size))
                     break;
@@ -3964,6 +3977,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                    function has one at all: `run()` calls `make()` once at the top
                    and then loops without calling anything, which is exactly the
                    shape worth laying out. */
+                if (getenv("WHALE_JIT_DUMP"))
+                    fprintf(stderr, "[fill] pos=%d t=%d strn=%d calln=%d sites=%d mono=%d\n",
+                            pos, t, whale_str_n, whale_call_n, whale_field_sites_n,
+                            whale_sites_mono(whale_field_sites, whale_field_sites_n));
                 if (!getenv("WHALE_NO_UNBOX") && whale_str_n == 0 &&
                     (whale_call_n == 0 || pos > whale_call_pos[whale_call_n - 1]) &&
                     (WHALE_IS_OBJ(t) || WHALE_IS_VAL(t)) &&
