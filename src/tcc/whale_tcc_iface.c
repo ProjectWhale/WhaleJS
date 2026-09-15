@@ -437,6 +437,46 @@ int JS_WhaleTokIdent(const char *name)
    The text is built in memory because a gcc backend hands it to the driver's
    stdin pipe - it is not written to a file.
    ======================================================================== */
+/* The tokens whose spelling is not a plain ASCII character. get_tok_str() knows them too, but on
+   this token it does not find the entry: TOK_NE came back empty and the token
+   reached the file as a raw 0x95, which is how the `%` guard every case emits -
+   `(v[0] != 0) && ...` - turned the generated C into something gcc will not
+   parse. Matching on the token constant rather than on the spelling cannot
+   drift from the compiler. */
+/* The spelling of a token that is not a plain ASCII character. Matching on the
+   token constant rather than on a value range is what makes this correct:
+   `<=`, `==`, `!=` and `&&` sit above 128, but `<<` is 1 and `>>` is 2, and
+   `<` and `>` have their own constants above 128 as well - TinyCC needs those
+   apart from `<<`/`<=` and `>>`/`>=` for longest-match, so they are single
+   characters that do not live in ASCII here. Writing any of them with fputc()
+   put a raw byte in the file. */
+static const char *whale_tok_spelling(int tok)
+{
+    switch (tok) {
+    case TOK_LT:    return "<";
+    case TOK_GT:    return ">";
+    case TOK_LE:    return "<=";
+    case TOK_GE:    return ">=";
+    case TOK_NE:    return "!=";
+    case TOK_LAND:  return "&&";
+    case TOK_LOR:   return "||";
+    case TOK_INC:   return "++";
+    case TOK_DEC:   return "--";
+    case TOK_EQ:    return "==";
+    case TOK_SHL:   return "<<";
+    case TOK_SAR:   return ">>";
+    case TOK_A_ADD: return "+=";
+    case TOK_A_SUB: return "-=";
+    case TOK_A_MUL: return "*=";
+    case TOK_A_DIV: return "/=";
+    case TOK_A_MOD: return "%=";
+    case TOK_A_AND: return "&=";
+    case TOK_A_XOR: return "^=";
+    case TOK_A_OR:  return "|=";
+    case TOK_ARROW: return "->";
+    default:        return NULL;
+    }
+}
 typedef struct WhaleText {
     char *p;
     int   len;
@@ -482,35 +522,39 @@ static void whale_render_one(WhaleText *t, int tok, double num)
     if (tok == TOK_EOF)
         return;                 /* the end marker is not C */
     /* Order matters: TOK_IDENT (256) and the CINT/CDOUBLE pseudo-tokens sit
-       ABOVE 128, so they have to be recognised before the 128..255 range. */
+       ABOVE 128, so they have to be recognised before anything reads the value
+       as a character. */
     if (tok == TOK_CINT) {
         snprintf(tmp, sizeof(tmp), "%d ", (int)num);
         whale_text_puts(t, tmp);
-    } else if (tok == TOK_CDOUBLE) {
+        return;
+    }
+    if (tok == TOK_CDOUBLE) {
         snprintf(tmp, sizeof(tmp), "%.17g ", num);
         whale_text_puts(t, tmp);
-    } else if (tok >= TOK_IDENT) {
+        return;
+    }
+    if (tok >= TOK_IDENT) {
         const char *nm = get_tok_str(tok, NULL);
 
         whale_text_puts(t, nm ? nm : "?");
         whale_text_putc(t, ' ');
-    } else if (tok >= 128) {
-        /* 128..255 name TinyCC's multi-character tokens: the relational,
-           logical and shift operators, and the arrow. They are not bytes, and
-           writing them as bytes is how `L1 <= A0` once reached the file as
-           `L1 <9c> A0`. get_tok_str() walks the compiler's own tok_two_chars
-           table and stops at its terminating zero, so it is both authoritative
-           and in-bounds. */
-        const char *nm = get_tok_str(tok, NULL);
+        return;
+    }
+    /* A multi-character token is NOT identified by its value: `<=`, `==` and
+       `!=` live above 128, but `<<` is token 1 and `>>` is token 2, inside
+       ASCII, so a value test would write those as raw bytes. The token constant
+       is what actually identifies them. */
+    {
+        const char *ops = whale_tok_spelling(tok);
 
-        if (nm && nm[0]) {
-            whale_text_puts(t, nm);
+        if (ops) {
+            whale_text_puts(t, ops);
             whale_text_putc(t, ' ');
-        } else {
-            snprintf(tmp, sizeof(tmp), "T%d ", tok);
-            whale_text_puts(t, tmp);
+            return;
         }
-    } else if (tok > 0) {
+    }
+    if (tok > 0) {
         whale_text_putc(t, tok);
         whale_text_putc(t, (tok == ';' || tok == '{' || tok == '}') ? '\n' : ' ');
     } else {
