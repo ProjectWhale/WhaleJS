@@ -425,8 +425,117 @@ int JS_WhaleTokIdent(const char *name)
    fold_inline_expr() - which bypasses the helpers entirely - did not appear at
    all. Reading that file as if it were the C gave `return` with no `return`, `a b`
    where the code was `a + b`, and `= ( )` where a whole folded expression stood. */
+/* ---- the C renderer ------------------------------------------------------
+   The generator produces a token stream, not text. TinyCC consumes that stream
+   through whale_next_token(), but anything else that wants the function as C -
+   the WHALE_JIT_SRC dump, and a gcc backend whose driver only reads text - has
+   to render it. The finished stream sits in the generator's go_tok/go_num in
+   final order, so rendering walks that array; it never has to observe the
+   stream as TinyCC pulls it, which is what tied this to TinyCC's own consume
+   point before.
+
+   The text is built in memory because a gcc backend hands it to the driver's
+   stdin pipe - it is not written to a file.
+   ======================================================================== */
+typedef struct WhaleText {
+    char *p;
+    int   len;
+    int   cap;
+} WhaleText;
+
+static void whale_text_put(WhaleText *t, const char *s, int n)
+{
+    if (!t->p) {
+        t->cap = 1 << 16;
+        t->p = (char *)tcc_malloc(t->cap);
+        t->p[0] = '\0';
+    }
+    if (t->len + n + 1 > t->cap) {
+        while (t->len + n + 1 > t->cap)
+            t->cap *= 2;
+        t->p = (char *)tcc_realloc(t->p, t->cap);
+    }
+    if (n > 0)
+        memcpy(t->p + t->len, s, n);
+    t->len += n;
+    t->p[t->len] = '\0';
+}
+
+static void whale_text_puts(WhaleText *t, const char *s)
+{
+    whale_text_put(t, s, (int)strlen(s));
+}
+
+static void whale_text_putc(WhaleText *t, int c)
+{
+    char ch = (char)c;
+
+    whale_text_put(t, &ch, 1);
+}
+
+/* One token as C. This is the whole of the rendering; everything above is
+   buffer plumbing and everything below is a caller. */
+static void whale_render_one(WhaleText *t, int tok, double num)
+{
+    char tmp[64];
+
+    if (tok == TOK_EOF)
+        return;                 /* the end marker is not C */
+    /* Order matters: TOK_IDENT (256) and the CINT/CDOUBLE pseudo-tokens sit
+       ABOVE 128, so they have to be recognised before the 128..255 range. */
+    if (tok == TOK_CINT) {
+        snprintf(tmp, sizeof(tmp), "%d ", (int)num);
+        whale_text_puts(t, tmp);
+    } else if (tok == TOK_CDOUBLE) {
+        snprintf(tmp, sizeof(tmp), "%.17g ", num);
+        whale_text_puts(t, tmp);
+    } else if (tok >= TOK_IDENT) {
+        const char *nm = get_tok_str(tok, NULL);
+
+        whale_text_puts(t, nm ? nm : "?");
+        whale_text_putc(t, ' ');
+    } else if (tok >= 128) {
+        /* 128..255 name TinyCC's multi-character tokens: the relational,
+           logical and shift operators, and the arrow. They are not bytes, and
+           writing them as bytes is how `L1 <= A0` once reached the file as
+           `L1 <9c> A0`. get_tok_str() walks the compiler's own tok_two_chars
+           table and stops at its terminating zero, so it is both authoritative
+           and in-bounds. */
+        const char *nm = get_tok_str(tok, NULL);
+
+        if (nm && nm[0]) {
+            whale_text_puts(t, nm);
+            whale_text_putc(t, ' ');
+        } else {
+            snprintf(tmp, sizeof(tmp), "T%d ", tok);
+            whale_text_puts(t, tmp);
+        }
+    } else if (tok > 0) {
+        whale_text_putc(t, tok);
+        whale_text_putc(t, (tok == ';' || tok == '{' || tok == '}') ? '\n' : ' ');
+    } else {
+        snprintf(tmp, sizeof(tmp), "T%d ", tok);
+        whale_text_puts(t, tmp);
+    }
+}
+
+/* Render a whole finished stream. Returns the length and stores a malloc'd,
+   NUL-terminated buffer in *out for the caller to free. */
+int JS_WhaleRenderStream(const int *tok, const double *num, int n, char **out)
+{
+    WhaleText t;
+    int i;
+
+    memset(&t, 0, sizeof(t));
+    for (i = 0; i < n; i++)
+        whale_render_one(&t, tok[i], num[i]);
+    *out = t.p;
+    return t.len;
+}
 static FILE *whale_mirror_fp;
 static int whale_mirror_tried;
+
+static WhaleText whale_mirror_text;
 
 static void whale_mirror_write(int t, double num)
 {
@@ -439,36 +548,12 @@ static void whale_mirror_write(int t, double num)
     }
     if (!whale_mirror_fp)
         return;
-    if (t == TOK_EOF)
-        return;                 /* the end marker is not C */
-    /* Order matters: TOK_IDENT (256) and the CINT/CDOUBLE pseudo-tokens sit
-       ABOVE 128, so they have to be recognised before the 128..255 range. */
-    if (t == TOK_CINT)
-        fprintf(whale_mirror_fp, "%d ", (int)num);
-    else if (t == TOK_CDOUBLE)
-        fprintf(whale_mirror_fp, "%.17g ", num);
-    else if (t >= TOK_IDENT) {
-        const char *nm = get_tok_str(t, NULL);
-
-        fprintf(whale_mirror_fp, "%s ", nm ? nm : "?");
-    } else if (t >= 128) {
-        /* Values 128..255 name TinyCC's multi-character tokens: the relational,
-           logical and shift operators, and the arrow. They are NOT bytes -
-           writing them with fputc() put raw bytes in the file, which is how
-           `L1 <= A0` came out as `L1 <9c> A0`. get_tok_str() renders them by
-           walking the compiler's own tok_two_chars table and stops at its
-           terminating zero, so it is both authoritative and in-bounds. */
-        const char *nm = get_tok_str(t, NULL);
-
-        if (nm && nm[0])
-            fprintf(whale_mirror_fp, "%s ", nm);
-        else
-            fprintf(whale_mirror_fp, "T%d ", t);
-    } else if (t > 0) {
-        fputc(t, whale_mirror_fp);
-        fputc((t == ';' || t == '{' || t == '}') ? '\n' : ' ', whale_mirror_fp);
-    } else
-        fprintf(whale_mirror_fp, "T%d ", t);
+    whale_render_one(&whale_mirror_text, t, num);
+    if (whale_mirror_text.len > 0) {
+        fwrite(whale_mirror_text.p, 1, whale_mirror_text.len, whale_mirror_fp);
+        whale_mirror_text.len = 0;
+        whale_mirror_text.p[0] = '\0';
+    }
     fflush(whale_mirror_fp);
 }
 

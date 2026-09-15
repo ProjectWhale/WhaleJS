@@ -5396,6 +5396,87 @@ static void whale_gen_cb(void *unused)
     whale_gen_ok = whale_jit_gen(whale_gen_ctx, whale_gen_info);
 }
 
+typedef struct WhaleHostSym {
+    const char *name;
+    void       *addr;
+} WhaleHostSym;
+
+/* The one place that says which host functions generated code may call.
+   TinyCC needs this map to resolve them, and a gcc backend needs exactly
+   the same map to relocate the undefined symbols in the object file it
+   gets back - so it is one table rather than sixty calls. Whether each of
+   them also has a prototype in the token stream is a separate question,
+   and the one an implicit declaration hides: a name that is registered
+   here but never declared there compiles under TinyCC and does not under
+   gcc, which is how JS_WhaleDeoptNote stayed missing. */
+#define WHALE_HOST_SYM(fn) { #fn, (void *)fn }
+
+static const WhaleHostSym whale_host_syms[] = {
+    WHALE_HOST_SYM(JS_WhaleVarRefIsSelf),
+    WHALE_HOST_SYM(JS_WhaleVarRefGetNum),
+    WHALE_HOST_SYM(JS_WhaleVarRefSetNum),
+    WHALE_HOST_SYM(JS_WhaleVarRefGetObj),
+    WHALE_HOST_SYM(JS_WhaleCheckStack),
+    WHALE_HOST_SYM(whale_jit_box_num),
+    WHALE_HOST_SYM(whale_jit_unbox_num),
+    WHALE_HOST_SYM(JS_NewFloat64),
+    WHALE_HOST_SYM(JS_NewBool),
+    WHALE_HOST_SYM(JS_WhaleToInt32),
+    WHALE_HOST_SYM(JS_WhaleDeoptNote),
+    WHALE_HOST_SYM(JS_WhaleGetGlobalNum),
+    WHALE_HOST_SYM(JS_WhaleObjSlot),
+    WHALE_HOST_SYM(JS_WhaleObjGet),
+    WHALE_HOST_SYM(JS_WhaleObjProbe),
+    WHALE_HOST_SYM(JS_WhaleObjProbeFrom),
+    WHALE_HOST_SYM(JS_WhaleGetGlobalObj),
+    WHALE_HOST_SYM(JS_WhaleNewU8Array),
+    WHALE_HOST_SYM(JS_WhaleTAU8Get),
+    WHALE_HOST_SYM(JS_WhaleTAU8Set),
+    WHALE_HOST_SYM(JS_WhaleTAU8Ptr),
+    WHALE_HOST_SYM(JS_WhaleObjSlotNull),
+    WHALE_HOST_SYM(JS_WhaleObjSlotEmptyString),
+    WHALE_HOST_SYM(JS_WhaleObjSlotUndef),
+    WHALE_HOST_SYM(JS_WhaleThrow),
+    WHALE_HOST_SYM(JS_WhaleObjSlotAtom),
+    WHALE_HOST_SYM(JS_WhaleObjDefineValue),
+    WHALE_HOST_SYM(JS_WhaleBinopVal),
+    WHALE_HOST_SYM(JS_WhaleCpoolSlot),
+    WHALE_HOST_SYM(JS_WhaleObjStoreValue),
+    WHALE_HOST_SYM(JS_WhaleShapeFields),
+    WHALE_HOST_SYM(JS_WhaleObjNew),
+    WHALE_HOST_SYM(JS_WhaleObjShape),
+    WHALE_HOST_SYM(JS_WhaleObjFieldPtr),
+    WHALE_HOST_SYM(JS_WhaleObjDefineNum),
+    WHALE_HOST_SYM(JS_WhaleObjValueNum),
+    WHALE_HOST_SYM(JS_WhaleArrPtr),
+    WHALE_HOST_SYM(JS_WhaleArrNew),
+    WHALE_HOST_SYM(JS_WhaleArrSetNum),
+    WHALE_HOST_SYM(JS_WhaleObjFieldNum),
+    WHALE_HOST_SYM(JS_WhaleStructNew),
+    WHALE_HOST_SYM(JS_WhaleStructFieldNum),
+    WHALE_HOST_SYM(JS_WhaleStructSetNum),
+    WHALE_HOST_SYM(JS_WhaleNativeEnsureSlot),
+    WHALE_HOST_SYM(JS_WhaleNativeSlotFieldNum),
+    WHALE_HOST_SYM(JS_WhaleNativeSlotPutNum),
+    WHALE_HOST_SYM(JS_WhaleObjStoreNum),
+    WHALE_HOST_SYM(JS_WhaleObjSlotNum),
+    WHALE_HOST_SYM(JS_WhaleObjSlotCopy),
+    WHALE_HOST_SYM(JS_WhaleArgGetObj),
+    WHALE_HOST_SYM(JS_WhaleCallValue),
+    WHALE_HOST_SYM(JS_WhaleCallSelfValue),
+    WHALE_HOST_SYM(JS_WhaleConstructValue),
+    WHALE_HOST_SYM(JS_WhaleExceptionValue),
+    WHALE_HOST_SYM(JS_WhaleStepPushNum),
+    WHALE_HOST_SYM(JS_WhaleStepPushSlot),
+    WHALE_HOST_SYM(JS_WhaleStepRun),
+    WHALE_HOST_SYM(JS_WhaleStepOutIsNum),
+    WHALE_HOST_SYM(JS_WhaleStepOutNum),
+    WHALE_HOST_SYM(JS_WhaleStepOutSlot),
+    WHALE_HOST_SYM(JS_WhaleStepClear),
+};
+#define WHALE_HOST_SYM_COUNT \
+    ((int)(sizeof(whale_host_syms) / sizeof(whale_host_syms[0])))
+
 static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, void **handle_out)
 {
     TCCState *s;
@@ -5424,70 +5505,8 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
         tcc_add_include_path(s, WHALE_JIT_SRC_DIR);
         tcc_add_library_path(s, WHALE_JIT_TCC_DIR "/lib");
         tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
-        tcc_add_symbol(s, "JS_WhaleVarRefIsSelf", (void *)JS_WhaleVarRefIsSelf);
-        tcc_add_symbol(s, "JS_WhaleVarRefGetNum", (void *)JS_WhaleVarRefGetNum);
-        tcc_add_symbol(s, "JS_WhaleVarRefSetNum", (void *)JS_WhaleVarRefSetNum);
-        tcc_add_symbol(s, "JS_WhaleVarRefGetObj", (void *)JS_WhaleVarRefGetObj);
-        tcc_add_symbol(s, "JS_WhaleCheckStack", (void *)JS_WhaleCheckStack);
-        tcc_add_symbol(s, "whale_jit_box_num", (void *)whale_jit_box_num);
-        tcc_add_symbol(s, "whale_jit_unbox_num", (void *)whale_jit_unbox_num);
-        tcc_add_symbol(s, "JS_NewFloat64", (void *)JS_NewFloat64);
-        tcc_add_symbol(s, "JS_NewBool", (void *)JS_NewBool);
-        tcc_add_symbol(s, "JS_WhaleToInt32", (void *)JS_WhaleToInt32);
-        tcc_add_symbol(s, "JS_WhaleDeoptNote", (void *)JS_WhaleDeoptNote);
-        tcc_add_symbol(s, "JS_WhaleGetGlobalNum", (void *)JS_WhaleGetGlobalNum);
-        /* object slots: the GC-visible place to keep an object across a call */
-        tcc_add_symbol(s, "JS_WhaleObjSlot", (void *)JS_WhaleObjSlot);
-        tcc_add_symbol(s, "JS_WhaleObjGet", (void *)JS_WhaleObjGet);
-        tcc_add_symbol(s, "JS_WhaleObjProbe", (void *)JS_WhaleObjProbe);
-        tcc_add_symbol(s, "JS_WhaleObjProbeFrom", (void *)JS_WhaleObjProbeFrom);
-        /* typed arrays: the array travels as an object slot number */
-        tcc_add_symbol(s, "JS_WhaleGetGlobalObj", (void *)JS_WhaleGetGlobalObj);
-        tcc_add_symbol(s, "JS_WhaleNewU8Array", (void *)JS_WhaleNewU8Array);
-        tcc_add_symbol(s, "JS_WhaleTAU8Get", (void *)JS_WhaleTAU8Get);
-        tcc_add_symbol(s, "JS_WhaleTAU8Set", (void *)JS_WhaleTAU8Set);
-        tcc_add_symbol(s, "JS_WhaleTAU8Ptr", (void *)JS_WhaleTAU8Ptr);
-        tcc_add_symbol(s, "JS_WhaleObjSlotNull", (void *)JS_WhaleObjSlotNull);
-        tcc_add_symbol(s, "JS_WhaleObjSlotEmptyString", (void *)JS_WhaleObjSlotEmptyString);
-        tcc_add_symbol(s, "JS_WhaleObjSlotUndef", (void *)JS_WhaleObjSlotUndef);
-        tcc_add_symbol(s, "JS_WhaleThrow", (void *)JS_WhaleThrow);
-        tcc_add_symbol(s, "JS_WhaleObjSlotAtom", (void *)JS_WhaleObjSlotAtom);
-        tcc_add_symbol(s, "JS_WhaleObjDefineValue", (void *)JS_WhaleObjDefineValue);
-        tcc_add_symbol(s, "JS_WhaleBinopVal", (void *)JS_WhaleBinopVal);
-        tcc_add_symbol(s, "JS_WhaleCpoolSlot", (void *)JS_WhaleCpoolSlot);
-        tcc_add_symbol(s, "JS_WhaleObjStoreValue", (void *)JS_WhaleObjStoreValue);
-        tcc_add_symbol(s, "JS_WhaleShapeFields", (void *)JS_WhaleShapeFields);
-        tcc_add_symbol(s, "JS_WhaleObjNew", (void *)JS_WhaleObjNew);
-        tcc_add_symbol(s, "JS_WhaleObjShape", (void *)JS_WhaleObjShape);
-        tcc_add_symbol(s, "JS_WhaleObjFieldPtr", (void *)JS_WhaleObjFieldPtr);
-        tcc_add_symbol(s, "JS_WhaleObjDefineNum", (void *)JS_WhaleObjDefineNum);
-        tcc_add_symbol(s, "JS_WhaleObjValueNum", (void *)JS_WhaleObjValueNum);
-        tcc_add_symbol(s, "JS_WhaleArrPtr", (void *)JS_WhaleArrPtr);
-        tcc_add_symbol(s, "JS_WhaleArrNew", (void *)JS_WhaleArrNew);
-        tcc_add_symbol(s, "JS_WhaleArrSetNum", (void *)JS_WhaleArrSetNum);
-        tcc_add_symbol(s, "JS_WhaleObjFieldNum", (void *)JS_WhaleObjFieldNum);
-        tcc_add_symbol(s, "JS_WhaleStructNew", (void *)JS_WhaleStructNew);
-        tcc_add_symbol(s, "JS_WhaleStructFieldNum", (void *)JS_WhaleStructFieldNum);
-        tcc_add_symbol(s, "JS_WhaleStructSetNum", (void *)JS_WhaleStructSetNum);
-        tcc_add_symbol(s, "JS_WhaleNativeEnsureSlot", (void *)JS_WhaleNativeEnsureSlot);
-        tcc_add_symbol(s, "JS_WhaleNativeSlotFieldNum", (void *)JS_WhaleNativeSlotFieldNum);
-        tcc_add_symbol(s, "JS_WhaleNativeSlotPutNum", (void *)JS_WhaleNativeSlotPutNum);
-        tcc_add_symbol(s, "JS_WhaleObjStoreNum", (void *)JS_WhaleObjStoreNum);
-        tcc_add_symbol(s, "JS_WhaleObjSlotNum", (void *)JS_WhaleObjSlotNum);
-        tcc_add_symbol(s, "JS_WhaleObjSlotCopy", (void *)JS_WhaleObjSlotCopy);
-        tcc_add_symbol(s, "JS_WhaleArgGetObj", (void *)JS_WhaleArgGetObj);
-        tcc_add_symbol(s, "JS_WhaleCallValue", (void *)JS_WhaleCallValue);
-        tcc_add_symbol(s, "JS_WhaleCallSelfValue", (void *)JS_WhaleCallSelfValue);
-        tcc_add_symbol(s, "JS_WhaleConstructValue", (void *)JS_WhaleConstructValue);
-        tcc_add_symbol(s, "JS_WhaleExceptionValue", (void *)JS_WhaleExceptionValue);
-        /* the single-instruction fallback */
-        tcc_add_symbol(s, "JS_WhaleStepPushNum", (void *)JS_WhaleStepPushNum);
-        tcc_add_symbol(s, "JS_WhaleStepPushSlot", (void *)JS_WhaleStepPushSlot);
-        tcc_add_symbol(s, "JS_WhaleStepRun", (void *)JS_WhaleStepRun);
-        tcc_add_symbol(s, "JS_WhaleStepOutIsNum", (void *)JS_WhaleStepOutIsNum);
-        tcc_add_symbol(s, "JS_WhaleStepOutNum", (void *)JS_WhaleStepOutNum);
-        tcc_add_symbol(s, "JS_WhaleStepOutSlot", (void *)JS_WhaleStepOutSlot);
-        tcc_add_symbol(s, "JS_WhaleStepClear", (void *)JS_WhaleStepClear);
+        for (int i = 0; i < WHALE_HOST_SYM_COUNT; i++)
+            tcc_add_symbol(s, whale_host_syms[i].name, whale_host_syms[i].addr);
         whale_jit_state = s;
     }
     s = whale_jit_state;
