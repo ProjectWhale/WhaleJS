@@ -3739,21 +3739,28 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                    as a number. */
                 if (WHALE_IS_STRUCT(ta)) {
                     int col = whale_str_col(whale_str_atoms, whale_str_n, atom);
+                    int fm;
 
                     if (col < 0)
                         { whale_out_line = __LINE__; goto out; }
-                    nm = whale_vserial++;
-                    {
-                        int fm = fold_mark();
-
-                        wk(JS_WK_IF); wt('('); wt('!'); wt_arr("sp", col); wt(')'); wt('{');
-                        wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
-                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
-                        wt_arr("v", nm); wt('='); wt_slot("L", whale_str_L[col]); wt(';');
-                        fold_commit(fm);
-                        whale_vname[sp - 1] = nm;
-                        whale_vmat[sp - 1] = 1;
-                    }
+                    /* The presence flag is a statement, so it is emitted on its own,
+                       closed off with a commit. It also has to come first: it reads
+                       sp[col], which nothing in the expression below touches. */
+                    fm = fold_mark();
+                    wk(JS_WK_IF); wt('('); wt('!'); wt_arr("sp", col); wt(')'); wt('{');
+                    wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    fold_commit(fm);
+                    /* The column is the value. It is a register scalar already, so
+                       reading it where it is used costs one operand - copying it into
+                       _ws.v[] first put a store and a reload on every field access,
+                       and it is the round trip, not the arithmetic, that a chain of
+                       field reads pays for. Same rule as a deferred local: the column
+                       stays in the expression until its length ceiling is hit or the
+                       block ends, and fold_materialize() gives it a real slot then. */
+                    fm = fold_mark();
+                    wt_slot("L", whale_str_L[col]);
+                    fold_set(sp - 1, fm);
                     cur[var_count + sp - 1] = WHALE_T_NUM;
                     break;
                 }
