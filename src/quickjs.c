@@ -3399,19 +3399,37 @@ int JS_WhaleCheckStack(JSContext *ctx)
    interpreter's.
 
    Behind WHALE_DEOPT_DBG, one line per call - the benchmarks here call a function
-   in the low tens of times, so that is cheap and readable. */
+   in the low tens of times, so that is cheap and readable.
+
+   The count is also what tells a benchmark apart from a benchmark-shaped no-op.
+   A case that calls the same function with the same argument in a loop can have
+   most of those calls folded into one, and then the file reports a time for a
+   fraction of the work it thinks it did - with a correct check value and no other
+   sign. So the total is printed at exit under WHALE_ENTER_COUNT, and perftest
+   shows it next to the time. */
+static long whale_entry_total;
+static int whale_entry_registered;
+
+static void whale_entry_at_exit(void)
+{
+    fprintf(stderr, "WHALE_ENTRIES n=%ld\n", whale_entry_total);
+}
+
 extern char *getenv(const char *);
 void JS_WhaleDeoptNote(JSContext *ctx, int flag)
 {
     static long by_flag[8];
-    static long total;
 
     (void)ctx;
     if (flag >= 0 && flag < 8)
         by_flag[flag]++;
-    total++;
+    whale_entry_total++;
+    if (!whale_entry_registered && getenv("WHALE_ENTER_COUNT")) {
+        whale_entry_registered = 1;
+        atexit(whale_entry_at_exit);
+    }
     if (getenv("WHALE_DEOPT_DBG"))
-        fprintf(stderr, "[deopt] call=%ld flag=%d\n", total, flag);
+        fprintf(stderr, "[deopt] call=%ld flag=%d\n", whale_entry_total, flag);
 }
 
 /* ---- JIT object slots -----------------------------------------------------

@@ -102,19 +102,34 @@ function probe(cmd) {
     return !r.error && r.status === 0;
 }
 
-/* Run one case under one engine; returns {ms, check} or {error}. */
+/* Run one case under one engine; returns {ms, check, entries} or {error}.
+
+   `entries` is how many times the compiled code was actually entered, when the
+   engine can say so. It is not decoration: a case that calls the same function
+   with the same argument in a loop can have most of those calls folded into one,
+   and then it reports the time of a fraction of the work with a correct check
+   value and nothing else to show for it. perftest/cases/object.js did exactly
+   that - 20 calls, 1 entry, and a time 20x too good that was then compared
+   against objfields.js, which really does run all twenty. */
 function run(cmd, file, timeoutSeconds) {
+    const env = { ...process.env };
+    const wantEntries = /whalejs|qjs/.test(path.basename(cmd)) && !cmd.includes('c-');
+
+    if (wantEntries) env.WHALE_ENTER_COUNT = '1';
+
     const r = spawnSync(cmd, [file], {
         encoding: 'utf8',
         windowsHide: true,
         timeout: timeoutSeconds * 1000,
         maxBuffer: 16 * 1024 * 1024,
+        env,
     });
     if (r.error) return { error: r.error.code === 'ETIMEDOUT' ? 'timeout' : String(r.error.message || r.error) };
     const out = `${r.stdout || ''}${r.stderr || ''}`;
     const m = out.match(/^WHALE_BENCH\s+(\S+)\s+ms=(\d+)\s+check=(\S+)/m);
     if (!m) return { error: `no result line (exit ${r.status})` };
-    return { ms: parseInt(m[2], 10), check: m[3] };
+    const en = out.match(/^WHALE_ENTRIES n=(\d+)/m);
+    return { ms: parseInt(m[2], 10), check: m[3], entries: en ? parseInt(en[1], 10) : undefined };
 }
 
 function pad(s, n) {
@@ -190,8 +205,8 @@ function main() {
     const w = Math.max(12,
         ...engines.map(e => e.length + 2),
         ...wanted.map(c => c.length + 2));
-        process.stdout.write(pad('case', w) + engines.map(e => pad(e, 12)).join('') + '\n');
-        process.stdout.write('-'.repeat(w + 12 * engines.length) + '\n');
+        process.stdout.write(pad('case', w) + engines.map(e => pad(e, 12)).join('') + pad('entries', 10) + '\n');
+        process.stdout.write('-'.repeat(w + 12 * engines.length + 10) + '\n');
         for (const c of wanted) {
             const cells = engines.map(e => {
                 const r = results[c][e];
@@ -199,7 +214,16 @@ function main() {
                 if (!r) return pad('--', 12);
                 return pad(r.error ? `-- ${r.error}` : `${r.ms} ms`, 12);
             });
-            process.stdout.write(pad(c, w) + cells.join('') + '\n');
+            /* How many times whalejs actually entered compiled code. Read it against
+               the case's own call count: bitops calls its function once, so `1` is
+               what it should be, while a case written as `for (r < 20) f(n)` that
+               shows `1` had nineteen of those calls folded away - the milliseconds
+               are then for one pass, not twenty, and are not comparable with the
+               other columns. */
+            const ent = results[c].whalejs && results[c].whalejs.entries;
+            const entCell = ent === undefined ? '' : String(ent);
+
+            process.stdout.write(pad(c, w) + cells.join('') + pad(entCell, 10) + '\n');
         }
     }
 
