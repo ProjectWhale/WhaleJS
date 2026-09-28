@@ -465,9 +465,6 @@ typedef struct AttributeDef {
 typedef struct Sym {
     int v; /* symbol token */
     unsigned short r; /* associated register or VT_CONST/VT_LOCAL and LVAL type */
-    int pin_reg; /* WhaleJS: a `register` local's pinned register, plus one.
-                    Zero (the memset default) means not pinned. See
-                    whale_pin_alloc(). */
     struct SymAttr a; /* symbol attributes */
     union {
         struct {

@@ -367,8 +367,6 @@ static void wt_num(double v)
    unique while earlier functions' code remains live. */
 static TCCState *whale_jit_state;
 static unsigned whale_jit_seq;
-/* TCC side of the pinned-register map: one scope per JIT compilation. */
-void JS_WhalePinEnter(void);
 /* WhaleJS: dump the finished code section so it can be disassembled. Defined in
    tccgen.c, which is the only place text_section is in scope. */
 void JS_WhaleDumpCode(FILE *f);
@@ -5470,10 +5468,6 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
     s = whale_jit_state;
 
     /* fresh names per compile: the code accumulates in this one state */
-    /* One JS function becomes two C functions (a core and a wrapper). Pinned
-       registers have to span both, so claim the map for the whole compilation
-       rather than letting each C function reset it. */
-    JS_WhalePinEnter();
     snprintf(whale_core_name, sizeof(whale_core_name), "whale_jit_core_%u", ++whale_jit_seq);
     snprintf(whale_entry_name, sizeof(whale_entry_name), "whale_jit_fn_%u", whale_jit_seq);
 
@@ -5672,7 +5666,6 @@ static int whale_gcc_compile(JSContext *ctx, const char *src, void **entry_out, 
     if (!whale_jit_state_ensure())
         return 0;
 
-    JS_WhalePinEnter();
     snprintf(whale_core_name, sizeof(whale_core_name), "whale_jit_core_%u", ++whale_jit_seq);
     snprintf(whale_entry_name, sizeof(whale_entry_name), "whale_jit_fn_%u", whale_jit_seq);
 
