@@ -16,6 +16,7 @@
 #include <stdarg.h>
 
 #include "quickjs.h"
+#include "whale_dbg.h"
 #include "whale_jit.h"
 
 #include "libtcc.h"
@@ -514,7 +515,7 @@ static int whale_feeds_call_as_callee(const uint8_t *pc, int len, int pos, int s
         int o = (int)pc[k];
         int s;
 
-        if (getenv("WHALE_JIT_DUMP"))
+        if (whale_dbg_env("WHALE_JIT_DUMP"))
             fprintf(stderr, "[feeds] k=%d o=%d dup=%d push=%d\n",
                     k, o, OP_dup, whale_is_push_op(o));
         if (whale_is_call_op(o))
@@ -939,7 +940,7 @@ static void fold_inline_expr(const WhaleVExpr *e)
 /* Append the value of slot k to what is being built right now. */
 static void fold_inline(int k)
 {
-    if (getenv("WHALE_EMPTY_DBG") && !whale_vmat[k] && whale_vexpr[k].len == 0)
+    if (whale_dbg_env("WHALE_EMPTY_DBG") && !whale_vmat[k] && whale_vexpr[k].len == 0)
         fprintf(stderr, "[empty] slot=%d (len=0, off=%d)\n", k, whale_vexpr[k].off);
     if (whale_vmat[k]) {
         wt_arr("v", whale_vname[k]);   /* already a real variable */
@@ -1204,7 +1205,7 @@ static void local_materialize(int d)
 
     if (!m->live)
         return;
-    if (getenv("WHALE_MEM_TRACE"))
+    if (whale_dbg_env("WHALE_MEM_TRACE"))
         fprintf(stderr, "[mat] L%d off=%d len=%d\n", d, m->expr.off, m->expr.len);
     mark = fold_mark();
     wt_slot("L", d); wt('=');
@@ -1225,7 +1226,7 @@ static void local_materialize(int d)
    in local_set() keeps the duplication bounded. */
 static void local_inline(int d)
 {
-    if (getenv("WHALE_MEM_TRACE"))
+    if (whale_dbg_env("WHALE_MEM_TRACE"))
         fprintf(stderr, "[inl] L%d live=%d\n", d, whale_lmem[d].live);
     if (!whale_lmem[d].live) {
         wt_slot("L", d);
@@ -1252,7 +1253,7 @@ static void local_set(int d, int mark)
     m->expr.len = JS_WhaleTokSinkLen() - mark;
     m->live = 1;
     m->used = 0;
-    if (getenv("WHALE_MEM_TRACE"))
+    if (whale_dbg_env("WHALE_MEM_TRACE"))
         fprintf(stderr, "[set] L%d off=%d len=%d\n", d, m->expr.off, m->expr.len);
     if (m->expr.len > whale_expr_max)
         local_materialize(d);
@@ -1651,7 +1652,7 @@ static int whale_prof_one_shape(unsigned off)
             n = 2;
         static int dbg;
 
-        if (getenv("WHALE_PROF_DBG") && dbg < 40) {
+        if (whale_dbg_env("WHALE_PROF_DBG") && dbg < 40) {
             int fa[WHALE_STRUCT_FIELDS];
             int fn = whale_struct_fields(off, fa, WHALE_STRUCT_FIELDS);
             int q;
@@ -1683,7 +1684,7 @@ static int whale_prof_site_ok(unsigned off)
     if (off == 0 || whale_prof_now == NULL)
         return 0;
     n = JS_WhaleProfShapes(whale_prof_now, off, sh, 8);
-    if (getenv("WHALE_PROF_DBG"))
+    if (whale_dbg_env("WHALE_PROF_DBG"))
         fprintf(stderr, "[site] off=%u n=%d %s\n", off, n,
                 (n == 0 || n == 1) ? "ok" : "REFUSED");
     return n == 0 || n == 1;
@@ -1737,17 +1738,20 @@ static int whale_step_emit(int op, int pos, int *sp_io, uint8_t *cur, int var_co
                            int stack_size)
 {
     int n_pop = 0, n_push = 0, i, sp = *sp_io, fm;
-    int dbg = getenv("WHALE_STEP_DBG") != NULL;
+    int dbg = whale_dbg_env("WHALE_STEP_DBG") != NULL;
 
     /* Bisect switch: WHALE_STEP_OFF=<opcode> refuses that one opcode, so a single
        hand-over can be turned off without touching the rest. It is how "object in
-       a value position" was isolated, and it stays for the next one. */
+       a value position" was isolated, and it stays for the next one.
+       (Diagnostic: debug builds only.) */
+#ifdef WHALE_DEBUG
     {
         const char *off = getenv("WHALE_STEP_OFF");
 
         if (off && atoi(off) == op)
             return 0;
     }
+#endif
 
     if (whale_step_is_control(op) || !JS_WhaleStepCovers(op)) {
         if (dbg)
@@ -1775,7 +1779,7 @@ static int whale_step_emit(int op, int pos, int *sp_io, uint8_t *cur, int var_co
            notes/whale-step-repro.md. The rule stays default-on while that is being
            found; WHALE_VALUE_OBJ=1 turns it off, which is how the reproducer is
            reached without editing this file. */
-        if (i > 0 && !whale_type_is_num(t) && !getenv("WHALE_VALUE_OBJ")) {
+        if (i > 0 && !whale_type_is_num(t) && !whale_dbg_env("WHALE_VALUE_OBJ")) {
             if (dbg)
                 fprintf(stderr, "[emit] pos=%d op=%d REFUSE object in value "
                         "position slot=%d t=%d\n", pos, op, sp - n_pop + i, t);
@@ -1873,7 +1877,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     /* A linear disassembly, as opcode numbers and offsets. The generator's own view
        of the bytecode is the only one that matters when a case is refused, and
        reading it back out of the switch is guesswork. */
-    if (getenv("WHALE_OP_DBG")) {
+    if (whale_dbg_env("WHALE_OP_DBG")) {
         int k = 0;
 
         fprintf(stderr, "[consts] if_false8=%d if_true8=%d goto8=%d if_false=%d goto=%d catch=%d throw=%d put_field=%d get_field=%d get_field2=%d mod=%d\n",
@@ -1893,7 +1897,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     }
     /* The loops the compiler gave us. Printed here so the generator side of the
        hand-over can be checked without emitting anything yet. */
-    if (getenv("WHALE_LOOP_DBG") && info->loop_count > 0) {
+    if (whale_dbg_env("WHALE_LOOP_DBG") && info->loop_count > 0) {
         int li;
 
         fprintf(stderr, "[gen-loops] blen=%d count=%d:", info->byte_code_len,
@@ -1907,7 +1911,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     /* What JS_UNDEFINED actually looks like, measured rather than assumed. The tag
        value, the word boundaries and the width are all things to read off the engine,
        and guessing them has already cost several rounds. */
-    if (getenv("WHALE_UNDEF_DBG")) {
+    if (whale_dbg_env("WHALE_UNDEF_DBG")) {
         static int once;
         union { JSValue v; unsigned char b[16]; } u;
         int q;
@@ -1938,13 +1942,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        which is enough to tell one JS function from another: in objfields, make() is
        0/0 and run() is 1/1. The generated names (whale_jit_fn_N) are sequence
        numbers and say nothing about which function they are. */
-    if (getenv("WHALE_JIT_DUMP"))
+    if (whale_dbg_env("WHALE_JIT_DUMP"))
         fprintf(stderr, "[gen] argc=%d varc=%d len=%d prof=%p\n",
                 info->arg_count, info->var_count, info->byte_code_len, info->prof);
     whale_gen_self_ref = 0;
     {
         static int once;
-        if (!once && getenv("WHALE_JIT_DUMP")) {
+        if (!once && whale_dbg_env("WHALE_JIT_DUMP")) {
             once = 1;
 
             fprintf(stderr, "whale jit op ids: get_var_ref0=%d add=%d invalid=%d count=%d temp_start=%d temp_end=%d\n",
@@ -2053,7 +2057,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         if (op == OP_goto8 || op == OP_if_false8 || op == OP_if_true8) {
             int tgt = pos + 1 + (int8_t)pc[pos + 1];
 
-            if (getenv("WHALE_OP_DBG"))
+            if (whale_dbg_env("WHALE_OP_DBG"))
                 fprintf(stderr, "[tgt8] pos=%d op=%d tgt=%d\n", pos, op, tgt);
             targets[tgt] = 1;
             if (tgt < pos)              /* backward jump: a loop back edge */
@@ -2061,7 +2065,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         } else if (op == OP_goto || op == OP_if_false || op == OP_if_true) {
             int tgt = pos + 1 + (int32_t)whale_get_u32(pc + pos + 1);
 
-            if (getenv("WHALE_OP_DBG"))
+            if (whale_dbg_env("WHALE_OP_DBG"))
                 fprintf(stderr, "[tgt] pos=%d op=%d tgt=%d\n", pos, op, tgt);
             targets[tgt] = 1;
             if (tgt < pos)
@@ -2072,7 +2076,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                later op that jumps into the catch block - has nowhere to land. */
             int ctgt = pos + 1 + (int32_t)whale_get_u32(pc + pos + 1);
 
-            if (getenv("WHALE_OP_DBG"))
+            if (whale_dbg_env("WHALE_OP_DBG"))
                 fprintf(stderr, "[catch-tgt] pos=%d raw=%u tgt=%d\n",
                         pos, (unsigned)whale_get_u32(pc + pos + 1), ctgt);
             targets[ctgt] = 1;
@@ -2493,7 +2497,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     for (i = 0; i < var_count; i++) {
         wk(JS_WK_DOUBLE); wt_slot("L", i); wt('='); wt_int(0); wt(';');
     }
-    if (getenv("WHALE_STR_DBG")) {
+    if (whale_dbg_env("WHALE_STR_DBG")) {
         int cols = whale_layout_from_sites(whale_field_sites, whale_field_sites_n,
                                            whale_str_atoms, WHALE_STRUCT_FIELDS);
         int si;
@@ -2569,7 +2573,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        and (like every other slot) numbered below the call scratch area. */
     for (i = 0; i < arg_count; i++) {
         arg_obj_slot[i] = -1;
-        if (getenv("WHALE_ARG_DBG")) fprintf(stderr, "[argslot] i=%d args_obj=%d objs=%d argc=%d varc=%d len=%d\n", i, args_obj[i], whale_objs, arg_count, var_count, len);
+        if (whale_dbg_env("WHALE_ARG_DBG")) fprintf(stderr, "[argslot] i=%d args_obj=%d objs=%d argc=%d varc=%d len=%d\n", i, args_obj[i], whale_objs, arg_count, var_count, len);
         if (args_obj[i]) {
             if (whale_objs >= WHALE_CALL_BASE) {
                 whale_objs = WHALE_CALL_BASE;   /* no room: refuse the function */
@@ -2588,15 +2592,17 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        every statement, so a longer expression is not free. The ceiling stays where
        it was measured. */
     whale_expr_max = 24;
+#ifdef WHALE_DEBUG
     if (getenv("WHALE_EXPR_MAX"))
         whale_expr_max = atoi(getenv("WHALE_EXPR_MAX"));
-    if (getenv("WHALE_EXPR_DBG"))
+#endif
+    if (whale_dbg_env("WHALE_EXPR_DBG"))
         fprintf(stderr, "[expr] blen=%d sites=%d call=%d max=%d\n",
                 info->byte_code_len, whale_field_sites_n, whale_has_call,
                 whale_expr_max);
 
     sp = 0;
-    if (getenv("WHALE_OP_DBG")) {
+    if (whale_dbg_env("WHALE_OP_DBG")) {
         int k;
 
         fprintf(stderr, "[targets] len=%d:", len);
@@ -2688,7 +2694,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                             snap[base + k] = cv;
                         else if (!WHALE_IS_STRUCT(sv) && WHALE_IS_STRUCT(cv))
                             snap[base + k] = sv;
-                        if (getenv("WHALE_MERGE_DBG"))
+                        if (whale_dbg_env("WHALE_MERGE_DBG"))
                             fprintf(stderr, "[merge-obj] pos=%d slot=%d prev=%d now=%d -> %d\n",
                                     pos, k, sv, cv, snap[base + k]);
                         continue;
@@ -2696,7 +2702,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     if (sv == WHALE_T_UNKNOWN) {
                         snap[base + k] = cv; /* optimistic merge */
                     } else if (cv != WHALE_T_UNKNOWN) {
-                        if (getenv("WHALE_MERGE_DBG"))
+                        if (whale_dbg_env("WHALE_MERGE_DBG"))
                             fprintf(stderr, "[merge] pos=%d slot=%d (of %d) "
                                     "prev=%d now=%d\n", pos, k, live, sv, cv);
                         differ = 1;
@@ -2736,7 +2742,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             {
                 int fm = fold_mark();
 
-                if (getenv("WHALE_OP_DBG"))
+                if (whale_dbg_env("WHALE_OP_DBG"))
                     fprintf(stderr, "[label] pos=%d depth=%d outlen=%d\n",
                             pos, whale_loop_depth, *whale_out_len);
                 wt_slot("L", pos); wt(':');
@@ -3116,7 +3122,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     /* The callee has to be reachable through a slot: the helper looks
                        it up there. A function this compilation can see is parked from
                        the constant pool; anything else must already be parked. */
-                    if (getenv("WHALE_JIT_DUMP"))
+                    if (whale_dbg_env("WHALE_JIT_DUMP"))
                         fprintf(stderr, "[ctor] pos=%d argc=%d tc=%d fslot=%d sp=%d\n",
                                 pos, argc, tc, fslot, sp);
                     if (WHALE_IS_VAL(tc) || WHALE_IS_OBJ(tc))
@@ -3308,7 +3314,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         mono = 0;
                 if (whale_field_sites_n == 0)
                     mono = 0;
-                if (getenv("WHALE_PROF_DBG"))
+                if (whale_dbg_env("WHALE_PROF_DBG"))
                     fprintf(stderr, "[obj] pos=%d sites=%d mono=%d\n",
                             pos, whale_field_sites_n, mono);
 
@@ -3338,7 +3344,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                    out or rebuilt on the way in. A function that keeps its object to
                    itself stays on the frame-column path below, which allocates nothing
                    and is already fast. */
-                if (!getenv("WHALE_NO_UNBOX") && mono && whale_str_n == 0 &&
+                if (!whale_dbg_env("WHALE_NO_UNBOX") && mono && whale_str_n == 0 &&
                     whale_ret_obj_g) {
                     int fn = whale_layout_from_sites(whale_field_sites,
                                                      whale_field_sites_n,
@@ -3377,7 +3383,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         break;
                     }
                 }
-                if (!getenv("WHALE_NO_UNBOX") && mono && whale_str_n == 0 &&
+                if (!whale_dbg_env("WHALE_NO_UNBOX") && mono && whale_str_n == 0 &&
                     (whale_call_n == 0 || pos > whale_call_pos[whale_call_n - 1])) {
                     int fn = whale_layout_from_sites(whale_field_sites,
                                                      whale_field_sites_n,
@@ -3635,7 +3641,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     sp -= 2;
                     break;
                 }
-                if (getenv("WHALE_JIT_DUMP"))
+                if (whale_dbg_env("WHALE_JIT_DUMP"))
                     fprintf(stderr, "[put] pos=%d ta=%d slot=%d tb=%d isnum=%d fields=%d isobj=%d\n",
                             pos, ta, WHALE_IS_SLOT(ta), tb, whale_type_is_num(tb),
                             whale_fields, WHALE_IS_OBJ(ta));
@@ -4027,7 +4033,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 t = cur[var_count + sp - 1];
                 if (t == WHALE_T_UNKNOWN || idx < 0 || idx >= var_count)
                     { WHALE_STEP_INSTEAD_OF_BAILING(); }
-                if (getenv("WHALE_MEM_TRACE"))
+                if (whale_dbg_env("WHALE_MEM_TRACE"))
                     fprintf(stderr, "[put_loc] L%d t=%d is_struct=%d is_slot=%d\n",
                             idx, t, WHALE_IS_STRUCT(t), WHALE_IS_SLOT(t));
                 /* An object that arrived from elsewhere - a call's result, or an
@@ -4048,11 +4054,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                    function has one at all: `run()` calls `make()` once at the top
                    and then loops without calling anything, which is exactly the
                    shape worth laying out. */
-                if (getenv("WHALE_JIT_DUMP"))
+                if (whale_dbg_env("WHALE_JIT_DUMP"))
                     fprintf(stderr, "[fill] pos=%d t=%d strn=%d calln=%d sites=%d mono=%d\n",
                             pos, t, whale_str_n, whale_call_n, whale_field_sites_n,
                             whale_sites_mono(whale_field_sites, whale_field_sites_n));
-                if (!getenv("WHALE_NO_UNBOX") && whale_str_n == 0 &&
+                if (!whale_dbg_env("WHALE_NO_UNBOX") && whale_str_n == 0 &&
                     (whale_call_n == 0 || pos > whale_call_pos[whale_call_n - 1]) &&
                     (WHALE_IS_OBJ(t) || WHALE_IS_VAL(t)) &&
                     whale_sites_mono(whale_field_sites, whale_field_sites_n)) {
@@ -4428,7 +4434,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                    than the arguments, so the engine must not memoise this
                    function. */
                 whale_gen_pure = 0;
-                if (getenv("WHALE_JIT_DUMP"))
+                if (whale_dbg_env("WHALE_JIT_DUMP"))
                     fprintf(stderr, "[getvar] pos=%d sz=%d atom=%d feeds_call=%d\n",
                             pos, sz, atom, whale_feeds_call_as_callee(pc, len, pos, sz));
                 if (whale_feeds_call_as_callee(pc, len, pos, sz)) {
@@ -4518,7 +4524,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         fm = fold_mark();
                         rtype = whale_inline_body(&ci, cur, var_count, sp - argc);
                         whale_inline_nested = saved_nested;
-                        if (getenv("WHALE_JIT_DUMP"))
+                        if (whale_dbg_env("WHALE_JIT_DUMP"))
                             fprintf(stderr, "[inline] pos=%d argc=%d rtype=%d (num=%d slot=%d obj=%d)\n",
                                     pos, argc, rtype, rtype == WHALE_T_NUM,
                                     WHALE_IS_SLOT(rtype), WHALE_IS_OBJ(rtype));
@@ -4580,12 +4586,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         int tk = cur[var_count + sp - argc + k];
                         int ms, m;
 
-                        if (getenv("WHALE_JIT_DUMP"))
+                        if (whale_dbg_env("WHALE_JIT_DUMP"))
                             fprintf(stderr, "[mat-arg] pos=%d k=%d tk=%d struct=%d strn=%d\n",
                                     pos, k, tk, WHALE_IS_STRUCT(tk), whale_str_n);
                         if (!WHALE_IS_STRUCT(tk))
                             continue;
-                        if (getenv("WHALE_JIT_DUMP"))
+                        if (whale_dbg_env("WHALE_JIT_DUMP"))
                             fprintf(stderr, "[mat-arg] objs=%d callbase=%d\n",
                                     whale_objs, WHALE_CALL_BASE);
                         if (whale_str_obj_slot < 0) {
@@ -4640,7 +4646,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     int nxt = pos + sz;
                     int ret_slot;
 
-                    if (getenv("WHALE_JIT_DUMP"))
+                    if (whale_dbg_env("WHALE_JIT_DUMP"))
                         fprintf(stderr, "[call] pos=%d argc=%d tc=%d slot=%d callslots=%d\n",
                                 pos, argc, tc, WHALE_IS_SLOT(tc), WHALE_CALL_SLOTS);
                     if (!WHALE_IS_SLOT(tc) && tc != WHALE_T_SELF)
@@ -4664,7 +4670,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         int tk = cur[var_count + sp - argc + k];
 
                         if (!whale_type_is_num(tk) && !WHALE_IS_VAL(tk) && !WHALE_IS_OBJ(tk)) {
-                            if (getenv("WHALE_JIT_DUMP"))
+                            if (whale_dbg_env("WHALE_JIT_DUMP"))
                                 fprintf(stderr, "[call] arg k=%d tk=%d rejected\n", k, tk);
                             { WHALE_STEP_INSTEAD_OF_BAILING(); }
                         }
@@ -5116,7 +5122,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int fm;
 
                 t = cur[var_count + sp - 1];
-                if (getenv("WHALE_OP_DBG"))
+                if (whale_dbg_env("WHALE_OP_DBG"))
                     fprintf(stderr, "[ret] pos=%d sp=%d t=%d num=%d\n",
                             pos, sp, t, whale_type_is_num(t));
                 if (WHALE_IS_OBJLIKE(t)) {
@@ -5200,6 +5206,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        That keeps JS_EXCEPTION (a macro with no linkable address) out of the
        generated code entirely. */
     wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleCheckStack"); wt('('); wt_id("ctx"); wt(')'); wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_id("whale_jit_box_num"); wt('('); wt_id("ctx"); wt(','); wt_int(0); wt(')'); wt(';'); wt('}');
+#ifdef WHALE_DEBUG
     {
         /* ---- object-slot self test (WHALE_OBJ_TEST=<arg index>) -----------
            Park the argument in a JIT object slot, force a full GC, and return
@@ -5217,6 +5224,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             wt(')'); wt(';');
         }
     }
+#endif
     for (i = 0; i < arg_count; i++) {
         if (!args_used[i])
             continue;
@@ -5269,7 +5277,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     ret = 1; /* every opcode lowered successfully */
     whale_gen_objs = whale_objs;
   out:
-    if (!ret && getenv("WHALE_JIT_DUMP")) {
+    if (!ret && whale_dbg_env("WHALE_JIT_DUMP")) {
         int bad = (pos < len) ? pc[pos] : -1;
 
         fprintf(stderr, "whale jit: gen gave up at pos=%d op=%d (%s) bail=%d\n",
@@ -5450,7 +5458,7 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
     TCCState *s;
     void *fn;
 
-    if (getenv("WHALE_JIT_DUMP"))
+    if (whale_dbg_env("WHALE_JIT_DUMP"))
         fprintf(stderr, "whale jit paths: src=%s rt=%s\n", WHALE_JIT_SRC_DIR, WHALE_JIT_TCC_DIR);
 
     /* the lexer must be OFF before anything in TinyCC defines a builtin macro,
@@ -5478,13 +5486,15 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
         /* Which side of the hand-off failed matters: the generator bailing on an
            opcode is a different problem from the tokens not parsing or TinyCC
            failing later. All of them end up here. */
-        if (getenv("WHALE_JIT_DUMP"))
+        if (whale_dbg_env("WHALE_JIT_DUMP"))
             fprintf(stderr, "whale jit: compile failed (gen_ok=%d)\n", whale_gen_ok);
         goto fail;
     }
     /* Diagnostics: write the object out so the machine code TinyCC actually
        produced can be disassembled (objdump -d). Everything so far has been read
-       from the generated C, which is one step removed from what runs. */
+       from the generated C, which is one step removed from what runs.
+       (Diagnostic: debug builds only.) */
+#ifdef WHALE_DEBUG
     if (getenv("WHALE_JIT_OBJ")) {
         char objbuf[256];
         FILE *df;
@@ -5498,13 +5508,14 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
             fprintf(stderr, "whale jit: wrote %s\n", objbuf);
         }
     }
+#endif
     if (tcc_relocate(s, TCC_RELOCATE_AUTO) < 0)
         goto fail;
     fn = tcc_get_symbol(s, whale_entry_name);
     if (!fn)
         goto fail;
 
-    if (getenv("WHALE_JIT_DUMP"))
+    if (whale_dbg_env("WHALE_JIT_DUMP"))
         fprintf(stderr, "whale jit: %s -> %p\n", whale_entry_name, fn);
 
 
@@ -5535,6 +5546,25 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
 int JS_WhaleRenderStream(const int *tok, const double *num, int n, char **out);
 void JS_WhaleRenderFree(char *p);
 #define WHALE_CC_PATH 640
+
+/* The backend driver the embedder chose with JS_WhaleSetJitCc, and its flags.
+   Process-global on purpose: the JIT backend (and the TinyCC state beneath it)
+   is process-global, so a per-context setting could not have two backends live
+   at once anyway. Empty means "not chosen" - the TinyCC backend stays. */
+static char whale_cc_driver[WHALE_CC_PATH];
+static char whale_cc_flags[WHALE_CC_PATH];
+
+void JS_WhaleSetJitCc(const char *driver, const char *flags)
+{
+    if (driver && *driver)
+        snprintf(whale_cc_driver, sizeof(whale_cc_driver), "%s", driver);
+    else
+        whale_cc_driver[0] = '\0';
+    if (flags && *flags)
+        snprintf(whale_cc_flags, sizeof(whale_cc_flags), "%s", flags);
+    else
+        whale_cc_flags[0] = '\0';
+}
 
 static char whale_gcc_module[WHALE_CC_PATH];
 
@@ -5620,7 +5650,7 @@ static int whale_gcc_prepare(const char *cc, char *lib_out, int lib_size)
        product. */
     (void)system(cmd);
     if (GetFileAttributesA(def) == INVALID_FILE_ATTRIBUTES) {
-        if (getenv("WHALE_JIT_DUMP"))
+        if (whale_dbg_env("WHALE_JIT_DUMP"))
             fprintf(stderr, "whale gcc: gendef produced no .def\n");
         return 0;
     }
@@ -5631,7 +5661,7 @@ static int whale_gcc_prepare(const char *cc, char *lib_out, int lib_size)
              bin, def, lib, whale_gcc_module);
     (void)system(cmd);
     if (GetFileAttributesA(lib) == INVALID_FILE_ATTRIBUTES) {
-        if (getenv("WHALE_JIT_DUMP"))
+        if (whale_dbg_env("WHALE_JIT_DUMP"))
             fprintf(stderr, "whale gcc: dlltool produced no import library\n");
         return 0;
     }
@@ -5640,7 +5670,7 @@ static int whale_gcc_prepare(const char *cc, char *lib_out, int lib_size)
 
 static int whale_gcc_compile(JSContext *ctx, const char *src, void **entry_out, void **handle_out)
 {
-    const char *cc = getenv("WHALE_JIT_CC");
+    const char *cc = whale_cc_driver;
     const char *tmp = getenv("TEMP");
     const char *extra;
     char *text = NULL;
@@ -5651,13 +5681,9 @@ static int whale_gcc_compile(JSContext *ctx, const char *src, void **entry_out, 
     int n, ok = 0;
 
     (void)src;
-    if (!cc)
+    if (!cc || !*cc)
         return 0;
-    if (!*cc)
-        return 0;
-    if (!tmp)
-        return 0;
-    if (!*tmp)
+    if (!tmp || !*tmp)
         return 0;
     if (!whale_gcc_prepare(cc, lib, sizeof(lib)))
         return 0;
@@ -5687,9 +5713,8 @@ static int whale_gcc_compile(JSContext *ctx, const char *src, void **entry_out, 
     /* -fno-strict-aliasing is not optional: the generated code reaches through
        casts the compiler cannot see the provenance of, and -O2 is entitled to
        assume otherwise. TinyCC does not care, so this only shows up here.
-       WHALE_JIT_CFLAGS replaces the default flags, which is how the crash was
-       narrowed down without rebuilding each time. */
-    extra = getenv("WHALE_JIT_CFLAGS");
+       The flag override comes from JS_WhaleSetJitCc's second argument. */
+    extra = whale_cc_flags[0] ? whale_cc_flags : NULL;
     if (!extra)
         extra = "";
     /* The outer quotes are for cmd.exe, which otherwise strips the driver's own
@@ -5698,29 +5723,29 @@ static int whale_gcc_compile(JSContext *ctx, const char *src, void **entry_out, 
              "\"\"%s\" -x c - -x none \"%s\" -shared -w -fno-strict-aliasing "
              "-Wno-error=incompatible-pointer-types %s -o \"%s\"\"",
              cc, lib, *extra ? extra : "-O2", obj);
-    if (getenv("WHALE_JIT_DUMP"))
+    if (whale_dbg_env("WHALE_JIT_DUMP"))
         fprintf(stderr, "whale gcc: %s\n", cmd);
     pipe = _popen(cmd, "w");
     if (!pipe) {
-        if (getenv("WHALE_JIT_DUMP"))
+        if (whale_dbg_env("WHALE_JIT_DUMP"))
             fprintf(stderr, "whale gcc: cannot start the driver\n");
         goto done;
     }
     fwrite(text, 1, n, pipe);
     if (_pclose(pipe) != 0) {
-        if (getenv("WHALE_JIT_DUMP"))
+        if (whale_dbg_env("WHALE_JIT_DUMP"))
             fprintf(stderr, "whale gcc: driver failed\n");
         goto done;
     }
     mod = LoadLibraryA(obj);
     if (!mod) {
-        if (getenv("WHALE_JIT_DUMP"))
+        if (whale_dbg_env("WHALE_JIT_DUMP"))
             fprintf(stderr, "whale gcc: LoadLibrary failed (%lu)\n", GetLastError());
         goto done;
     }
     fn = (void *)GetProcAddress(mod, whale_entry_name);
     if (!fn) {
-        if (getenv("WHALE_JIT_DUMP"))
+        if (whale_dbg_env("WHALE_JIT_DUMP"))
             fprintf(stderr, "whale gcc: %s not found\n", whale_entry_name);
         FreeLibrary(mod);
         goto done;
@@ -5730,7 +5755,7 @@ static int whale_gcc_compile(JSContext *ctx, const char *src, void **entry_out, 
     /* The image stays valid without its directory entry, so the file can go.
        WHALE_JIT_KEEP holds it back for a post-mortem: the machine code gcc
        produced is the only account of what actually ran. */
-    if (getenv("WHALE_JIT_KEEP")) {
+    if (whale_dbg_env("WHALE_JIT_KEEP")) {
         fprintf(stderr, "whale gcc: kept %s\n", obj);
     } else {
         DeleteFileA(obj);
@@ -5779,33 +5804,20 @@ int JS_WhaleJitCompileFunction(JSContext *ctx, const JSWhaleFuncInfo *info,
     whale_gen_ctx = ctx;
     whale_gen_info = info;
 
-    if (getenv("WHALE_JIT_DUMP")) {
+    if (whale_dbg_env("WHALE_JIT_DUMP")) {
         /* there is no source text any more: the generator emits tokens straight
            into TinyCC. The probe only shows that we really are inside the
            TinyCC translation unit. */
         fprintf(stderr, "whale tcc internal probe: vstack cap=%d\n", JS_WhaleTccProbe());
     }
 
-    /* Off unless the environment names a driver. The gcc path needs a MinGW
-       toolchain and builds an import library on first use, so it is opt-in
-       rather than the default; the variable carries the driver because there is
-       nothing sensible to guess about where it lives. */
-    {
-        static int chosen;
-        const char *cc;
-
-        if (!chosen) {
-            chosen = 1;
-            cc = getenv("WHALE_JIT_CC");
-            if (cc) {
-                if (*cc) {
-                    whale_jit_backend = &whale_backend_gcc;
-                    if (getenv("WHALE_JIT_DUMP"))
-                        fprintf(stderr, "whale jit: backend gcc (%s)\n", cc);
-                }
-            }
-        }
-    }
+    /* Off until the embedder names a driver through JS_WhaleSetJitCc. The gcc
+       path needs a MinGW toolchain and builds an import library on first use,
+       so it is opt-in rather than the default - and where the toolchain lives
+       is knowledge only the embedding application has, which is why this is
+       an API and not an environment variable. */
+    if (whale_cc_driver[0])
+        whale_jit_backend = &whale_backend_gcc;
     if (!whale_jit_backend->compile(ctx, NULL, &entry, &handle))
         return 0;
 

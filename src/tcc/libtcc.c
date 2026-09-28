@@ -755,11 +755,13 @@ LIBTCCAPI TCCState *tcc_new(void)
        consult this yet - it still emits the SSE2 baseline - so this is a no-op
        until instruction selection is made capability-driven. */
     s->isa_bits = whale_isa_detect();
+#ifdef WHALE_DEBUG
     {
         /* WHALE_ISA=<list> pins the extensions the backend may use, so a build
            can be exercised against a lower baseline regardless of the host CPU
            (or the reverse, to test a capability layer). An unset, empty or
-           unparsable value leaves the probe result in place. */
+           unparsable value leaves the probe result in place.
+           (Diagnostic: debug builds only.) */
         const char *isa = getenv("WHALE_ISA");
 
         if (isa && *isa) {
@@ -770,6 +772,7 @@ LIBTCCAPI TCCState *tcc_new(void)
                 s->isa_bits = forced;
         }
     }
+#endif
 #endif
     /* enable this if you want symbols with leading underscore on windows: */
 #if 0 /* def TCC_TARGET_PE */

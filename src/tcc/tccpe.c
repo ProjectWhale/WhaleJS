@@ -789,7 +789,7 @@ static void pe_build_imports(struct pe_info *pe)
     for (sym_cnt = i = 0; i < ndlls; ++i)
         sym_cnt += pe->imp_info[i]->sym_count;
 
-    if (getenv("WHALE_JIT_DUMP"))
+    if (whale_dbg_env("WHALE_JIT_DUMP"))
         fprintf(stderr, "[pe] build_imports: ndlls=%d sym_cnt=%d data_offset=%u sh_addr=%p imagebase=%p\n",
                 ndlls, sym_cnt, (unsigned)pe->thunk->data_offset,
                 (void*)pe->thunk->sh_addr, (void*)pe->imagebase);
@@ -1222,7 +1222,7 @@ static int pe_check_symbols(struct pe_info *pe)
             int imp_sym = pe_find_import(pe->s1, sym);
             struct import_symbol *is;
 
-            if (getenv("WHALE_JIT_DUMP"))
+            if (whale_dbg_env("WHALE_JIT_DUMP"))
                 fprintf(stderr, "[pe] undef '%s' type=%u other=0x%x -> imp_sym=%d\n",
                         name, type, (unsigned)sym->st_other, imp_sym);
 

@@ -16,6 +16,14 @@ option("libtcc_prebuilt")
     set_description("Link the prebuilt libtcc (DLL + import library) instead of compiling TinyCC from source")
 option_end()
 
+-- 诊断开关（WHALE_JIT_DUMP / WHALE_STR_STAT / ... 这类环境变量）只进调试构建。
+-- 这是引擎本身的开发工具，不是跑在引擎上的程序的配置；发布二进制里没有这些读取。
+option("whale_debug")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Compile in the WHALE_* diagnostic switches (JIT dumps, helper counters)")
+option_end()
+
 local libtcc_prebuilt = has_config("libtcc_prebuilt")
 
 local SRC = "src"
@@ -88,6 +96,9 @@ if not libtcc_prebuilt then
         add_files(TCC .. "/whale_tcc_iface.c")
         add_includedirs(TCC, TCC_RT)
         add_defines("TCC_TARGET_PE", "TCC_TARGET_X86_64")
+        if has_config("whale_debug") then
+            add_defines("WHALE_DEBUG")
+        end
 end
 
 -- whalejs CLI（对照与手工验证用）
@@ -99,6 +110,9 @@ target("whalejs")
     add_files(SRC .. "/qjs.c", SRC .. "/gen/repl.c", SRC .. "/gen/standalone.c")
     add_includedirs(SRC, TCC)
     add_defines(qjs_defines)
+    if has_config("whale_debug") then
+        add_defines("WHALE_DEBUG")
+    end
     link_whale()
 
 -- WhaleJS 单元测试：xmake run whale_test
@@ -110,4 +124,7 @@ target("whale_test")
     add_files("tests/whale/*.c")
     add_includedirs(SRC, TCC)
     add_defines(qjs_defines)
+    if has_config("whale_debug") then
+        add_defines("WHALE_DEBUG")
+    end
     link_whale()

@@ -263,7 +263,7 @@ void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr, addr_t 
             long long diff;
             diff = (long long)val - addr;
             if (diff < -2147483648LL || diff > 2147483647LL) {
-                if (getenv("WHALE_JIT_DUMP")) {
+                if (whale_dbg_env("WHALE_JIT_DUMP")) {
                     ElfW(Sym) *ws = (ElfW(Sym) *)s1->symtab->data + sym_index;
                     fprintf(stderr, "[reloc] %s: val=%llx addr=%llx diff=%lld st_shndx=%d st_value=%llx\n",
                             (char *)s1->symtab->link->data + ws->st_name,

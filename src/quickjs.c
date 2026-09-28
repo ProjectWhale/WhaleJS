@@ -48,6 +48,7 @@
 #include "libregexp.h"
 #include "dtoa.h"
 #include "whalejs.h"   /* WhaleJS: JIT/AOT 扩展接口 */
+#include "whale_dbg.h" /* WhaleJS: 诊断开关（仅调试构建生效） */
 #include "whale_jit.h" /* WhaleJS: JIT codegen 模块（独立编译单元） */
 
 #if defined(EMSCRIPTEN) || defined(_MSC_VER)
@@ -3068,7 +3069,7 @@ static int whale_str_stat_on(void)
     static int on = -1;
 
     if (on < 0)
-        on = getenv("WHALE_STR_STAT") != NULL;
+        on = whale_dbg_env("WHALE_STR_STAT") != NULL;
     return on;
 }
 
@@ -3465,7 +3466,7 @@ void JS_WhaleDeoptNote(JSContext *ctx, int flag)
     /* Cached: this runs on every compiled call return, and a getenv per call
        was measurable all by itself (the CRT consults the process environment). */
     if (dbg < 0)
-        dbg = getenv("WHALE_DEOPT_DBG") != NULL;
+        dbg = whale_dbg_env("WHALE_DEOPT_DBG") != NULL;
     if (dbg)
         fprintf(stderr, "[deopt] call=%ld flag=%d\n", whale_entry_total, flag);
 }
@@ -3887,7 +3888,7 @@ int JS_WhaleGlobalIsU8Ctor(JSContext *ctx, int atom)
 
     if (JS_IsException(v))
         return 0;
-    if (getenv("WHALE_JIT_DUMP"))
+    if (whale_dbg_env("WHALE_JIT_DUMP"))
         fprintf(stderr, "[isu8] ctx=%p global=%p var=%p tag=%d\n",
                 (void *)ctx, (void *)JS_VALUE_GET_PTR(ctx->global_obj),
                 (void *)JS_VALUE_GET_PTR(ctx->global_var_obj),
@@ -4337,11 +4338,11 @@ static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
         return 0;
     b->whale_jit_tried = 1;
     b->whale_prof_on = 0;
-    if (getenv("WHALE_PROF_DBG"))
+    if (whale_dbg_env("WHALE_PROF_DBG"))
         whale_prof_dump(b);
     {
         static int whale_op_probe;
-        if (!whale_op_probe && getenv("WHALE_JIT_DUMP")) {
+        if (!whale_op_probe && whale_dbg_env("WHALE_JIT_DUMP")) {
             whale_op_probe = 1;
             fprintf(stderr, "whale engine op ids: get_var_ref0=%d add=%d invalid=%d count=%d temp_start=%d temp_end=%d\n",
                     OP_get_var_ref0, OP_add, OP_invalid, OP_COUNT, OP_TEMP_START, OP_TEMP_END);
@@ -4377,7 +4378,7 @@ static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
 
             b->whale_jit_entry2 = NULL;
             whale_assume_self = 1;
-            if (getenv("WHALE_INL_DBG")) {
+            if (whale_dbg_env("WHALE_INL_DBG")) {
             int ci;
 
             fprintf(stderr, "[cpool] %d entries:", b->cpool_count);
@@ -20530,7 +20531,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 b->whale_jit_entry2 = NULL;
                 b->whale_jit_entry = whale_e2;
                 b->whale_pure = 0;   /* this reading depends on captured state */
-                if (getenv("WHALE_JIT_DUMP"))
+                if (whale_dbg_env("WHALE_JIT_DUMP"))
                     fprintf(stderr, "whale jit: call target is not this function, using the other reading\n");
                 continue;
             }
@@ -20539,7 +20540,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             break;
         }
         if (unlikely(whale_deopt)) {
-            if (getenv("WHALE_JIT_DUMP"))
+            if (whale_dbg_env("WHALE_JIT_DUMP"))
                 fprintf(stderr, "whale jit: deopt (flag=%d), back to the interpreter\n", whale_deopt);
             /* flag 1 and 3 are the checks on the arguments and on a closure slot, both
                taken before anything of the body has run - so one refusal says
@@ -39553,7 +39554,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     if (fd->whale_loop_count > 0) {
         memcpy(b->whale_loops, fd->whale_loops,
                sizeof(WhaleLoopInfo) * fd->whale_loop_count);
-        if (getenv("WHALE_LOOP_DBG")) {
+        if (whale_dbg_env("WHALE_LOOP_DBG")) {
             int li;
             fprintf(stderr, "[loop-dbg] blen=%d loops=%d:",
                     b->byte_code_len, fd->whale_loop_count);
@@ -67436,7 +67437,7 @@ static int whale_step_dbg_on(void)
     static int on = -1;
 
     if (on < 0)
-        on = getenv("WHALE_STEP_DBG") != NULL;
+        on = whale_dbg_env("WHALE_STEP_DBG") != NULL;
     return on;
 }
 

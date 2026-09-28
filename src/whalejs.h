@@ -70,6 +70,14 @@ JS_EXTERN void      JS_WhaleSetJitMode(JSContext *ctx, JSJitMode mode);
 JS_EXTERN JSJitMode JS_WhaleGetJitMode(JSContext *ctx);
 JS_EXTERN void      JS_WhaleGetJitStats(JSContext *ctx, JSWhaleJitStats *out);
 
+/* 选择 JIT 后端的编译器驱动 —— 这是嵌入方的接口，不是环境变量：本引擎是基础
+   支持库，gcc/clang 装在哪里只有嵌入它的人知道。
+   driver：编译器可执行文件（建议完整路径，如 "C:/mingw64/bin/gcc.exe"）；
+           NULL 或空串恢复默认（TinyCC）。
+   flags：  传给驱动的额外参数（可为 NULL）；TinyCC 后端忽略。
+   两者内部各保留一份拷贝，可随时再次调用覆盖；须在本进程第一次 JIT 编译前设置。 */
+JS_EXTERN void JS_WhaleSetJitCc(const char *driver, const char *flags);
+
 /* 引擎内部：JIT 路径用于累加统计（host 一般不用） */
 JS_EXTERN void JS_WhaleNoteJitRequest(JSContext *ctx);
 JS_EXTERN void JS_WhaleNoteJitResult(JSContext *ctx, int ok, uint64_t code_bytes);

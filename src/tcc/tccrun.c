@@ -214,7 +214,7 @@ static int tcc_relocate_ex(TCCState *s1, void *ptr, addr_t ptr_diff)
                 int i;
                 for (i = 1; i < s1->nb_sections; i++) {
                     Section *sec = s1->sections[i];
-                    if (sec->reloc && (sec->sh_flags & SHF_ALLOC) && !getenv("WHALE_NO_RESET"))
+                    if (sec->reloc && (sec->sh_flags & SHF_ALLOC) && !whale_dbg_env("WHALE_NO_RESET"))
                         relocate_reset(s1, sec);
                 }
             }

@@ -1,3 +1,6 @@
+/* Diagnostics live behind WHALE_DEBUG (see the file): include it before libtcc.c
+   so every upstream file pulled in below sees the same definition. */
+#include "../whale_dbg.h"
 #include "libtcc.c"
 
 /* ========================================================================
@@ -148,7 +151,7 @@ void *JS_WhaleIrCompileAdd2(const char *tcc_dir)
     func_ind = ind;
     vla_sp_loc = -1;
     vla_sp_root_loc = -1;
-    if (getenv("WHALE_IR_DEBUG"))
+    if (whale_dbg_env("WHALE_IR_DEBUG"))
         fprintf(stderr, "  ir2: before prolog: func.ref=%p retsym=%p retsym->next=%p pa=%p\n",
                 (void *)funcsym->type.ref, (void *)retsym, (void *)retsym->next, (void *)pa);
     tcc_debug_funcstart(tcc_state, funcsym);
@@ -156,12 +159,12 @@ void *JS_WhaleIrCompileAdd2(const char *tcc_dir)
     local_scope = 1;
     gfunc_prolog(&funcsym->type);
     local_scope = 0;
-    if (getenv("WHALE_IR_DEBUG"))
+    if (whale_dbg_env("WHALE_IR_DEBUG"))
         fprintf(stderr, "  ir2: after prolog: loc=%d pa(r=%x c=%d) pb(r=%x c=%d)\n",
                 loc, pa->r, (int)pa->c, pb->r, (int)pb->c);
 
     /* a and b are locals now; gfunc_prolog put their stack offsets in ->c */
-    if (getenv("WHALE_IR_DEBUG"))
+    if (whale_dbg_env("WHALE_IR_DEBUG"))
         fprintf(stderr, "  ir2: pa(r=%x c=%d) pb(r=%x c=%d) loc=%d\n",
                 pa->r, (int)pa->c, pb->r, (int)pb->c, loc);
     dt.t = VT_DOUBLE;
@@ -171,7 +174,7 @@ void *JS_WhaleIrCompileAdd2(const char *tcc_dir)
        token to get the stack offsets it assigned (PE/x86-64: positive offsets). */
     pa = sym_find(ta->tok);
     pb = sym_find(tb->tok);
-    if (getenv("WHALE_IR_DEBUG"))
+    if (whale_dbg_env("WHALE_IR_DEBUG"))
         fprintf(stderr, "  ir2: a(r=%x c=%d) b(r=%x c=%d) loc=%d\n",
                 pa ? pa->r : 0, pa ? (int)pa->c : -1,
                 pb ? pb->r : 0, pb ? (int)pb->c : -1, loc);
@@ -196,7 +199,7 @@ void *JS_WhaleIrCompileAdd2(const char *tcc_dir)
     func_var = 0;
     nocode_wanted = 0x80000000;
     check_vstack();
-    if (getenv("WHALE_IR_DEBUG")) {
+    if (whale_dbg_env("WHALE_IR_DEBUG")) {
         int i, n = ind - func_ind;
         fprintf(stderr, "  ir2: code [%d,%d) %d bytes:", func_ind, ind, n);
         for (i = func_ind; i < ind && i < func_ind + 56; i++)
@@ -233,7 +236,7 @@ void *JS_WhaleIrAdd2C(const char *tcc_dir)
     if (tcc_compile_string(s, src) < 0)
         return NULL;
 
-    if (getenv("WHALE_IR_DEBUG")) {
+    if (whale_dbg_env("WHALE_IR_DEBUG")) {
         int i;
         Section *tsec = NULL;
         /* find the text section by name without relying on the global */
@@ -258,7 +261,7 @@ void *JS_WhaleIrAdd2C(const char *tcc_dir)
     if (tcc_relocate(s, TCC_RELOCATE_AUTO) < 0)
         return NULL;
     fn = tcc_get_symbol(s, "whale_ir_add");
-    if (getenv("WHALE_IR_DEBUG"))
+    if (whale_dbg_env("WHALE_IR_DEBUG"))
         fprintf(stderr, "  irC: entry=%p\n", fn);
     return fn;
 }
@@ -590,11 +593,15 @@ static WhaleText whale_mirror_text;
 static void whale_mirror_write(int t, double num)
 {
     if (!whale_mirror_tried) {
+#ifdef WHALE_DEBUG
         const char *p = getenv("WHALE_JIT_SRC");
 
         whale_mirror_tried = 1;
         if (p && *p)
             whale_mirror_fp = fopen(p, "w");
+#else
+        whale_mirror_tried = 1;
+#endif
     }
     if (!whale_mirror_fp)
         return;
@@ -729,7 +736,7 @@ int JS_WhaleCompileTokens(TCCState *s, void (*emit)(void *), void *emit_ctx)
             /* Every identifier that looks like a label, with its position. A
                "duplicate label" is only diagnosable if both definitions are visible,
                and the 8-token window below shows at most one of them. */
-            if (getenv("WHALE_OP_DBG")) {
+            if (whale_dbg_env("WHALE_OP_DBG")) {
                 for (k = 0; k < whale_tok_len; k++) {
                     int t = whale_tok_buf[k];
                     const char *nm;
@@ -822,7 +829,7 @@ int JS_WhaleCompileTokens(TCCState *s, void (*emit)(void *), void *emit_ctx)
         return 0;
     }
 
-    if (getenv("WHALE_IR_DEBUG")) {
+    if (whale_dbg_env("WHALE_IR_DEBUG")) {
         fprintf(stderr, "[isa] bits=0x%x sse2=%d sse4.2=%d avx2=%d (override with WHALE_ISA)\n",
                 s->isa_bits,
                 !!(s->isa_bits & WHALE_ISA_SSE2),
