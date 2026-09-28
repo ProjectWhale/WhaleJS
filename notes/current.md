@@ -1549,3 +1549,44 @@ obj slots 实数）。objfields+gcc 17ms 已反超 node；c_native/objfields.c �
 
 ## 状态
 `dd3f863` 绿：`whale api test: ok`、25/25 case 0 mismatch、git 干净。
+
+# <63>: objshape 分相、逃逸对象真 struct、单块分配、immutable 的剩余成本结构
+SOLVED + 测量 + PLAN
+
+## objshape 分相（1.2M 迭代/相，temp/obj_phase.js）
+twoShapes 47 / growsShape 16 / writeOrder 20 / **escaped 430**（node：15/11/5/19）。
+growsShape 1.5x、writeOrder 4x 都已可接受；**escaped 一相占全案 80%**。
+
+## 逃逸修复（commit 46f84c1）
+`OP_put_array_el` → `whale_ret_obj_g = 1`：数组活得比迭代长，帧列布局每次存入都要
+物化成真对象（ObjNew + 每列 ObjDefineNum，~350ns/迭代）。现在字面量直接 StructNew，
+fresh 窗口内写直走 `_sdp[col]`，**读也直走**（get_field fresh 分支：tag 8/0 内联，
+否则 `JS_WhaleObjValueNum` deopt），数组存的是引用。对象身份真实、别名安全。
+
+## 单块分配
+`JS_WhaleStructNew`：header + atoms + data 一次 js_mallocz，finalizer 一次 free。
+immutable_update 每迭代一次 StructNew → **491 → 392ms**（200 万次 malloc 消失）。
+
+## 诚实数据
+escaped 自身 413-680ms（改前 430）：**没变快**。墙 = `JS_NewObjectClass`（JSObject+
+shape 构建、`js_trigger_gc` 检查）+ 每分配的 GC 扫描 + 每迭代一次 finalizer。node 18ms
+靠逃逸分析——`t` 没有真正分配。要在"对象必须真实存在"（out 数组持有）的前提下逼近，
+需要分配器级工程：轻量类对象路径（跳过 shape/proprop）或真新生代 bump 分配。
+
+## immutable_update 392ms 的成本结构（1M 次迭代）
+每迭代：1 次 `JS_WhaleCallValue` → `JS_Call`（**全帧装配 ~250ns**，占一半以上）；
+`VarRefGetObj` 每迭代重 park setField（指针整个调用期不变，应入口 park 一次）；
+`fver++` 每代 3 个 fp site 各重解析（JS_WhaleObjShape + FieldPtr = 6 helper）；
+setField 内部：StructNew（单块后已便宜）+ fresh 直写 + ret_obj 装箱。
+**下一步（按值排序）**：
+1. **compiled-to-compiled fast call**：JS_WhaleCallValue 里查 callee 已编译（bytecode
+   function + whale_jit_entry）→ 绕过 JS_Call 的解释器帧装配，手工建最小帧
+   （current_stack_frame/arg_buf 拷贝/var_refs/prev_frame 四件事）+ 调 entry + 拆帧。
+   预期 -150~200ms。这是"switch 直跳 JIT"大方向的第一小步（notes <61> 混合编译评估）。
+2. var_ref 入口 park 一次（~20ms）。
+3. fver 代内 shape 共享（~60ms）：fver++ 后首个访问解析并把 shape 存进代槽，同代
+   其它 site 直接比代槽——把 6 helper 降到 4。
+4. 分配器：JS_NewObjectClass 的 struct 专用轻量路径。
+## 状态
+`46f84c1` 绿：25/25 编译、0 mismatch。objshape 481ms（entries 48 = 四相全编译）、
+immutable_update 392ms。
