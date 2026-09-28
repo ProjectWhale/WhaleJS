@@ -3133,6 +3133,26 @@ int JS_WhaleStructNew(JSContext *ctx, const int *atoms, int nslots, int slot)
     return 1;
 }
 
+/* The column array of the struct in `slot`, with its length. A factory shape -
+   `JS_WhaleStructNew` immediately followed by a run of field stores - resolves
+   the pointer once and then writes each column as plain memory; per-field
+   helper calls (each one a column scan) were the remaining per-call cost of
+   the Redux and vnode shapes. The pointer stays valid for the struct's
+   lifetime: the columns are allocated once and never move. */
+JSValue *JS_WhaleStructDataPtr(JSContext *ctx, int slot, double *len_out)
+{
+    WhaleStruct *ws;
+
+    if (slot < 0 || slot >= WHALE_OBJ_SLOTS)
+        return NULL;
+    ws = whale_struct_of(whale_frame_obj_slots(ctx)[slot]);
+    if (!ws)
+        return NULL;
+    if (len_out)
+        *len_out = (double)ws->nslots;
+    return ws->data;
+}
+
 /* The column a name maps to, or -1. This is the offset map: a map from name to column,
    and nothing else - it holds no values. A name that is not in it never was a column of
    this object. The shape plays no part here; it belongs to the dynamic properties. */

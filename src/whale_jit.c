@@ -2041,6 +2041,17 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     int whale_str_n = 0;
     int whale_str_slot = -1;
     int whale_str_L[WHALE_STRUCT_FIELDS];
+    /* The object slot JS_WhaleStructNew just built, and its column count.
+       While it stays current - no call, no jump target in between - the
+       initialiser stores go straight through `_sdp` instead of per-field
+       helpers. -1 when there is no fresh struct. */
+    int whale_str_fresh = -1;
+    int whale_str_fresh_n = 0;
+    /* Object slots this compilation built as plain objects (the OP_object
+       fallback arm). A define_field/put_field on one of them must go through
+       the ordinary property store - JS_WhaleStructSetNum only answers for
+       structs, and pairing it with a plain object deopted every call. */
+    unsigned whale_plain_slots = 0;
     int prev_op;    /* the opcode before the current one, in the scan pass */
     /* The one object slot this layout is materialised into when it has to become a
        real JSValue - as a call argument, say. One slot, not one per materialisation
@@ -2433,6 +2444,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleStructSetNum"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(',');
         wk(JS_WK_INT); wt_id("atom"); wt(','); wk(JS_WK_DOUBLE); wt_id("v"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wt_id("JSValue"); wt('*'); wt_id("JS_WhaleStructDataPtr"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(',');
+        wk(JS_WK_DOUBLE); wt('*'); wt_id("len_out"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleNativeEnsureSlot"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(',');
         wk(JS_WK_INT); wt('*'); wt_id("atoms"); wt(','); wk(JS_WK_INT); wt_id("n"); wt(')'); wt(';');
@@ -2536,6 +2550,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        call, and those return numbers, so nothing reads it. Every statement here
        is one TinyCC spills, on every call. */
     wt_id("JSValue"); wt_id("_cref"); wt(';');
+    /* The fresh struct's columns, set by JS_WhaleStructDataPtr right after
+       JS_WhaleStructNew. Valid only while whale_str_fresh names this slot -
+       no call, no jump target in between - which is exactly the run of
+       initialiser stores a factory body is. */
+    wt_id("JSValue"); wt('*'); wt_id("_sdp"); wt(';');
     /* The locals, as plain doubles. No `register`: pinning paid 5-12% at best
        under TinyCC (the fused statements it helps were already single
        load/store round trips), it actively harmed the gcc backend - sixteen
@@ -2689,6 +2708,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
            be the code that set the pending expression. */
         if (targets[pos])
             local_flush_all(var_count);
+
+        /* The fresh-struct window closes at any boundary a jump can reach or
+           any call: past either, the object in the slot may not be the one
+           JS_WhaleStructDataPtr resolved. */
+        if (whale_str_fresh >= 0 && (targets[pos] || whale_is_call_op(pc[pos])))
+            whale_str_fresh = -1;
 
         cur[state_len - 1] = (uint8_t)sp;
         if (targets[pos]) {
@@ -3393,15 +3418,26 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                    out or rebuilt on the way in. A function that keeps its object to
                    itself stays on the frame-column path below, which allocates nothing
                    and is already fast. */
-                if (!whale_dbg_env("WHALE_NO_UNBOX") && mono && whale_str_n == 0 &&
+                if (!whale_dbg_env("WHALE_NO_UNBOX") && whale_str_n == 0 &&
                     whale_ret_obj_g) {
-                    int fn = whale_layout_from_sites(whale_field_sites,
-                                                     whale_field_sites_n,
-                                                     whale_str_atoms,
-                                                     WHALE_STRUCT_FIELDS);
+                    /* The layout: the literal's own define_field names when the
+                       profiler saw no access sites (a factory body has none),
+                       otherwise the union the sites observed. */
+                    int fn = whale_def_atoms_n > 0
+                        ? whale_def_atoms_n
+                        : whale_layout_from_sites(whale_field_sites,
+                                                  whale_field_sites_n,
+                                                  whale_str_atoms,
+                                                  WHALE_STRUCT_FIELDS);
 
                     if (fn > 0) {
-                        int k, wfm = fold_mark();
+                        int k;
+
+                        if (whale_def_atoms_n > 0)
+                            for (k = 0; k < fn; k++)
+                                whale_str_atoms[k] = whale_def_atoms[k];
+                        {
+                            int k, wfm = fold_mark();
 
                         /* The offset map has to be named before it is built, and
                            these four statements have to be *committed*: the emitters
@@ -3425,7 +3461,16 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                             wt_int(fn); wt(','); wt_int(os); wt(')'); wt(')');
                             wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
                             wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                            /* The initialiser stores that follow write the
+                               columns as plain memory through the data
+                               pointer - one resolve instead of one helper
+                               (and one column scan) per field. */
+                            wt_id("_sdp"); wt('='); wt_id("JS_WhaleStructDataPtr");
+                            wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_int(0); wt(')'); wt(';');
                             fold_commit(afm);
+                            whale_str_fresh = os;
+                            whale_str_fresh_n = fn;
+                        }
                         }
                         cur[var_count + sp] = WHALE_OBJ_T(os);
                         sp++;
@@ -3466,6 +3511,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
                     fold_commit(fm);
                 }
+                whale_plain_slots |= 1u << os;
                 cur[var_count + sp] = WHALE_OBJ_T(os);
                 sp++;
             }
@@ -3537,17 +3583,57 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                    column from the object's offset map, and the write goes through to the
                    property as well, so the interpreter sees the same value. */
                 if (whale_ret_obj_g && WHALE_IS_OBJ(ta) && whale_type_is_num(tb)) {
-                    int fm = fold_mark();
+                    /* A plain object from the OP_object fallback arm: the
+                       ordinary define - JS_WhaleStructSetNum would refuse it
+                       and every call would deopt. */
+                    if (whale_plain_slots & (1u << WHALE_OBJ_SLOT(ta))) {
+                        int fm = fold_mark();
 
-                    fold_materialize(sp - 1);
-                    wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleStructSetNum");
-                    wt('('); wt_id("ctx"); wt(','); wt_int(WHALE_OBJ_SLOT(ta)); wt(',');
-                    wt_int(atom); wt(','); fold_inline(sp - 1); wt(')'); wt(')');
-                    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
-                    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
-                    fold_commit(fm);
-                    sp--;   /* the object stays on the stack */
-                    break;
+                        fold_materialize(sp - 1);
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjDefineNum");
+                        wt('('); wt_id("ctx"); wt(','); wt_int(WHALE_OBJ_SLOT(ta)); wt(',');
+                        wt_int(atom); wt(','); fold_inline(sp - 1); wt(')'); wt(')');
+                        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        fold_commit(fm);
+                        sp--;   /* the object stays on the stack */
+                        break;
+                    }
+                    /* Still inside the fresh-struct window: the column is a
+                       compile-time constant and the store is two plain
+                       assignments through the data pointer - no helper, no
+                       column scan. This is the hot shape of setField,
+                       makeProps and createElement. */
+                    if (whale_str_fresh == WHALE_OBJ_SLOT(ta)) {
+                        int col = whale_str_col(whale_str_atoms, whale_str_fresh_n, atom);
+
+                        if (col >= 0) {
+                            int fm = fold_mark();
+
+                            fold_materialize(sp - 1);
+                            wt_id("_sdp"); wt('['); wt_int(col); wt(']');
+                            wt_op(JS_OP_DOT); wt_id("tag"); wt('='); wt_int(8); wt(';');
+                            wt_id("_sdp"); wt('['); wt_int(col); wt(']');
+                            wt_op(JS_OP_DOT); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64"); wt('=');
+                            fold_inline(sp - 1); wt(';');
+                            fold_commit(fm);
+                            sp--;   /* the object stays on the stack */
+                            break;
+                        }
+                    }
+                    {
+                        int fm = fold_mark();
+
+                        fold_materialize(sp - 1);
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleStructSetNum");
+                        wt('('); wt_id("ctx"); wt(','); wt_int(WHALE_OBJ_SLOT(ta)); wt(',');
+                        wt_int(atom); wt(','); fold_inline(sp - 1); wt(')'); wt(')');
+                        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        fold_commit(fm);
+                        sp--;   /* the object stays on the stack */
+                        break;
+                    }
                 }
                 /* The fields of an unboxed struct are frame variables, not
                    properties: the literal's initialisers become direct stores into
@@ -3660,17 +3746,50 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                    map. Same code whether the object was built here or handed in by
                    another compiled function - the columns travel with it. */
                 if (whale_ret_obj_g && WHALE_IS_OBJ(ta) && whale_type_is_num(tb)) {
-                    int fm = fold_mark();
+                    if (whale_plain_slots & (1u << WHALE_OBJ_SLOT(ta))) {
+                        /* plain object: the ordinary property store */
+                        int fm = fold_mark();
 
-                    fold_materialize(sp - 1);
-                    wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleStructSetNum");
-                    wt('('); wt_id("ctx"); wt(','); wt_int(WHALE_OBJ_SLOT(ta)); wt(',');
-                    wt_int(atom); wt(','); fold_inline(sp - 1); wt(')'); wt(')');
-                    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
-                    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
-                    fold_commit(fm);
-                    sp -= 2;
-                    break;
+                        fold_materialize(sp - 1);
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjDefineNum");
+                        wt('('); wt_id("ctx"); wt(','); wt_int(WHALE_OBJ_SLOT(ta)); wt(',');
+                        wt_int(atom); wt(','); fold_inline(sp - 1); wt(')'); wt(')');
+                        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        fold_commit(fm);
+                        sp -= 2;
+                        break;
+                    }
+                    if (whale_str_fresh == WHALE_OBJ_SLOT(ta)) {
+                        int col = whale_str_col(whale_str_atoms, whale_str_fresh_n, atom);
+
+                        if (col >= 0) {
+                            int fm = fold_mark();
+
+                            fold_materialize(sp - 1);
+                            wt_id("_sdp"); wt('['); wt_int(col); wt(']');
+                            wt_op(JS_OP_DOT); wt_id("tag"); wt('='); wt_int(8); wt(';');
+                            wt_id("_sdp"); wt('['); wt_int(col); wt(']');
+                            wt_op(JS_OP_DOT); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64"); wt('=');
+                            fold_inline(sp - 1); wt(';');
+                            fold_commit(fm);
+                            sp -= 2;
+                            break;
+                        }
+                    }
+                    {
+                        int fm = fold_mark();
+
+                        fold_materialize(sp - 1);
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleStructSetNum");
+                        wt('('); wt_id("ctx"); wt(','); wt_int(WHALE_OBJ_SLOT(ta)); wt(',');
+                        wt_int(atom); wt(','); fold_inline(sp - 1); wt(')'); wt(')');
+                        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        fold_commit(fm);
+                        sp -= 2;
+                        break;
+                    }
                 }
                 /* A struct field is a frame variable: the store is one
                    assignment - no shape check, no pointer chase, no tag branch.
@@ -5573,6 +5692,7 @@ static const WhaleHostSym whale_host_syms[] = {
 WHALE_HOST_SYM(JS_WhaleArrSetVal),
     WHALE_HOST_SYM(JS_WhaleObjFieldNum),
     WHALE_HOST_SYM(JS_WhaleStructNew),
+WHALE_HOST_SYM(JS_WhaleStructDataPtr),
     WHALE_HOST_SYM(JS_WhaleStructFieldNum),
     WHALE_HOST_SYM(JS_WhaleStructSetNum),
     WHALE_HOST_SYM(JS_WhaleNativeEnsureSlot),

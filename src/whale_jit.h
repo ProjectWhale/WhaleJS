@@ -320,6 +320,9 @@ int JS_WhaleNativeSlotPutNum(JSContext *ctx, int slot, int col, int atom, double
 int JS_WhaleStructNew(JSContext *ctx, const int *atoms, int nslots, int slot);
 int JS_WhaleStructFieldNum(JSContext *ctx, int slot, JSAtom atom, double *out);
 int JS_WhaleStructSetNum(JSContext *ctx, int slot, JSAtom atom, double v);
+/* The struct's flat column array (see JS_WhaleStructNew). Valid for the
+   struct's lifetime; a factory writes its columns through it directly. */
+JSValue *JS_WhaleStructDataPtr(JSContext *ctx, int slot, double *len_out);
 
 /* Compile-time only - never called by generated code. Does global `atom` name
    the Uint8Array constructor? Asking while emitting is what keeps each stack
