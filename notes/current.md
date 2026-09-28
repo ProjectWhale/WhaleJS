@@ -1407,3 +1407,90 @@ reverted: `0 mismatches` over all 25 cases, `whale api test: ok`.
   the conflicting types at a merge) and `[ops]` printing opcode names. Re-add
   `WHALE_FOLD_DBG` and the `[fill-slot]`/`[setloc-slot]`/`[putloc-struct]` prints if
   this is picked up again - they are what localised layers 5 and 6.
+# <61>: 补丁清理、两个关键 bug、struct 统一字段协议（框架 case 的编译通路）
+SOLVED + PLAN
+
+## 先提交的（前一轮遗留）
+- `5a3add3` goal.md：用户删去 AOT 与 Full/Lite，项目收窄为纯 JIT。
+- `036a6f8` 未提交 WIP（deopt re-arm + pin 门槛 + 热路径 getenv 打印）原样入库——它构建绿、25 case 全对；其中 pin 门槛被下一提交证明引入了 vnode_build 的编译失败，getenv 打印随后删除。留档是为了每一步可回退。
+
+## bug#1：vnode_build `'L3' undeclared`（commit 3964cf7 修复）
+`[tokerr] failed at token 1665: ... return 0; }  L3 = JS_WhaleObjFieldNum(...)`——
+不是标签丢了，是**用了没声明的变量**：prologue 的 struct 列声明（`L[var_count..+16)`）被 WIP
+新加的 `whale_shape_stable` 门住不发了，而 `put_loc` 的填充路径（strn/call位置/mono 一组条件）
+照样发 `L3 = JS_WhaleObjFieldNum(...)`。**同一件事的两半必须同源**：现在列变量无条件声明，
+谁填充都有的用；16 个 double 是"永不发散"的全部代价。vnode_build 恢复编译（3 fn，entries=1）。
+
+## bug#2：immutable_update 的 flag=1 deopt 退役循环（commit cf13703 修复）
+症状：3 个 fn 编译成功，`[deopt] call=1 flag=0` 之后 call=2 起全 flag=1，8 次后退役，515ms ≈ 解释器。
+机制：fn_3（setField，参数已按 (对象,数值) 处理）第一次调用收到**普通对象**（step 里字面量建的 st）
+一切正常；从某次起收到的是 `JS_WhaleStructNew` 造的 **WHALE_STRUCT**，而
+`JS_WhaleObjFieldPtr` 第 8446 行 `class_id != JS_CLASS_OBJECT → NULL` → fp resolve 失败 → deopt。
+**修法 = struct 走同一个 `JSValue*` 字段协议**：
+- `JS_WhaleObjShape` 对 struct 返回 WhaleStruct 指针本身（列一次分配永不移动；两个 struct
+  绝不能共享键——struct 对象没有普通属性，p->shape 会给所有 struct 同一个空 shape）；
+- `JS_WhaleObjFieldPtr/ObjFieldNum` 对 struct 查列返回 `&ws->data[col]`；
+- `JS_SetPropertyInternal2` 加写 hook：列写进列，列外名字进 dynamic map——否则中途 deopt 后
+  解释器 `st.a=...` 会 find_own_property 落空、长出普通属性，而读永远先答列 → 静默丢写。
+配套（各自由 31 秒首测量身定制）：
+- **offset map 从 JS 对象改平行 atom 数组**：原来每列每次调用一次 `JS_GetProperty`，
+  Redux 循环每迭代 ~15 次，是最大单项；
+- **dynamic map 惰性创建**（三个 hook 都已把 undefined 当"尚无 dynamic"）；
+- **`js_whale_struct_gc_mark` 注册**：列里的 JSValue 与 dynamic 都由 malloc 的 struct 持有，
+  不在 JSObject prop 数组里，mark_children 看不见——**vnode 的 `props` 字段此前会被 GC 回收**；
+- **运行时 getenv 全部缓存**（`whale_str_stat_on`/`whale_step_dbg_on`/DeoptNote 的 dbg）：
+  `whale_struct_col` 每查一次列调一次 getenv、每迭代九次，31 秒里最大头。
+结果：immutable_update entries=1000920/1000920 全进编译代码，468-538ms ≈ 解释器速度——
+每迭代一次真实跨函数调用（CallValue 建帧+wrapper）+ struct 三次分配（ws/atoms/data）。
+要快起来靠内联（A4）或参数特化（D3）让 setField 不再经过引擎建帧，以及把 StructNew 的
+三次 malloc 合成一两次——都已列入路线。
+
+## 补丁问题（commit 3964cf7 + 8031b05）
+- 生成器不再发任何 `register`（pin1/pin2 选择、whale_str_need 的 16 个 register 列、
+  induction[] 扫描、whale_nloops 计数全部删除——它们唯一的读者就是 pin 门）。
+- TCC 侧 pin 簇八处全部恢复上游：whale_pin_alloc/地图/PinEnter/PinLeave、save_reg 的
+  spill-on-call、get_reg/get_reg_ex 的 pin 测试、gv 读捷径、gen_op 操作数归一化、vstore 写捷径、
+  TOK_REGISTER 忽略如初、`Sym.pin_reg` 从 tcc.h 删除。
+- 热路径 getenv 调试打印删除（JS_WhaleArgGetObj / whale_jit_unbox_num——每次 JIT 调用入口执行）。
+**删除的意外收益**：closure 57→10ms（3.3×node）、props_diff 125→22ms（5.5×node）——
+16 个 `register` 声明消失后 TCC 的寄存器分配恢复正常。notes 里"pin 收益 5-12%"的测量
+是在 pin 只覆盖无循环小函数时取得的；对真正带对象工作的函数它是纯负担。
+
+## 测量注记（又见热身陷阱）
+同一二进制直接连跑 props_diff = 65-124ms 且漂移；runner（先 probe 预热 + repeat 取最小）
+稳定 21-22ms。**A/B 差异里顺序效应可以伪装成因果**——先跑的组吃冷启动。以 runner 为准。
+
+## gcc 后端注记
+- 必须给全路径：`WHALE_JIT_CC=gcc`（裸名）时 `whale_cc_dir` 得到空串，命令拼成
+  `"\gendef.exe"` → `gendef produced no .def` → **静默退回解释器**（bitops 545ms vs TCC 150ms）。
+  全路径下数值循环全面反超（nested 87→18、locals 102→24、minmax 110→35、sieve 165→70 ≈ C -O1）。
+- **objfields+gcc = 17ms，反超 node 19ms**。`c_native/objfields.c` 103ms 的"天花板"被
+  `fmod(i,7)` 的完整 double 语义压低——gcc 不能把 libm 调用整数化，而 JIT 的守卫 idiv
+  （两操作数为小整数时走 idiv，否则回 fmod，<57> 实测守卫免费）在 JS 语义内合法更快。
+  "比 C 基线还快"不神秘，是**基线被 double 语义束缚**；真正该修的是把 c_native 基线里的
+  fmod 换成 C 里的 `(long)i % 7` 才是同口径天花板。
+- props_diff 在 gcc 后端 614ms（TCC 22ms）：大函数体在 gcc 默认 flags 下疑似无 -O，
+  一切过内存。后端轮再处理（WHALE_JIT_CFLAGS 实验 + 默认值检查）。
+
+## 下一步（具体方案，按杠杆排序）
+1. **call_method（string/arr_methods 的总闸）**：bail=5174。receiver 在 `sp[-2-argc]`、
+   method 在 `sp[-1-argc]`，都 park 进 obj slot，method 用 `WHALE_VAL_T`，
+   复用 `JS_WhaleCallValue(func_slot=method, argc, arg_base=receiver,...)`——
+   call2 fallback 的参数 parking 已在，缺的只是把 receiver 算作第 0 个参数。
+2. **add_loc 的 opaque 通路（stringcat）**：bail=4278。`s += "x"` 两侧都是 VAL slot 时
+   降为 `JS_WhaleBinopVal(add, slot(s), slot(v), out)` 再写回 local——写回要走 loc_slot
+   统一（<60> 第五层同款坑：入口边和回边的槽号必须一致），不是 10 行的事，但方案闭合。
+3. **数组参数 D3-lite（array/list_reconcile/nested2d/objshape 的共同缺口）**：
+   wrapper 的参数守卫加"packed array"读法（`JS_WhaleArrPtr` 已在），配 `get_length`
+   helper（当前没有）、`get_array_el/put_array_el` 的对象值版（objshape 的 escaped()
+   在 put_array_el 带对象值处 bail=4023）、嵌套 ARR 元素（`g[r]` 读出的是数组）。
+4. **字符串装箱**（用户方向）：字符串运算全部退化到引擎 C 函数（js_add_slow 一类
+   已经存在，`JS_WhaleBinopVal` 已接）——瓶颈不在算，在**跨 helper 的装箱纪律**：
+   值只停 obj slot、进出口一次装箱，避免"helper 间来回 tag 判断"。做 1/2 时顺手定规约。
+5. **StructNew 分配合并**：ws+atoms+data 三次 malloc → 一次（尾随分配），每 struct
+   少两次堆往返；Redux 形状每次迭代都建 struct，这是它的剩余大头之一。
+6. gcc 后端默认 flags 检查（props_diff 614ms 疑案）与裸名陷阱报错显式化。
+
+## 状态
+`8031b05` 绿：`whale api test: ok`，25/25 case 与 node 一致（runner 口径 0 mismatch，
+含 vnode_build/immutable_update 恢复编译）。temp/ 下的 gen_*.c dump 不入 git。
