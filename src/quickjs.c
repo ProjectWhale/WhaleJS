@@ -2997,13 +2997,12 @@ static void js_whale_struct_finalizer(JSRuntime *rt, JSValue val)
     if (ws && ws->magic == WHALE_STRUCT_MAGIC) {
         uint32_t k;
 
-        /* The values are flat JSValues owned by this struct, so they go first, then
-           the arrays. The dynamic map is an ordinary object holding its own values,
-           so freeing the value is all it takes. */
+        /* The values are flat JSValues owned by this struct, so they go first.
+           The block is one allocation - struct header, atoms, data - so only
+           the values are freed individually. The dynamic map is an ordinary
+           object holding its own values, so freeing the value is all it takes. */
         for (k = 0; k < ws->nslots; k++)
             JS_FreeValueRT(rt, ws->data[k]);
-        js_free_rt(rt, ws->data);
-        js_free_rt(rt, ws->atoms);
         JS_FreeValueRT(rt, ws->dynamic);
         js_free_rt(rt, ws);
     }
@@ -3090,31 +3089,23 @@ int JS_WhaleStructNew(JSContext *ctx, const int *atoms, int nslots, int slot)
     obj = JS_NewObjectClass(ctx, JS_CLASS_WHALE_STRUCT);
     if (JS_IsException(obj))
         return 0;
-    ws = js_mallocz(ctx, sizeof(WhaleStruct));
+    /* One allocation for the whole thing - header, atoms, data - so a struct
+       per iteration costs one malloc instead of three, and the finalizer is
+       one free. The arrays live past the header, in column order. */
+    ws = js_mallocz(ctx, sizeof(WhaleStruct)
+                            + sizeof(JSAtom) * (size_t)nslots
+                            + sizeof(JSValue) * (size_t)nslots);
     if (!ws) {
         JS_FreeValue(ctx, obj);
         return 0;
     }
-    ws->data = js_mallocz(ctx, sizeof(JSValue) * nslots);
-    ws->atoms = js_mallocz(ctx, sizeof(JSAtom) * nslots);
+    ws->atoms = (JSAtom *)((char *)ws + sizeof(WhaleStruct));
+    ws->data = (JSValue *)(ws->atoms + nslots);
     /* The dynamic map is created lazily: nearly every struct never receives a
        property its columns do not cover, and one JS object per struct was a
        visible slice of the per-call cost of the Redux shape. The three hooks
        below treat undefined as "nothing dynamic yet" and create it on demand. */
     ws->dynamic = JS_UNDEFINED;
-    if (!ws->data || !ws->atoms) {
-        if (ws->data) {
-            for (k = 0; k < nslots; k++)
-                JS_FreeValue(ctx, ws->data[k]);
-            js_free(ctx, ws->data);
-        }
-        if (ws->atoms)
-            js_free(ctx, ws->atoms);
-        JS_FreeValue(ctx, ws->dynamic);
-        js_free(ctx, ws);
-        JS_FreeValue(ctx, obj);
-        return 0;
-    }
     for (k = 0; k < nslots; k++) {
         /* Reserved, never set: undefined with a nonzero value. A plain read reports
            undefined, which is what the language requires. `in` reads this value: a

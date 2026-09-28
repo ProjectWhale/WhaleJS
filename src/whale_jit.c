@@ -2222,6 +2222,15 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                  whale_loc_obj[prev_op - OP_get_loc0]) ||
                 prev_op == OP_define_field || prev_op == OP_object)
                 whale_ret_obj_g = 1;
+        } else if (op == OP_put_array_el) {
+            /* A local object stored into an array leaves the function's own
+               lifetime: the array outlives the iteration, and a frame-column
+               layout would have to be materialised into a real object on
+               every single store. Marking the function as one that hands
+               objects over makes the literal build a real struct instead -
+               the columns travel with it, and the array store parks a
+               reference. escaped() in objshape spent its whole loop here. */
+            whale_ret_obj_g = 1;
         } else if (op == OP_call || (op >= OP_call0 && op <= OP_call3)) {
             whale_has_call = 1;
             /* Where this call is, for the "nothing after this point may call"
@@ -3955,6 +3964,38 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                    same code whether the object was built here or handed in by another
                    compiled function. */
                 if (whale_ret_obj_g && WHALE_IS_OBJ(ta)) {
+                    /* Fresh window: the read is the column through the data
+                       pointer - `t.v` in `t.u = t.v * 3` right after the
+                       literal was built. Tag-checked inline, no helper. */
+                    if (whale_str_fresh == WHALE_OBJ_SLOT(ta)) {
+                        int col = whale_str_col(whale_str_atoms, whale_str_fresh_n, atom);
+                        int nm;
+
+                        if (col >= 0) {
+                            nm = whale_vserial++;
+                            {
+                                int fm = fold_mark();
+
+                                wt_arr("v", nm); wt('=');
+                                wt_id("_sdp"); wt('['); wt_int(col); wt(']');
+                                wt_op(JS_OP_DOT); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(8); wt('?');
+                                wt_id("_sdp"); wt('['); wt_int(col); wt(']');
+                                wt_op(JS_OP_DOT); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64");
+                                wt(':'); wt('('); wt_id("_sdp"); wt('['); wt_int(col); wt(']');
+                                wt_op(JS_OP_DOT); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(0); wt('?');
+                                wt('('); wk(JS_WK_DOUBLE); wt(')'); wt_id("_sdp"); wt('['); wt_int(col); wt(']');
+                                wt_op(JS_OP_DOT); wt_id("u"); wt_op(JS_OP_DOT); wt_id("int32");
+                                wt(':'); wt_id("JS_WhaleObjValueNum"); wt('('); wt_id("ctx"); wt(',');
+                                wt('&'); wt_id("_sdp"); wt('['); wt_int(col); wt(']'); wt(','); wt_id("deopt"); wt(')');
+                                wt(';');
+                                fold_commit(fm);
+                            }
+                            whale_vname[sp - 1] = nm;
+                            whale_vmat[sp - 1] = 1;
+                            cur[var_count + sp - 1] = WHALE_T_NUM;
+                            break;
+                        }
+                    }
                     nm = whale_vserial++;
                     {
                         int fm = fold_mark();
