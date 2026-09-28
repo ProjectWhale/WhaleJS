@@ -1494,3 +1494,58 @@ SOLVED + PLAN
 ## 状态
 `8031b05` 绿：`whale api test: ok`，25/25 case 与 node 一致（runner 口径 0 mismatch，
 含 vnode_build/immutable_update 恢复编译）。temp/ 下的 gen_*.c dump 不入 git。
+
+# <62>: env 重构、25/25 全编译、BinopVal 栈约定、fresh struct 直写
+SOLVED + PLAN
+
+## env 重构（commit 164cfcf）
+- `JS_WhaleSetJitCc(driver, flags)`（whalejs.h）替代 WHALE_JIT_CC/CFLAGS/KEEP。全局存储在
+  whale_jit.c（后端和 TCC state 本就进程级）。**必须完整路径**：裸 `gcc` 让 whale_cc_dir 得空串，
+  拼出 `\gendef.exe` 静默失败退回解释器。
+- 75 个诊断读取点经 `whale_dbg_env()` 宏；release 构建编译为常量 0。`--whale_debug=y` 进
+  WHALE_DEBUG。字符串型（STEP_OFF/EXPR_MAX/OBJ_TEST/JIT_OBJ/JIT_SRC/ISA）各自 #ifdef。
+- WHALE_ENTER_COUNT 不条件化：它是 perftest 输出协议的一部分（entries 列），不是打印。
+
+## 两个静默错误答案 bug（commit bb3d440）
+- **JS_WhaleBinopVal 的操作数布局**：`js_add_slow`/`js_binary_arith_slow` 等的契约是
+  解释器操作数栈——读 `sp[-2]`、`sp[-1]`，结果写 `sp[-2]`。传本地 `JSValue v[2]` 意味着它们
+  读写**数组之前的 C 栈残留**：算了一堆垃圾、结果丢在数组外、v[0] 原样回槽——**每个 opaque
+  binop 都是静默无操作**。stringcat 拼 200 次长度仍 0 就是它。修法：操作数放 v[2]/v[3]，传 v+4。
+- **cur_sp = NULL 实验残留**：入口处把 cur_sp 设 NULL（注释自称 TEMPORARY EXPERIMENT，
+  <55> 排除的是崩溃症状，代码没恢复）→ GC 对 JIT 帧什么都不标 → 长循环里分配触发的 GC
+  回收槽内对象。恢复 `obj_slots + WHALE_OBJ_SLOTS`（<46> 的语义）。
+- 定位手法值得记：单次调用永远解释器（编译在热阈触发、当次退回解释器）——**测编译版必须
+  两次调用**；逐步打印链条（pushSlot → run → get_length → outNum → binop rc/len）每一环
+  都"正确"、答案仍错时，正确性洞在**函数间约定**（栈布局/GC 窗口），不在任何单环。
+
+## 四条新通路（commit 5a891fb）
+- `call_method/tail_call_method`：`JS_WhaleCallMethodValue(ctx, func_slot, this_slot, argc,
+  arg_base, ret_slot)`——receiver park 后作 this，其余同 CallValue。emit 时注意每臂闭自己的
+  括号（SlotCopy 臂漏一个 `)` = `')' expected`）。
+- `add_loc` opaque：BinopVal 写回 local 自己的槽，槽身份不变、合并不受影响。
+- `put_array_el` 对象值：`JS_WhaleArrSetVal(ctx, slot, idx, val_slot)`，镜像 ArrSetNum。
+- 数组参数：scan 前瞻 `whale_feeds_array_use`（.length 相邻；get_array_el 前 1 推；
+  put_array_el 前 2 推）→ wrapper 用 `JS_WhaleArrBind`（查 class）→ `get_arg` 类型
+  WHALE_T_ARR → 现有 packed 路径接管。
+
+## fresh struct 直写 + makeProps 的 mono 陷阱（commit dd3f863）
+- `JS_WhaleStructDataPtr` 一次取列数组；fresh 窗口（StructNew 后、遇 call/跳转目标前）内
+  define_field/put_field 数值写直接 `_sdp[col].tag=8; _sdp[col].u.float64=v;`。
+- **mono 陷阱**：ret_obj StructNew arm 原要求 `mono`（profiler 单 shape 判定），但工厂函数
+  没有访问 site → sites_n=0 → mono 恒假 → 落入 ObjNew 兜底 → 后续 StructSetNum 拒普通对象
+  → **每次调用必 deopt、8 次退役、全程解释器**。布局来源改为字面量自身的 define_field atoms
+  （scan 已收集 `whale_def_atoms`），兜底 arm 配 `JS_WhaleObjDefineNum` + plain 位图。
+- 教训：同一 helper 配不同对象种类 = deopt on rails；新 arm 落地时先问"每个前置条件的
+  反例是什么形状"。
+
+## 性能与下一步
+25/25 编译、0 mismatch。props_diff 17ms（entries 39808）、vnode_build 10ms、
+immutable_update 491ms（1,000,920/1,000,920 进编译代码）。vnode/diff 剩余成本 = **每调用
+包装**（CheckStack + ArgGetObj×2 + `_ws` 2.7KB memset + DeoptNote + memo 查找）≈ 执行体
+20 倍：突破口是内联（A4，已列第一梯队）与 `_ws` 按需定尺寸（scan 已知 field sites/
+obj slots 实数）。objfields+gcc 17ms 已反超 node；c_native/objfields.c 的 fmod 基线口径
+问题记 <61>。gcc 后端走 JS_WhaleSetJitCc API（完整路径）；stdio 写 .o/.a + TCC 解析加载的
+后端形态待后端轮（先验证 MinGW COFF 对象与 TCC PE 装载器的兼容性）。
+
+## 状态
+`dd3f863` 绿：`whale api test: ok`、25/25 case 0 mismatch、git 干净。
