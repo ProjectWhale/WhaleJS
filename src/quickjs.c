@@ -3681,6 +3681,33 @@ int JS_WhaleCallValue(JSContext *ctx, int func_slot, int argc, int arg_base,
     return 1;
 }
 
+/* OP_call_method - `arr.push(x)`, `parts.join(",")`. In the interpreter the
+   stack holds [receiver, method, args...]; here the receiver and the method are
+   parked in their own slots and the arguments in arg_base.., exactly as
+   JS_WhaleCallValue parks a plain call. The one difference: the receiver
+   travels as `this` instead of JS_UNDEFINED. Same throw semantics - 0 with the
+   exception pending, because the callee must not run a second time. */
+int JS_WhaleCallMethodValue(JSContext *ctx, int func_slot, int this_slot,
+                            int argc, int arg_base, int ret_slot)
+{
+    JSValue *slots = whale_frame_obj_slots(ctx);
+    JSValue r;
+
+    if (func_slot < 0 || func_slot >= WHALE_OBJ_SLOTS ||
+        this_slot < 0 || this_slot >= WHALE_OBJ_SLOTS)
+        return 0;
+    if (argc < 0 || arg_base < 0 || arg_base + argc > WHALE_OBJ_SLOTS)
+        return 0;
+    r = JS_Call(ctx, slots[func_slot], slots[this_slot], argc, slots + arg_base);
+    if (JS_IsException(r))
+        return 0;
+    if (ret_slot >= 0 && ret_slot < WHALE_OBJ_SLOTS)
+        JS_WhaleObjSlot(ctx, ret_slot, r);   /* takes over the reference */
+    else
+        JS_FreeValue(ctx, r);
+    return 1;
+}
+
 /* `new F(...)`. Same shape as JS_WhaleCallValue - the callee and every argument are
    slots - but the call goes through the constructor path, so the result is a freshly
    created object and the callee sees itself as new.target.
@@ -8644,6 +8671,44 @@ int JS_WhaleArrSetNum(JSContext *ctx, int slot, double idx, double v)
     /* anything else: the general path, which grows the array properly.
        JS_SetPropertyInt64 takes over the value either way. */
     if (JS_SetPropertyInt64(ctx, a, (int64_t)i, JS_NewFloat64(ctx, v)) < 0)
+        return 0;
+    return 1;
+}
+
+/* Store a parked value into a packed array element - `out[i] = t` where t is
+   an object, a string, whatever the generated code holds in a slot. Mirrors
+   JS_WhaleArrSetNum with the value coming from another slot; the value is
+   duplicated out of its slot, and the same append / replace / general-store
+   routes apply. */
+int JS_WhaleArrSetVal(JSContext *ctx, int slot, double idx, int val_slot)
+{
+    JSValue *slots = whale_frame_obj_slots(ctx);
+    JSValue a, v;
+    JSObject *p;
+    uint32_t i;
+
+    if (slot < 0 || slot >= WHALE_OBJ_SLOTS ||
+        val_slot < 0 || val_slot >= WHALE_OBJ_SLOTS)
+        return 0;
+    a = slots[slot];
+    if (JS_VALUE_GET_TAG(a) != JS_TAG_OBJECT)
+        return 0;
+    if (!(idx >= 0 && idx <= 4294967294.0))
+        return 0;
+    i = (uint32_t)idx;
+    p = JS_VALUE_GET_OBJ(a);
+    v = js_dup(slots[val_slot]);
+    if (p->fast_array && p->class_id == JS_CLASS_ARRAY) {
+        if (i == p->u.array.count)
+            return add_fast_array_element(ctx, p, v, JS_PROP_C_W_E) > 0;
+        if (i < p->u.array.count) {
+            JS_FreeValue(ctx, p->u.array.u.values[i]);
+            p->u.array.u.values[i] = v;
+            return 1;
+        }
+    }
+    /* anything else: the general path, which grows the array properly */
+    if (JS_SetPropertyInt64(ctx, a, (int64_t)i, v) < 0)
         return 0;
     return 1;
 }
@@ -18570,50 +18635,56 @@ static no_inline int js_strict_eq_slow(JSContext *ctx, JSValue *sp,
    record (a string key) out of the JIT. The engine already has the semantics in its
    js_*_slow functions; this is just the door into them from generated code.
 
-   Both inputs are taken by reference from their slots and released here; the slow
-   functions consume them and leave the result in sp[0]. */
+   The js_*_slow functions read their operands at sp[-2] and sp[-1] of the
+   interpreter's operand stack and leave the result at sp[-2] - so the two
+   values are staged at v[2]/v[3] and v+4 is passed as sp. Laying them at
+   v[0]/v[1] and passing v made the helpers read and write *below the array*:
+   whatever the C stack happened to hold there was added to the left operand,
+   the "result" landed outside the array, and v[0] went back into the slot
+   untouched. Every opaque binop computed nothing, silently - stringcat
+   concatenated two hundred times and kept the empty string. */
 int JS_WhaleBinopVal(JSContext *ctx, int op, int a_slot, int b_slot, int out_slot)
 {
     JSValue *slots = whale_frame_obj_slots(ctx);
-    JSValue v[2];
+    JSValue v[4];
     int rc;
 
-    v[0] = js_dup(slots[a_slot]);
-    v[1] = js_dup(slots[b_slot]);
+    v[2] = js_dup(slots[a_slot]);
+    v[3] = js_dup(slots[b_slot]);
     switch (op) {
     case OP_add:
-        rc = js_add_slow(ctx, v);
+        rc = js_add_slow(ctx, v + 4);
         break;
     case OP_sub: case OP_mul: case OP_div: case OP_mod: case OP_pow:
-        rc = js_binary_arith_slow(ctx, v, (OPCodeEnum)op);
+        rc = js_binary_arith_slow(ctx, v + 4, (OPCodeEnum)op);
         break;
     case OP_and: case OP_or: case OP_xor: case OP_shl: case OP_sar:
     case OP_shr:
-        rc = js_binary_logic_slow(ctx, v, (OPCodeEnum)op);
+        rc = js_binary_logic_slow(ctx, v + 4, (OPCodeEnum)op);
         break;
     case OP_lt: case OP_lte: case OP_gt: case OP_gte:
-        rc = js_relational_slow(ctx, v, (OPCodeEnum)op);
+        rc = js_relational_slow(ctx, v + 4, (OPCodeEnum)op);
         break;
     case OP_neq:
-        rc = js_eq_slow(ctx, v, 1);
+        rc = js_eq_slow(ctx, v + 4, 1);
         break;
     case OP_eq:
-        rc = js_eq_slow(ctx, v, 0);
+        rc = js_eq_slow(ctx, v + 4, 0);
         break;
     case OP_strict_neq:
-        rc = js_strict_eq_slow(ctx, v, 1);
+        rc = js_strict_eq_slow(ctx, v + 4, 1);
         break;
     case OP_strict_eq:
-        rc = js_strict_eq_slow(ctx, v, 0);
+        rc = js_strict_eq_slow(ctx, v + 4, 0);
         break;
     default:
-        JS_FreeValue(ctx, v[0]);
-        JS_FreeValue(ctx, v[1]);
+        JS_FreeValue(ctx, v[2]);
+        JS_FreeValue(ctx, v[3]);
         return 0;
     }
     if (rc)
         return 0;                       /* exception; the caller deopts */
-    JS_WhaleObjSlot(ctx, out_slot, v[0]);   /* takes ownership */
+    JS_WhaleObjSlot(ctx, out_slot, v[2]);   /* takes ownership */
     return 1;
 }
 
@@ -20494,17 +20565,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         int whale_deopt = 0;
         JSValue whale_ret;
         /* Loan the object slots to the JIT by extending the frame's live range
-           over them. While the generated code runs, sf->cur_sp is NULL - that is
-           how the interpreter says "this frame is executing" - and GC only marks
-           arg_buf .. cur_sp, so without this the slots would be invisible and an
-           object parked in one could be collected underneath the JIT.
-           A function whose code never parks an object has nothing to protect, so
-           it skips all of this - the frame stays exactly as the interpreter
-           would have left it. */
-        /* TEMPORARY EXPERIMENT: do not widen the frame's live range, to find out
-           whether the cur_sp loan is what confuses the allocation path. */
+           over them. While the generated code runs, GC marks arg_buf .. cur_sp,
+           so cur_sp has to sit past the slots or an object parked in one is
+           invisible and the collection triggered by the twentieth allocation
+           inside a long loop frees it underneath the JIT - stringcat's running
+           counter read as 0 for exactly that reason. An earlier revision set
+           NULL here as a temporary experiment against a crash that was later
+           traced elsewhere; the experiment never left.
+           A function whose code never parks an object has nothing to protect,
+           so it skips all of this. */
         if (b->whale_needs_obj)
-            sf->cur_sp = NULL;
+            sf->cur_sp = obj_slots + WHALE_OBJ_SLOTS;
         /* Two compilations of one function are possible: one reading a closure
            slot that feeds a call as this function, one reading it as an
            enclosing closure's value. *deopt == 3 is that entry check failing,
@@ -67667,8 +67738,8 @@ int JS_WhaleStepRun(JSContext *ctx, int pc_off, int n_pop, int n_push)
         return 0;
     }
     if (whale_step_dbg_on())
-        fprintf(stderr, "[step] run pc=%d op=%d np=%d nu=%d ssize=%d\n",
-                pc_off, op, n_pop, n_push, b->stack_size);
+        fprintf(stderr, "[step] run pc=%d op=%d np=%d nu=%d cell0_tag=%d\n",
+                pc_off, op, n_pop, n_push, JS_VALUE_GET_TAG(stack[0]));
 
     switch (op) {
     case OP_push_empty_string:
