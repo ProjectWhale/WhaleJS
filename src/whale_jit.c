@@ -416,7 +416,6 @@ int whale_jit_unbox_num(JSContext *ctx, JSValue v, double *out)
         *out = (double)JS_VALUE_GET_FLOAT64(v);
         return 1;
     }
-    if (getenv("WHALE_ARG_DBG")) fprintf(stderr, "[unbox] FAILED tag=%d", t);
     return 0;
 }
 
@@ -1972,15 +1971,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     int *loop_back = NULL;      /* per position: the backward jump that closes it */
     uint8_t var_ref_used[4] = { 0, 0, 0, 0 };
     unsigned *assign_cnt = NULL;   /* weighted access count */
-    uint8_t *induction = NULL;     /* the local is a for-loop counter */
     uint8_t lo_c[WHALE_JIT_MAX_SLOTS];
     double lo_cv[WHALE_JIT_MAX_SLOTS];
     int unreachable = 0;
     int ret_is_bool = -1;
     int whale_objs = 0;   /* object slots handed out; each new object takes one */
     int whale_has_call = 0; /* a call clobbers registers, so no pinning then */
-    int whale_fields = 0;   /* object-property cache pairs handed out */
-    int whale_shape_stable = 0; /* object shapes cannot change after this point */
+    int whale_fields = 0;   /* object-property cache pairs handed out */    int whale_shape_stable = 0; /* object shapes cannot change after this point */
     int whale_ret_obj = 0;      /* the function can return an array or object */
     int whale_def_atoms[WHALE_ATOM_MAX];
     int whale_put_atoms[WHALE_ATOM_MAX];
@@ -2008,12 +2005,6 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     int whale_str_atoms[WHALE_STRUCT_FIELDS];
     int whale_str_n = 0;
     int whale_str_slot = -1;
-    /* Whether this function lays any object out. Decided once, from the scan pass's
-       access sites, before the prologue is emitted: the column variables have to be
-       declared - and pinned - in the prologue, but only a function that will use them
-       may have them, because an unused `register` variable still takes a register
-       away from TinyCC's expression evaluation. */
-    int whale_str_need = 0;
     int whale_str_L[WHALE_STRUCT_FIELDS];
     int prev_op;    /* the opcode before the current one, in the scan pass */
     /* The one object slot this layout is materialised into when it has to become a
@@ -2022,7 +2013,6 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        slot numbers, meet as different types and merge to UNKNOWN, which throws the
        whole function away. That is exactly what happened to immutable_update. */
     int whale_str_obj_slot = -1;
-    int whale_nloops = 0;   /* backward jumps; more than one means nesting */
 
     if (!info->is_normal)
         return 0;
@@ -2040,13 +2030,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     arg_obj_slot = malloc(sizeof(int) * (arg_count > 0 ? arg_count : 1));
     loc_slot = malloc(sizeof(int) * (var_count > 0 ? var_count : 1));
     assign_cnt = calloc(var_count > 0 ? var_count : 1, sizeof(unsigned));
-    induction = calloc(var_count > 0 ? var_count : 1, 1);
     whale_vexpr = calloc(stack_size, sizeof(WhaleVExpr));
     whale_vmat = calloc(1, stack_size);
     whale_lmem = calloc(var_count > 0 ? var_count : 1, sizeof(WhaleLocal));
     loop_back = malloc((len + 1) * sizeof(*loop_back));
     if (!targets || !seen || !snap || !cur || !args_used || !assign_cnt ||
-        !whale_vexpr || !whale_vmat || !whale_lmem || !loop_back || !induction)
+        !whale_vexpr || !whale_vmat || !whale_lmem || !loop_back)
         { whale_out_line = __LINE__; goto out; }
     for (i = 0; i <= len; i++)
         loop_back[i] = -1;
@@ -2120,14 +2109,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             whale_obj_pending = 1;
         } else if (op == OP_inc_loc || op == OP_dec_loc) {
             {   /* these write a local too, so it is not a constant.
-                   Recorded separately rather than folded into assign_cnt: an
-                   induction variable is the best thing to pin, but only one of
-                   them may be pinned per function. minmax has two (i and j) and
-                   pinning both hangs it, while pinning either one alone is fine. */
+                   Weighted higher than one put_loc: a loop counter is written
+                   once per iteration. */
                 int a = (int)pc[pos + 1];
                 if (a < var_count) {
                     assign_cnt[a] += 4;
-                    induction[a] = 1;
                 }
             }
         } else if (op >= OP_put_loc0 && op <= OP_put_loc3) {
@@ -2214,23 +2200,6 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         }
         prev_op = op;
         pos += sz;
-    }
-
-    {
-        /* Count the back edges. A nested loop needs more live registers than a
-           flat one, and pinning its counters is what made minmax spin for ever:
-           with both induction variables pinned TinyCC has nowhere left to put a
-           temporary. */
-        int k, nloops = 0;
-
-        /* loop_back[] is -1 for "no back edge", so a truth test counted every
-           entry: arith has one loop and reported 21, which made the
-           `whale_nloops <= 1` gate false for every function long enough to have
-           a loop. The pins were effectively off. */
-        for (k = 0; k < len; k++)
-            if (loop_back[k] >= 0)
-                nloops++;
-        whale_nloops = nloops;
     }
 
     /* A store to a name no literal defined would add a property, which changes
@@ -2516,94 +2485,41 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        call, and those return numbers, so nothing reads it. Every statement here
        is one TinyCC spills, on every call. */
     wt_id("JSValue"); wt_id("_cref"); wt(';');
-    /* Pin the hottest loop counter, and the hottest local that is not one.
-       One counter only: minmax has two nested loops, each with its own counter,
-       and pinning both makes it never terminate. Pinning either one alone is
-       fine, and every case that measured 25-30% faster has a single loop.
-       The second slot goes to the hottest non-counter - the accumulator shape.
-       Two rather than more because the allocator has about fourteen float
-       registers and a third pin already hangs on get_reg() exhaustion. */
-    {
-        int pin1 = -1, pin2 = -1, k;
+    /* The locals, as plain doubles. No `register`: pinning paid 5-12% at best
+       under TinyCC (the fused statements it helps were already single
+       load/store round trips), it actively harmed the gcc backend - sixteen
+       `register` hints on the struct columns alone drove its allocator into
+       spilling, props_diff 125 -> 830ms - and it came with six hand-written
+       special cases in tccgen.c. Removed; the TCC-side mechanism goes with it.
+       See notes/pinned-registers.md and notes/reg-alloc-plan.md. */
+    for (i = 0; i < var_count; i++) {
+        wk(JS_WK_DOUBLE); wt_slot("L", i); wt('='); wt_int(0); wt(';');
+    }
+    if (getenv("WHALE_STR_DBG")) {
+        int cols = whale_layout_from_sites(whale_field_sites, whale_field_sites_n,
+                                           whale_str_atoms, WHALE_STRUCT_FIELDS);
+        int si;
 
-        /* DISABLED: pinning is correct now but not profitable. Measured with
-           temp/measure.ps1 (minimum of several runs): nested +11%,
-           immutable_update +9%, sieve +6%, loop_sum +5%, against minmax -4%
-           and array -5%. Two structural costs: every xmm is caller-saved so a
-           pinned value is spilled at every call and reloaded after, and each
-           pinned register is one less for TinyCC's own expression evaluation.
-           Kept because the mechanism and its fixes are real (see cb87bf1) and
-           because an ABI with non-volatile float registers would make it pay.
-           See notes/pinning-design.md. */
-        /* Only while no call sits inside a loop. A register variable does not
-           survive a call in the code TinyCC generates, and that is exactly what
-           whale_shape_stable already answers - the same question as for the
-           field pointers below, for the same reason. immutable_update calls
-           setField() from inside its loop, the induction variable L1 came back
-           clobbered, and the loop body never ran once. */
-        if (whale_shape_stable) {
-            for (k = 0; k < var_count; k++)
-                if (induction[k] && (pin1 < 0 || assign_cnt[k] > assign_cnt[pin1]))
-                    pin1 = k;
-            for (k = 0; k < var_count; k++) {
-                if (k == pin1 || induction[k] || assign_cnt[k] == 0)
-                    continue;
-                if (pin2 < 0 || assign_cnt[k] > assign_cnt[pin2])
-                    pin2 = k;
-            }
-        }
-        if (getenv("WHALE_PIN_DBG"))
-            fprintf(stderr, "[pin] var_count=%d pin1=L%d pin2=L%d\n",
-                    var_count, pin1, pin2);
-        for (i = 0; i < var_count; i++) {
-            if (i == pin1 || i == pin2)
-                wk(JS_WK_REGISTER);
-            wk(JS_WK_DOUBLE); wt_slot("L", i); wt('='); wt_int(0); wt(';');
-        }
-        /* Will this function lay an object out? That is exactly the question of
-           whether the layout the field accesses share has any columns, which the
-           access sites answer. Decided here, before the columns are declared, and
-           not at the first OP_object: a variable declaration is a prologue thing, and
-           a `register` one is only honoured there. */
-        whale_str_need = whale_sites_mono(whale_field_sites, whale_field_sites_n) &&
-                         whale_layout_from_sites(whale_field_sites, whale_field_sites_n,
-                                                 whale_str_atoms, WHALE_STRUCT_FIELDS) > 0;
-        if (getenv("WHALE_STR_DBG")) {
-            int cols = whale_layout_from_sites(whale_field_sites, whale_field_sites_n,
-                                               whale_str_atoms, WHALE_STRUCT_FIELDS);
-            int si;
-
-            fprintf(stderr, "[str-table] blen=%d sites=%d mono=%d need=%d cols=%d atoms=[",
-                    info->byte_code_len, whale_field_sites_n,
-                    whale_sites_mono(whale_field_sites, whale_field_sites_n),
-                    whale_str_need, cols);
-            for (si = 0; si < cols; si++)
-                fprintf(stderr, "%s%s", si ? "," : "",
-                        JS_AtomToCString(ctx, whale_str_atoms[si]));
-            fprintf(stderr, "] site_pos=[");
-            for (si = 0; si < whale_field_sites_n; si++)
-                fprintf(stderr, "%s%d", si ? "," : "", whale_field_sites[si]);
-            fprintf(stderr, "]\n");
-        }
-        /* The columns. Pinned, because a field access reads and writes them on every
-           iteration of the loop the layout exists for - and that loop, unlike the
-           rest of the function, contains no call, so the pinned value is never
-           spilled. */
-        if (whale_str_need) {
-            if (!whale_shape_stable)
-                whale_str_need = 0;
-        }
-        if (whale_str_need) {
-            for (i = 0; i < WHALE_STRUCT_FIELDS; i++) {
-                whale_str_L[i] = var_count + i;
-                wk(JS_WK_REGISTER);
-                wk(JS_WK_DOUBLE); wt_slot("L", whale_str_L[i]);
-                wt('='); wt_int(0); wt(';');
-            }
-        } else {
-            for (i = 0; i < WHALE_STRUCT_FIELDS; i++)
-                whale_str_L[i] = var_count + i;
-        }
+        fprintf(stderr, "[str-table] blen=%d sites=%d mono=%d cols=%d atoms=[",
+                info->byte_code_len, whale_field_sites_n,
+                whale_sites_mono(whale_field_sites, whale_field_sites_n), cols);
+        for (si = 0; si < cols; si++)
+            fprintf(stderr, "%s%s", si ? "," : "",
+                    JS_AtomToCString(ctx, whale_str_atoms[si]));
+        fprintf(stderr, "] site_pos=[");
+        for (si = 0; si < whale_field_sites_n; si++)
+            fprintf(stderr, "%s%d", si ? "," : "", whale_field_sites[si]);
+        fprintf(stderr, "]\n");
+    }
+    /* The struct-column variables, declared unconditionally. Which put_loc
+       actually lays an object out is decided per instruction (strn / call
+       position / mono), and a declaration gated on a prologue hint diverges
+       from that decision: the body then reads `L3` with no declaration, which
+       is exactly vnode_build's `L3 undeclared`. Sixteen doubles is the whole
+       cost of never diverging. */
+    for (i = 0; i < WHALE_STRUCT_FIELDS; i++) {
+        whale_str_L[i] = var_count + i;
+        wk(JS_WK_DOUBLE); wt_slot("L", whale_str_L[i]); wt('='); wt_int(0); wt(';');
     }
     /* All of the generator's scratch state in one zero-initialised block: the
        value slots (stack_size plus the spare names fold_materialize() hands out,

@@ -3602,7 +3602,6 @@ int JS_WhaleObjSlotCopy(JSContext *ctx, int src, int dst)
    argument that is not an object makes that a deopt, not a wrong answer. */
 int JS_WhaleArgGetObj(JSContext *ctx, JSValue v, int slot)
 {
-    if (getenv("WHALE_ARG_DBG")) fprintf(stderr, "[argget] slot=%d isobj=%d", slot, (int)JS_IsObject(v));
     if (slot < 0 || slot >= WHALE_OBJ_SLOTS)
         return 0;
     if (!JS_IsObject(v))
