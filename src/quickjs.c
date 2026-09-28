@@ -2945,11 +2945,10 @@ void JS_FreeRuntime(JSRuntime *rt)
 
 /* The C-struct object's storage: three pointers, not a data structure.
  *
- *   offset   name -> byte offset into data. In this engine the shape *is* that map:
- *            it already carries the names, their order and their flags, so there is
- *            no second table to keep in step.
+ *   atoms    name -> column, as a parallel array: column k holds property
+ *            atoms[k]. Atoms are interned, so the lookup is a value scan.
  *   dynamic  names the offset map does not cover, in an ordinary object.
- *   data     the values, flat - one JSValue per column, 16 bytes, in offset order.
+ *   data     the values, flat - one JSValue per column, 16 bytes, in column order.
  *
  * "Struct" is only a way of thinking about it. In generated code a property access is
  * the data pointer plus a compile-time offset: two constants and a load.
@@ -2964,9 +2963,12 @@ void JS_FreeRuntime(JSRuntime *rt)
 typedef struct WhaleStruct {
     uint32_t  magic;
     uint32_t  nslots;
-    /* The two maps are ordinary objects, held as values like anything else, so they
-       are freed and traced the ordinary way. */
-    JSValue   offset;          /* name -> column. A map object, and only a map */
+    /* name -> column, as a parallel array: atoms[k] is the name column k holds.
+       A flat scan of a handful of ints is what every lookup wants - the map was
+       an ordinary object once, and one JS_GetProperty per column per call was
+       the single largest cost of the Redux shape (immutable_update spent its
+       time inside property lookups, not in the generated arithmetic). */
+    JSAtom   *atoms;
     JSValue   dynamic;         /* names the offset map does not cover */
     JSValue  *data;            /* flat: nslots JSValues, in column order */
 } WhaleStruct;
@@ -2995,20 +2997,38 @@ static void js_whale_struct_finalizer(JSRuntime *rt, JSValue val)
         uint32_t k;
 
         /* The values are flat JSValues owned by this struct, so they go first, then
-           the array itself, then the two maps. Each map is an ordinary object holding
-           its own values, so freeing the value is all it takes. */
+           the arrays. The dynamic map is an ordinary object holding its own values,
+           so freeing the value is all it takes. */
         for (k = 0; k < ws->nslots; k++)
             JS_FreeValueRT(rt, ws->data[k]);
         js_free_rt(rt, ws->data);
-        JS_FreeValueRT(rt, ws->offset);
+        js_free_rt(rt, ws->atoms);
         JS_FreeValueRT(rt, ws->dynamic);
         js_free_rt(rt, ws);
     }
     p->u.opaque = NULL;
 }
 
+/* Columns hold JSValues the struct owns, and so does the dynamic map - none of
+   them live in the JSObject's prop array, so without this the collector treats
+   every object stored in a column as garbage (a vnode's `props` field is
+   exactly that shape). */
+static void js_whale_struct_gc_mark(JSRuntime *rt, JSValue val,
+                                    JS_MarkFunc *mark_func)
+{
+    WhaleStruct *ws = whale_struct_of(val);
+    uint32_t k;
+
+    if (!ws)
+        return;
+    if (!JS_IsUndefined(ws->dynamic))
+        JS_MarkValue(rt, ws->dynamic, mark_func);
+    for (k = 0; k < ws->nslots; k++)
+        JS_MarkValue(rt, ws->data[k], mark_func);
+}
+
 static const JSClassShortDef js_whale_struct_class_def[] = {
-    { JS_ATOM_Object, js_whale_struct_finalizer, NULL },  /* JS_CLASS_WHALE_STRUCT */
+    { JS_ATOM_Object, js_whale_struct_finalizer, js_whale_struct_gc_mark },  /* JS_CLASS_WHALE_STRUCT */
 };
 
 int JS_AddIntrinsicWhaleStruct(JSContext *ctx)
@@ -3040,13 +3060,25 @@ static JSShapeProperty *find_own_property(JSProperty **ppr, JSObject *p, JSAtom 
    A column is a JSValue, so a value that is not a number is stored as it is and costs
    nothing special. The columns are the only storage; there is no second copy. */
 
+/* Diagnostic switch for the struct paths, read once. These helpers sit on the
+   per-iteration path of every struct-using compiled loop, and a getenv per
+   call is real money there (immutable_update: millions of col lookups). */
+static int whale_str_stat_on(void)
+{
+    static int on = -1;
+
+    if (on < 0)
+        on = getenv("WHALE_STR_STAT") != NULL;
+    return on;
+}
+
 int JS_WhaleStructNew(JSContext *ctx, const int *atoms, int nslots, int slot)
 {
     WhaleStruct *ws;
     JSValue obj;
     int k;
 
-    if (getenv("WHALE_STR_STAT")) {
+    if (whale_str_stat_on()) {
         static long n;
         fprintf(stderr, "[str-stat] StructNew calls=%ld nslots=%d slot=%d\n", ++n, nslots, slot);
     }
@@ -3063,15 +3095,20 @@ int JS_WhaleStructNew(JSContext *ctx, const int *atoms, int nslots, int slot)
         return 0;
     }
     ws->data = js_mallocz(ctx, sizeof(JSValue) * nslots);
-    ws->offset = JS_NewObject(ctx);
-    ws->dynamic = JS_NewObject(ctx);
-    if (!ws->data || JS_IsException(ws->offset) || JS_IsException(ws->dynamic)) {
+    ws->atoms = js_mallocz(ctx, sizeof(JSAtom) * nslots);
+    /* The dynamic map is created lazily: nearly every struct never receives a
+       property its columns do not cover, and one JS object per struct was a
+       visible slice of the per-call cost of the Redux shape. The three hooks
+       below treat undefined as "nothing dynamic yet" and create it on demand. */
+    ws->dynamic = JS_UNDEFINED;
+    if (!ws->data || !ws->atoms) {
         if (ws->data) {
             for (k = 0; k < nslots; k++)
                 JS_FreeValue(ctx, ws->data[k]);
             js_free(ctx, ws->data);
         }
-        JS_FreeValue(ctx, ws->offset);
+        if (ws->atoms)
+            js_free(ctx, ws->atoms);
         JS_FreeValue(ctx, ws->dynamic);
         js_free(ctx, ws);
         JS_FreeValue(ctx, obj);
@@ -3084,9 +3121,9 @@ int JS_WhaleStructNew(JSContext *ctx, const int *atoms, int nslots, int slot)
            property really is undefined. So a reserved column costs nothing and claims
            nothing. */
         ws->data[k] = JS_MKPTR(JS_TAG_UNDEFINED, (void *)(intptr_t)1);
-        /* And the offset map names the column. A map, and nothing else: the values
-           stay in `data`, never in here. */
-        JS_SetProperty(ctx, ws->offset, atoms[k], js_int32(k));
+        /* And the offset map names the column. A flat array, and nothing else: the
+           values stay in `data`, never in here. */
+        ws->atoms[k] = (JSAtom)atoms[k];
     }
     ws->magic = WHALE_STRUCT_MAGIC;
     ws->nslots = (uint32_t)nslots;
@@ -3100,27 +3137,22 @@ int JS_WhaleStructNew(JSContext *ctx, const int *atoms, int nslots, int slot)
    this object. The shape plays no part here; it belongs to the dynamic properties. */
 static int whale_struct_col(JSContext *ctx, WhaleStruct *ws, JSAtom name)
 {
-    JSValue v;
-    int col;
+    uint32_t k;
 
-    if (getenv("WHALE_STR_STAT")) {
+    (void)ctx;
+    if (whale_str_stat_on()) {
         static long n;
         n++;
         if (n == 1 || (n & (n - 1)) == 0)
             fprintf(stderr, "[str-stat] col_lookup calls=%ld\n", n);
     }
-    v = JS_GetProperty(ctx, ws->offset, name);
-    if (JS_IsException(v)) {
-        JS_FreeValue(ctx, v);
-        return -1;
-    }
-    if (JS_VALUE_GET_TAG(v) != JS_TAG_INT) {   /* not a column of this object */
-        JS_FreeValue(ctx, v);
-        return -1;
-    }
-    col = JS_VALUE_GET_INT(v);
-    JS_FreeValue(ctx, v);
-    return col;
+    /* Atoms are interned, so identity is the value. Columns number in the
+       single digits, and the scan runs at most once per column per call - the
+       generated code caches the resulting address. */
+    for (k = 0; k < ws->nslots; k++)
+        if (ws->atoms[k] == name)
+            return (int)k;
+    return -1;
 }
 
 /* Read a column as a number. 0 means "not a plain number here", and the caller keeps
@@ -3132,7 +3164,7 @@ int JS_WhaleStructFieldNum(JSContext *ctx, int slot, JSAtom name, double *out)
     JSValue v;
     int col;
 
-    if (getenv("WHALE_STR_STAT")) {
+    if (whale_str_stat_on()) {
         static long n;
         n++;
         if (n == 1 || (n & (n - 1)) == 0)
@@ -3164,7 +3196,7 @@ int JS_WhaleStructSetNum(JSContext *ctx, int slot, JSAtom name, double d)
     WhaleStruct *ws;
     int col;
 
-    if (getenv("WHALE_STR_STAT")) {
+    if (whale_str_stat_on()) {
         static long n;
         n++;
         if (n == 1 || (n & (n - 1)) == 0)
@@ -3420,6 +3452,7 @@ extern char *getenv(const char *);
 void JS_WhaleDeoptNote(JSContext *ctx, int flag)
 {
     static long by_flag[8];
+    static int dbg = -1;
 
     (void)ctx;
     if (flag >= 0 && flag < 8)
@@ -3429,7 +3462,11 @@ void JS_WhaleDeoptNote(JSContext *ctx, int flag)
         whale_entry_registered = 1;
         atexit(whale_entry_at_exit);
     }
-    if (getenv("WHALE_DEOPT_DBG"))
+    /* Cached: this runs on every compiled call return, and a getenv per call
+       was measurable all by itself (the CRT consults the process environment). */
+    if (dbg < 0)
+        dbg = getenv("WHALE_DEOPT_DBG") != NULL;
+    if (dbg)
         fprintf(stderr, "[deopt] call=%ld flag=%d\n", whale_entry_total, flag);
 }
 
@@ -8417,13 +8454,18 @@ int JS_WhaleVarRefGetObj(JSContext *ctx, void *var_refs, int idx, int slot)
 }
 
 /* The object's shape, as an opaque key for generated code to compare against
-   the one it cached. */
+   the one it cached. A struct object answers with the struct itself: its
+   columns are allocated once and never move, and two struct objects must
+   never share a key - struct objects carry no ordinary properties, so p->shape
+   would hand every one of them the same empty shape. */
 void *JS_WhaleObjShape(JSContext *ctx, int slot)
 {
     JSValue o = whale_frame_obj_slots(ctx)[slot];
 
     if (JS_VALUE_GET_TAG(o) != JS_TAG_OBJECT)
         return NULL;
+    if (JS_VALUE_GET_OBJ(o)->class_id == JS_CLASS_WHALE_STRUCT)
+        return JS_VALUE_GET_OBJ(o)->u.opaque;
     return JS_VALUE_GET_OBJ(o)->shape;
 }
 
@@ -8431,7 +8473,10 @@ void *JS_WhaleObjShape(JSContext *ctx, int slot)
    deopt. It also hands back the shape the answer belongs to, which is what
    makes the returned pointer safe to keep: a shape only changes when a
    property is added or removed, so a loop over fixed fields compares equal
-   every iteration. */
+   every iteration. A struct object answers with the address of its column -
+   allocated once, never moved - and the struct itself as the key (see
+   JS_WhaleObjShape), so a function can read a column of a struct that arrived
+   from another compiled function exactly as it reads a plain object's field. */
 JSValue *JS_WhaleObjFieldPtr(JSContext *ctx, int slot, int atom, void **shape_io)
 {
     JSValue o = whale_frame_obj_slots(ctx)[slot];
@@ -8442,6 +8487,18 @@ JSValue *JS_WhaleObjFieldPtr(JSContext *ctx, int slot, int atom, void **shape_io
     if (JS_VALUE_GET_TAG(o) != JS_TAG_OBJECT)
         return NULL;
     p = JS_VALUE_GET_OBJ(o);
+    if (p->class_id == JS_CLASS_WHALE_STRUCT) {
+        WhaleStruct *ws = whale_struct_of(o);
+        int col;
+
+        if (!ws)
+            return NULL;
+        col = whale_struct_col(ctx, ws, atom);
+        if (col < 0 || (uint32_t)col >= ws->nslots)
+            return NULL;
+        *shape_io = ws;
+        return &ws->data[col];
+    }
     if (p->class_id != JS_CLASS_OBJECT)
         return NULL;                    /* arrays and the rest are other shapes */
     *shape_io = p->shape;
@@ -8609,6 +8666,18 @@ double JS_WhaleObjFieldNum(JSContext *ctx, int slot, int atom,
     p = JS_VALUE_GET_OBJ(o);
     if (p->shape == *shape_cache) {
         v = *ptr_cache;                 /* resolved before, shape unchanged */
+    } else if (p->class_id == JS_CLASS_WHALE_STRUCT) {
+        WhaleStruct *ws = whale_struct_of(o);
+        int col;
+
+        if (!ws)
+            goto bad;
+        col = whale_struct_col(ctx, ws, atom);
+        if (col < 0 || (uint32_t)col >= ws->nslots)
+            goto bad;
+        v = &ws->data[col];
+        *shape_cache = ws;              /* the struct is the key; see JS_WhaleObjShape */
+        *ptr_cache = v;
     } else {
         JSProperty *pr;
         JSShapeProperty *prs;
@@ -12650,6 +12719,34 @@ static int JS_SetPropertyInternal2(JSContext *ctx, JSValueConst obj, JSAtom prop
     }
 
 retry:
+    /* WhaleJS: a struct's columns are its real storage. A write to a column
+       lands there - the alternative is find_own_property() missing, the write
+       growing an ordinary property, and every later read (which answers from
+       the column first) silently ignoring it. A name the offset map does not
+       cover goes to the dynamic map, where the read hook looks next. Only the
+       receiver-is-the-struct case is handled: a struct on a prototype chain is
+       not a shape this engine creates. */
+    if (p == p1 && p1->class_id == JS_CLASS_WHALE_STRUCT) {
+        WhaleStruct *ws = whale_struct_of(JS_MKPTR(JS_TAG_OBJECT, p1));
+
+        if (ws) {
+            int col = whale_struct_col(ctx, ws, prop);
+
+            if (col >= 0 && (uint32_t)col < ws->nslots) {
+                set_value(ctx, &ws->data[col], val);
+                return true;
+            }
+            if (JS_IsUndefined(ws->dynamic)) {
+                JSValue d = JS_NewObject(ctx);
+
+                if (JS_IsException(d))
+                    return -1;          /* the exception is already set */
+                ws->dynamic = d;
+            }
+            return JS_SetPropertyInternal2(ctx, ws->dynamic, prop, val,
+                                           ws->dynamic, flags);
+        }
+    }
     prs = find_own_property(&pr, p1, prop);
     if (prs) {
         if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
@@ -67331,6 +67428,18 @@ uintptr_t js_std_cmd(int cmd, ...) {
 
 /* ---- WhaleJS: JIT codegen services (defined here, after short_opcode_info) ---- */
 
+/* Diagnostic switch for the single-instruction fallback, read once. A step
+   helper runs per non-compiled instruction, so the env lookup cannot be per
+   call there either. */
+static int whale_step_dbg_on(void)
+{
+    static int on = -1;
+
+    if (on < 0)
+        on = getenv("WHALE_STEP_DBG") != NULL;
+    return on;
+}
+
 /* opcode operand size, straight from the interpreter's own table */
 int JS_WhaleOpSize(int op)
 {
@@ -67460,7 +67569,7 @@ int JS_WhaleStepPushSlot(JSContext *ctx, int i, int slot)
         return 0;
     JS_FreeValue(ctx, *cell);
     *cell = js_dup(whale_frame_obj_slots(ctx)[slot]);
-    if (getenv("WHALE_STEP_DBG"))
+    if (whale_step_dbg_on())
         fprintf(stderr, "[step] pushSlot i=%d slot=%d src_tag=%d dst=%p\n",
                 i, slot, JS_VALUE_GET_TAG(whale_frame_obj_slots(ctx)[slot]),
                 (void *)cell);
@@ -67531,14 +67640,14 @@ int JS_WhaleStepRun(JSContext *ctx, int pc_off, int n_pop, int n_push)
     int op;
 
     if (!stack || !b || pc_off < 0 || pc_off >= b->byte_code_len) {
-        if (getenv("WHALE_STEP_DBG"))
+        if (whale_step_dbg_on())
             fprintf(stderr, "[step] no frame/range: pc=%d b=%p stack=%p\n",
                     pc_off, (void *)b, (void *)stack);
         return 0;
     }
     if (n_pop < 0 || n_push < 0 ||
         n_pop > b->stack_size || n_push > b->stack_size) {
-        if (getenv("WHALE_STEP_DBG"))
+        if (whale_step_dbg_on())
             fprintf(stderr, "[step] arity out of range: np=%d nu=%d ssize=%d\n",
                     n_pop, n_push, b->stack_size);
         return 0;
@@ -67550,13 +67659,13 @@ int JS_WhaleStepRun(JSContext *ctx, int pc_off, int n_pop, int n_push)
        how a wrong answer gets baked in. Refuse instead. */
     if ((int)short_opcode_info(op).n_pop != n_pop ||
         (int)short_opcode_info(op).n_push != n_push) {
-        if (getenv("WHALE_STEP_DBG"))
+        if (whale_step_dbg_on())
             fprintf(stderr, "[step] arity mismatch: op=%d np=%d/%d nu=%d/%d\n",
                     op, n_pop, (int)short_opcode_info(op).n_pop,
                     n_push, (int)short_opcode_info(op).n_push);
         return 0;
     }
-    if (getenv("WHALE_STEP_DBG"))
+    if (whale_step_dbg_on())
         fprintf(stderr, "[step] run pc=%d op=%d np=%d nu=%d ssize=%d\n",
                 pc_off, op, n_pop, n_push, b->stack_size);
 
@@ -67622,7 +67731,7 @@ int JS_WhaleStepRun(JSContext *ctx, int pc_off, int n_pop, int n_push)
         {
             int ret;
 
-            if (getenv("WHALE_STEP_DBG"))
+            if (whale_step_dbg_on())
                 fprintf(stderr, "[step] put_array_el tags=%d/%d/%d stack=%p "
                         "needs_obj=%d var_refs=%p objslots=%p var_buf=%p varc=%d\n",
                         JS_VALUE_GET_TAG(stack[0]), JS_VALUE_GET_TAG(stack[1]),
