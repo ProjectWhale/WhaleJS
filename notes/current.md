@@ -1590,3 +1590,36 @@ setField 内部：StructNew（单块后已便宜）+ fresh 直写 + ret_obj 装�
 ## 状态
 `46f84c1` 绿：25/25 编译、0 mismatch。objshape 481ms（entries 48 = 四相全编译）、
 immutable_update 392ms。
+
+# <64>: compiled-to-compiled fast call、closure 值 prologue park 一次
+SOLVED
+
+## fast call（commit ae43f3e）
+`whale_fast_call(ctx, func, argc, args, ret)`：callee 已编译时（bytecode function +
+whale_jit_entry），绕过 JS_Call 的解释器路径——类分发、whale_on_call（已编译后只喂计数）、
+参数拷贝（**caller 的 obj slots 本就是 dup 过、GC 可见的 parked 值，直接作为 callee 的
+arg_buf 借用，零拷贝**）。保留的只有不能跳的：帧本体（生成代码的每个 helper 都读它：
+obj slots、栈检查、异常展开）。deopt 语义完全保持："整帧从顶部重跑" = 丢弃快帧 +
+全新 JS_Call（re-arm 计数同样维护）；deopt==3 的换读法在快帧内原位重入（快帧本就是
+正确读法的帧）。约束：argc == arg_count 且 var_ref_count == 0，否则落 JS_Call。
+JS_WhaleCallValue 先试 fast-call，失败无副作用地落 JS_Call。
+
+**测量：immutable_update 392 → 342ms**。比预期的 -150 小：事后归因，JS_Call 对已编译
+callee 的开销里帧装配占大头且无法省，真正省掉的是分发 + hook + 参数拷贝 ≈ 50ns/调用。
+**教训：估算"调用开销"前先分清"帧装配（不可省）"与"路径杂费（可省）"。**
+
+## closure 值 prologue park（同 commit）
+closure reading 的调用目标槽（setField）原来**每循环迭代**重 park 一次
+（JS_WhaleVarRefGetObj + dup）。捕获值在整个调用期不可变——entry 自检依赖同一事实——
+现改为 prologue 一次 park。为此 scan 增设 `var_ref_val[]`（closure reading 的值读标记）：
+原 `var_ref_used[]` 的语义收窄为 entry self-check（仅 self reading）。
+**注意**：单遍 emit 无法预知，park 语句必须发在 prologue 结构段（scan 已知 var_ref_val），
+emit 处只推 VAL(槽)。
+
+## 测量口径备忘（第三次）
+直跑（cold）与 runner（warm+取最小）差 5-6×：closure 直跑 52ms / runner 11ms。
+**裁定一律用 runner**；直跑只用于看诊断输出。
+
+## 状态
+`ae43f3e` 绿：25/25 编译、0 mismatch。immutable_update 342ms、objshape 462、
+props_diff 15、vnode_build 10。
