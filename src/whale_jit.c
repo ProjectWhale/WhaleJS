@@ -416,6 +416,7 @@ int whale_jit_unbox_num(JSContext *ctx, JSValue v, double *out)
         *out = (double)JS_VALUE_GET_FLOAT64(v);
         return 1;
     }
+    if (getenv("WHALE_ARG_DBG")) fprintf(stderr, "[unbox] FAILED tag=%d", t);
     return 0;
 }
 
@@ -2534,7 +2535,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
            Kept because the mechanism and its fixes are real (see cb87bf1) and
            because an ABI with non-volatile float registers would make it pay.
            See notes/pinning-design.md. */
-        if (1) {
+        /* Only while no call sits inside a loop. A register variable does not
+           survive a call in the code TinyCC generates, and that is exactly what
+           whale_shape_stable already answers - the same question as for the
+           field pointers below, for the same reason. immutable_update calls
+           setField() from inside its loop, the induction variable L1 came back
+           clobbered, and the loop body never ran once. */
+        if (whale_shape_stable) {
             for (k = 0; k < var_count; k++)
                 if (induction[k] && (pin1 < 0 || assign_cnt[k] > assign_cnt[pin1]))
                     pin1 = k;
@@ -2582,6 +2589,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
            iteration of the loop the layout exists for - and that loop, unlike the
            rest of the function, contains no call, so the pinned value is never
            spilled. */
+        if (whale_str_need) {
+            if (!whale_shape_stable)
+                whale_str_need = 0;
+        }
         if (whale_str_need) {
             for (i = 0; i < WHALE_STRUCT_FIELDS; i++) {
                 whale_str_L[i] = var_count + i;
@@ -2644,6 +2655,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        and (like every other slot) numbered below the call scratch area. */
     for (i = 0; i < arg_count; i++) {
         arg_obj_slot[i] = -1;
+        if (getenv("WHALE_ARG_DBG")) fprintf(stderr, "[argslot] i=%d args_obj=%d objs=%d argc=%d varc=%d len=%d\n", i, args_obj[i], whale_objs, arg_count, var_count, len);
         if (args_obj[i]) {
             if (whale_objs >= WHALE_CALL_BASE) {
                 whale_objs = WHALE_CALL_BASE;   /* no room: refuse the function */

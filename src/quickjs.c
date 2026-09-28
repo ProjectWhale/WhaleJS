@@ -929,6 +929,7 @@ typedef struct JSFunctionBytecode {
     uint8_t whale_jit_tried;   /* JIT compile already attempted */
     void *whale_jit_tcc;       /* owning TCCState (keeps the code alive) */
 void *whale_jit_entry2;    /* the other reading of a closure-slot call target */
+int whale_deopt_count;     /* refusals seen before the entry was retired */
     /* Memoisation: this function was JIT-compiled and never reads a global, so
        its result depends only on its numeric arguments - repeated calls with
        the same ones can reuse it. `whale_memo` is a small bounded table (see
@@ -3601,6 +3602,7 @@ int JS_WhaleObjSlotCopy(JSContext *ctx, int src, int dst)
    argument that is not an object makes that a deopt, not a wrong answer. */
 int JS_WhaleArgGetObj(JSContext *ctx, JSValue v, int slot)
 {
+    if (getenv("WHALE_ARG_DBG")) fprintf(stderr, "[argget] slot=%d isobj=%d", slot, (int)JS_IsObject(v));
     if (slot < 0 || slot >= WHALE_OBJ_SLOTS)
         return 0;
     if (!JS_IsObject(v))
@@ -20442,9 +20444,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         }
         if (unlikely(whale_deopt)) {
             if (getenv("WHALE_JIT_DUMP"))
-                fprintf(stderr, "whale jit: deopt, back to the interpreter\n");
-            b->whale_jit_entry = NULL;   /* give up and interpret this one */
-            b->whale_jit_tried = 1;
+                fprintf(stderr, "whale jit: deopt (flag=%d), back to the interpreter\n", whale_deopt);
+            /* flag 1 and 3 are the checks on the arguments and on a closure slot, both
+               taken before anything of the body has run - so one refusal says
+               nothing about the next call. setField() is handed an object every
+               single time and still refused once, and that one refusal retired
+               the entry for good: every later call went to the interpreter.
+               Re-arm on those flags and retire only when they will not stop.
+               Any other flag may already have run a host call, so those keep
+               the give-up behaviour. */
+            if ((whale_deopt == 1 || whale_deopt == 3) && ++b->whale_deopt_count < 8) {
+                b->whale_jit_entry2 = NULL;
+            } else {
+                b->whale_jit_entry = NULL;   /* give up and interpret this one */
+                b->whale_jit_tried = 1;
+            }
         } else {
             if (unlikely(sf->var_ref_count != 0))
                 close_var_refs(rt, sf);
