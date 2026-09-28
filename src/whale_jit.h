@@ -224,6 +224,12 @@ int JS_WhaleObjSlotNum(JSContext *ctx, int slot, double v);
    borrowed from their slots, which is what keeps them alive across the call. */
 int JS_WhaleCallValue(JSContext *ctx, int func_slot, int argc, int arg_base,
                       int ret_slot);
+/* OP_call_method: the callee is a property of a receiver. Receiver and method
+   travel in their own slots, the receiver becoming `this`; everything else is
+   JS_WhaleCallValue. 0 means the call threw - the exception is pending and the
+   callee must not run again. */
+int JS_WhaleCallMethodValue(JSContext *ctx, int func_slot, int this_slot,
+                            int argc, int arg_base, int ret_slot);
 /* `new F(...)`: the same slot arrangement as JS_WhaleCallValue, but through the
    constructor path, so the result is a new object and the callee is its own
    new.target. One call out is the whole cost - `new` does the prototype dance. */
@@ -277,6 +283,9 @@ double JS_WhaleObjValueNum(JSContext *ctx, JSValue *v, int *deopt);
 JSValue *JS_WhaleArrPtr(JSContext *ctx, int slot, double *len_out);
 int JS_WhaleArrNew(JSContext *ctx, int slot);
 int JS_WhaleArrSetNum(JSContext *ctx, int slot, double idx, double v);
+/* The same store, with the value parked in another slot - `out[i] = t` where t
+   is an object or any opaque value. */
+int JS_WhaleArrSetVal(JSContext *ctx, int slot, double idx, int val_slot);
 /* Park argument `idx` in object slot `slot` as a packed array; 0 to deopt. Lets
    a function that takes an array stay in the JIT - the generated code assumes
    the parameter is one (a wrong guess only bails) and this checks it. */

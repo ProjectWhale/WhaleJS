@@ -539,6 +539,38 @@ static int whale_feeds_call_as_callee(const uint8_t *pc, int len, int pos, int s
     return 0;
 }
 
+/* Is this argument used as an *array* - `.length`, indexed in or out?
+   `a.length` is adjacent; `a[i]` is get_arg0 a, get_loc0 i, get_array_el, so
+   the container sits under the one pushed index; `out[i] = a` is put_array_el
+   under two. The walker counts pure pushes and answers only when an array use
+   appears with this argument as its container. Being wrong is safe: the
+   argument then travels as a plain number and any object use deopts. */
+static int whale_feeds_array_use(const uint8_t *pc, int len, int pos, int sz)
+{
+    int k = pos + sz;
+    int n = 0;
+
+    while (k < len && n < 5) {
+        int o = (int)pc[k];
+        int s;
+
+        if (o == OP_get_length && n == 0)
+            return 1;
+        if (o == OP_get_array_el && n == 1)
+            return 1;
+        if (o == OP_put_array_el && n == 2)
+            return 1;
+        if (o != OP_dup && o != OP_push_atom_value && !whale_is_push_op(o))
+            return 0;
+        s = whale_op_size_of(o);
+        if (s <= 0)
+            return 0;
+        k += s;
+        n++;
+    }
+    return 0;
+}
+
 static int whale_var_ref_feeds_call(const uint8_t *pc, int len, int pos, int sz)
 {
     int k = pos + sz;
@@ -1968,6 +2000,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     int pos, i, sp, ret = 0, tail_mark;
     uint8_t *targets = NULL, *seen = NULL, *snap = NULL, *cur = NULL, *args_used = NULL;
     uint8_t *args_obj = NULL;   /* per argument: read as the object of a field access */
+    uint8_t *args_arr = NULL;   /* per argument: read as an array (length/index) */
     int *arg_obj_slot = NULL;   /* per argument: the slot it travels in, or -1 */
     int *loc_slot = NULL;       /* per local: its own slot when it is reassigned */
     int *loop_back = NULL;      /* per position: the backward jump that closes it */
@@ -2029,6 +2062,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     cur = calloc(1, state_len);
     args_used = calloc(1, arg_count > 0 ? arg_count : 1);
     args_obj = calloc(1, arg_count > 0 ? arg_count : 1);
+    args_arr = calloc(1, arg_count > 0 ? arg_count : 1);
     arg_obj_slot = malloc(sizeof(int) * (arg_count > 0 ? arg_count : 1));
     loc_slot = malloc(sizeof(int) * (var_count > 0 ? var_count : 1));
     assign_cnt = calloc(var_count > 0 ? var_count : 1, sizeof(unsigned));
@@ -2037,6 +2071,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     whale_lmem = calloc(var_count > 0 ? var_count : 1, sizeof(WhaleLocal));
     loop_back = malloc((len + 1) * sizeof(*loop_back));
     if (!targets || !seen || !snap || !cur || !args_used || !assign_cnt ||
+        !args_obj || !args_arr ||
         !whale_vexpr || !whale_vmat || !whale_lmem || !loop_back)
         { whale_out_line = __LINE__; goto out; }
     for (i = 0; i <= len; i++)
@@ -2084,12 +2119,16 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             args_used[op - OP_get_arg0] = 1;
             if (whale_next_is_field_read(pc, len, pos, sz))
                 args_obj[op - OP_get_arg0] = 1;
+            if (whale_feeds_array_use(pc, len, pos, sz))
+                args_arr[op - OP_get_arg0] = 1;
         } else if (op == OP_get_arg) {
             int a = (int)whale_get_u16(pc + pos + 1);
             if (a >= 0 && a < arg_count) {
                 args_used[a] = 1;
                 if (whale_next_is_field_read(pc, len, pos, sz))
                     args_obj[a] = 1;
+                if (whale_feeds_array_use(pc, len, pos, sz))
+                    args_arr[a] = 1;
             }
         } else if (op == OP_fclosure || op == OP_fclosure8) {
             /* 'fclosure8 M' carries its pool index; the 5-byte 'fclosure'
@@ -2424,6 +2463,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleArrSetNum"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(',');
         wk(JS_WK_DOUBLE); wt_id("idx"); wt(','); wk(JS_WK_DOUBLE); wt_id("v"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleArrSetVal"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(',');
+        wk(JS_WK_DOUBLE); wt_id("idx"); wt(','); wk(JS_WK_INT); wt_id("val_slot"); wt(')'); wt(';');
     /* Host calls. Declared like everything else: without a prototype TinyCC
        applies the C89 implicit declaration and a double argument goes to the
        wrong register - the call still links and silently computes nonsense. */
@@ -2433,6 +2475,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleArgGetObj"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wt_id("JSValue"); wt_id("v"); wt(',');
         wk(JS_WK_INT); wt_id("slot"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleArrBind"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(',');
+        wt_id("JSValue"); wt('*'); wt_id("args"); wt(','); wk(JS_WK_INT); wt_id("idx"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleObjSlotCopy"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("src"); wt(',');
         wk(JS_WK_INT); wt_id("dst"); wt(')'); wt(';');
@@ -2448,6 +2493,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(',');
         wk(JS_WK_INT); wt_id("argc"); wt(','); wk(JS_WK_INT); wt_id("arg_base"); wt(',');
         wk(JS_WK_INT); wt_id("ret_slot"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleCallMethodValue"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("func_slot"); wt(',');
+        wk(JS_WK_INT); wt_id("this_slot"); wt(','); wk(JS_WK_INT); wt_id("argc"); wt(',');
+        wk(JS_WK_INT); wt_id("arg_base"); wt(','); wk(JS_WK_INT); wt_id("ret_slot"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_WhaleExceptionValue"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(')'); wt(';');
     /* object-slot test hook (WHALE_OBJ_TEST). Declared like the rest: without a
@@ -2574,7 +2623,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     for (i = 0; i < arg_count; i++) {
         arg_obj_slot[i] = -1;
         if (whale_dbg_env("WHALE_ARG_DBG")) fprintf(stderr, "[argslot] i=%d args_obj=%d objs=%d argc=%d varc=%d len=%d\n", i, args_obj[i], whale_objs, arg_count, var_count, len);
-        if (args_obj[i]) {
+        if (args_obj[i] || args_arr[i]) {
             if (whale_objs >= WHALE_CALL_BASE) {
                 whale_objs = WHALE_CALL_BASE;   /* no room: refuse the function */
                 { whale_out_line = __LINE__; goto out; }
@@ -3939,8 +3988,36 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                                     stack_size))
                     break;
                 if (WHALE_IS_ARR(ta)) {
-                    if (!whale_type_is_num(tb) || !whale_type_is_num(tc))
+                    if (!whale_type_is_num(tb))
                         { whale_out_line = __LINE__; goto out; }
+                    if (!whale_type_is_num(tc)) {
+                        /* `out[i] = t` with t an object (or any parked value):
+                           one helper store out of the slot. This is the shape
+                           objshape's escaped() phase is - without it every
+                           function that keeps an object in an array is
+                           refused. */
+                        if (!WHALE_IS_SLOT(tc))
+                            { WHALE_STEP_INSTEAD_OF_BAILING(); }
+                        os = WHALE_OBJ_SLOT(ta);
+                        tk = whale_vserial++;      /* the index, evaluated once */
+                        {
+                            int fm = fold_mark();
+
+                            /* a store can move the backing store (the array
+                               grows), so the cached pointer must not be
+                               trusted afterwards */
+                            wt_arr("ai", os); wt('='); wt_int(0); wt(';');
+                            wt_arr("v", tk); wt('='); fold_inline(sp - 2); wt(';');
+                            wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleArrSetVal");
+                            wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(',');
+                            wt_arr("v", tk); wt(','); wt_int(WHALE_SLOT(tc)); wt(')'); wt(')');
+                            wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                            wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                            fold_commit(fm);
+                        }
+                        sp -= 3;
+                        break;
+                    }
                     os = WHALE_OBJ_SLOT(ta);
                     tk = whale_vserial++;      /* the index, evaluated once */
                     {
@@ -4280,6 +4357,24 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 t = cur[var_count + sp - 1];
                 if (t == WHALE_T_UNKNOWN || idx < 0 || idx >= var_count)
                     { WHALE_STEP_INSTEAD_OF_BAILING(); }
+                if (WHALE_IS_VAL(cur[idx]) && WHALE_IS_VAL(t)) {
+                    /* `s += "x"` - compound assignment on opaque values. The
+                        general binop runs on the parked slots and the result
+                        lands back in the local's own slot, so the slot
+                        identity - and with it the jump-target merge - is
+                        unchanged. This is what kept stringcat from compiling. */
+                    fm = fold_mark();
+                    wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleBinopVal");
+                    wt('('); wt_id("ctx"); wt(','); wt_int(OP_add); wt(',');
+                    wt_int(WHALE_VAL_SLOT(cur[idx])); wt(',');
+                    wt_int(WHALE_VAL_SLOT(t)); wt(',');
+                    wt_int(WHALE_VAL_SLOT(cur[idx])); wt(')'); wt(')');
+                    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    fold_commit(fm);
+                    sp--;
+                    break;
+                }
                 if (!whale_type_is_num(cur[idx]) || !whale_type_is_num(t))
                     { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 /* Folds to one expression as well. The left operand is the
@@ -4319,9 +4414,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 if (idx < 0 || idx >= arg_count)
                     { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 if (arg_obj_slot[idx] >= 0) {
-                    /* This argument is the receiver of a property access, so it
-                       travels as the JSValue parked in its slot. */
-                    cur[var_count + sp] = WHALE_VAL_T(arg_obj_slot[idx]);
+                    /* This argument travels parked in its slot: as an array
+                       when the body indexes it, otherwise as an opaque value. */
+                    cur[var_count + sp] = args_arr[idx]
+                        ? (uint8_t)WHALE_ARR_T(arg_obj_slot[idx])
+                        : (uint8_t)WHALE_VAL_T(arg_obj_slot[idx]);
                     whale_vmat[sp] = 1;
                     sp++;
                     break;
@@ -4491,6 +4588,67 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 }
                 cur[var_count + sp] = WHALE_T_NUM;
                 sp++;
+            }
+            break;
+
+        /* method call: [... receiver, method, arg1..argN ]. `arr.push(x)` and
+           `parts.join(",")` - the whole Array.prototype surface a front-end
+           loop touches. The receiver and the method park in their own slots
+           and the call runs as one engine entry with the receiver as `this`;
+           the result follows the same drop-or-park rule as a plain call.
+           tail_call_method is the same instruction - the bytecode drops the
+           frame right after, which is exactly what this emit does anyway. */
+        case OP_call_method:
+        case OP_tail_call_method:
+            {
+                int argc = (int)whale_get_u16(pc + pos + 1);
+                int sp_new = sp - 2 - argc;
+                int k, fm, ret_slot, nxt = pos + sz;
+
+                if (sp_new < 0 || argc + 2 > WHALE_CALL_SLOTS)
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
+                /* every operand has to be parkable */
+                for (k = 0; k < argc + 2; k++) {
+                    int tk = cur[var_count + sp_new + k];
+
+                    if (!whale_type_is_num(tk) && !WHALE_IS_SLOT(tk))
+                        { WHALE_STEP_INSTEAD_OF_BAILING(); }
+                }
+                if (nxt < len && (int)pc[nxt] == OP_drop) {
+                    ret_slot = -1;
+                } else {
+                    if (whale_objs >= WHALE_CALL_BASE)
+                        { WHALE_STEP_INSTEAD_OF_BAILING(); }
+                    ret_slot = whale_objs++;
+                }
+                fm = fold_mark();
+                /* receiver at CALL_BASE+argc, method right after it, then args */
+                for (k = 0; k < argc + 2; k++) {
+                    int tk = cur[var_count + sp_new + k];
+
+                    wk(JS_WK_IF); wt('('); wt('!');
+                    if (whale_type_is_num(tk)) {
+                        wt_id("JS_WhaleObjSlotNum"); wt('('); wt_id("ctx"); wt(',');
+                        wt_int(WHALE_CALL_BASE + k); wt(',');
+                        fold_inline(sp_new + k); wt(')');
+                    } else {
+                        wt_id("JS_WhaleObjSlotCopy"); wt('('); wt_id("ctx"); wt(',');
+                        wt_int(WHALE_SLOT(tk)); wt(',');
+                        wt_int(WHALE_CALL_BASE + k); wt(')');
+                    }
+                    wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                }
+                wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleCallMethodValue");
+                wt('('); wt_id("ctx"); wt(','); wt_int(WHALE_CALL_BASE + argc + 1); wt(',');
+                wt_int(WHALE_CALL_BASE + argc); wt(','); wt_int(argc); wt(',');
+                wt_int(WHALE_CALL_BASE); wt(','); wt_int(ret_slot); wt(')'); wt(')');
+                wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(2); wt(';');
+                wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                fold_commit(fm);
+                cur[var_count + sp_new] = (ret_slot < 0)
+                    ? (uint8_t)WHALE_T_UNKNOWN : WHALE_VAL_T(ret_slot);
+                sp = sp_new + 1;
             }
             break;
 
@@ -5229,9 +5387,16 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         if (!args_used[i])
             continue;
         if (arg_obj_slot[i] >= 0) {
-            /* travels as an object, so it is not unboxed as a number */
-            wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleArgGetObj"); wt('('); wt_id("ctx"); wt(',');
-            wt_id("args"); wt('['); wt_int(i); wt(']'); wt(','); wt_int(arg_obj_slot[i]); wt(')'); wt(')');
+            /* travels as an object (or a packed array), so it is not unboxed
+               as a number. An argument the body indexes is bound as an array,
+               which checks the class as well - a wrong guess only deopts. */
+            if (args_arr[i]) {
+                wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleArrBind"); wt('('); wt_id("ctx"); wt(',');
+                wt_int(arg_obj_slot[i]); wt(','); wt_id("args"); wt(','); wt_int(i); wt(')'); wt(')');
+            } else {
+                wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleArgGetObj"); wt('('); wt_id("ctx"); wt(',');
+                wt_id("args"); wt('['); wt_int(i); wt(']'); wt(','); wt_int(arg_obj_slot[i]); wt(')'); wt(')');
+            }
             wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
             wk(JS_WK_RETURN); wt_id("whale_jit_box_num"); wt('('); wt_id("ctx"); wt(','); wt_int(0); wt(')'); wt(';'); wt('}');
             continue;
@@ -5295,6 +5460,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         free(args_used);
     if (args_obj)
         free(args_obj);
+    if (args_arr)
+        free(args_arr);
     if (arg_obj_slot)
         free(arg_obj_slot);
     if (loc_slot)
@@ -5403,6 +5570,7 @@ static const WhaleHostSym whale_host_syms[] = {
     WHALE_HOST_SYM(JS_WhaleArrPtr),
     WHALE_HOST_SYM(JS_WhaleArrNew),
     WHALE_HOST_SYM(JS_WhaleArrSetNum),
+WHALE_HOST_SYM(JS_WhaleArrSetVal),
     WHALE_HOST_SYM(JS_WhaleObjFieldNum),
     WHALE_HOST_SYM(JS_WhaleStructNew),
     WHALE_HOST_SYM(JS_WhaleStructFieldNum),
@@ -5414,7 +5582,9 @@ static const WhaleHostSym whale_host_syms[] = {
     WHALE_HOST_SYM(JS_WhaleObjSlotNum),
     WHALE_HOST_SYM(JS_WhaleObjSlotCopy),
     WHALE_HOST_SYM(JS_WhaleArgGetObj),
+WHALE_HOST_SYM(JS_WhaleArrBind),
     WHALE_HOST_SYM(JS_WhaleCallValue),
+WHALE_HOST_SYM(JS_WhaleCallMethodValue),
     WHALE_HOST_SYM(JS_WhaleCallSelfValue),
     WHALE_HOST_SYM(JS_WhaleConstructValue),
     WHALE_HOST_SYM(JS_WhaleExceptionValue),
