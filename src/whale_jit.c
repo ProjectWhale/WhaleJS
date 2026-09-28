@@ -2005,6 +2005,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     int *loc_slot = NULL;       /* per local: its own slot when it is reassigned */
     int *loop_back = NULL;      /* per position: the backward jump that closes it */
     uint8_t var_ref_used[4] = { 0, 0, 0, 0 };
+    uint8_t var_ref_val[4] = { 0, 0, 0, 0 };   /* closure reading: the slot is read as a value */
     unsigned *assign_cnt = NULL;   /* weighted access count */
     uint8_t lo_c[WHALE_JIT_MAX_SLOTS];
     double lo_cv[WHALE_JIT_MAX_SLOTS];
@@ -2041,6 +2042,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     int whale_str_n = 0;
     int whale_str_slot = -1;
     int whale_str_L[WHALE_STRUCT_FIELDS];
+    /* Per closure slot: the object slot its value is parked in, or -1. Filled
+       in the prologue for the slots this reading reads as values. */
+    int whale_vr_slot[4];
     /* The object slot JS_WhaleStructNew just built, and its column count.
        While it stays current - no call, no jump target in between - the
        initialiser stores go straight through `_sdp` instead of per-field
@@ -2244,19 +2248,27 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             if (whale_call_n < WHALE_CALL_MAX)
                 whale_call_pos[whale_call_n++] = pos;
         } else if (op >= OP_get_var_ref0 && op < OP_get_var_ref0 + 4) {
-            /* Only a slot used as a call target has to be this very function; an
-               enclosing closure's variable is read as a number instead. */
-            if (whale_assume_self && whale_var_ref_feeds_call(pc, len, pos, sz)) {
-                var_ref_used[op - OP_get_var_ref0] = 1;
-                whale_gen_self_ref = 1;
+            /* Only a slot used as a call target has to be this very function;
+               in the other reading the same slot is read as a value, which the
+               prologue parks once. */
+            if (whale_var_ref_feeds_call(pc, len, pos, sz)) {
+                if (whale_assume_self) {
+                    var_ref_used[op - OP_get_var_ref0] = 1;
+                    whale_gen_self_ref = 1;
+                } else {
+                    var_ref_val[op - OP_get_var_ref0] = 1;
+                }
             }
         } else if (op == OP_get_var_ref) {
             int a = (int)whale_get_u16(pc + pos + 1);
 
-            if (a >= 0 && a < 4 && whale_assume_self &&
-                whale_var_ref_feeds_call(pc, len, pos, sz)) {
-                var_ref_used[a] = 1;
-                whale_gen_self_ref = 1;
+            if (a >= 0 && a < 4 && whale_var_ref_feeds_call(pc, len, pos, sz)) {
+                if (whale_assume_self) {
+                    var_ref_used[a] = 1;
+                    whale_gen_self_ref = 1;
+                } else {
+                    var_ref_val[a] = 1;
+                }
             }
         }
         prev_op = op;
@@ -2639,6 +2651,26 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         if (args_used[i]) {
             wk(JS_WK_DOUBLE); wt_slot("A", i); wt('='); wt_id("An"); wt('['); wt_int(i); wt(']'); wt(';');
         }
+    }
+    /* Closure slots this reading reads as values: parked once here, in the
+       structural prologue. The captured value cannot change during the call -
+       the same fact the entry's self-check relies on - so re-parking per read
+       was one helper call and one dup per loop iteration for nothing. */
+    for (i = 0; i < 4; i++)
+        whale_vr_slot[i] = -1;
+    for (i = 0; i < 4; i++) {
+        if (!var_ref_val[i])
+            continue;
+        if (whale_objs >= WHALE_CALL_BASE) {
+            whale_objs = WHALE_CALL_BASE;   /* no room: refuse the function */
+            { whale_out_line = __LINE__; goto out; }
+        }
+        whale_vr_slot[i] = whale_objs++;
+        wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleVarRefGetObj"); wt('(');
+        wt_id("ctx"); wt(','); wt_id("var_refs"); wt(','); wt_int(i); wt(',');
+        wt_int(whale_vr_slot[i]); wt(')'); wt(')');
+        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
     }
     fold_commit(0);     /* the whole implicit prologue is structural */
 
@@ -4624,21 +4656,16 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 }
                 if (!whale_assume_self) {
                     /* The other reading of the same bytecode: the slot holds an
-                       enclosing closure's value. Park it as-is and let the call
-                       site hand it to the engine. */
-                    int slot = whale_objs++;
-                    int fmb;
+                       enclosing closure's value. It is parked once in the
+                       prologue (see the whale_vr_slot section) - the captured
+                       value cannot change during this call, the same fact the
+                       entry's self-check relies on - so every read here just
+                       pushes the parked reference. */
+                    int slot = whale_vr_slot[idx];
 
-                    if (slot >= WHALE_CALL_BASE)
+                    if (slot < 0)
                         { WHALE_STEP_INSTEAD_OF_BAILING(); }
                     whale_gen_pure = 0;   /* depends on captured state */
-                    fmb = fold_mark();
-                    wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleVarRefGetObj"); wt('(');
-                    wt_id("ctx"); wt(','); wt_id("var_refs"); wt(','); wt_int(idx); wt(',');
-                    wt_int(slot); wt(')'); wt(')');
-                    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
-                    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
-                    fold_commit(fmb);
                     cur[var_count + sp] = WHALE_VAL_T(slot);
                     sp++;
                     break;

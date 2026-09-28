@@ -3672,6 +3672,156 @@ int JS_WhaleArgGetObj(JSContext *ctx, JSValue v, int slot)
    generated code then hands that exception straight back instead of deopting:
    re-interpreting the frame would run the call a second time, and the callee is
    exactly the kind of thing (a DOM mutation) that must not happen twice. */
+/* A compiled callee called from compiled code. JS_Call's interpreter path
+   re-checks the class, re-runs the whale_on_call hook (for an already
+   compiled function that only feeds counters), and copies the arguments -
+   but the caller has just parked them, duped and GC-visible, in its own
+   object slots, so the callee's arg_buf can simply *be* that slot area. What
+   remains is the one thing that cannot be skipped: the frame itself, because
+   every helper the generated code calls reads it (object slots, stack checks,
+   exception unwinding).
+
+   Returns 1 with *ret set, 0 to mean "use JS_Call": uncompiled callee, arity
+   or closure mismatch, stack overflow (JS_Call raises that properly), or the
+   entry deopted - a deopt means "re-run this frame from the top in the
+   interpreter", which a discarded fast frame plus a fresh JS_Call reproduces
+   exactly, re-arm counters included. */
+typedef struct WhaleMemo WhaleMemo;
+static int whale_memo_lookup(WhaleMemo *m, int argc, const JSValue *argv, JSValue *out);
+static void whale_memo_insert(JSContext *ctx, WhaleMemo *m, int argc,
+                              const JSValue *argv, JSValue ret);
+static int whale_fast_call(JSContext *ctx, JSValue func, int argc,
+                           JSValue *args, JSValue *ret)
+{
+    JSRuntime *rt = ctx->rt;
+    JSObject *p;
+    JSFunctionBytecode *b;
+    JSStackFrame sf_s, *sf = &sf_s;
+    JSValue *local_buf, *var_buf, *stack_buf, *obj_slots, *pval, whale_ret;
+    JSContext *callee_ctx;
+    size_t alloca_size;
+    int whale_obj_n, i, whale_deopt;
+
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(func);
+    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
+        return 0;
+    b = p->u.func.function_bytecode;
+    if (!b->whale_jit_entry)
+        return 0;
+    /* The entry's wrapper reads args[i] directly; a missing argument would
+       have to be filled with undefined first, and a captured variable needs
+       the interpreter's var_ref area. Both are rare - leave them to JS_Call. */
+    if (argc != b->arg_count || b->var_ref_count != 0)
+        return 0;
+    if (js_check_stack_overflow(rt, 0))
+        return 0;
+
+    whale_obj_n = b->whale_needs_obj ? WHALE_OBJ_SLOTS : 0;
+    alloca_size = sizeof(JSValue) * (b->var_count + b->stack_size + whale_obj_n) +
+        sizeof(JSVarRef *) * b->var_ref_count;
+    if (js_check_stack_overflow(rt, alloca_size))
+        return 0;
+
+    sf->is_strict_mode = b->is_strict_mode;
+    sf->is_constructor = 0;
+    sf->arg_count = argc;
+    sf->cur_func = func;
+    sf->arg_buf = args;            /* borrowed; the caller's slots keep them alive */
+    local_buf = alloca(alloca_size);
+    var_buf = local_buf;
+    sf->var_buf = var_buf;
+    for (i = 0; i < b->var_count; i++)
+        var_buf[i] = JS_UNDEFINED;
+    stack_buf = var_buf + b->var_count;
+    obj_slots = stack_buf + b->stack_size;
+    if (b->whale_needs_obj) {
+        for (i = 0; i < b->stack_size; i++)
+            stack_buf[i] = JS_UNDEFINED;
+        for (i = 0; i < WHALE_OBJ_SLOTS; i++)
+            obj_slots[i] = JS_UNDEFINED;
+    }
+    sf->var_refs = (JSVarRef **)(obj_slots + whale_obj_n);
+    sf->var_ref_count = b->var_ref_count;
+    for (i = 0; i < b->var_ref_count; i++)
+        sf->var_refs[i] = NULL;
+    sf->cur_gc_obj = NULL;
+    sf->cur_pc = NULL;
+    sf->prev_frame = rt->current_stack_frame;
+    rt->current_stack_frame = sf;
+    callee_ctx = b->realm;
+
+    if (unlikely(b->whale_pure)) {
+        JSValue memo_ret;
+
+        if (whale_memo_lookup((WhaleMemo *)b->whale_memo, argc, args, &memo_ret)) {
+            rt->current_stack_frame = sf->prev_frame;
+            *ret = memo_ret;
+            return 1;
+        }
+    }
+
+    whale_deopt = 0;
+    whale_ret = ((JSValue (*)(JSContext *, JSValue *, JSValue *, int *, JSValue,
+                              void *, void *))b->whale_jit_entry)
+                    (callee_ctx, args, var_buf, &whale_deopt, func,
+                     b->whale_jit_entry, (void *)p->u.func.var_refs);
+    if (b->whale_needs_obj) {
+        sf->cur_sp = NULL;
+        /* drop whatever the JIT parked: the slots were only borrowed for the
+           duration of this call */
+        for (pval = obj_slots; pval < obj_slots + WHALE_OBJ_SLOTS; pval++) {
+            JS_FreeValue(ctx, *pval);
+            *pval = JS_UNDEFINED;
+        }
+        sf->cur_sp = obj_slots + WHALE_OBJ_SLOTS;
+    }
+    if (whale_deopt == 3 && b->whale_jit_entry2) {
+        /* the other reading - see JS_CallInternal. The fast frame built here
+           is the correct reading's frame already (same bytecode, same
+           layout), so the swap can happen in place. */
+        void *whale_e2 = b->whale_jit_entry2;
+
+        b->whale_jit_entry2 = NULL;
+        b->whale_jit_entry = whale_e2;
+        b->whale_pure = 0;
+        if (whale_dbg_env("WHALE_JIT_DUMP"))
+            fprintf(stderr, "whale jit: fast call switches to the other reading\n");
+        whale_deopt = 0;
+        whale_ret = ((JSValue (*)(JSContext *, JSValue *, JSValue *, int *, JSValue,
+                                  void *, void *))b->whale_jit_entry)
+                        (callee_ctx, args, var_buf, &whale_deopt, func,
+                         b->whale_jit_entry, (void *)p->u.func.var_refs);
+        if (b->whale_needs_obj) {
+            for (pval = obj_slots; pval < obj_slots + WHALE_OBJ_SLOTS; pval++) {
+                JS_FreeValue(ctx, *pval);
+                *pval = JS_UNDEFINED;
+            }
+        }
+    }
+    if (unlikely(whale_deopt)) {
+        /* Same re-arm policy as JS_CallInternal, then a fresh JS_Call re-runs
+           the frame from the top in the interpreter. */
+        if ((whale_deopt == 1 || whale_deopt == 3) && ++b->whale_deopt_count < 8) {
+            b->whale_jit_entry2 = NULL;
+        } else {
+            b->whale_jit_entry = NULL;
+            b->whale_jit_tried = 1;
+        }
+        rt->current_stack_frame = sf->prev_frame;
+        return 0;
+    }
+    for (pval = local_buf; pval < stack_buf; pval++)
+        JS_FreeValue(ctx, *pval);
+    if (unlikely(b->whale_pure))
+        whale_memo_insert(ctx, (WhaleMemo *)b->whale_memo, argc, args,
+                          js_dup(whale_ret));
+    rt->current_stack_frame = sf->prev_frame;
+    *ret = whale_ret;
+    return 1;
+}
+
 int JS_WhaleCallValue(JSContext *ctx, int func_slot, int argc, int arg_base,
                       int ret_slot)
 {
@@ -3682,6 +3832,14 @@ int JS_WhaleCallValue(JSContext *ctx, int func_slot, int argc, int arg_base,
         return 0;
     if (argc < 0 || arg_base < 0 || arg_base + argc > WHALE_OBJ_SLOTS)
         return 0;
+    /* compiled callee: straight to the entry, no interpreter frame */
+    if (whale_fast_call(ctx, slots[func_slot], argc, slots + arg_base, &r)) {
+        if (ret_slot >= 0 && ret_slot < WHALE_OBJ_SLOTS)
+            JS_WhaleObjSlot(ctx, ret_slot, r);   /* takes over the reference */
+        else
+            JS_FreeValue(ctx, r);
+        return 1;
+    }
     r = JS_Call(ctx, slots[func_slot], JS_UNDEFINED, argc, slots + arg_base);
     if (JS_IsException(r))
         return 0;
