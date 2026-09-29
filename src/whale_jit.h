@@ -224,6 +224,16 @@ int JS_WhaleObjSlotNum(JSContext *ctx, int slot, double v);
    borrowed from their slots, which is what keeps them alive across the call. */
 int JS_WhaleCallValue(JSContext *ctx, int func_slot, int argc, int arg_base,
                       int ret_slot);
+/* Speculative inline support: resolve closure slot `idx` to the bytecode
+   function it currently holds (filling `out` the way whale_on_call does, and
+   handing back the function object pointer), and the runtime guard that checks
+   the slot still holds the function a call site was compiled against. The
+   expected pointer is registered compile-time (JS_WhaleVrExpectAdd) and only
+   its table index travels in the generated code. */
+int JS_WhaleVarRefFuncInfo(JSContext *ctx, int idx,
+                           void **fn_out, JSWhaleFuncInfo *out);
+int JS_WhaleVrExpectAdd(void *fn);
+int JS_WhaleVarRefIsFn(JSContext *ctx, void *var_refs, int idx, int expect_slot);
 /* OP_call_method: the callee is a property of a receiver. Receiver and method
    travel in their own slots, the receiver becoming `this`; everything else is
    JS_WhaleCallValue. 0 means the call threw - the exception is pending and the

@@ -3877,6 +3877,99 @@ int JS_WhaleCallMethodValue(JSContext *ctx, int func_slot, int this_slot,
     return 1;
 }
 
+/* Resolve closure slot `idx` to a bytecode function, for speculative inlining:
+   fill `out` the way whale_on_call fills it and hand back the function object
+   pointer (the identity a runtime guard compares against). 0 = the slot does
+   not currently hold a bytecode function. */
+int JS_WhaleVarRefFuncInfo(JSContext *ctx, int idx,
+                           void **fn_out, JSWhaleFuncInfo *out)
+{
+    JSRuntime *rt = ctx->rt;
+    JSStackFrame *sf;
+    JSObject *fp;
+    JSVarRef **vrs;
+    JSVarRef *vr;
+    JSValue v;
+    JSObject *p;
+    JSFunctionBytecode *b;
+
+    /* Called from whale_on_call, so the frame that is being compiled - and
+       whose closure slot is being resolved - is the current one. Its
+       var_refs are the function object's own captured environment, the same
+       array the entry gets handed at run time. */
+    sf = rt->current_stack_frame;
+    if (!sf || JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
+        return 0;
+    fp = JS_VALUE_GET_OBJ(sf->cur_func);
+    if (fp->class_id != JS_CLASS_BYTECODE_FUNCTION)
+        return 0;
+    vrs = fp->u.func.var_refs;
+    if (!vrs || idx < 0 || idx >= 4 || !out)
+        return 0;
+    vr = vrs[idx];
+    if (!vr || !vr->pvalue)
+        return 0;
+    v = *vr->pvalue;
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(v);
+    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
+        return 0;
+    b = p->u.func.function_bytecode;
+    if (!b || !b->byte_code_buf)
+        return 0;
+    memset(out, 0, sizeof(*out));
+    out->byte_code = b->byte_code_buf;
+    out->byte_code_len = b->byte_code_len;
+    out->prof = b->whale_prof;
+    out->is_normal = (b->func_kind == JS_FUNC_NORMAL);
+    out->arg_count = b->arg_count;
+    out->var_count = b->var_count;
+    out->stack_size = b->stack_size;
+    out->var_ref_count = b->var_ref_count;
+    out->cpool_count = b->cpool_count;
+    out->cpool = b->cpool;
+    out->loops = b->whale_loops;
+    out->loop_count = b->whale_loop_count;
+    if (fn_out)
+        *fn_out = JS_VALUE_GET_PTR(v);
+    return 1;
+}
+
+/* The runtime half of the speculative inline: does closure slot `idx` still
+   hold the exact function the call site was compiled against? The expected
+   pointer comes from the compile-time registration table (index `slot`), so
+   the generated code never spells a pointer literal. */
+static void *whale_vr_expect[64];
+static int whale_vr_expect_n;
+
+int JS_WhaleVrExpectAdd(void *fn)
+{
+    if (whale_vr_expect_n >= 64)
+        return -1;
+    whale_vr_expect[whale_vr_expect_n] = fn;
+    return whale_vr_expect_n++;
+}
+
+int JS_WhaleVarRefIsFn(JSContext *ctx, void *var_refs, int idx, int expect_slot)
+{
+    JSVarRef **vrs = (JSVarRef **)var_refs;
+    JSVarRef *vr;
+    JSValue v;
+
+    (void)ctx;
+    if (!vrs || idx < 0 || idx >= 4 || expect_slot < 0 ||
+        expect_slot >= whale_vr_expect_n)
+        return 0;
+    vr = vrs[idx];
+    if (!vr || !vr->pvalue)
+        return 0;
+    v = *vr->pvalue;
+    return JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_PTR(v) == (uintptr_t)whale_vr_expect[expect_slot] &&
+        JS_VALUE_GET_OBJ(v)->class_id == JS_CLASS_BYTECODE_FUNCTION;
+}
+
 /* `new F(...)`. Same shape as JS_WhaleCallValue - the callee and every argument are
    slots - but the call goes through the constructor path, so the result is a freshly
    created object and the callee sees itself as new.target.

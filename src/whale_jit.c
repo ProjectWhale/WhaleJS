@@ -156,6 +156,11 @@ enum {
                             that is not in every observed shape keeps its slot and
                             gets a presence flag - reserving eight bytes is cheap
                             next to the access it replaces. */
+    WHALE_T_VRFN = 11, /* a closure slot read as a call target, resolved at
+                          compile time to the function it held then. The call is
+                          expanded inline behind an identity guard: if the slot
+                          no longer holds that function, the guard deopts. The
+                          byte carries the var_ref index, not a slot number. */
 };
 
 /* The object slot a type carries, packed into the same byte as the type.
@@ -180,6 +185,11 @@ enum {
 #define WHALE_STRUCT_T(slot) ((uint8_t)(WHALE_T_STRUCT | (((slot) + 1) << 4)))
 #define WHALE_IS_STRUCT(t)   (((t) & 0x0f) == WHALE_T_STRUCT)
 #define WHALE_STRUCT_SLOT(t) ((int)((t) >> 4) - 1)
+/* a closure slot resolved to a function at compile time: the byte carries the
+   var_ref index (0..3), not a slot number */
+#define WHALE_VRFN_T(idx)  ((uint8_t)(WHALE_T_VRFN | (((idx) + 1) << 4)))
+#define WHALE_IS_VRFN(t)   (((t) & 0x0f) == WHALE_T_VRFN)
+#define WHALE_VRFN_IDX(t)  ((int)((t) >> 4) - 1)
 
 /* Anything that carries an object slot - a plain object, a packed array, or an
    arbitrary value - encodes the slot the same way, so one accessor serves all
@@ -1341,12 +1351,20 @@ static int whale_inline_nested;      /* one level at a time: see the call site *
    them - the two areas cannot collide. */
 int whale_objs;
 int whale_fields;
-/* Defined further down with the rest of the generator state. The inliner hands
-   out slots from both, which is safe because a single linear pass allocates from
-   them - the two areas cannot collide. */
-int whale_objs;
-int whale_fields;
+/* The struct layout an inlined callee's object literal is built with: the
+   caller sets it before whale_inline_body and clears it after. The fresh
+   window lives here too, because the inlined body's define_field/put_field
+   stores and get_field reads go through the same _sdp path as the main
+   loop's. Reset at the top of the emit pass. */
+int whale_str_atoms[WHALE_STRUCT_FIELDS];
+int whale_str_n = 0;
+int whale_str_fresh = -1;
+int whale_str_fresh_n = 0;
+int whale_str_fresh_atoms[WHALE_STRUCT_FIELDS];
+int whale_inline_str_atoms[WHALE_STRUCT_FIELDS];
+int whale_inline_str_n = 0;
 
+static int whale_str_col(const int *atoms, int n, int atom);
 static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
                              int var_count, int arg_base)
 {
@@ -1376,13 +1394,23 @@ static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
         case OP_get_arg:
             {
                 int a = (op == OP_get_arg) ? (int)whale_get_u16(pc + pos + 1) : op - OP_get_arg0;
+                int t;
 
                 if (a < 0 || a >= callee->arg_count || whale_inline_argmap[a] < 0)
                     goto done;
+                /* The argument carries the type it has at the call site - a
+                   numeric stays a number, an object stays an object slot.
+                   Hard-typing it WHALE_T_NUM (the old behaviour) refused every
+                   callee whose parameter is an object: setField(o, v) died on
+                   its first get_field. */
+                t = cur[var_count + whale_inline_argmap[a]];
+                if (whale_dbg_env("WHALE_JIT_DUMP"))
+                    fprintf(stderr, "[vr-inline] get_arg a=%d map=%d t=%d\n",
+                            a, whale_inline_argmap[a], t);
                 fm = fold_mark();
                 fold_inline(whale_inline_argmap[a]);
                 fold_set(sp, fm);
-                cur[var_count + sp] = WHALE_T_NUM;
+                cur[var_count + sp] = (uint8_t)t;
                 sp++;
             }
             break;
@@ -1394,12 +1422,39 @@ static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
                 if (whale_objs >= WHALE_CALL_BASE)
                     goto done;
                 os = whale_objs++;
-                fm = fold_mark();
-                wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjNew"); wt('(');
-                wt_id("ctx"); wt(','); wt_int(os); wt(')'); wt(')');
-                wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
-                wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
-                fold_commit(fm);
+                if (whale_inline_str_n > 0) {
+                    /* The caller pre-scanned this callee's define_field names:
+                       build a real struct whose columns travel with it, and
+                       let the initialiser stores below go through the data
+                       pointer - the same shape the main loop emits for a
+                       factory body. Without this an inlined factory pays
+                       ObjNew + one helper per field, which eats the entire
+                       win from not crossing into the engine. */
+                    int k, afm = fold_mark();
+
+                    for (k = 0; k < whale_inline_str_n; k++) {
+                        wt_arr("wa", k); wt('='); wt_int(whale_inline_str_atoms[k]); wt(';');
+                    }
+                    wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleStructNew");
+                    wt('('); wt_id("_ws"); wt('.'); wt_id("wa"); wt(',');
+                    wt_int(whale_inline_str_n); wt(','); wt_int(os); wt(')'); wt(')');
+                    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                    wk(JS_WK_RETURN); wt_int(0); wt('}');
+                    wt_id("_sdp"); wt('='); wt_id("JS_WhaleStructDataPtr");
+                    wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_int(0); wt(')'); wt(';');
+                    fold_commit(afm);
+                    whale_str_fresh = os;
+                    whale_str_fresh_n = whale_inline_str_n;
+                    for (k = 0; k < whale_inline_str_n; k++)
+                        whale_str_fresh_atoms[k] = whale_inline_str_atoms[k];
+                } else {
+                    fm = fold_mark();
+                    wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjNew"); wt('(');
+                    wt_id("ctx"); wt(','); wt_int(os); wt(')'); wt(')');
+                    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    fold_commit(fm);
+                }
                 cur[var_count + sp] = WHALE_OBJ_T(os);
                 sp++;
             }
@@ -1415,6 +1470,22 @@ static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
                 tb = cur[var_count + sp - 1];
                 if (!WHALE_IS_OBJ(ta) || !whale_type_is_num(tb))
                     goto done;
+                /* The fresh window covers the inlined initialiser too. */
+                if (whale_str_fresh == WHALE_OBJ_SLOT(ta)) {
+                    int col = whale_str_col(whale_str_fresh_atoms, whale_str_fresh_n, atom);
+
+                    if (col >= 0) {
+                        fm = fold_mark();
+                        wt_id("_sdp"); wt('['); wt_int(col); wt(']');
+                        wt_op(JS_OP_DOT); wt_id("tag"); wt('='); wt_int(8); wt(';');
+                        wt_id("_sdp"); wt('['); wt_int(col); wt(']');
+                        wt_op(JS_OP_DOT); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64"); wt('=');
+                        fold_inline(sp - 1); wt(';');
+                        fold_commit(fm);
+                        sp--;
+                        break;
+                    }
+                }
                 fm = fold_mark();
                 wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjDefineNum"); wt('(');
                 wt_id("ctx"); wt(','); wt_int(WHALE_OBJ_SLOT(ta)); wt(','); wt_int(atom); wt(',');
@@ -1434,8 +1505,11 @@ static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
                 if (sp < 1)
                     goto done;
                 ta = cur[var_count + sp - 1];
-                if (!WHALE_IS_SLOT(ta) || whale_fields >= WHALE_FIELD_CACHE)
+                if (!WHALE_IS_SLOT(ta) || whale_fields >= WHALE_FIELD_CACHE) {
+                    if (whale_dbg_env("WHALE_JIT_DUMP"))
+                        fprintf(stderr, "[vr-inline] get_field: ta=%d fields=%d\n", ta, whale_fields);
                     goto done;
+                }
                 fc = whale_fields++;
                 nm = whale_vserial++;
                 /* not a literal we can prove stable: keep the shape check */
@@ -1570,6 +1644,9 @@ static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
     }
 
   done:
+    if (whale_dbg_env("WHALE_JIT_DUMP") && ret < 0)
+        fprintf(stderr, "[vr-inline] refused at pos=%d op=%d (%s) sp=%d\n",
+                pos, pc[pos], whale_op_name((int)pc[pos]), sp);
     for (i = 0; i < 4; i++)
         whale_inline_argmap[i] = saved_argmap[i];
     return ret;
@@ -2037,24 +2114,20 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     int whale_field_sites_n = 0;
     /* The layout of an unboxed struct: which atom sits in which column, plus the
        object slot index it was laid out for. Filled when OP_object creates one, read
-       by every field access on that slot. */
-    int whale_str_atoms[WHALE_STRUCT_FIELDS];
-    int whale_str_n = 0;
+       by every field access on that slot.
+       These four are file-level statics (like whale_objs/whale_fields below):
+       whale_inline_body lays out and reads an inlined callee's object too, and
+       it is a separate function. Reset at the top of the emit pass. */
     int whale_str_slot = -1;
     int whale_str_L[WHALE_STRUCT_FIELDS];
     /* Per closure slot: the object slot its value is parked in, or -1. Filled
        in the prologue for the slots this reading reads as values. */
     int whale_vr_slot[4];
-    /* The object slot JS_WhaleStructNew just built, and its column count.
-       While it stays current - no call, no jump target in between - the
-       initialiser stores go straight through `_sdp` instead of per-field
-       helpers. -1 when there is no fresh struct. */
-    int whale_str_fresh = -1;
-    int whale_str_fresh_n = 0;
-    /* Object slots this compilation built as plain objects (the OP_object
-       fallback arm). A define_field/put_field on one of them must go through
-       the ordinary property store - JS_WhaleStructSetNum only answers for
-       structs, and pairing it with a plain object deopted every call. */
+    /* Speculative inline of a closure-slot call target: the function the slot
+       held at compile time, its info, and the guard-table index. */
+    void *whale_vr_fn[4] = { 0 };
+    int whale_vr_expect_slot[4] = { -1, -1, -1, -1 };
+    JSWhaleFuncInfo whale_vr_info[4];
     unsigned whale_plain_slots = 0;
     int prev_op;    /* the opcode before the current one, in the scan pass */
     /* The one object slot this layout is materialised into when it has to become a
@@ -2093,6 +2166,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         loop_back[i] = -1;
     memset(lo_c, 0, sizeof(lo_c));
     memset(lo_cv, 0, sizeof(lo_cv));
+    /* the file-level struct-layout state: one compilation owns it at a time */
+    whale_str_n = 0;
+    whale_str_fresh = -1;
+    whale_str_fresh_n = 0;
+    whale_inline_str_n = 0;
 
     /* pass 1: jump targets + which arguments are read */
     /* The previous opcode, for the one shallow test this pass makes about a return
@@ -2228,14 +2306,16 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 whale_ret_obj_g = 1;
         } else if (op == OP_put_array_el) {
             /* A local object stored into an array leaves the function's own
-               lifetime: the array outlives the iteration, and a frame-column
-               layout would have to be materialised into a real object on
-               every single store. Marking the function as one that hands
-               objects over makes the literal build a real struct instead -
-               the columns travel with it, and the array store parks a
-               reference. escaped() in objshape spent its whole loop here. */
-            whale_ret_obj_g = 1;
-        } else if (op == OP_call || (op >= OP_call0 && op <= OP_call3)) {
+               lifetime, so a frame-column layout gets materialised into a
+               real object on every store (ObjNew + one ObjDefineNum per
+               column). Marking the function as one that hands objects over
+               would make the literal build a real struct directly - and that
+               was tried: StructNew per iteration (one JSObject plus a block
+               allocation, plus the GC scan each allocation triggers) measured
+               612ms against 430 for the materialising path. The wall is
+               JS_NewObjectClass itself, not the column layout, so the mark
+               stays off until the allocator has a lighter path for this
+               class. */        } else if (op == OP_call || (op >= OP_call0 && op <= OP_call3)) {
             whale_has_call = 1;
             /* Where this call is, for the "nothing after this point may call"
                gate the layout arms test. That gate reads whale_call_pos[last] and
@@ -2342,9 +2422,18 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     wt_id("void"); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("flag"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleVarRefGetNum"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_VOID); wt('*'); wt_id("var_refs"); wt(',');
-        wk(JS_WK_INT); wt_id("idx"); wt(','); wk(JS_WK_DOUBLE); wt('*'); wt_id("out"); wt(')'); wt(';');    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleVarRefGetObj"); wt('(');
+        wk(JS_WK_INT); wt_id("idx"); wt(','); wk(JS_WK_DOUBLE); wt('*'); wt_id("out"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleVarRefGetObj"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_VOID); wt('*'); wt_id("var_refs"); wt(',');
         wk(JS_WK_INT); wt_id("idx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(')'); wt(';');
+    /* Runtime identity guard for a speculatively inlined closure-slot call
+       target: does the slot still hold the function the call site was
+       compiled against? The expected function travels as a table index
+       (JS_WhaleVrExpectAdd, a compile-time call), never as a pointer
+       literal - the token emitters have no 64-bit literal. */
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleVarRefIsFn"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_VOID); wt('*'); wt_id("var_refs"); wt(',');
+        wk(JS_WK_INT); wt_id("idx"); wt(','); wk(JS_WK_INT); wt_id("expect_slot"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleVarRefSetNum"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_VOID); wt('*'); wt_id("var_refs"); wt(',');
         wk(JS_WK_INT); wt_id("idx"); wt(','); wk(JS_WK_DOUBLE); wt_id("v"); wt(')'); wt(';');
@@ -3511,6 +3600,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                             fold_commit(afm);
                             whale_str_fresh = os;
                             whale_str_fresh_n = fn;
+                            for (k = 0; k < fn; k++)
+                                whale_str_fresh_atoms[k] = whale_str_atoms[k];
                         }
                         }
                         cur[var_count + sp] = WHALE_OBJ_T(os);
@@ -3646,7 +3737,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                        column scan. This is the hot shape of setField,
                        makeProps and createElement. */
                     if (whale_str_fresh == WHALE_OBJ_SLOT(ta)) {
-                        int col = whale_str_col(whale_str_atoms, whale_str_fresh_n, atom);
+                        int col = whale_str_col(whale_str_fresh_atoms, whale_str_fresh_n, atom);
 
                         if (col >= 0) {
                             int fm = fold_mark();
@@ -3802,7 +3893,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         break;
                     }
                     if (whale_str_fresh == WHALE_OBJ_SLOT(ta)) {
-                        int col = whale_str_col(whale_str_atoms, whale_str_fresh_n, atom);
+                        int col = whale_str_col(whale_str_fresh_atoms, whale_str_fresh_n, atom);
 
                         if (col >= 0) {
                             int fm = fold_mark();
@@ -4000,7 +4091,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                        pointer - `t.v` in `t.u = t.v * 3` right after the
                        literal was built. Tag-checked inline, no helper. */
                     if (whale_str_fresh == WHALE_OBJ_SLOT(ta)) {
-                        int col = whale_str_col(whale_str_atoms, whale_str_fresh_n, atom);
+                        int col = whale_str_col(whale_str_fresh_atoms, whale_str_fresh_n, atom);
                         int nm;
 
                         if (col >= 0) {
@@ -4660,13 +4751,44 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                        prologue (see the whale_vr_slot section) - the captured
                        value cannot change during this call, the same fact the
                        entry's self-check relies on - so every read here just
-                       pushes the parked reference. */
+                       pushes the parked reference.
+
+                       And if the parked value is a bytecode function - the
+                       React shape, a component calling a helper - the call can
+                       be expanded inline behind an identity guard: WHALE_T_VRFN
+                       tells the call site to emit the guard plus the inlined
+                       body. Resolution happens once, here, at compile time. */
                     int slot = whale_vr_slot[idx];
 
                     if (slot < 0)
                         { WHALE_STEP_INSTEAD_OF_BAILING(); }
                     whale_gen_pure = 0;   /* depends on captured state */
-                    cur[var_count + sp] = WHALE_VAL_T(slot);
+                    if (whale_vr_fn[idx]) {
+                        /* resolved on an earlier read: the call site expands
+                           this inline behind the identity guard. Note cur[idx]
+                           is NOT set - the var_ref index and the local index
+                           are different spaces, and writing here polluted a
+                           local's type (step's `i` came out as a function). */
+                        cur[var_count + sp] = WHALE_VRFN_T(idx);
+                    } else {
+                        void *fn = NULL;
+
+                        if (0 && JS_WhaleVarRefFuncInfo(ctx, idx, &fn,
+                                                   &whale_vr_info[idx]) &&
+                            whale_vr_info[idx].is_normal &&
+                            whale_vr_info[idx].var_count == 0 &&
+                            whale_vr_info[idx].arg_count <= 4) {
+                            int gi = JS_WhaleVrExpectAdd(fn);
+
+                            if (gi >= 0) {
+                                whale_vr_fn[idx] = fn;
+                                cur[var_count + sp] = WHALE_VRFN_T(idx);
+                                sp++;
+                                break;
+                            }
+                        }
+                        cur[var_count + sp] = WHALE_VAL_T(slot);
+                    }
                     sp++;
                     break;
                 }
@@ -4849,6 +4971,76 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                 if (func_slot < 0)
                     { WHALE_STEP_INSTEAD_OF_BAILING(); }
+                /* A closure-slot call target resolved at compile time: expand
+                    the callee inline behind an identity guard - the slot must
+                    still hold the exact function this code was compiled
+                    against. One pointer compare per call replaces the whole
+                    engine-call chain. */
+                if (WHALE_IS_VRFN(cur[var_count + func_slot]) && !whale_inline_nested) {
+                    int vidx = WHALE_VRFN_IDX(cur[var_count + func_slot]);
+                    int rtype, saved_nested = whale_inline_nested;
+                    int guard_ok = 1;
+
+                    for (k = 0; k < argc; k++) {
+                        int tk = cur[var_count + sp - argc + k];
+
+                        if (!whale_type_is_num(tk) && !WHALE_IS_SLOT(tk))
+                            guard_ok = 0;
+                    }
+                    if (guard_ok) {
+                        /* The callee's own field names, in definition order -
+                           its object literal is built as a real struct with
+                           these columns (the same thing the scan pass does
+                           for a whole function). */
+                        const uint8_t *cpc = whale_vr_info[vidx].byte_code;
+                        int clen = whale_vr_info[vidx].byte_code_len, cpos;
+                        int csz;
+
+                        whale_inline_str_n = 0;
+                        for (cpos = 0; cpos < clen; ) {
+                            int cop = cpc[cpos];
+
+                            csz = whale_op_size_of(cop);
+                            if (csz <= 0 || cpos + csz > clen)
+                                break;
+                            if (cop == OP_define_field &&
+                                whale_inline_str_n < WHALE_STRUCT_FIELDS)
+                                whale_inline_str_atoms[whale_inline_str_n++] =
+                                    (int)whale_get_u32(cpc + cpos + 1);
+                            cpos += csz;
+                        }
+                        fm = fold_mark();
+                        /* the guard itself: a statement, committed with the body */
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleVarRefIsFn");
+                        wt('('); wt_id("ctx"); wt(','); wt_id("var_refs"); wt(',');
+                        wt_int(vidx); wt(','); wt_int(whale_vr_expect_slot[vidx]); wt(')'); wt(')');
+                        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt('}');
+                        whale_inline_nested = 1;
+                        rtype = whale_inline_body(&whale_vr_info[vidx], cur,
+                                                  var_count, sp - argc);
+                        whale_inline_nested = saved_nested;
+                        if (whale_dbg_env("WHALE_JIT_DUMP"))
+                            fprintf(stderr, "[vr-inline] pos=%d argc=%d rtype=%d\n",
+                                    pos, argc, rtype);
+                        if (rtype < 0) {
+                            /* the inliner refused this callee - drop the guard
+                               and the partial body, re-type the callee as the
+                               plain parked value and take the general path */
+                            JS_WhaleTokSinkTruncate(fm);
+                            cur[var_count + func_slot] =
+                                WHALE_VAL_T(whale_vr_slot[vidx]);
+                        } else {
+                            fold_commit(fm);
+                            cur[var_count + func_slot] = (uint8_t)rtype;
+                            sp = func_slot + 1;
+                            break;
+                        }
+                    } else {
+                        cur[var_count + func_slot] =
+                            WHALE_VAL_T(whale_vr_slot[vidx]);
+                    }
+                }
                 if (cur[var_count + func_slot] == WHALE_T_FN && !whale_inline_nested) {
                     /* A callee this compilation can see through: expand it in
                        place instead of crossing into the engine. */
@@ -5722,6 +5914,7 @@ static const WhaleHostSym whale_host_syms[] = {
     WHALE_HOST_SYM(JS_WhaleVarRefGetNum),
     WHALE_HOST_SYM(JS_WhaleVarRefSetNum),
     WHALE_HOST_SYM(JS_WhaleVarRefGetObj),
+WHALE_HOST_SYM(JS_WhaleVarRefIsFn),
     WHALE_HOST_SYM(JS_WhaleCheckStack),
     WHALE_HOST_SYM(whale_jit_box_num),
     WHALE_HOST_SYM(whale_jit_unbox_num),
