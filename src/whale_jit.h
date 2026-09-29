@@ -234,6 +234,9 @@ int JS_WhaleVarRefFuncInfo(JSContext *ctx, int idx,
                            void **fn_out, JSWhaleFuncInfo *out);
 int JS_WhaleVrExpectAdd(void *fn);
 int JS_WhaleVarRefIsFn(JSContext *ctx, void *var_refs, int idx, int expect_slot);
+/* The storage cell of closure slot `idx`: get_var_ref/put_var_ref become
+   tag-checked loads and stores through it (zero helper calls per access). */
+JSValue *JS_WhaleVarRefPval(JSContext *ctx, void *var_refs, int idx);
 /* OP_call_method: the callee is a property of a receiver. Receiver and method
    travel in their own slots, the receiver becoming `this`; everything else is
    JS_WhaleCallValue. 0 means the call threw - the exception is pending and the

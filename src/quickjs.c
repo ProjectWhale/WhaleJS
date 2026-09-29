@@ -3936,6 +3936,25 @@ int JS_WhaleVarRefFuncInfo(JSContext *ctx, int idx,
     return 1;
 }
 
+/* The storage cell of closure slot `idx`, for direct access from generated
+   code: get_var_ref/put_var_ref become tag-checked loads and stores through
+   this pointer instead of two helper calls per access. The pointer is stable
+   for the whole call - a detached var_ref points at its own value, an open
+   one at the capturing frame's slot, and neither moves. */
+JSValue *JS_WhaleVarRefPval(JSContext *ctx, void *var_refs, int idx)
+{
+    JSVarRef **vrs = (JSVarRef **)var_refs;
+    JSVarRef *vr;
+
+    (void)ctx;
+    if (!vrs || idx < 0 || idx >= 4)
+        return NULL;
+    vr = vrs[idx];
+    if (!vr || !vr->pvalue)
+        return NULL;
+    return vr->pvalue;
+}
+
 /* The runtime half of the speculative inline: does closure slot `idx` still
    hold the exact function the call site was compiled against? The expected
    pointer comes from the compile-time registration table (index `slot`), so

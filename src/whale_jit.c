@@ -1439,7 +1439,7 @@ static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
                     wt('('); wt_id("_ws"); wt('.'); wt_id("wa"); wt(',');
                     wt_int(whale_inline_str_n); wt(','); wt_int(os); wt(')'); wt(')');
                     wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
-                    wk(JS_WK_RETURN); wt_int(0); wt('}');
+                    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
                     wt_id("_sdp"); wt('='); wt_id("JS_WhaleStructDataPtr");
                     wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_int(0); wt(')'); wt(';');
                     fold_commit(afm);
@@ -1624,6 +1624,7 @@ static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
                     ret = WHALE_VAL_T(os);
                 } else if (whale_type_is_num(ta)) {
                     int nm = whale_vserial++;
+                    int fm = 0;
 
                     wt_arr("v", nm); wt('='); fold_inline(sp - 1); wt(';');
                     whale_vname[sp - 1] = nm;
@@ -2083,6 +2084,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     int *loop_back = NULL;      /* per position: the backward jump that closes it */
     uint8_t var_ref_used[4] = { 0, 0, 0, 0 };
     uint8_t var_ref_val[4] = { 0, 0, 0, 0 };   /* closure reading: the slot is read as a value */
+    uint8_t var_ref_rw[4] = { 0, 0, 0, 0 };    /* any value read or write: the slot gets a pval */
     unsigned *assign_cnt = NULL;   /* weighted access count */
     uint8_t lo_c[WHALE_JIT_MAX_SLOTS];
     double lo_cv[WHALE_JIT_MAX_SLOTS];
@@ -2339,6 +2341,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     var_ref_val[op - OP_get_var_ref0] = 1;
                 }
             }
+            /* Every value read or write gets the slot a pval: get_var_ref and
+               put_var_ref become tag-checked loads and stores through the
+               cell pointer, zero helper calls per access. */
+            var_ref_rw[op - OP_get_var_ref0] = 1;
         } else if (op == OP_get_var_ref) {
             int a = (int)whale_get_u16(pc + pos + 1);
 
@@ -2350,6 +2356,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     var_ref_val[a] = 1;
                 }
             }
+            if (a >= 0 && a < 4)
+                var_ref_rw[a] = 1;
+        } else if (op == OP_put_var_ref || (op >= OP_put_var_ref0 && op <= OP_put_var_ref3)) {
+            int w = (op == OP_put_var_ref) ? (int)whale_get_u16(pc + pos + 1) : op - OP_put_var_ref0;
+
+            if (w >= 0 && w < 4)
+                var_ref_rw[w] = 1;
         }
         prev_op = op;
         pos += sz;
@@ -2431,6 +2444,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        compiled against? The expected function travels as a table index
        (JS_WhaleVrExpectAdd, a compile-time call), never as a pointer
        literal - the token emitters have no 64-bit literal. */
+    wk(JS_WK_EXTERN); wt_id("JSValue"); wt('*'); wt_id("JS_WhaleVarRefPval"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_VOID); wt('*'); wt_id("var_refs"); wt(',');
+        wk(JS_WK_INT); wt_id("idx"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleVarRefIsFn"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_VOID); wt('*'); wt_id("var_refs"); wt(',');
         wk(JS_WK_INT); wt_id("idx"); wt(','); wk(JS_WK_INT); wt_id("expect_slot"); wt(')'); wt(';');
@@ -2660,6 +2676,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        call, and those return numbers, so nothing reads it. Every statement here
        is one TinyCC spills, on every call. */
     wt_id("JSValue"); wt_id("_cref"); wt(';');
+    /* Closure-slot storage cells, fetched once in the prologue: get_var_ref
+       and put_var_ref read and write through them directly. */
+    wt_id("JSValue"); wt('*'); wt_id("_p0"); wt(';');
+    wt_id("JSValue"); wt('*'); wt_id("_p1"); wt(';');
+    wt_id("JSValue"); wt('*'); wt_id("_p2"); wt(';');
+    wt_id("JSValue"); wt('*'); wt_id("_p3"); wt(';');
     /* The fresh struct's columns, set by JS_WhaleStructDataPtr right after
        JS_WhaleStructNew. Valid only while whale_str_fresh names this slot -
        no call, no jump target in between - which is exactly the run of
@@ -2759,6 +2781,19 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wt_id("ctx"); wt(','); wt_id("var_refs"); wt(','); wt_int(i); wt(',');
         wt_int(whale_vr_slot[i]); wt(')'); wt(')');
         wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+    }
+    /* Closure slots read or written as values: fetch the storage cell once.
+       get_var_ref / put_var_ref then run as tag-checked loads and stores
+       through the pointer - `n = n + 1` inside a compiled closure loop costs
+       a load, an add and a store, with no helper call in sight. */
+    for (i = 0; i < 4; i++) {
+        if (!var_ref_rw[i])
+            continue;
+        wk(JS_WK_IF); wt('('); wt('!'); wt('('); wt_slot("_p", i); wt('=');
+        wt_id("JS_WhaleVarRefPval"); wt('('); wt_id("ctx"); wt(','); wt_id("var_refs"); wt(',');
+        wt_int(i); wt(')'); wt(')'); wt(')'); wt('{');
+        wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
         wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
     }
     fold_commit(0);     /* the whole implicit prologue is structural */
@@ -4725,18 +4760,29 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                    enclosing closure's variable, read here as a number. */
                 if (!whale_var_ref_feeds_call(pc, len, pos, sz)) {
                     int nm = whale_vserial++;
-                    int fm = fold_mark();
+                    int fm = 0;
 
                     /* The result now depends on something other than the
-                       arguments - the captured state - so the engine must not
-                       memoise this function. Without this a counter closure
-                       returns the first answer for ever. */
+                        arguments - the captured state - so the engine must not
+                        memoise this function. Without this a counter closure
+                        returns the first answer for ever. */
                     whale_gen_pure = 0;
 
-                    wk(JS_WK_IF); wt('('); wt('!');
-                    wt_id("JS_WhaleVarRefGetNum"); wt('('); wt_id("ctx"); wt(',');
-                    wt_id("var_refs"); wt(','); wt_int(idx); wt(','); wt('&'); wt_arr("v", nm); wt(')');
-                    wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                    /* Through the storage cell (fetched once in the prologue):
+                       a tag-checked load, no helper. `n = n + 1` in a compiled
+                       closure loop costs a load, an add and a store. */
+                    fm = fold_mark();
+                    wk(JS_WK_IF); wt('('); wt_slot("_p", idx);
+                    wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(8); wt(')'); wt('{');
+                    wt_arr("v", nm); wt('='); wt_slot("_p", idx);
+                    wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64"); wt(';');
+                    wt('}'); wk(JS_WK_ELSE); wk(JS_WK_IF); wt('('); wt_slot("_p", idx);
+                    wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(0); wt(')'); wt('{');
+                    wt_arr("v", nm); wt('='); wt('('); wk(JS_WK_DOUBLE); wt(')');
+                    wt_slot("_p", idx); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT);
+                    wt_id("int32"); wt(';');
+                    wt('}'); wk(JS_WK_ELSE); wt('{');
+                    wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
                     wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
                     fold_commit(fm);
                     whale_vname[sp] = nm;
@@ -4744,8 +4790,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     cur[var_count + sp] = WHALE_T_NUM;
                     sp++;
                     break;
-                }
-                if (!whale_assume_self) {
+                }                if (!whale_assume_self) {
                     /* The other reading of the same bytecode: the slot holds an
                        enclosing closure's value. It is parked once in the
                        prologue (see the whale_vr_slot section) - the captured
@@ -4813,13 +4858,21 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 if (!whale_type_is_num(cur[var_count + sp - 1]))
                     { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 whale_gen_pure = 0;   /* writes captured state */
+                /* Through the storage cell: the old value is known to be a
+                   number (anything else deopted on the read that produced it,
+                   and the initial undefined deopts the first write too), so
+                   overwriting it needs no JS_FreeValue. One tag-checked
+                   store, no helper call. */
                 fm = fold_mark();
-                wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleVarRefSetNum"); wt('(');
-                wt_id("ctx"); wt(','); wt_id("var_refs"); wt(','); wt_int(idx); wt(',');
-                fold_inline(sp - 1); wt(')'); wt(')');
-                wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                wk(JS_WK_IF); wt('('); wt_slot("_p", idx);
+                wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_NE); wt_int(8);
+                wt_op(JS_OP_AND); wt_slot("_p", idx);
+                wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_NE); wt_int(0); wt(')'); wt('{');
+                wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
                 wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
-                fold_commit(fm);
+                wt_slot("_p", idx); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT);
+                wt_id("float64"); wt('='); fold_inline(sp - 1); wt(';');
+                wt_slot("_p", idx); wt_op(JS_OP_ARROW); wt_id("tag"); wt('='); wt_int(8); wt(';');                fold_commit(fm);
                 sp--;
             }
             break;
@@ -5015,7 +5068,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         wt('('); wt_id("ctx"); wt(','); wt_id("var_refs"); wt(',');
                         wt_int(vidx); wt(','); wt_int(whale_vr_expect_slot[vidx]); wt(')'); wt(')');
                         wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
-                        wk(JS_WK_RETURN); wt_int(0); wt('}');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
                         whale_inline_nested = 1;
                         rtype = whale_inline_body(&whale_vr_info[vidx], cur,
                                                   var_count, sp - argc);
@@ -5915,6 +5968,7 @@ static const WhaleHostSym whale_host_syms[] = {
     WHALE_HOST_SYM(JS_WhaleVarRefSetNum),
     WHALE_HOST_SYM(JS_WhaleVarRefGetObj),
 WHALE_HOST_SYM(JS_WhaleVarRefIsFn),
+    WHALE_HOST_SYM(JS_WhaleVarRefPval),
     WHALE_HOST_SYM(JS_WhaleCheckStack),
     WHALE_HOST_SYM(whale_jit_box_num),
     WHALE_HOST_SYM(whale_jit_unbox_num),
