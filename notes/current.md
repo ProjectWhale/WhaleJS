@@ -1623,3 +1623,40 @@ emit 处只推 VAL(槽)。
 ## 状态
 `ae43f3e` 绿：25/25 编译、0 mismatch。immutable_update 342ms、objshape 462、
 props_diff 15、vnode_build 10。
+
+# <65>: var_ref 推测内联——机制建成、实测变慢、单点关闭
+SOLVED（机制）/ UNRESOLVED（为什么慢）
+
+## 机制（commit 41a5ebc，全部在树内）
+- 引擎：`JS_WhaleVarRefFuncInfo(ctx, idx, &fn, &info)` 编译期解析（current_stack_frame
+  正是**正在编译**的帧，其 var_refs 活着——这是"编译期拿运行时值"的合法通道）；
+  `JS_WhaleVrExpectAdd(fn)` 把期望函数注册进静态表返回索引（token 发射器没有 64 位
+  字面量，指针以索引 travels）；`JS_WhaleVarRefIsFn(ctx, var_refs, idx, expect_slot)`
+  是运行期守卫。
+- 类型 `WHALE_T_VRFN=11`，字节编 **var_ref 索引**（不是槽号）。
+- `whale_inline_body` 参数类型继承调用点栈槽（原硬编码 WHALE_T_NUM——setField(o,v)
+  第一个 get_field 就死）；内联体的 OP_object 走 StructNew+DataPtr+fresh 直写
+  （列 = callee 自己的 define_field 序，调用点预扫）；whale_str_atoms/n/fresh 提为
+  文件级 static（与 whale_objs/whale_fields 同模式），gen emit 入口重置。
+
+## 三个踩过的坑（修完机制才通）
+1. **cur[idx] 一格两用**：var_ref idx 与 local idx 是不同空间，get_var_ref closure
+   分支写 `cur[idx]=VRFN` 污染了 local（step 的 `i` 变成函数类型 → 参数被拒）。
+2. **gen 没有 var_refs**：编译期解析走 current_stack_frame 的 cur_func。
+3. **前置声明顺序**：whale_str_col 定义在 inline_body 后，inline_body 现在要调它。
+
+## 实测：变慢，已单点关闭（`if (0 && JS_WhaleVarRefFuncInfo...)`）
+immutable_update 342 → 549ms 且 entries 归零；objfields 55 → 554ms entries 归零。
+关闭解析后全恢复：immutable **327ms**、25/25、0 mismatch。**为什么慢未诊断**——
+下一步第一件事：dump 两个读法的内联流（self reading 的 get_var_ref 分支同样受
+scan 改动影响；vr-inline 的 truncate/re-type 与 general 分支的 fresh 物化段交互是
+首要嫌疑）。
+
+## 好消息
+- fast-call + park（<64>）在无干扰下稳态兑现：immutable 342 → 327ms。
+- escaped 的 StructNew-per-iteration 实测 612 vs 物化 430 —— 逃逸标记回退，
+  原因注释在 scan（墙是 JS_NewObjectClass，不是列布局）。
+- whale_str_* static 化 + inline_body 的 StructNew/fresh 直写保留（内联转正时即用）。
+
+## 状态
+`41a5ebc` 绿：25/25 编译、0 mismatch、immutable 327ms。
