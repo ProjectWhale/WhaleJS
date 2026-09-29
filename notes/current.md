@@ -1660,3 +1660,20 @@ scan 改动影响；vr-inline 的 truncate/re-type 与 general 分支的 fresh �
 
 ## 状态
 `41a5ebc` 绿：25/25 编译、0 mismatch、immutable 327ms。
+
+# <66 续>: closure 槽 = 存储单元（pval），一次取、直读写
+SOLVED
+
+`JS_WhaleVarRefPval(ctx, var_refs, idx)` 返回闭包槽的存储 cell（`JSValue *`），prologue
+按 `var_ref_rw[]`（scan 新增：值读或写）每槽取一次；get_var_ref 变成 `_p->tag` 检查的
+直接读，put_var_ref 变成 tag 检查（证明旧值是 immediate，无需 JS_FreeValue）后的直接写。
+`n = n + 1` 在编译的闭包循环里 = load + add + store，零 helper、零装箱——
+**"普通函数 + 闭包上下文指针"的形态，正是用户问的**；比"出入口装箱"更进一步：循环路径
+完全无箱。
+
+坑：`wt_id("_p"); wt_int(idx);` 发出**两个** token（`_p` `0`），TCC 读作 `_p` 未声明——
+组合名必须走 `wt_slot("_p", idx)`（与 L0/_p0 同机制）；另有三处 `return 0 }` 漏分号
+（同一批编辑引入）。
+
+closure 10-11 → **9ms**（node 3ms；剩余 = 每迭代 2 次 tag 分支 + 访存，TCC 无寄存器
+提升）。**进一步**：闭包计数器的循环内寄存器化（回边写回）需要 LICM 级证明，暂缓。
