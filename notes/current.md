@@ -1677,3 +1677,64 @@ SOLVED
 
 closure 10-11 → **9ms**（node 3ms；剩余 = 每迭代 2 次 tag 分支 + 访存，TCC 无寄存器
 提升）。**进一步**：闭包计数器的循环内寄存器化（回边写回）需要 LICM 级证明，暂缓。
+
+# <66 续>: TCC/ELS 调研 + vr-inline 的正确性修复清单（机制禁用中）
+TIPS + UNRESOLVED
+
+## vr-inline 三个正确性修复（已做但因性能回退随分支丢弃，重新启用时需重做）
+1. `whale_inline_body` 的 get_arg 参数类型必须**继承调用点栈槽**（`t = cur[var_count +
+   argmap[a]]`），原硬编码 WHALE_T_NUM 让 setField(o, v) 的第一个 get_field 就拒。
+2. get_var_ref closure 分支**不得写 cur[idx]**：var_ref idx 与 local idx 是不同空间，
+   写 cur[idx]=VRFN 污染了 local（step 的 `i` 被类型化成函数 → 参数被拒 → 549ms 全解释）。
+3. 编译期解析走 `JS_WhaleVarRefFuncInfo(ctx, idx, ...)`（current_stack_frame 是正在
+   编译的帧，其 var_refs 活着）。
+即使三修复齐全，实测仍 549ms + entries 归零（fn_2 编译失败）——第二个读法的 get_field
+拒绝链（ta=1）未根因。**下轮第一步**：修完三坑后 dump 第二读法的内联 token 流，逐 token
+对照 —— refuses 链在 get_field ta 继承（ caller 栈槽类型在解析时刻的值需要打印确认）。
+
+## TCC/ELS 调研（用户问：延时生成 + ELS 强制扭转 spill 是否可行）
+### 现状（源码量化）
+tccgen.c 6986 行，**单遍解析即发码**：`g()` 被调 **1487** 次、`o()` **3270** 次
+（共 ~4800 个直发字节调用点），寄存器管理仅 `get_reg` 8 处 / `save_reg` 4 处。
+**没有 IR、没有活跃分析、没有寄存器压力模型**——局部变量永远走内存（VT_LVAL 每次
+load/store），寄存器只活在一个表达式内部。这是 TCC 的设计选择（编译速度优先），
+不是 bug。
+### ELS 需要什么
+1. **延时生成（两遍化）**：全部 4800 个发码点改为"记录操作"—— 即一个线性 IR
+   （load_local/store_local/const/binop/call/branch/label，词表 ~40 个 op）。
+2. **活跃分析**：对 IR 线性扫（反向）得每个 local 的活区间。
+3. **ELS 分配**：区间按起点排序，扫过活跃列表分配 xmm/r 续借寄存器，用尽时
+   spill 区间终点最远者。对热循环（2-6 个活跃值、14 个 xmm）绰绰有余。
+4. **重放发码**：spill 决策已在 IR 上，重放是直译。
+### 难度
+- **路线 A（改 tccgen 本体）**：`gen_modrm` 把"选寄存器/寻址模式"与"发字节"熔合在
+  x86_64-gen.c（2238 行）内部；ELS 要在发码**前**知道寄存器归属 → 必须解耦寻址
+  选择 → 动到 x86_64 全部指令的寻址决策。估计 2-4 周 + 全 C 前端回归面
+  （初始化器/位域/VLA/long long/浮点转换……）。**不建议**。
+- **路线 B（生成器侧 ELS，推荐）**：我们的"输入"不是任意 C——是 whale_jit.c 生成的
+  **规则子集**（直通数值代码 + 分支 + helper 调用），而且**全函数体已在缓冲里**
+  （loop_begin/loop_end 的 token 缓冲、<58> 的循环表）。在生成器层直接产出
+  带 ELS 寄存器分配的线性 IR、绕过 tccgen 直发 x86（或以"预分配寄存器"的形式
+  馈 TCC），工作量 ≈ 一个小型专用后端（估 800-1500 行），避开 tccgen 纠缠。
+  **这正是 fast-call/内联一路的自然延伸：由我们控制的编译管线。**
+### 编译时长代价
+- TCC 单函数编译 < 1ms（热阈触发的编译尖峰从未被观测为可测停顿）。
+- ELS 增量：op 缓冲 + 线性活跃扫 + 区间排序，对 50-200 op 的函数体是**微秒级**
+  ——编译时长代价可忽略。
+- 对照：gcc 后端单函数几十-几百 ms（进程 spawn + 编译 + 链接），质量最高但
+  浏览器冷启动不可接受。**ELS-in-generator 的意义 = gcc 质量的分配 + TCC 量级的
+  延迟**，正好是当前缺的中间档。
+### 收益上限（参照 gcc 后端实测）
+bitops 150→70、nested 87→18、locals 102→24、minmax 110→35、sieve 165→70 ——
+数值循环 1.5-4x。ELS 只覆盖分配维度（指令选择/调度仍差），诚实预估**热循环
+1.3-2x**。而 fast-call/内联（immutable 327ms 一路）对框架形状的收益更大，
+**优先级低于内联，高于 TCC 本体改造**。
+### 建议排序
+1. gcc 后端做**热路径专用**（冷启动 TCC + 热点换 gcc 的两级 JIT——WHALE_JIT_CC
+   已在，加"再编译"机制即可，先测延迟分布）。
+2. 若延迟不可接受 → 生成器侧 ELS（路线 B）。
+3. tccgen 本体改造（路线 A）永不。
+## 状态
+`effa8f0` 基线绿：25/25 编译、0 mismatch、immutable 367ms、props_diff 16ms。
+本轮探索性改动（vr-inline 修复 + _ws 选择性清零）已从工作区移除，详细修复清单
+与本节结论保留在此，供下轮继续。
