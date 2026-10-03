@@ -661,7 +661,7 @@ static WhaleLocal *whale_lmem;
 
 /* Decide what this load means. Returns 0 if it is not a simple load. */
 static int whale_load_analyze(const JSWhaleFuncInfo *info, const uint8_t *pc, int pos, const uint8_t *cur,
-                              int var_count, const uint8_t *lo_c, const double *lo_cv,
+                              int var_count, const uint8_t *loc_c, const double *loc_cv,
                               int *len_out, int *type_out, int *kind_out, int *idx_out, double *cval_out)
 {
     int op = pc[pos];
@@ -715,9 +715,9 @@ static int whale_load_analyze(const JSWhaleFuncInfo *info, const uint8_t *pc, in
             *type_out = tt;
             /* constant propagation: a local written exactly once with a
                compile-time constant is that constant everywhere afterwards */
-            if (idx >= 0 && idx < var_count && lo_c && lo_c[idx]) {
+            if (idx >= 0 && idx < var_count && loc_c && loc_c[idx]) {
                 *kind_out = WLD_REAL;
-                *cval_out = lo_cv[idx];
+                *cval_out = loc_cv[idx];
             } else {
                 *kind_out = WLD_SLOT;
                 *idx_out = idx;
@@ -877,6 +877,13 @@ static uint8_t    *whale_vmat;    /* 1 = already forced into a variable */
    *first* one. References go through whale_vname[k]. */
 #define WHALE_VSER_MAX 64
 static int whale_vname[WHALE_JIT_MAX_SLOTS];  /* slot -> name number */
+/* Single-assignment constant locals: lo_c[d] means local d is a compile-time
+   constant lo_cv[d] everywhere afterwards. Written by put_loc (fast path and
+   generic path), read by the analyser and by local_inline below - a deferred
+   local that turns out to be a constant must inline as the literal, not as
+   the variable that will only hold it after the flush. */
+static uint8_t whale_lo_c[WHALE_JIT_MAX_SLOTS];
+static double whale_lo_cv[WHALE_JIT_MAX_SLOTS];
 /* Diagnostics: how many times fold_inline_expr was handed a range that no longer
    points at an expression. See the note in its body. */
 int whale_empty_ranges;
@@ -1272,6 +1279,10 @@ static void local_inline(int d)
     if (whale_dbg_env("WHALE_MEM_TRACE"))
         fprintf(stderr, "[inl] L%d live=%d\n", d, whale_lmem[d].live);
     if (!whale_lmem[d].live) {
+        if (d >= 0 && d < WHALE_JIT_MAX_SLOTS && whale_lo_c[d]) {
+            wt_num(whale_lo_cv[d]);
+            return;
+        }
         wt_slot("L", d);
         return;
     }
@@ -2200,8 +2211,6 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     uint8_t var_ref_val[4] = { 0, 0, 0, 0 };   /* closure reading: the slot is read as a value */
     uint8_t var_ref_rw[4] = { 0, 0, 0, 0 };    /* any value read or write: the slot gets a pval */
     unsigned *assign_cnt = NULL;   /* weighted access count */
-    uint8_t lo_c[WHALE_JIT_MAX_SLOTS];
-    double lo_cv[WHALE_JIT_MAX_SLOTS];
     int unreachable = 0;
     int ret_is_bool = -1;
     int whale_objs = 0;   /* object slots handed out; each new object takes one */
@@ -2276,12 +2285,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     loop_back = malloc((len + 1) * sizeof(*loop_back));
     if (!targets || !seen || !snap || !cur || !args_used || !assign_cnt ||
         !args_obj || !args_arr ||
-        !whale_vexpr || !whale_vmat || !whale_lmem || !loop_back)
+        !whale_vexpr || !whale_vmat ||
+        !whale_lmem || !loop_back)
         { whale_out_line = __LINE__; goto out; }
     for (i = 0; i <= len; i++)
         loop_back[i] = -1;
-    memset(lo_c, 0, sizeof(lo_c));
-    memset(lo_cv, 0, sizeof(lo_cv));
+    memset(whale_lo_c, 0, sizeof(whale_lo_c));
+    memset(whale_lo_cv, 0, sizeof(whale_lo_cv));
     /* the file-level struct-layout state: one compilation owns it at a time */
     whale_str_n = 0;
     whale_str_fresh = -1;
@@ -2392,6 +2402,19 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     whale_obj_pending = 0;
                 }
             }
+        } else if ((op >= OP_set_loc0 && op <= OP_set_loc3) ||
+                   op == OP_set_loc8 || op == OP_set_loc) {
+            /* set_loc stores too (and leaves the value): missing it here
+               miscounts a loop-carried variable as single-assignment, and the
+               constant propagator then rewrites the loop body with the initial
+               value - a silent wrong answer, the same class as the inc_loc
+               hole fixed in <13>. */
+            int a = (op == OP_set_loc8) ? (int)pc[pos + 1]
+                : (op == OP_set_loc) ? (int)whale_get_u16(pc + pos + 1)
+                : op - OP_set_loc0;
+
+            if (a < var_count)
+                assign_cnt[a]++;
         } else if (op == OP_get_field || op == OP_get_field2 || op == OP_put_field) {
             /* the offset the profile table is keyed by: the access site's operand,
                which is the opcode offset plus one */
@@ -3104,11 +3127,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         }
 
         /* --- peephole 1: <load> <load> <binop> [put_loc] -> one assignment --- */
-        ok1 = whale_load_analyze(info, pc, pos, cur, var_count, lo_c, lo_cv, &l1, &t1, &k1, &i1, &cv1);
+        ok1 = whale_load_analyze(info, pc, pos, cur, var_count, whale_lo_c, whale_lo_cv, &l1, &t1, &k1, &i1, &cv1);
         if (ok1) {
             p2 = pos + l1;
             if (p2 < len)
-                ok2 = whale_load_analyze(info, pc, p2, cur, var_count, lo_c, lo_cv, &l2, &t2, &k2, &i2, &cv2);
+                ok2 = whale_load_analyze(info, pc, p2, cur, var_count, whale_lo_c, whale_lo_cv, &l2, &t2, &k2, &i2, &cv2);
         } else if (op == OP_get_loc0_loc1 && var_count >= 2 &&
                    cur[0] != WHALE_T_UNKNOWN && cur[1] != WHALE_T_UNKNOWN) {
             k1 = WLD_SLOT; i1 = 0;
@@ -3256,11 +3279,16 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     fold_commit(fm);
                 }
                 cur[d2] = (uint8_t)t1;
-                if (assign_cnt[d2] == 1 && c1) {
-                    lo_c[d2] = 1;
-                    lo_cv[d2] = cv1;
+                /* c1 was never assigned (it stays 0 from its declaration), so
+                   this arm never fired and constant initialisers never
+                   propagated - every loop re-read them as variables. A load
+                   whose kind is a constant IS the constant. */
+                if (assign_cnt[d2] == 1 &&
+                    (k1 == WLD_INT || k1 == WLD_REAL)) {
+                    whale_lo_c[d2] = 1;
+                    whale_lo_cv[d2] = cv1;
                 } else {
-                    lo_c[d2] = 0;
+                    whale_lo_c[d2] = 0;
                 }
                 pos = pb + l5;
                 continue;
@@ -4598,7 +4626,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         whale_str_slot = slot;
                         local_forget(idx);
                         cur[idx] = WHALE_STRUCT_T(slot);
-                        lo_c[idx] = 0;
+                        whale_lo_c[idx] = 0;
                         sp--;
                         break;
                     }
@@ -4617,7 +4645,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         loc_slot[idx] = WHALE_SLOT(t);
                     local_forget(idx);
                     cur[idx] = WHALE_STRUCT_T(loc_slot[idx]);
-                    lo_c[idx] = 0;
+                    whale_lo_c[idx] = 0;
                     sp--;
                     break;
                 }
@@ -4646,7 +4674,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         fold_commit(fm);
                         local_forget(idx);
                         cur[idx] = (uint8_t)t;
-                        lo_c[idx] = 0;
+                        whale_lo_c[idx] = 0;
                         sp--;
                         break;
                     }
@@ -4660,7 +4688,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                            has no C variable to read. */
                         local_forget(idx);
                         cur[idx] = (uint8_t)t;
-                        lo_c[idx] = 0;
+                        whale_lo_c[idx] = 0;
                         sp--;
                         break;
                     }
@@ -4686,7 +4714,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     fold_commit(fm);
                     local_forget(idx);
                     cur[idx] = (uint8_t)t;
-                    lo_c[idx] = 0;                    fm = fold_mark();
+                    whale_lo_c[idx] = 0;                    fm = fold_mark();
                     wt_id("_ws"); wt('.'); wt_id("fver"); wt('=');
                     wt_id("_ws"); wt('.'); wt_id("fver"); wt_op(JS_OP_ADD); wt_int(1); wt(';');
                     fold_commit(fm);
@@ -4700,7 +4728,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 fold_inline(sp - 1);
                 local_set(idx, fm);
                 cur[idx] = (uint8_t)t;
-                lo_c[idx] = 0;
+                whale_lo_c[idx] = 0;
                 sp--;
             }
             break;
@@ -4726,7 +4754,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         loc_slot[idx] = WHALE_SLOT(t);
                     local_forget(idx);
                     cur[idx] = WHALE_STRUCT_T(loc_slot[idx]);
-                    lo_c[idx] = 0;
+                    whale_lo_c[idx] = 0;
                     break;
                 }
                 if (WHALE_IS_ARR(t)) {
@@ -4736,7 +4764,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     wt_arr("oi", WHALE_SLOT(t)); wt('='); wt_int(0); wt(';');
                     fold_commit(fm);
                     cur[idx] = (uint8_t)t;
-                    lo_c[idx] = 0;
+                    whale_lo_c[idx] = 0;
                     break;
                 }
                 if (WHALE_IS_SLOT(t)) {
@@ -4764,7 +4792,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     local_forget(idx);
                     cur[idx] = WHALE_VAL_T(loc_slot[idx]);
                     cur[var_count + sp - 1] = WHALE_VAL_T(loc_slot[idx]);
-                    lo_c[idx] = 0;                    fm = fold_mark();
+                    whale_lo_c[idx] = 0;                    fm = fold_mark();
                     wt_id("_ws"); wt('.'); wt_id("fver"); wt('=');
                     wt_id("_ws"); wt('.'); wt_id("fver"); wt_op(JS_OP_ADD); wt_int(1); wt(';');
                     fold_commit(fm);
@@ -4775,7 +4803,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 fold_inline(sp - 1);
                 local_set(idx, fm);
                 cur[idx] = (uint8_t)t;
-                lo_c[idx] = 0;
+                whale_lo_c[idx] = 0;
                 /* sp unchanged */
             }
             break;
@@ -4817,7 +4845,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 wt_slot("L", idx); wt('+'); fold_inline(sp - 1);
                 local_set(idx, fm);
                 cur[idx] = WHALE_T_NUM;
-                lo_c[idx] = 0;
+                whale_lo_c[idx] = 0;
                 sp--;
             }
             break;
@@ -5688,7 +5716,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 wt_slot("L", idx); wt('+'); wt_int(1);
                 local_set(idx, fm);
                 cur[idx] = WHALE_T_NUM;
-                lo_c[idx] = 0;
+                whale_lo_c[idx] = 0;
             }
             break;
         case OP_drop:
@@ -6398,6 +6426,8 @@ static int whale_gcc_compile(JSContext *ctx, const char *src, void **entry_out, 
             fprintf(stderr, "whale gcc: %s not found\n", whale_entry_name);
         goto done_unlink;
     }
+    if (whale_dbg_env("WHALE_JIT_DUMP"))
+        fprintf(stderr, "whale gcc: %s -> %p\n", whale_entry_name, fn);
     *entry_out = fn;
     /* the single TCCState is process-wide and must outlive the functions it
        hosts, same as the TinyCC path: no per-function handle to release */

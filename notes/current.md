@@ -1938,3 +1938,59 @@ SOLVED（多 Runtime）+ SOLVED（free list）
 ## 状态
 绿，待提交。分配器下一步：GC 扫描侧（escaped 的剩余 90%）需分代或标记优化，
 属大工程，按 <68> 排在 ELS 之前评估。
+
+# <73>: ELS 上限实测 + c1 死变量 + pe_isafunc 真 bug
+SOLVED（测量+两个 bug）/ LICM 未动手
+
+## ELS 收益上限（同函数、唯一变量是后端，gcc-o vs TCC）
+| case | TCC | gcc-O2 | 倍数 | 形状 |
+|---|---|---|---|---|
+| nested | 108 | 18 | 6.0x | 长表达式链 |
+| locals | 118 | 26 | 4.5x | 局部轮转 |
+| minmax | 170 | 36 | 4.7x | 嵌套归约 |
+| arith | 123 | 69 | 1.8x | 单链 |
+| bitops | 181 | 108 | 1.7x | 位运算 |
+
+nested/locals 的 4-6x 主要来自 gcc 全局优化（LICM/强度削弱/调度），不是纯
+分配——ELS（纯分配）能稳拿的是 arith/bitops 档的 1.5-2x。pin 只值 5-12%
+（历史数据）的原因同：语句级 load/store 已是最简，变量级 pin 省无可省。
+
+## bug#1：`c1/c2` 死变量（<13> 的常量传播从没工作过）
+fast path 的 `assign_cnt[d2]==1 && c1` 里 `c1` 从声明就没被赋值过（搜全文件
+无一处写入）→ 条件恒假 → `lo_c` 永不置位 → 字面量初始化永不传播。改为
+`(k1==WLD_INT || k1==WLD_REAL)`（analyze 的 kind 本来就是常量判据）。
+修后 nested 体内出现 `(5.5+1.5)`、`(2.5*3.5)` 等字面量；nested 90→82ms。
+配套：`lo_c/lo_cv` 提文件 static（`whale_lo_c/lo_cv`），`local_inline` 对
+deferred 常量发字面量而非变量。
+
+## bug#2：`pe_isafunc` 在 x86_64 下恒假（上轮的 bits 崩溃根因）
+`ELF32_R_INFO(sym, R_386_PC32)` 的 32 位打包永不等于 64 位 `r_info` →
+函数全判成数据 → 不建 thunk jmp → call 跳进 IAT 数据 → 野解码。
+fibg 靠地址值解码运气没崩，bits 的 SIGFPE 才暴露。改为
+`ELFW(R_INFO)(sym, R_X86_64_PC32)`。修后 bits gcc-o 108ms vs TCC 181ms。
+教训：TCC 上游的 PE 代码有 32/64 位混用残留，动它的符号逻辑要逐行验位宽。
+
+## 删掉的死代码
+`whale_const` 全套（栈槽字面量标记）：`push_const; put_loc` 全被 peephole 2
+截获，通用路径的消费永不命中。与 fast path 重叠，留着是负担。
+
+## LICM 未动手（下轮）
+常量传播修完 nested 只 -9%：TCC 自己会折叠字面量表达式，真瓶颈是变量访存
++ 长链求值。真正的 LICM（`loop_end` 处 token 重排，不变式移缓冲外）插入点
+已确认（`loop_begin/loop_end` + `WhaleLoop` 缓冲），但需要解析 token 流识别
+不变式，本轮没动手。顺序：LICM → pin/ELS 分配（转正 vr-inline 的前置不变）。
+
+## bug#3：`set_loc` 漏统计 → 常量传播静默错答案（本轮最危险）
+- 症状：`mixed`（`x=1.0` 初始化 + 循环内 `x=x+y*2`）JIT 给 `60000005`，
+  node/qjs 给 NaN（指数发散后 `Inf-Inf`）。`x` 被当成单赋值常量 `1` 重写循环体。
+- 根因：`assign_cnt` 只统计 `put_loc/inc_dec`，不统计 `set_loc`（存值又留栈）。
+  `x` 的循环体内写是 `set_loc0` → 只计初始化 1 次 → 误判单赋值 → 错误传播。
+  与 <13> 的 `inc_loc` 漏统计**同类**（"传播类优化漏算一个写操作"）。
+- 修法：预扫描加 `OP_set_loc0-3/8/set_loc` 全形态计数。
+- 教训：任何"写局部"的 opcode（put/set/inc/dec）都必须进 `assign_cnt`；
+  加新写 opcode 时先查这张表。`mixed` 必须进回归（它是唯一的 set_loc 覆盖）。
+
+## 验证
+`whale api test: ok`；25/25 全对，0 mismatch；nested 73ms。
+## 状态
+绿，待提交。

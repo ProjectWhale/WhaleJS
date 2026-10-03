@@ -1192,7 +1192,12 @@ static int pe_isafunc(int sym_index)
 {
     Section *sr = text_section->reloc;
     ElfW_Rel *rel, *rel_end;
-    Elf32_Word info = ELF32_R_INFO(sym_index, R_386_PC32);
+    /* The call sites that reference this symbol use the target's PC32
+       relocation (R_XXX_THUNKFIX, which is R_X86_64_PC32 here). The old code
+       compared against ELF32_R_INFO(sym, R_386_PC32): the 32-bit packing never
+       equals a 64-bit r_info, so every function read as data, no thunk jmp
+       was built, and calls jumped into the IAT instead of code. */
+    ElfW(Addr) info = ELFW(R_INFO)(sym_index, R_X86_64_PC32);
     if (!sr)
         return 0;
     rel_end = (ElfW_Rel *)(sr->data + sr->data_offset);
