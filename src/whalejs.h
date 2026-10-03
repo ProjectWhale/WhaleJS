@@ -78,6 +78,14 @@ JS_EXTERN void      JS_WhaleGetJitStats(JSContext *ctx, JSWhaleJitStats *out);
    两者内部各保留一份拷贝，可随时再次调用覆盖；须在本进程第一次 JIT 编译前设置。 */
 JS_EXTERN void JS_WhaleSetJitCc(const char *driver, const char *flags);
 
+/* Compile one function with the gcc backend instead of TinyCC. The function
+   keeps running interpreted until it goes hot; at that point the gcc backend
+   compiles it (`-c`, linked in-process by TinyCC itself - no shared object,
+   no LoadLibrary) exactly where the TinyCC backend would have. Needs a driver
+   named with JS_WhaleSetJitCc, otherwise the mark has no effect; every
+   function not so marked stays on TinyCC, so gcc is opt-in per function. */
+JS_EXTERN void JS_WhaleSetJitCcForFunction(JSContext *ctx, JSValue func);
+
 /* 引擎内部：JIT 路径用于累加统计（host 一般不用） */
 JS_EXTERN void JS_WhaleNoteJitRequest(JSContext *ctx);
 JS_EXTERN void JS_WhaleNoteJitResult(JSContext *ctx, int ok, uint64_t code_bytes);

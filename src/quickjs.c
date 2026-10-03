@@ -957,6 +957,10 @@ int whale_deopt_count;     /* refusals seen before the entry was retired */
        and out of the clone path. */
     uint16_t whale_loop_count;
     WhaleLoopInfo whale_loops[WHALE_LOOP_TABLE_MAX];
+    /* Compile this function with the gcc backend instead of TinyCC (raised by
+       the embedder through JS_WhaleSetJitCcForFunction; needs a driver named
+       with JS_WhaleSetJitCc, otherwise it has no effect). Off by default. */
+    uint8_t whale_jit_gcc;
 } JSFunctionBytecode;
 
 typedef struct JSBoundFunction {
@@ -3358,6 +3362,24 @@ void JS_WhaleNoteJitResult(JSContext *ctx, int ok, uint64_t code_bytes)
     }
 }
 
+/* Mark one function for the gcc backend. The flag travels into
+   JSWhaleFuncInfo at compile time (see whale_on_call); without a driver
+   named with JS_WhaleSetJitCc it has no effect, and every unmarked function
+   stays on TinyCC. */
+void JS_WhaleSetJitCcForFunction(JSContext *ctx, JSValue func)
+{
+    JSObject *p;
+    JSFunctionBytecode *b;
+
+    if (!ctx || !JS_IsFunction(ctx, func))
+        return;
+    p = JS_VALUE_GET_OBJ(func);
+    b = p->u.func.function_bytecode;
+    if (!b)
+        return;
+    b->whale_jit_gcc = 1;
+}
+
 /* WhaleJS: JS_CallInternal 的热点入口��?   当前�??��计；TinyCC 编译接入后在这里产出机器码并�?b->whale_jit_entry�?   注意：JIT=OFF 时必须零弢�锢�返回�?*/
 /* ---- services the JIT codegen module (src/whale_jit.c) needs from us ---- */
 
@@ -3600,6 +3622,7 @@ int JS_WhaleCpoolFuncInfo(JSContext *ctx, const JSValue *cpool, int idx,
     out->var_ref_count = b->var_ref_count;
     out->cpool_count = b->cpool_count;
     out->cpool = b->cpool;
+    out->prefer_gcc = b->whale_jit_gcc;
     return 1;
 }
 
@@ -3942,6 +3965,7 @@ int JS_WhaleVarRefFuncInfo(JSContext *ctx, int idx,
     out->cpool = b->cpool;
     out->loops = b->whale_loops;
     out->loop_count = b->whale_loop_count;
+    out->prefer_gcc = b->whale_jit_gcc;
     if (fn_out)
         *fn_out = JS_VALUE_GET_PTR(v);
     return 1;
@@ -4684,6 +4708,7 @@ static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
            which only reads head/back/exit/kind through the struct it shares. */
         info.loops = b->whale_loops;
         info.loop_count = b->whale_loop_count;
+        info.prefer_gcc = b->whale_jit_gcc;
         /* A closure slot that feeds a call is either this very function
            (self-recursion) or an enclosing closure's value, and the bytecode
            does not say which - only the entry check does. So compile both

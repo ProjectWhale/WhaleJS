@@ -4,7 +4,9 @@
  * 构建：xmake run whale_test
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "quickjs.h"
 #include "whalejs.h"
@@ -117,6 +119,8 @@ static void check_ir_direct(void)
 
 int main(void)
 {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
     check_ir_direct();
 
     JSRuntime *rt = JS_NewRuntime();
@@ -195,12 +199,76 @@ int main(void)
     /* 9. JIT: a hot non-recursive function must actually get compiled */
     JS_WhaleSetJitMode(ctx, JS_JIT_LAZY);
     {
-        double v = eval_number(ctx,
+        double v;
+        clock_t t0;
+        double ms;
+
+        t0 = clock();
+        v = eval_number(ctx,
             "function fibi(n){var a=0,b=1;for(var i=0;i<n;i++){var t=a+b;a=b;b=t;}return a;}"
             "var acc=0; for (var k=0;k<400;k++) acc=fibi(30); acc");
+        ms = (double)(clock() - t0) * 1000.0 / CLOCKS_PER_SEC;
         CHECK(v == 832040.0);
         JS_WhaleGetJitStats(ctx, &st);
         CHECK(st.compiled >= 1);
+        printf("  [tcc] 400x fibi(30) = %.0f ms\n", ms);
+    }
+
+    /* 10. gcc backend: compile one marked function through gcc -c, linked
+       in-process by TinyCC itself (no .dll, no LoadLibrary). Needs a MinGW
+       gcc; the driver comes from WHALE_TEST_GCC or the well-known install
+       path, and the test is skipped when neither exists. */
+    {
+        const char *gcc = getenv("WHALE_TEST_GCC");
+        char gcc_path[512];
+        FILE *probe;
+        JSValue global, fn;
+        uint32_t compiled_before;
+        double v;
+
+        if (!gcc || !*gcc) {
+            snprintf(gcc_path, sizeof(gcc_path),
+                     "C:/Program Files/mingw64/bin/gcc.exe");
+            probe = fopen(gcc_path, "rb");
+            if (probe)
+                fclose(probe);
+            else
+                gcc_path[0] = '\0';
+            gcc = gcc_path[0] ? gcc_path : NULL;
+        }
+        if (gcc) {
+            clock_t t0;
+            double ms;
+
+            JS_WhaleSetJitCc(gcc, NULL);
+            eval_number(ctx,
+                "function fibg(n){var a=0,b=1;for(var i=0;i<n;i++){var t=a+b;a=b;b=t;}return a;} 0");
+            global = JS_GetGlobalObject(ctx);
+            fn = JS_GetPropertyStr(ctx, global, "fibg");
+            JS_WhaleSetJitCcForFunction(ctx, fn);
+            JS_FreeValue(ctx, fn);
+            JS_FreeValue(ctx, global);
+            JS_WhaleGetJitStats(ctx, &st);
+            compiled_before = st.compiled;
+            t0 = clock();
+            v = eval_number(ctx,
+                "var accg=0; for (var k=0;k<400;k++) accg=fibg(30); accg");
+            ms = (double)(clock() - t0) * 1000.0 / CLOCKS_PER_SEC;
+            CHECK(v == 832040.0);
+            JS_WhaleGetJitStats(ctx, &st);
+            CHECK(st.compiled > compiled_before);
+            /* informational only: same shape as §9's fibi, for the notes */
+            printf("  [gcc] 400x fibg(30) = %.0f ms (incl. one gcc compile)\n", ms);
+            t0 = clock();
+            v = eval_number(ctx,
+                "var accg2=0; for (var k=0;k<400;k++) accg2=fibg(30); accg2");
+            ms = (double)(clock() - t0) * 1000.0 / CLOCKS_PER_SEC;
+            CHECK(v == 832040.0);
+            printf("  [gcc] 400x fibg(30) again = %.0f ms (compiled code only)\n", ms);
+            JS_WhaleSetJitCc(NULL, NULL);
+        } else {
+            printf("  [gcc] no driver found, skipped\n");
+        }
     }
 
     check_tcc_backend();

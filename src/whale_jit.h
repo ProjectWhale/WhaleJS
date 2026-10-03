@@ -68,6 +68,11 @@ typedef struct JSWhaleFuncInfo {
        from the opcode stream. */
     const WhaleLoopInfo *loops;
     int loop_count;
+    /* Prefer the gcc backend for this function (set from the bytecode flag the
+       embedder raised with JS_WhaleSetJitCcForFunction). The gcc backend only
+       runs when a driver was named with JS_WhaleSetJitCc; otherwise, and for
+       every function not so marked, the TinyCC backend stays. */
+    int prefer_gcc;
 } JSWhaleFuncInfo;
 
 /* Number of JSValue slots the engine lends to a JIT-compiled function so it has

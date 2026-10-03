@@ -1525,7 +1525,20 @@ static int read_mem(int fd, unsigned offset, void *buffer, unsigned len)
     return len == read(fd, buffer, len);
 }
 
-/* ------------------------------------------------------------- */
+/* -------------------------------------------------------------
+ *  Load a COFF relocatable object (.o) as produced by `gcc -c` for
+ *  x86-64 Windows, and merge it into this state the way tcc_load_object_file
+ *  does for ELF: ALLOC sections are appended to the matching TCC sections,
+ *  defined symbols go into symtab with their new offsets, and relocations
+ *  become TCC reloc entries for the existing relocate pass.
+ *
+ *  Scope is deliberately narrow: only what the JIT's gcc backend emits.
+ *  Sections other than code/data/rodata (notably .pdata/.xdata unwind info,
+ *  which a JIT call does not need) are skipped, as are debug and static
+ *  symbols nobody references. Undefined symbols stay SHN_UNDEF in symtab -
+ *  pe_build_imports binds them to tcc_add_symbol addresses later, exactly
+ *  like the ones TinyCC's own parser produces.
+ * ------------------------------------------------------------- */
 
 PUB_FUNC int tcc_get_dllexports(const char *filename, char **pp)
 {
@@ -1664,6 +1677,234 @@ quit:
     return ret;
 }
 
+/* -------------------------------------------------------------
+ *  WhaleJS: load a COFF relocatable object (.o) as produced by `gcc -c`
+ *  for x86-64 Windows, merging it into this state the way
+ *  tcc_load_object_file does for ELF: ALLOC sections are appended to the
+ *  matching TCC sections, defined symbols go into symtab with their new
+ *  offsets, and relocations become TCC reloc entries for the existing
+ *  relocate pass.
+ *
+ *  Scope is deliberately narrow: only what the JIT's gcc backend emits.
+ *  Sections other than code/data/rodata (notably .pdata/.xdata unwind info,
+ *  which a JIT call does not need) are skipped, as are debug and static
+ *  symbols nobody references. Undefined symbols stay SHN_UNDEF in symtab -
+ *  pe_build_imports binds them to tcc_add_symbol addresses later, exactly
+ *  like the ones TinyCC's own parser produces.
+ * ------------------------------------------------------------- */
+
+#pragma pack(push, 1)
+/* PE-COFF symbol table entry (IMAGE_SYMBOL, 18 bytes) */
+typedef struct _wh_coff_sym {
+    union {
+        BYTE ShortName[8];
+        struct {
+            DWORD Zeroes;
+            DWORD Offset;
+        } Long;
+    } N;
+    DWORD Value;
+    SHORT SectionNumber;   /* 1-based, 0 = undefined, -1 = debug, -2 = absolute */
+    WORD Type;
+    BYTE StorageClass;     /* 2 = external, 3 = static */
+    BYTE NumberOfAuxSymbols;
+} WH_COFF_SYM;
+/* PE-COFF relocation entry (IMAGE_RELOCATION, 10 bytes) */
+typedef struct _wh_coff_rel {
+    DWORD VirtualAddress;  /* offset within the section */
+    DWORD SymbolTableIndex;
+    WORD Type;
+} WH_COFF_REL;
+#pragma pack(pop)
+
+#define WH_COFF_SCL_EXTERNAL 2
+#define WH_COFF_SCL_STATIC 3
+#define WH_IMG_REL_AMD64_REL32 0x0004
+/* section characteristics we merge; anything else (notably unwind info,
+   which a JIT call never needs) is skipped with its relocations */
+#define WH_SCN_CNT_CODE 0x00000020
+#define WH_SCN_CNT_INIT_DATA 0x00000040
+#define WH_SCN_LNK_REMOVE 0x00000800
+
+static int pe_load_coff(TCCState *s1, int fd)
+{
+    IMAGE_FILE_HEADER fh;
+    IMAGE_SECTION_HEADER *sh;
+    WH_COFF_SYM *syms;
+    char *strtab;
+    DWORD strsize;
+    Section **secmap;   /* COFF section index -> TCC section (NULL = skipped) */
+    DWORD *secoff;      /* base offset the COFF section landed at */
+    int *symmap;        /* COFF symbol index -> symtab index */
+    int i, j, ret = -1;
+
+    if (!read_mem(fd, 0, &fh, sizeof fh))
+        return -1;
+    if (fh.Machine != IMAGE_FILE_MACHINE
+        || fh.SizeOfOptionalHeader != 0
+        || (fh.Characteristics & 0x0002)) /* IMAGE_FILE_EXECUTABLE_IMAGE */
+        return -1;
+    if (fh.NumberOfSections <= 0 || fh.NumberOfSections > 96)
+        return -1;
+
+    sh = tcc_malloc(sizeof(*sh) * fh.NumberOfSections);
+    if (!read_mem(fd, sizeof fh, sh, sizeof(*sh) * fh.NumberOfSections))
+        goto quit;
+
+    /* string table follows the symbol table; long names are offsets into it */
+    if (!read_mem(fd, fh.PointerToSymbolTable + fh.NumberOfSymbols * 18,
+                  &strsize, 4) || strsize < 4 || strsize > (1 << 24))
+        goto quit;
+    strtab = tcc_malloc(strsize);
+    if (!read_mem(fd, fh.PointerToSymbolTable + fh.NumberOfSymbols * 18 + 4,
+                  strtab + 4, strsize - 4))
+        goto quit_free_str;
+    memcpy(strtab, &strsize, 4);
+
+    syms = tcc_malloc(18 * fh.NumberOfSymbols);
+    if (!read_mem(fd, fh.PointerToSymbolTable, syms, 18 * fh.NumberOfSymbols))
+        goto quit_free_syms;
+
+    secmap = tcc_mallocz(sizeof(*secmap) * fh.NumberOfSections);
+    secoff = tcc_mallocz(sizeof(*secoff) * fh.NumberOfSections);
+    symmap = tcc_mallocz(sizeof(*symmap) * fh.NumberOfSymbols);
+
+    /* pass 1: merge ALLOC sections. find_section reuses the existing TCC
+       section (.text/.data exist already), so repeated loads accumulate
+       exactly like repeated TinyCC compiles do. Long section names (`/N`,
+       an offset into the string table - gcc uses them for grouped rodata
+       like .rdata$zzz) are resolved before filtering: only unwind info and
+       debug sections are skipped, everything else with content merges. */
+    for (i = 0; i < fh.NumberOfSections; i++) {
+        char name[64];
+        Section *s;
+        BYTE *ptr;
+
+        if (sh[i].Name[0] == '/') {
+            DWORD off = 0;
+            int k;
+
+            for (k = 1; k < 8 && sh[i].Name[k] >= '0' && sh[i].Name[k] <= '9'; k++)
+                off = off * 10 + (sh[i].Name[k] - '0');
+            if (off < strsize) {
+                int n = 0;
+                while (n < 60 && strtab[off + n]) {
+                    name[n] = strtab[off + n];
+                    n++;
+                }
+                name[n] = '\0';
+            } else {
+                name[0] = '\0';
+            }
+        } else {
+            memcpy(name, sh[i].Name, 8);
+            name[8] = '\0';
+        }
+        if (!(sh[i].Characteristics & (WH_SCN_CNT_CODE | WH_SCN_CNT_INIT_DATA))
+            || (sh[i].Characteristics & WH_SCN_LNK_REMOVE)
+            || !strcmp(name, ".pdata") || !strcmp(name, ".xdata")
+            || !strncmp(name, ".debug", 6))
+            continue;
+        s = find_section(s1, name);
+        secoff[i] = s->data_offset;
+        secmap[i] = s;
+        if (sh[i].SizeOfRawData) {
+            lseek(fd, sh[i].PointerToRawData, SEEK_SET);
+            ptr = section_ptr_add(s, sh[i].SizeOfRawData);
+            if (sh[i].SizeOfRawData != (DWORD)read(fd, ptr, sh[i].SizeOfRawData))
+                goto quit_free_maps;
+        }
+    }
+
+    /* pass 2: symbols. Defined ones record their new address; undefined
+       externals stay undefined for pe_build_imports; static and debug
+       symbols are local noise the relocations never name. */
+    for (i = 0; i < (int)fh.NumberOfSymbols; ) {
+        WH_COFF_SYM *cs = &syms[i];
+        const char *name;
+        char shortname[9];
+
+        if (cs->N.Long.Zeroes == 0) {
+            DWORD off = cs->N.Long.Offset;
+            name = (off < strsize) ? strtab + off : "";
+        } else {
+            memcpy(shortname, cs->N.ShortName, 8);
+            shortname[8] = '\0';
+            name = shortname;
+        }
+        if (cs->SectionNumber > 0 && cs->StorageClass == WH_COFF_SCL_EXTERNAL
+            && cs->SectionNumber <= (SHORT)fh.NumberOfSections
+            && secmap[cs->SectionNumber - 1]) {
+            int sec = cs->SectionNumber - 1;
+            symmap[i] = set_elf_sym(symtab_section,
+                                    cs->Value + secoff[sec], 0,
+                                    ELFW(ST_INFO)(STB_GLOBAL, STT_FUNC), 0,
+                                    secmap[sec]->sh_num, name);
+        } else if (cs->SectionNumber == 0 && cs->StorageClass == WH_COFF_SCL_EXTERNAL) {
+            symmap[i] = set_elf_sym(symtab_section, 0, 0,
+                                    ELFW(ST_INFO)(STB_GLOBAL, STT_NOTYPE), 0,
+                                    SHN_UNDEF, name);
+        } else if (cs->SectionNumber > 0 && cs->StorageClass == WH_COFF_SCL_STATIC
+                   && cs->SectionNumber <= (SHORT)fh.NumberOfSections
+                   && secmap[cs->SectionNumber - 1] && name[0] == '.') {
+            /* section symbol (.text/.rdata): relocations against raw data
+               name it, so it must map to the section base */
+            int sec = cs->SectionNumber - 1;
+            symmap[i] = set_elf_sym(symtab_section, secoff[sec], 0,
+                                    ELFW(ST_INFO)(STB_LOCAL, STT_SECTION), 0,
+                                    secmap[sec]->sh_num, name);
+        }
+        i += 1 + cs->NumberOfAuxSymbols;
+    }
+
+    /* pass 3: relocations. REL32 becomes PC32, but the two do not share
+       the pc convention: COFF measures from the end of the relocated field
+       (P = r_offset + 4), while TCC's relocate() uses addr = sh_addr +
+       r_offset and its own codegen pre-biases the field by -4 to compensate.
+       gcc leaves the field at zero, so the -4 travels in the addend instead
+       (x86-64 uses RELA) - which also survives relocate_reset(), where a
+       patched-in -4 would be zeroed away on the second link. Anything but
+       REL32 only occurs in skipped sections, so meeting one is a real error. */
+    for (i = 0; i < fh.NumberOfSections; i++) {
+        DWORD nrel = sh[i].NumberOfRelocations;
+
+        if (!secmap[i] || !nrel)
+            continue;
+        /* COFF stores more than 65535 relocations as the count in the first
+           entry's VirtualAddress; the JIT never gets there, refuse it */
+        if (nrel == 0xffff)
+            goto quit_free_maps;
+        lseek(fd, sh[i].PointerToRelocations, SEEK_SET);
+        for (j = 0; (DWORD)j < nrel; j++) {
+            WH_COFF_REL rel;
+
+            if (sizeof rel != (size_t)read(fd, &rel, sizeof rel))
+                goto quit_free_maps;
+            if (rel.Type != WH_IMG_REL_AMD64_REL32)
+                goto quit_free_maps;
+            if (rel.SymbolTableIndex >= fh.NumberOfSymbols
+                || !symmap[rel.SymbolTableIndex])
+                goto quit_free_maps;
+            put_elf_reloca(symtab_section, secmap[i],
+                           rel.VirtualAddress + secoff[i],
+                           R_X86_64_PC32, symmap[rel.SymbolTableIndex], -4);
+        }
+    }
+
+    ret = 0;
+  quit_free_maps:
+    tcc_free(secmap);
+    tcc_free(secoff);
+    tcc_free(symmap);
+  quit_free_syms:
+    tcc_free(syms);
+  quit_free_str:
+    tcc_free(strtab);
+  quit:
+    tcc_free(sh);
+    return ret;
+}
+
 /* ------------------------------------------------------------- */
 
 static char *trimfront(char *p)
@@ -1762,6 +2003,8 @@ ST_FUNC int pe_load_file(struct TCCState *s1, const char *filename, int fd)
     if (0 == strcmp(tcc_fileextension(filename), ".def"))
         ret = pe_load_def(s1, fd);
     else if (pe_load_res(s1, fd) == 0)
+        ret = 0;
+    else if (pe_load_coff(s1, fd) == 0)
         ret = 0;
     else if (read_mem(fd, 0, buf, 4) && 0 == memcmp(buf, "MZ\220", 4))
         ret = pe_load_dll(s1, filename);

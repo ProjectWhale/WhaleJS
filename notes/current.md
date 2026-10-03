@@ -1799,3 +1799,55 @@ dump 第二读法 fn_2 的诊断，一层剥一层，共五个，每修一个露
 ## 状态
 绿，待提交。下一步按 <68> 排序：分配器（struct 轻量路径/新生代）→ 两级 JIT
 → 生成器侧 ELS（vr-inline 转正的前置）。
+
+# <70>: 两级 JIT 的 gcc 一半：按函数指定的 gcc -c 后端，TCC 进程内链接
+SOLVED
+
+## 用户要求（原话）
+两级 JIT 只需要允许 gcc，并且可以使用函数指定即可（默认不需要打开）；
+stdio 输出 .o 内容，用 TCC 本身的能力加载。
+
+## 落地形态（四件）
+1. **`pe_load_coff`（tccpe.c，新，~200 行）**：把 `gcc -c` 产的 PE-COFF .o
+   翻译进 TCC 内部表示——ALLOC 段（code/data/rodata，含 `/N` 长段名解析）
+   并入同名 TCC section；defined 符号 `set_elf_sym` 登记新地址；undefined
+   符号留 SHN_UNDEF（`pe_build_imports` 按现有链绑定 `tcc_add_symbol` 地址，
+   无需手动处理）；重定位只收 REL32→`R_X86_64_PC32`。`.pdata/.xdata`
+   unwind 与 debug 段跳过（JIT 调用不需要）。
+2. **PC 语义差 4 字节（真 bug，独立探针 + 生成码对照确认）**：COFF REL32 的
+   P 是字段末尾（r_offset+4），TCC 的 `relocate()` 用 `addr = sh_addr +
+   r_offset`（其自家 codegen 靠预置 -4 补偿）。gcc 留字段为 0，所以 -4 走
+   RELA addend（`put_elf_reloca(..., -4)`）——`relocate_reset()` 在二次链接时
+   把字段清零，补在数据里的 -4 会被洗掉，走 addend 则安然无恙。
+3. **`tcc_add_file` 不经过 `JS_WhaleCompileTokens`**：其尾声的
+   `runtime_main = NULL` 清理（<35>）走不到 → 下次 `pe_output_file` 误判为
+   "run a program"，`pe_add_runtime` 注入 `__runmain` + CRT 库 → 一堆
+   `undefined symbol 'main'/'IAT.*'`。修法：iface 新导出
+   `JS_WhaleTccClearRuntimeMain`，`whale_gcc_compile` 在 load 后调用。
+4. **按函数指定**：`JSFunctionBytecode.whale_jit_gcc`（默认 0）+
+   `JSWhaleFuncInfo.prefer_gcc`（三处填充点透传：whale_on_call/Cpool/VarRef）
+   + 公开 `JS_WhaleSetJitCcForFunction(ctx, func)`。选择条件是
+   `prefer_gcc && driver 已设`——默认全走 TCC，无行为变化。
+   旧 `.dll` 路径整套退役：gendef/dlltool/`whale_gcc_prepare`/`LoadLibrary`
+   （~100 行删除）。源码仍走 stdin pipe 不落盘；`.o` 落 TEMP 临时文件
+   （as 拒绝 `-o -`，实测确认），load 后删除（`WHALE_JIT_KEEP` 可保留做
+   `objdump -d`）。
+
+## 证伪记录（省得后人重走）
+- `pe_load_file` 只认 `.def`/`.res`/DLL；`tcc_load_coff` 是 C67 DSP 专用
+  （只注册符号不搬运 section），不可复用。
+- `gcc -c -o -` 不可用：as 报 `can't open a bfd on stdout`。
+
+## 测量（whale_test 第 9/10 段，同形状 fibi/fibg，400×fib(30)）
+- TCC：4ms（含编译）；gcc：252ms（含一次编译）/ **纯执行 1ms**。
+- 即 gcc -O2 执行体约 3-4 倍于 TCC（与 <61>/<67> 的 1.5-4x 一致），
+  但单函数编译成本 ~250ms（spawn + -O2 + as）。结论：小函数不划算，
+  大函数/长热点才值——"热点再编译"（ distant future，按 <68> 排序在分配器
+  之后）按需启用时，用执行时长/编译成本比做门限，别按调用次数。
+
+## 验证
+`whale api test: ok`（第 10 段 gcc-o 端到端：标记→编译→400 次调用全对→
+compiled 增长；无 driver 时跳过）；25/25 全对，0 mismatch；默认态 immutable
+314ms = 基线。
+## 状态
+绿，待提交。两级 JIT 剩下一半（热点再编译机制 + 门限策略）按 <68> 排在分配器之后。

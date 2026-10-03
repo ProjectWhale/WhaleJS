@@ -24,6 +24,18 @@ int JS_WhaleTccProbe(void)
     return (int)(sizeof(__vstack) / sizeof(__vstack[0])) - 1;
 }
 
+/* tcc_add_file() loads an object without going through JS_WhaleCompileTokens,
+   whose epilogue clears runtime_main (see its comment there). Without the
+   same clearing, the next pe_output_file() takes runtime_main as "run a
+   program" and pe_add_runtime() injects __runmain plus the CRT libraries -
+   whose symbols nobody can resolve, failing the compile. The gcc backend
+   calls this after loading its object. */
+void JS_WhaleTccClearRuntimeMain(TCCState *s)
+{
+    if (s)
+        s->runtime_main = NULL;
+}
+
 /* ------------------------------------------------------------------------
  * One translation unit, opened and closed the way tcc_compile() does
  * (libtcc.c:623): tcc_open_bf, tccelf_begin_file, preprocess_start, [emit],
