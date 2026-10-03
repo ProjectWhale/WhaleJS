@@ -18,6 +18,7 @@
 #include "quickjs.h"
 #include "whale_dbg.h"
 #include "whale_jit.h"
+#include "whalejs.h"
 
 #include "libtcc.h"
 
@@ -1882,32 +1883,107 @@ static int whale_str_col(const int *atoms, int n, int atom)
     return -1;
 }
 
-/* The layout a settled object has: the union of the atoms its field-access sites
-   were observed to use, in first-seen order. Returns the number of columns.
+/* The layout a settled object has: the attributes its observed shapes carry
+   often enough, most-covered first. Coverage is per distinct shape (the same
+   shape seen at ten sites counts once - it is one layout, not ten votes), and
+   the bar is 40% of shapes - lower than the old unanimous-mono rule, so a
+   mildly polymorphic program still lays out instead of falling back to the map
+   for everything. The gcc second compilation drops the bar to zero (every
+   known attribute, memory permitting): its code is better enough to pay for
+   wider structs.
 
-   The sites are the *access* sites (whale_field_sites), not a creation point -
-   what was observed is what the fields are, so it does not matter which function
-   created the object. That is what lets an object that arrives as a call's result
-   be laid out like one built here. */
-static int whale_layout_from_sites(const int *sites, int nsites, int *atoms, int max)
+   The shapes are the *access* sites' shapes, not a creation point - what was
+   observed is what the fields are, so it does not matter which function
+   created the object. That is what lets an object that arrives as a call's
+   result be laid out like one built here. */
+static int whale_layout_from_sites(const int *sites, int nsites, int *atoms, int max,
+                                     int pct)
 {
-    int n = 0, s;
+    const void *shapes[WHALE_ATOM_MAX];
+    int nshapes = 0, s, i;
+    int cand[WHALE_ATOM_MAX], cnt[WHALE_ATOM_MAX], n = 0;
 
-    for (s = 0; s < nsites && n < max; s++) {
-        int one[WHALE_STRUCT_FIELDS];
-        int on = whale_struct_fields((unsigned)sites[s], one, WHALE_STRUCT_FIELDS);
-        int q;
+    /* pct <= 0 means every known attribute (the gcc second compilation). */
+    for (s = 0; s < nsites; s++) {
+        const void *one[8];
+        int on, k;
 
-        for (q = 0; q < on; q++) {
-            int seen = 0, m;
+        if (sites[s] == 0 || whale_prof_now == NULL)
+            continue;
+        on = JS_WhaleProfShapes(whale_prof_now, (unsigned)sites[s], one, 8);
+        for (k = 0; k < on && nshapes < WHALE_ATOM_MAX; k++) {
+            int m, seen = 0;
 
-            for (m = 0; m < n; m++)
-                if (atoms[m] == one[q]) { seen = 1; break; }
+            for (m = 0; m < nshapes; m++)
+                if (shapes[m] == one[k]) { seen = 1; break; }
             if (!seen)
-                atoms[n++] = one[q];
+                shapes[nshapes++] = one[k];
         }
     }
-    return n;
+    for (s = 0; s < nshapes; s++) {
+        int fa[WHALE_STRUCT_FIELDS];
+        int fn = JS_WhaleShapeFields(shapes[s], fa, WHALE_STRUCT_FIELDS);
+        int q;
+
+        for (q = 0; q < fn && n < WHALE_ATOM_MAX; q++) {
+            int m, seen = 0;
+
+            for (m = 0; m < n; m++)
+                if (cand[m] == fa[q]) { seen = 1; break; }
+            if (seen)
+                continue;
+            {
+                int c = 0, t;
+
+                for (t = 0; t < nshapes; t++) {
+                    int fb[WHALE_STRUCT_FIELDS];
+                    int fm = JS_WhaleShapeFields(shapes[t], fb,
+                                                 WHALE_STRUCT_FIELDS);
+                    int u;
+
+                    for (u = 0; u < fm; u++)
+                        if (fb[u] == fa[q]) { c++; break; }
+                }
+                if (pct > 0 && nshapes > 0 && c * 100 < pct * nshapes)
+                    continue;
+            }
+            cand[n] = fa[q];
+            cnt[n] = 0;
+            {
+                int t;
+
+                for (t = 0; t < nshapes; t++) {
+                    int fb[WHALE_STRUCT_FIELDS];
+                    int fm = JS_WhaleShapeFields(shapes[t], fb,
+                                                 WHALE_STRUCT_FIELDS);
+                    int u;
+
+                    for (u = 0; u < fm; u++)
+                        if (fb[u] == fa[q]) { cnt[n]++; break; }
+                }
+            }
+            n++;
+        }
+    }
+    /* most-covered first; truncation then keeps the hottest columns */
+    for (i = 0; i < n; i++) {
+        int j, bj = i;
+
+        for (j = i + 1; j < n; j++)
+            if (cnt[j] > cnt[bj])
+                bj = j;
+        if (bj != i) {
+            int t = cand[i]; cand[i] = cand[bj]; cand[bj] = t;
+            t = cnt[i]; cnt[i] = cnt[bj]; cnt[bj] = t;
+        }
+    }
+    {
+        int k = n < max ? n : max;
+
+        for (i = 0; i < k; i++)
+            atoms[i] = cand[i];
+        return k;
+    }
 }
 
 static int whale_prof_one_shape(unsigned off)
@@ -2141,6 +2217,29 @@ static int whale_sites_mono(const int *sites, int nsites)
     for (i = 0; i < nsites; i++)
         if (!whale_prof_site_ok((unsigned)sites[i]))
             return 0;
+    return 1;
+}
+
+/* Frequency gate: like mono, but a polymorphic site (up to 4 shapes, the
+   recorder's cap) is accepted instead of refused. The layout then keeps only
+   the attributes seen often enough (see whale_layout_from_sites) and the rest
+   fall back to the dynamic map - which already exists for exactly this. An
+   explicitly disqualified site (negative) still refuses, as does an empty
+   site list. */
+static int whale_sites_freq(const int *sites, int nsites)
+{
+    const void *sh[8];
+    int i, n;
+
+    if (nsites == 0)
+        return 0;
+    for (i = 0; i < nsites; i++) {
+        if (sites[i] == 0 || whale_prof_now == NULL)
+            return 0;
+        n = JS_WhaleProfShapes(whale_prof_now, (unsigned)sites[i], sh, 8);
+        if (n < 0 || n > WHALE_PROFILE_SHAPES)
+            return 0;
+    }
     return 1;
 }
 
@@ -2874,7 +2973,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     }
     if (whale_dbg_env("WHALE_STR_DBG")) {
         int cols = whale_layout_from_sites(whale_field_sites, whale_field_sites_n,
-                                           whale_str_atoms, WHALE_STRUCT_FIELDS);
+                                           whale_str_atoms, WHALE_STRUCT_FIELDS,
+                                           info->prefer_gcc ? 0 : 40);
         int si;
 
         fprintf(stderr, "[str-table] blen=%d sites=%d mono=%d cols=%d atoms=[",
@@ -3774,12 +3874,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         case OP_object:
             {
                 int os;
-                int mono = 1, si;
+                int mono;
 
                 /* Was every field access site in this function observed holding a
-                   single shape? If so, the objects built here have a settled layout
-                   and can be laid out as a struct: one load per field instead of the
-                   7-memory-operation sequence.
+                   narrow-enough shape set? If so, the objects built here have a
+                   settled layout and can be laid out as a struct. Frequency, not
+                   unanimity: mildly polymorphic sites still lay out, their rare
+                   fields falling back to the dynamic map.
 
                    Asked at the function level because per-object would need a
                    provenance array kept in step with cur[] and snapshotted at every
@@ -3791,11 +3892,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                    The reservation rule applies inside: the layout is the union of the
                    observed shapes, so a field only some of them carry still gets a
                    slot, because reserving eight bytes beats falling back. */
-                for (si = 0; mono && si < whale_field_sites_n; si++)
-                    if (!whale_prof_site_ok((unsigned)whale_field_sites[si]))
-                        mono = 0;
-                if (whale_field_sites_n == 0)
-                    mono = 0;
+                mono = whale_sites_freq(whale_field_sites, whale_field_sites_n);
                 if (whale_dbg_env("WHALE_PROF_DBG"))
                     fprintf(stderr, "[obj] pos=%d sites=%d mono=%d\n",
                             pos, whale_field_sites_n, mono);
@@ -3836,7 +3933,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         : whale_layout_from_sites(whale_field_sites,
                                                   whale_field_sites_n,
                                                   whale_str_atoms,
-                                                  WHALE_STRUCT_FIELDS);
+                                                  WHALE_STRUCT_FIELDS,
+                                                  info->prefer_gcc ? 0 : 40);
 
                     if (fn > 0) {
                         int k;
@@ -3892,7 +3990,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     int fn = whale_layout_from_sites(whale_field_sites,
                                                      whale_field_sites_n,
                                                      whale_str_atoms,
-                                                     WHALE_STRUCT_FIELDS);
+                                                     WHALE_STRUCT_FIELDS,
+                                                     info->prefer_gcc ? 0 : 40);
 
                     if (fn > 0) {
                         int k, pfm = fold_mark();
@@ -4654,6 +4753,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                     local_inline(idx);
                     fold_set(sp, fm);
+                    /* A constant local inlines as its literal: the expression
+                       is loop-invariant iff the local is. */
+                    if (idx >= 0 && idx < WHALE_JIT_MAX_SLOTS &&
+                        whale_lo_c[idx])
+                        whale_vexpr[sp].inv = 1;
                 }
                 cur[var_count + sp] = (uint8_t)t;
                 sp++;
@@ -4695,15 +4799,16 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 if (whale_dbg_env("WHALE_JIT_DUMP"))
                     fprintf(stderr, "[fill] pos=%d t=%d strn=%d calln=%d sites=%d mono=%d\n",
                             pos, t, whale_str_n, whale_call_n, whale_field_sites_n,
-                            whale_sites_mono(whale_field_sites, whale_field_sites_n));
+                            whale_sites_freq(whale_field_sites, whale_field_sites_n));
                 if (!whale_dbg_env("WHALE_NO_UNBOX") && whale_str_n == 0 &&
                     (whale_call_n == 0 || pos > whale_call_pos[whale_call_n - 1]) &&
                     (WHALE_IS_OBJ(t) || WHALE_IS_VAL(t)) &&
-                    whale_sites_mono(whale_field_sites, whale_field_sites_n)) {
+                    whale_sites_freq(whale_field_sites, whale_field_sites_n)) {
                     int fn = whale_layout_from_sites(whale_field_sites,
                                                      whale_field_sites_n,
                                                      whale_str_atoms,
-                                                     WHALE_STRUCT_FIELDS);
+                                                     WHALE_STRUCT_FIELDS,
+                                                     info->prefer_gcc ? 0 : 40);
                     int slot = WHALE_SLOT(t);
 
                     if (fn > 0) {
@@ -4958,9 +5063,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                 local_inline(0);
                 fold_set(sp, fm);
+                if (whale_lo_c[0])
+                    whale_vexpr[sp].inv = 1;
                 fm = fold_mark();
                 local_inline(1);
                 fold_set(sp + 1, fm);
+                if (var_count > 1 && whale_lo_c[1])
+                    whale_vexpr[sp + 1].inv = 1;
             }
             cur[var_count + sp] = cur[0];
             cur[var_count + sp + 1] = cur[1];

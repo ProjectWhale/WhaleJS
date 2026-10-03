@@ -341,3 +341,5 @@ Reverted to 38579bc; both findings are recorded rather than half-fixed.- `<56>` 
 <76>(TIPS+未解): **fib 退化排查 + memo 关断回退 + A 收尾评估**。`by_flag` 死计数器删除（保留 `whale_entry_total`）。memo 关断（`pure1&&!selfref`）致 fib 16→349ms + deopt 暴涨，已回退，原因未明（疑 entry 选择与 memo 隐性交互）。A 收尾做不了：`wt_slot` 是单 ident token，生成器侧无 ident 表，无法反查变量号 → 排到 ELS（线性 IR 自带符号表）之后。见 current.md <76>
 
 <77>(PARTIAL): **LICM 地基（inv 追踪 + 外提框架，未生效）**。`WhaleVExpr.inv`（字面量/参数置 1，binop 取 AND，其余 0）；`fold_materialize` 在循环内 + inv 时发外层输出（只做栈槽）。语义安全（默认不外提）。未生效：nested 的 `_ws.v` 没外提，`inv` 链断在 `(L0+L1)`（peephole 没匹配 → 通用路径不记 inv）→ 下轮加 inv 诊断找断链点。见 current.md <77>
+
+<78>(SOLVED×2+TIPS): **CStruct 频率化 + object free list + 线性表结论**。`whale_sites_freq` 接受 ≤4 形状 site；布局按**去重形状覆盖率**≥40%（gcc 二编降到 0 全量），按覆盖率降序截断 16。中间踩坑：按 site 数算把 objfields 干到 188ms（tag 占 2/10 site 被滤）→ 改形状级后恢复 63ms。object free list（`ObjNew` 空对象单链，`DefineNum` 照常生长）：objshape -8%、immutable -17%。线性表结论：`col_lookup` 热路径零调用（缓存全命中）→ **保持线性，不引入哈希**。见 current.md <78>

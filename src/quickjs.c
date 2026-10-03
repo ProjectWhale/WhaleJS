@@ -446,6 +446,15 @@ struct JSRuntime {
 #define WHALE_STRUCT_FREE_DEPTH 64
     JSObject *whale_struct_free[WHALE_STRUCT_FIELDS];
     uint8_t whale_struct_free_n[WHALE_STRUCT_FIELDS];
+    /* WhaleJS plain-object free list, for the materialising path (escaped and
+       friends build a real object per iteration through JS_WhaleObjNew). Same
+       shape as above but a single chain: ObjNew always makes an empty object,
+       so there is no width to key on. Only empty objects return here (a shape
+       with properties keeps its values and needs freeing); checkout reuses
+       the shell and DefineNum regrows the shape as usual. */
+#define WHALE_OBJ_FREE_DEPTH 64
+    JSObject *whale_obj_free;
+    uint8_t whale_obj_free_n;
 };
 
 typedef struct JSStackFrame {
@@ -2753,20 +2762,34 @@ void JS_FreeRuntime(JSRuntime *rt)
        remove_gc_object would corrupt a list they are no longer on). */
     {
         int w;
+        JSObject *p, *next;
 
         for (w = 0; w < WHALE_STRUCT_FIELDS; w++) {
-            JSObject *p = rt->whale_struct_free[w];
+            p = rt->whale_struct_free[w];
 
             rt->whale_struct_free[w] = NULL;
             rt->whale_struct_free_n[w] = 0;
             while (p) {
-                JSObject *next = (JSObject *)p->prop;
+                next = (JSObject *)p->prop;
 
                 js_free_shape(rt, p->shape);
                 js_whale_struct_finalizer(rt, JS_MKPTR(JS_TAG_OBJECT, p));
                 js_free_rt(rt, p);
                 p = next;
             }
+        }
+        /* Plain-object chain: empty shells, same treatment minus the columns
+           (no finalizer - JS_CLASS_OBJECT has none - and the prop block went
+           back when the object chained off). */
+        p = rt->whale_obj_free;
+        rt->whale_obj_free = NULL;
+        rt->whale_obj_free_n = 0;
+        while (p) {
+            next = (JSObject *)p->prop;
+
+            js_free_shape(rt, p->shape);
+            js_free_rt(rt, p);
+            p = next;
         }
     }
 
@@ -8856,7 +8879,24 @@ static inline JSShapeProperty *find_own_property(JSProperty **ppr,
    local object literal, so nothing else shares the shape it ends up with. */
 int JS_WhaleObjNew(JSContext *ctx, int slot)
 {
-    JSValue o = JS_NewObject(ctx);
+    JSObject *p = ctx->rt->whale_obj_free;
+    JSValue o;
+
+    /* Free-list checkout: an empty shell, same as JS_NewObject would make
+       (empty shape, no properties). DefineNum regrows the shape from empty
+       exactly as on a fresh object. */
+    if (p) {
+        ctx->rt->whale_obj_free = (JSObject *)p->prop;
+        ctx->rt->whale_obj_free_n--;
+        p->prop = NULL;
+        p->free_mark = 0;
+        JS_REF_COUNT(p) = 1;
+        add_gc_object(ctx->rt, &p->header, JS_GC_OBJ_TYPE_JS_OBJECT);
+        o = JS_MKPTR(JS_TAG_OBJECT, p);
+        JS_WhaleObjSlot(ctx, slot, o);
+        return 1;
+    }
+    o = JS_NewObject(ctx);
 
     if (JS_IsException(o))
         return 0;
@@ -9650,6 +9690,23 @@ static void free_object(JSRuntime *rt, JSObject *p)
             rt->whale_struct_free_n[ws->nslots - 1]++;
             return;
         }
+    }
+    /* WhaleJS plain-object free list, for the materialising path: an empty
+       ordinary object (no properties yet - anything with values needs its
+       property storage freed) returns to a single chain, and the next ObjNew
+       reuses the shell. DefineNum regrows the shape from empty exactly as it
+       would on a fresh object, so nothing it does can tell the difference. */
+    if (p->class_id == JS_CLASS_OBJECT && !rt->in_free &&
+        p->shape && p->shape->prop_count == 0 && !p->first_weak_ref &&
+        rt->whale_obj_free_n < WHALE_OBJ_FREE_DEPTH) {
+        js_free_rt(rt, p->prop);
+        p->free_mark = 0;
+        JS_REF_COUNT(p) = 0; /* still dead: ObjNew revives on checkout */
+        remove_gc_object(&p->header);
+        p->prop = (JSProperty *)rt->whale_obj_free;
+        rt->whale_obj_free = p;
+        rt->whale_obj_free_n++;
+        return;
     }
     /* free all the fields */
     sh = p->shape;

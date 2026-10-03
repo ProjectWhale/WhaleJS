@@ -2041,6 +2041,42 @@ nested 的 `_ws.v[0]/v[1]` 没外提（体与之前相同）。`inv` 链在某�
 ## 状态
 绿，待提交。
 
+# <78>: CStruct 频率化 + object free list + 线性表结论
+SOLVED + SOLVED + TIPS
+
+## shape 频率化（用户设计）
+- 旧：`mono` 要求全 site 单形状（100% 一致），布局取并集。`objshape` 的
+  growsShape 多态污染全函数 → escaped 等单形状对象也被拒之门外。
+- 新：`whale_sites_freq` 接受 ≤4 形状的 site（明确放弃的仍拒绝）；
+  `whale_layout_from_sites` 按**去重形状覆盖率**过滤（≥40% 进布局，按覆盖率
+  降序，截断 16），gcc 二编（`prefer_gcc`）门限降到 0（全量已知属性）。
+- 中间踩坑：第一版按 site 数算覆盖率，objfields 188ms（3 倍退化）——tag/key/depth
+  各只占 2/10 site 被滤掉。改形状级（同形状多 site 只计一次）后恢复 63ms。
+  教训："40% 引用"指形状覆盖，不是 site 数；site 数会被访问点数量稀释。
+
+## object free list（物化路径的复用）
+- escaped 走 `ObjNew`（plain 对象，`ret_obj` 标记被 <63> 故意关闭），不在 <72>
+  的 struct free list 覆盖内。每迭代一次 `JSObject` + shape 生长 + 旧对象全释。
+- `JSRuntime.whale_obj_free` 单链（ObjNew 全是空对象，无需分桶）：
+  回链条件（`JS_CLASS_OBJECT` + 空 shape + 无 weak）+ `ObjNew` 取用（重挂 GC +
+  `DefineNum` 照常生长）+ FreeRuntime 排空。按 Runtime 隔离，同 struct。
+- objshape 577→530ms（-8%），immutable 285→236ms（-17%）。
+
+## 线性表结论（用户问：16 分界，统一入口两套内存？）
+- 实测：`col_lookup` 在热路径**零调用**（`_fs/_fp` 缓存全命中，`WHALE_STR_STAT`
+  无一行输出）——线性扫只在冷路径（shape 变化/first touch）跑。
+- 结论：**保持线性，不引入哈希**。冷路径 16 次比较可忽略，热路径已缓存；
+  两套内存 + 统一入口的复杂度不值。除非将来 prof 显示扫表进 top（届时直接看
+  `col_lookup` 计数器）。
+- 附带：`col_lookup` 计数器此前因 shell 环境变量传参问题误报"零调用"，用
+  ps1 脚本确认后仍是零——计数器本身正常，是传参姿势错（`set` 在 bash 仿真下
+  无效，要用 ps1 的 `$env:`）。
+
+## 验证
+`whale api test: ok`；25/25 全对，0 mismatch；nested 72ms（保持）。
+## 状态
+绿，待提交。
+
 # <76>: fib 退化排查 + memo 关断回退 + A 收尾评估
 TIPS + 未解
 
