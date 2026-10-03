@@ -971,13 +971,17 @@ static int whale_expr_max = 24;
 static void fold_materialize(int k);
 static void fold_commit(int mark);
 
-/* Record [mark, now) as the value of stack slot k. */
+/* Record [mark, now) as the value of stack slot k. inv defaults to 0: only
+   the emitters that can prove invariance (literal pushes, get_arg, binop AND,
+   constant-local reads) set it. In particular a helper/call result must never
+   inherit its arguments' invariance - hoisting a call out of a loop repeats
+   the first iteration's value forever. */
 static void fold_set(int k, int mark)
 {
     whale_vexpr[k].off = mark;
     whale_vexpr[k].len = JS_WhaleTokSinkLen() - mark;
     whale_vmat[k] = 0;
-    whale_vexpr[k].inv = 0;   /* callers that know better set it just below */
+    whale_vexpr[k].inv = 0;
     if (whale_vexpr[k].len > whale_expr_max)
         fold_materialize(k);
 }
@@ -5792,7 +5796,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 if (!whale_vmat[sp - 1])
                     fold_materialize(sp - 1);
                 fm = fold_mark();
-                if (pow2 > 0) {
+                {
+                    int inva = whale_vexpr[sp - 2].inv;
+                    int invb = whale_vexpr[sp - 1].inv;
+
+                    if (pow2 > 0) {
                     /* `% 2^k` is `& (2^k - 1)`, and idiv is the slowest integer
                        instruction there is - about 26 cycles against 1. The
                        reduction only holds for a non-negative dividend: JS's %
@@ -5811,10 +5819,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     wt('&'); wt_int(pow2 - 1); wt(')');
                     wt(':'); wt_id("fmod"); wt('('); fold_inline(sp - 2);
                     wt(','); wt_int(pow2); wt(')');
-                } else {
-                    fold_mod(sp - 2, sp - 1);
+                    } else {
+                        fold_mod(sp - 2, sp - 1);
+                    }
+                    fold_set(sp - 2, fm);
+                    whale_vexpr[sp - 2].inv = (uint8_t)(inva && invb);
                 }
-                fold_set(sp - 2, fm);
             }
             cur[var_count + sp - 2] = WHALE_T_NUM;
             sp--;
@@ -5830,6 +5840,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 { WHALE_STEP_INSTEAD_OF_BAILING(); }
             {
                 int fm = fold_mark();
+                int inva = whale_vexpr[sp - 2].inv;
+                int invb = whale_vexpr[sp - 1].inv;
 
                 wt('('); wk(JS_WK_DOUBLE); wt(')'); wt('(');
                 fold_toint32(sp - 2, whale_type_is_num(cur[var_count + sp - 2]),
@@ -5839,6 +5851,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                          cur[var_count + sp - 1] == WHALE_T_ICONST);
                 wt(')');
                 fold_set(sp - 2, fm);
+                whale_vexpr[sp - 2].inv = (uint8_t)(inva && invb);
             }
             cur[var_count + sp - 2] = WHALE_T_I32;   /* & | ^ are int32 by definition */
             sp--;
@@ -5850,6 +5863,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 { WHALE_STEP_INSTEAD_OF_BAILING(); }
             {
                 int fm = fold_mark();
+                int inva = whale_vexpr[sp - 2].inv;
+                int invb = whale_vexpr[sp - 1].inv;
 
                 wt('('); wk(JS_WK_DOUBLE); wt(')'); wt('(');
                 if (op == OP_shr) { wk(JS_WK_UNSIGNED); wk(JS_WK_INT); wt(')'); }   /* >>> is logical */
@@ -5861,6 +5876,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                          cur[var_count + sp - 1] == WHALE_T_ICONST); wt('&'); wt_int(31); wt(')');
                 wt(')');
                 fold_set(sp - 2, fm);
+                whale_vexpr[sp - 2].inv = (uint8_t)(inva && invb);
             }
             /* >>> is unsigned, so its result can exceed int32; << and >> cannot */
             cur[var_count + sp - 2] = (op == OP_shr) ? WHALE_T_NUM : WHALE_T_I32;

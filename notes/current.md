@@ -2041,6 +2041,42 @@ nested 的 `_ws.v[0]/v[1]` 没外提（体与之前相同）。`inv` 链在某�
 ## 状态
 绿，待提交。
 
+# <80>: inv 继承灾难（11 case 静默错答案）与删除
+SOLVED（回退）/ 教训
+
+## 症状
+11/25 case 静默错答案：`array`/`immutable`/`object`/`objfields` 直接 `check=0`，
+`bitops`/`branch`/`loop_sum`/`sieve` 等数值全错。共同形状是"循环只跑首轮值"。
+
+## 根因
+`fold_set` 的 `inv` 继承（`whale_fold_src`）：纯转发继承源槽 `inv`。但 `call`/
+helper 结果的 `fold_set` 后无覆盖 → 继承最后内联的参数源 → 参数常量则 `inv=1`
+→ `fold_materialize` 把**调用搬出循环** → 每轮读首轮值。`get_field` 等内存读
+同理（结果 `inv` 继承源，不变性无从谈起）。
+
+## 修法
+删继承（`fold_set` 默认 0，`whale_fold_src` 删除）。`inv` 只由能证明的点置位：
+字面量推送、`get_arg`、binop AND（含 `fold_mod`/位运算）、`get_loc` 的 `lo_c`。
+单目运算（`neg`/`lnot`）不需处理（`fold_set` 后无覆盖，但源是自身旧值，透传正确；
+`OP_plus` 恒等不调 `fold_set`，保持）。
+全量 0 mismatch 恢复。
+
+## 教训
+`inv` 这类"可外提"标记只能由**构造点**置位（字面量、参数、AND），绝不能由
+**转发**继承——转发不知道目标语义（调用/内存读的结果不是纯函数）。与 `lo_c`
+（只记字面量推送，不记表达式结果）同例。`fold_inline` 后 `fold_set` 的点凡
+无显式 `inv` 覆盖的，一律按可变处理。
+
+## 附带
+- runner 的 entries 列部分空白（`immutable_update` 等）：check 全对，无 MISMATCH，
+  功能正常；疑 `WHALE_ENTRIES` 行解析问题，待查，不阻塞。
+- immutable 245ms（基线），fib 21ms（噪声），mixed 204ms（基线）。
+
+## 验证
+`whale api test: ok`；25/25 全对，0 mismatch。
+## 状态
+绿，待提交。
+
 # <78>: CStruct 频率化 + object free list + 线性表结论
 SOLVED + SOLVED + TIPS
 
