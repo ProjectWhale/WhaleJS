@@ -2019,6 +2019,28 @@ SOLVED（折叠）/ 部分生效
 ## 状态
 绿，待提交。
 
+# <77>: LICM 地基（inv 追踪 + 外提框架，未生效待调试）
+PARTIAL
+
+## 做的事
+- `WhaleVExpr.inv`：字面量推送/`get_arg` 置 1，binop 取操作数 AND（通用路径 +
+  peephole 1），其余默认 0。`fold_set` 清零（调用点置位）。
+- `fold_materialize`：循环内 + `inv` → 语句发外层输出（循环头标签前），后读
+  内联变量如常。只做栈槽物化（`_ws.v<n>`），不做 deferred 局部。
+- 语义安全：`inv=0` 默认保守（不外提）；`inv=1` 要求操作数全字面量/参数/常量。
+
+## 未生效
+nested 的 `_ws.v[0]/v[1]` 没外提（体与之前相同）。`inv` 链在某处断了：
+`(L0+L1)` 的 peephole 1 没匹配（`ok1/ok2` 因 `live` 拒绝，尽管 `lo_c` 已置位——
+`live` 拒绝的修复只放行了 analyze，但 peephole 的 `ok1` 还要 `type_is_num` 等，
+或者 `p2/p3` 错位）→ 通用路径（`local_inline` 字面量，不记 `inv`）→ 链断。
+下轮加 `inv` 诊断（每步打印槽号 + inv），看断链点。
+
+## 验证
+`whale api test: ok`；25/25 全对，0 mismatch（不外提是保守正确，零风险）。
+## 状态
+绿，待提交。
+
 # <76>: fib 退化排查 + memo 关断回退 + A 收尾评估
 TIPS + 未解
 

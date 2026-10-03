@@ -339,3 +339,5 @@ Reverted to 38579bc; both findings are recorded rather than half-fixed.- `<56>` 
 <75>(SOLVED/部分): **peephole 常量折叠 + live 拒绝的常量例外**。双字面量 `+-*/` 编译期 double 求值（IEEE 一致，无 int 陷阱；小整数发 `wt_int` + 可继续传播）。`live` 拒绝让 peephole 对含常量表达式永不匹配 → 常量局部不拒绝；`local_inline` 对 flush 后常量发字面量。nested 90→73ms，其余持平。`(L0+L1)` 未折叠是 deferred 变量转发，需 `local_set` 透传 `lo_c`（下轮）。见 current.md <74>
 
 <76>(TIPS+未解): **fib 退化排查 + memo 关断回退 + A 收尾评估**。`by_flag` 死计数器删除（保留 `whale_entry_total`）。memo 关断（`pure1&&!selfref`）致 fib 16→349ms + deopt 暴涨，已回退，原因未明（疑 entry 选择与 memo 隐性交互）。A 收尾做不了：`wt_slot` 是单 ident token，生成器侧无 ident 表，无法反查变量号 → 排到 ELS（线性 IR 自带符号表）之后。见 current.md <76>
+
+<77>(PARTIAL): **LICM 地基（inv 追踪 + 外提框架，未生效）**。`WhaleVExpr.inv`（字面量/参数置 1，binop 取 AND，其余 0）；`fold_materialize` 在循环内 + inv 时发外层输出（只做栈槽）。语义安全（默认不外提）。未生效：nested 的 `_ws.v` 没外提，`inv` 链断在 `(L0+L1)`（peephole 没匹配 → 通用路径不记 inv）→ 下轮加 inv 诊断找断链点。见 current.md <77>
