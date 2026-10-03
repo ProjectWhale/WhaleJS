@@ -1990,7 +1990,31 @@ fibg 靠地址值解码运气没崩，bits 的 SIGFPE 才暴露。改为
 - 教训：任何"写局部"的 opcode（put/set/inc/dec）都必须进 `assign_cnt`；
   加新写 opcode 时先查这张表。`mixed` 必须进回归（它是唯一的 set_loc 覆盖）。
 
+# <74>: peephole 常量折叠 + live 拒绝的常量例外
+SOLVED（折叠）/ 部分生效
+
+## 常量折叠（peephole 1 的双字面量算术）
+- 两操作数全是 `WLD_INT/REAL` 字面量 → 编译期 double 求值发字面量。
+  IEEE 语义与运行时一致（`1/0=Inf`、`0/0=NaN`），无 int 除零陷阱（全程 double）。
+  只做 `+-*/`，不碰比较（bool 的 `?:` 形态收益小）。
+- 结果若是小整数发 `wt_int` + 记 `lo_c`（折叠结果也是常量，可继续传播）。
+
+## `live` 拒绝的常量例外
+- `whale_load_analyze` 对 deferred 局部一律拒绝（防 stale 读），导致 peephole 1
+  对含常量的表达式永不匹配——折叠代码 unreachable。
+- 修法：`live` 但 `lo_c` 置位 → 不拒绝（常量读出字面量，无 stale 可言）。
+- 配套：`local_inline` 对 `!live` 且 `lo_c` 的局部发字面量（deferred 常量在
+  flush 后也要读出字面量，而非变量）。
+
+## 效果与边界
+- nested 体内出现 `(5.5+1.5)`、`(2.5*3.5)` 等字面量（之前是变量引用）；
+  nested 90→73ms。其余数值 case 持平——TCC 自己会折叠字面量表达式，
+  真瓶颈仍是变量访存 + 长链求值（LICM 的事，本轮没动手）。
+- `(L0+L1)` 未折叠：`a/b` 的 pending 是变量（`local_set` 记录时栈顶是变量
+  引用，非字面量）→ `local_inline` 发变量。这是 deferred 变量转发的形状，
+  不是常量问题；要动它得让 `local_set` 透传 `lo_c`（下轮）。
+
 ## 验证
-`whale api test: ok`；25/25 全对，0 mismatch；nested 73ms。
+`whale api test: ok`；25/25 全对，0 mismatch。
 ## 状态
 绿，待提交。

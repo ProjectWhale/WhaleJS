@@ -709,8 +709,11 @@ static int whale_load_analyze(const JSWhaleFuncInfo *info, const uint8_t *pc, in
                 return 0;
             /* A local whose value is still a pending expression must not be
                read as `L<idx>` here - that would be the stale value. Refuse, so
-               the switch path goes through local_inline() instead. */
-            if (idx >= 0 && idx < var_count && whale_lmem && whale_lmem[idx].live)
+               the switch path goes through local_inline() instead. Exception:
+               a constant local reads as its literal either way, so there is
+               nothing stale to protect. */
+            if (idx >= 0 && idx < var_count && whale_lmem && whale_lmem[idx].live &&
+                !(idx >= 0 && idx < var_count && loc_c && loc_c[idx]))
                 return 0;
             *type_out = tt;
             /* constant propagation: a local written exactly once with a
@@ -3229,6 +3232,53 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         sp += 1;
                     }
                 } else {
+                    /* Constant folding: both sides are literals, so evaluate
+                       now and emit the answer. Double arithmetic matches the
+                       runtime exactly (same IEEE semantics, including 1/0=Inf
+                       and 0/0=NaN), and there is no int-divide trap because the
+                       computation stays in doubles. This is what turns
+                       loop-invariant `(a+b)` with constant a/b into `4.0`. */
+                    if (!is_cmp &&
+                        (k1 == WLD_INT || k1 == WLD_REAL) &&
+                        (k2 == WLD_INT || k2 == WLD_REAL) &&
+                        (opid == JS_OP_ADD || opid == JS_OP_SUB ||
+                         opid == JS_OP_MUL || opid == JS_OP_DIV)) {
+                        double cvr = (opid == JS_OP_ADD) ? cv1 + cv2
+                            : (opid == JS_OP_SUB) ? cv1 - cv2
+                            : (opid == JS_OP_MUL) ? cv1 * cv2 : cv1 / cv2;
+                        int is_int = (cvr == (double)(int)cvr &&
+                                      cvr >= -2147483648.0 &&
+                                      cvr <= 2147483647.0);
+                        int fm = fold_mark();
+
+                        if (dst >= 0) {
+                            local_forget(dst);
+                            wt_slot("L", dst); wt('=');
+                            if (is_int)
+                                wt_int((int)cvr);
+                            else
+                                wt_num(cvr);
+                            wt(';');
+                            fold_commit(fm);
+                            cur[dst] = WHALE_T_NUM;
+                            if (assign_cnt[dst] == 1) {
+                                whale_lo_c[dst] = 1;
+                                whale_lo_cv[dst] = cvr;
+                            } else {
+                                whale_lo_c[dst] = 0;
+                            }
+                        } else {
+                            if (is_int)
+                                wt_int((int)cvr);
+                            else
+                                wt_num(cvr);
+                            fold_set(sp, fm);
+                            cur[var_count + sp] = WHALE_T_NUM;
+                            sp += 1;
+                        }
+                        pos = p4 + l4;
+                        continue;
+                    }
                     if (dst >= 0) {
                         int fm = fold_mark();
 
