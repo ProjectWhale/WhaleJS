@@ -437,6 +437,15 @@ struct JSRuntime {
     void *user_opaque;
     void *libc_opaque;
     JSRuntimeFinalizerState *finalizers;
+    /* WhaleJS struct free list, one chain per column count. A struct object
+       whose reference drops to zero returns here instead of being freed, and
+       the next StructNew of the same width reuses it - no JSObject malloc, no
+       column-block malloc, no shape traffic. Per-runtime, so runtimes never
+       share. Chained through p->prop, which a struct never otherwise uses
+       (its shape is empty); depth-bounded, overflow frees normally. */
+#define WHALE_STRUCT_FREE_DEPTH 64
+    JSObject *whale_struct_free[WHALE_STRUCT_FIELDS];
+    uint8_t whale_struct_free_n[WHALE_STRUCT_FIELDS];
 };
 
 typedef struct JSStackFrame {
@@ -2710,11 +2719,14 @@ static inline void js_free_string0(JSRuntime *rt, JSString *str)
     }
 }
 
+/* WhaleJS struct finalizer, defined with the struct support below; declared
+   here for the free-list drain in JS_FreeRuntime. */
+static void js_whale_struct_finalizer(JSRuntime *rt, JSValue val);
+
 void JS_SetRuntimeInfo(JSRuntime *rt, const char *s)
 {
     if (rt)
-        rt->rt_info = s;
-}
+        rt->rt_info = s;}
 
 void JS_FreeRuntime(JSRuntime *rt)
 {
@@ -2734,6 +2746,29 @@ void JS_FreeRuntime(JSRuntime *rt)
     init_list_head(&rt->job_list);
 
     JS_RunGC(rt);
+
+    /* WhaleJS struct free list: chained-off objects hold a shape reference
+       and a column block each. They are already unlinked from every GC list,
+       so release them directly (free_object would re-chain them, and its
+       remove_gc_object would corrupt a list they are no longer on). */
+    {
+        int w;
+
+        for (w = 0; w < WHALE_STRUCT_FIELDS; w++) {
+            JSObject *p = rt->whale_struct_free[w];
+
+            rt->whale_struct_free[w] = NULL;
+            rt->whale_struct_free_n[w] = 0;
+            while (p) {
+                JSObject *next = (JSObject *)p->prop;
+
+                js_free_shape(rt, p->shape);
+                js_whale_struct_finalizer(rt, JS_MKPTR(JS_TAG_OBJECT, p));
+                js_free_rt(rt, p);
+                p = next;
+            }
+        }
+    }
 
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
     /* leaking objects */
@@ -3090,6 +3125,38 @@ int JS_WhaleStructNew(JSContext *ctx, const int *atoms, int nslots, int slot)
         return 0;
     if (slot < 0 || slot >= WHALE_OBJ_SLOTS)
         return 0;
+    /* Free-list checkout: same width, whole object reused - JSObject, empty
+       shape and column block all survive. The shape is empty for every struct
+       so it cannot be stale; atoms and columns are rewritten below before
+       anyone reads them, exactly like the fresh path. ref_count goes 0 -> 1
+       (it died to get here) and the frame slot takes the reference. */
+    {
+        JSObject *p = ctx->rt->whale_struct_free[nslots - 1];
+
+        if (p) {
+            ctx->rt->whale_struct_free[nslots - 1] = (JSObject *)p->prop;
+            ctx->rt->whale_struct_free_n[nslots - 1]--;
+            p->prop = NULL;
+            p->free_mark = 0;
+            JS_REF_COUNT(p) = 1;
+            /* Back on the GC list: remove_gc_object took it off when it
+               died, and an object the collector cannot see gets its columns
+               swept from under it. */
+            add_gc_object(ctx->rt, &p->header, JS_GC_OBJ_TYPE_JS_OBJECT);
+            ws = (WhaleStruct *)p->u.opaque;
+            /* The columns still hold the previous generation's values (the
+               free-list path skipped the finalizer that would have freed
+               them); release them before the fill below overwrites. */
+            {
+                uint32_t k;
+
+                for (k = 0; k < ws->nslots; k++)
+                    JS_FreeValueRT(ctx->rt, ws->data[k]);
+            }
+            obj = JS_MKPTR(JS_TAG_OBJECT, p);
+            goto fill;
+        }
+    }
     obj = JS_NewObjectClass(ctx, JS_CLASS_WHALE_STRUCT);
     if (JS_IsException(obj))
         return 0;
@@ -3105,6 +3172,7 @@ int JS_WhaleStructNew(JSContext *ctx, const int *atoms, int nslots, int slot)
     }
     ws->atoms = (JSAtom *)((char *)ws + sizeof(WhaleStruct));
     ws->data = (JSValue *)(ws->atoms + nslots);
+  fill:
     /* The dynamic map is created lazily: nearly every struct never receives a
        property its columns do not cover, and one JS object per struct was a
        visible slice of the per-call cost of the Redux shape. The three hooks
@@ -9554,6 +9622,37 @@ static void free_object(JSRuntime *rt, JSObject *p)
 
     p->free_mark = 1; /* used to tell the object is invalid when
                          freeing cycles */
+    /* WhaleJS struct free list: a struct with no dynamic properties returns
+       to its runtime's chain instead of being freed, and the next StructNew
+       of the same width reuses the whole thing - JSObject, empty shape, and
+       column block. The shape and columns are identical for every struct of
+       this width, so nothing is stale; the columns are rewritten by the next
+       StructNew before anyone reads them. A struct carrying a dynamic map is
+       not reusable (its extra properties need freeing) and overflows free
+       normally, which bounds the chain. */
+    if (p->class_id == JS_CLASS_WHALE_STRUCT && p->u.opaque) {
+        WhaleStruct *ws = (WhaleStruct *)p->u.opaque;
+
+        /* Not while the runtime itself is going away: the chains are about
+           to be dropped with it, and re-chaining would leak them past the
+           leak check below. */
+        if (!rt->in_free && ws->magic == WHALE_STRUCT_MAGIC
+            && ws->nslots > 0 && ws->nslots <= WHALE_STRUCT_FIELDS
+            && JS_IsUndefined(ws->dynamic)
+            && rt->whale_struct_free_n[ws->nslots - 1] < WHALE_STRUCT_FREE_DEPTH) {
+            /* The empty shape's prop block carries nothing (prop_count is 0),
+               so it goes now; the slot reuses p->prop as the chain link and
+               checkout restores NULL, which free_object already tolerates. */
+            js_free_rt(rt, p->prop);
+            p->free_mark = 0;
+            JS_REF_COUNT(p) = 0; /* still dead: StructNew revives on checkout */
+            remove_gc_object(&p->header);
+            p->prop = (JSProperty *)rt->whale_struct_free[ws->nslots - 1];
+            rt->whale_struct_free[ws->nslots - 1] = p;
+            rt->whale_struct_free_n[ws->nslots - 1]++;
+            return;
+        }
+    }
     /* free all the fields */
     sh = p->shape;
     pr = get_shape_prop(sh);

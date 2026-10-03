@@ -1903,3 +1903,38 @@ SOLVED（阈值）+ TIPS（清单）
 `whale api test: ok`；25/25 全对，0 mismatch；immutable 339ms = 基线。
 ## 状态
 绿，待提交。
+
+# <72>: 多 Runtime 安全确认 + struct free list（分配器第一步）
+SOLVED（多 Runtime）+ SOLVED（free list）
+
+## 多 Runtime（用户要求确认）
+- 审计结论：`whale_jit_state_ensure()` 有 `if (whale_jit_state) return 1`
+  守卫，**不会多次 `tcc_new()`**；`whale_vr_expect` 表单调追加（指针全局
+  唯一，满 64 返回 -1 已有检查）；host 符号地址进程通用；`.o` 临时文件名
+  seq 全局唯一；`whale_jit_backend` 按函数切换（同步编译，用完即覆盖）。
+- 实测：`temp/multi_rt.c`（不入库）双 Runtime 交替编译+调用，
+  `rt1=rt2=832040 OK`。
+- 约束（记入技术债）：**多线程并行编译不安全**——生成器暂存全是进程全局。
+  QuickJS 本身要求多线程用独立 Runtime，而我们的 JIT 让独立 Runtime 的
+  并行编译也会互踩。同线程多 Runtime 交替则安全（编译同步不重入）。
+
+## struct free list（按 Runtime 隔离，满足"别跨 Runtime 共享"）
+- 位置：`JSRuntime.whale_struct_free[16]` + 计数，`JS_NewRuntime` 零初始化
+  自带，`JS_FreeRuntime` 在 `JS_RunGC` 后手动排空（`in_free` 守卫让排空走
+  正常释放；直接调 `free_object` 会重回链 + 对已摘链节点 `list_del`）。
+- 回链（`free_object` 入口）：struct + 无 dynamic + 桶深<64。跳过 shape/prop/
+  finalizer 全套释放；prop 块先释（空 shape 的无内容），字段复作链指针。
+- 取用（`StructNew`）：出链 + `refcount 0->1` + 重挂 GC 链表 + 释旧列值 +
+  全列重写（与新路径同一 `fill:`）。
+- 两个真 bug（都是"复用对象与新对象状态不对等"）：
+  1. **复用对象不在 GC 链表**（`remove_gc_object` 摘了，新路径的
+     `add_gc_object` 没走）→ 列新值被 GC 回收 → 启动期即崩。补挂链。
+  2. **旧列值泄漏**（回链跳过 finalizer 的列释放，fill 直接覆盖）→ 补释放。
+- 测量：immutable_update 339→245ms（-28%）；objshape 580→528ms（-9%，
+  escaped 仍是 GC 扫描主导，符合 <63> 结论——free list 省分配，不省扫描）。
+
+## 验证
+`whale api test: ok`；25/25 全对，0 mismatch；multi_rt OK。
+## 状态
+绿，待提交。分配器下一步：GC 扫描侧（escaped 的剩余 90%）需分代或标记优化，
+属大工程，按 <68> 排在 ELS 之前评估。
