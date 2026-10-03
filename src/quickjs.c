@@ -4559,11 +4559,28 @@ static void whale_prof_record(JSFunctionBytecode *b, uint32_t pc, JSShape *shape
    one, which is why the table came back empty. */
 static void whale_prof_arm(JSContext *ctx, JSFunctionBytecode *b);
 
+/* Per-function compile threshold. One number for every shape over-compiles
+   small ones (a TCC compile is ~1ms; paying it for 100 calls of a tiny loop
+   is pure overhead) and under-compiles big ones (a nested loop's million
+   iterations should not wait 100 trips to go native). What is known before
+   compiling: the loop table (<58>, filled by compute_stack_size) and the
+   bytecode length. Nested loops compile earliest, big single loops next,
+   small loops later, straight-line code latest - the price of compiling is
+   the same for all of them, so the threshold follows the expected payoff. */
+static int whale_hot_threshold(JSFunctionBytecode *b)
+{
+    if (b->whale_loop_count >= 2)
+        return 10;
+    if (b->whale_loop_count == 1)
+        return b->byte_code_len > 64 ? 20 : 50;
+    return WHALE_JIT_HOT_THRESHOLD;
+}
+
 static void whale_prof_maybe_arm(JSContext *ctx, JSFunctionBytecode *b)
 {
     if (b->whale_prof_on || b->whale_jit_tried)
         return;
-    if (b->whale_call_count + WHALE_PROFILE_CALLS >= WHALE_JIT_HOT_THRESHOLD)
+    if (b->whale_call_count + WHALE_PROFILE_CALLS >= whale_hot_threshold(b))
         whale_prof_arm(ctx, b);
 }
 
@@ -4675,7 +4692,7 @@ static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
        the tail rather than the whole run keeps the cost bounded, and by then the
        function is warm: the first calls are still settling. */
     whale_prof_maybe_arm(ctx, b);
-    if (b->whale_call_count < WHALE_JIT_HOT_THRESHOLD)
+    if (b->whale_call_count < whale_hot_threshold(b))
         return 0;
     if (b->whale_jit_entry || b->whale_jit_tried)
         return 0;
@@ -4683,6 +4700,10 @@ static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
     b->whale_prof_on = 0;
     if (whale_dbg_env("WHALE_PROF_DBG"))
         whale_prof_dump(b);
+    if (whale_dbg_env("WHALE_JIT_DUMP"))
+        fprintf(stderr, "[hot] count=%u threshold=%d loops=%d bytelen=%d\n",
+                b->whale_call_count, whale_hot_threshold(b),
+                b->whale_loop_count, b->byte_code_len);
     {
         static int whale_op_probe;
         if (!whale_op_probe && whale_dbg_env("WHALE_JIT_DUMP")) {
@@ -4803,7 +4824,7 @@ static void whale_note_backedge(JSContext *ctx, JSFunctionBytecode *b)
     /* the back edge is what pushes a looping function to the threshold, so the
        observation window has to open here as well as in whale_on_call */
     whale_prof_maybe_arm(ctx, b);
-    if (++b->whale_call_count >= WHALE_JIT_HOT_THRESHOLD)
+    if (++b->whale_call_count >= whale_hot_threshold(b))
         (void)whale_on_call(ctx, b);   /* a compile here only takes effect next call */
 }
 

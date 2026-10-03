@@ -1851,3 +1851,55 @@ compiled 增长；无 driver 时跳过）；25/25 全对，0 mismatch；默认�
 314ms = 基线。
 ## 状态
 绿，待提交。两级 JIT 剩下一半（热点再编译机制 + 门限策略）按 <68> 排在分配器之后。
+
+# <71>: 编译阈值分级 + clang 说明 + 技术债清单
+SOLVED（阈值）+ TIPS（清单）
+
+## 阈值分级（用户要求：嵌套大循环早编译，纯数学运算晚编译）
+- 旧：一刀切 `WHALE_JIT_HOT_THRESHOLD=100`（调用+回边统一计数）。
+- 新：`whale_hot_threshold(b)`——`loop_count>=2`→10；单循环且字节码>64→20；
+  单循环小体→50；无循环→100（保持）。依据在编译前已知（<58> 循环表 +
+  byte_code_len），阈值跟随预期收益而非统一。
+- 三处调用点全换（`whale_on_call`/`whale_note_backedge`/`whale_prof_maybe_arm`）；
+  profiling 窗口（8 次）是绝对值，阈值 10 时在 count=2 打开，样本仍够 mono 判定。
+- `[hot]` 诊断（`WHALE_JIT_DUMP` 下打印 count/threshold/loops/bytelen）。
+- 验证：`nested`（loops=2）在 count=11 编译，`plain`（loops=1, len=22）在
+  count=51 编译，语义全对；25/25 全绿，稳态数字不变（perftest 都是长跑，
+  阈值只影响短跑/冷启动行为——这正是它的价值所在）。
+
+## clang（用户纠正：gcc/clang 都行，只需允许）
+- driver 本来就是路径参数，传 clang 路径即 clang 后端；所传 flags
+  （`-x c - -c -w -fno-strict-aliasing -Wno-error=incompatible-pointer-types
+  -O2 -o`）全是 clang 兼容的，无需代码改动。
+- 本机无 clang，实测待有环境时补。`JS_WhaleSetJitCc` 的注释已写"gcc/clang"。
+
+## 三级编译（用户：不一定，看 ELS 落地后的差距）
+- 暂不做。当前两级（TCC 默认 + gcc 按函数启用）已覆盖"允许"的全部语义；
+  ELS 落地后若 TCC 与 gcc 的差距从 3-4x 拉大到 ELS 也追不上的程度，再评估
+  中间级（gcc-O1 快速升级 / ELS 常驻 + gcc 热点换装）是否有必要。
+- "热点再编译"（ distant future）需按**执行时长/编译成本比**设门限（<70> 已记），
+  不能按调用次数——阈值分级解决的是"何时首次编译"，再编译解决的是"何时升级"，
+  两件事别混。
+
+## 技术债清单（截至本轮，仍欠的）
+1. **单例 TCCState 代码累积无上限**：每次编译追加 section，`whale_jit_seq`
+   递增，长期运行只增不减（<35> 设计如此，当时只解决正确性）。需按代回收
+   或上限驱逐。
+2. **ELS 未落地**（<66 续> 路线 B，估 800-1500 行）：数值循环 1.3-2x 的来源，
+   也是 vr-inline 转正的前置。用户已确认方向，排在分配器之后。
+3. **vr-inline 休眠**（<69>）：机制全通，`WHALE_VR_INLINE` 开可用，转正等 ELS。
+4. **热点再编译机制**：门限策略已明确（执行/编译比），机制未建。
+5. **分配器**（最大单项，<68> 排序第一）：struct 轻量路径或新生代 bump，
+   escaped 相（objshape 80% 时间）的墙是 `JS_NewObjectClass` + GC 扫描。
+6. **memo 只按 self 读法建**（<48>）：closure 读法无 memo，对应形状无缓存。
+7. **裸 driver 名诊断弱**：`JS_WhaleSetJitCc("gcc",...)` 靠 PATH 解析，失败静默
+   回退解释器（<61> 同款陷阱的 API 版）——应显式报错或在 stats 里记 failed。
+8. **longjmp 安全**：`tcc_error` 是 longjmp，`pe_load_coff` 内 `tcc_malloc` 的
+   失败路径用返回值而非异常（已如此），但 `set_elf_sym` 的"defined twice"
+   是 `tcc_error_noabort`（只记数不跳）——多次加载同一符号名时的行为待实测
+   确认（目前每次函数名带 seq 计数器，天然避开）。
+
+## 验证
+`whale api test: ok`；25/25 全对，0 mismatch；immutable 339ms = 基线。
+## 状态
+绿，待提交。
