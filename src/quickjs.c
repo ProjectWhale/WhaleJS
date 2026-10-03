@@ -3554,12 +3554,10 @@ static void whale_entry_at_exit(void)
 extern char *getenv(const char *);
 void JS_WhaleDeoptNote(JSContext *ctx, int flag)
 {
-    static long by_flag[8];
     static int dbg = -1;
 
     (void)ctx;
-    if (flag >= 0 && flag < 8)
-        by_flag[flag]++;
+    (void)flag;
     whale_entry_total++;
     if (!whale_entry_registered) {
         /* Probe once. This runs on every compiled-call return; before the

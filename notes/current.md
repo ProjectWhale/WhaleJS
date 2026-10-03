@@ -2018,3 +2018,29 @@ SOLVED（折叠）/ 部分生效
 `whale api test: ok`；25/25 全对，0 mismatch。
 ## 状态
 绿，待提交。
+
+# <76>: fib 退化排查 + memo 关断回退 + A 收尾评估
+TIPS + 未解
+
+## fib 8→16ms（用户指出）
+- `by_flag[8]` 死计数器删除（只递增从不读取）：省 1-2ms，保留。`whale_entry_total`
+  保留（perftest entries 列依赖）。
+- memo 关断实验（`pure1 && !selfref`）：fib 16→349ms（掉回解释器）+ entries 12→31
+  （deopt 暴涨），**已回退**。原因未明：memo 只跳过执行不改变语义，关断不应引发
+  deopt；怀疑 `selfref` 为真时的 entry 选择与 memo 有隐性交互（entry2 编译 + memo
+  缺失的组合），待查。记入技术债，不阻塞。
+- 回退后 19ms（噪声）。8ms 时代是 memo 命中 + 更少的 wrapper 开销；当前 16-19ms
+  是稳态。B（ELS/LICM）落地后重测。
+
+## A 收尾评估：做不了（需 ident 反查）
+- `(L0+L1)` 未折叠是 deferred 变量转发：`local_set` 记录时栈顶是 `L0` 变量引用，
+  `local_inline` 原样发出。要透传 `lo_c`，需从 token 反查变量号。
+- `wt_slot` 发的是单 ident token（`tok_alloc("L0")` 的 id），生成器侧无 ident 表，
+  无法从 `gw_tok[off]` 反查 n。`fold_inline`/`local_set` 都不知道栈顶变量号。
+- 结论：A 收尾需要 ident 反查基础设施，排到 ELS（路线 B 建线性 IR 时自然有符号表）
+  之后。本轮不做，诚实记录。
+
+## 验证
+`whale api test: ok`；fib 19ms（稳态）。
+## 状态
+绿，待提交。

@@ -337,3 +337,5 @@ Reverted to 38579bc; both findings are recorded rather than half-fixed.- `<56>` 
 <74>(SOLVED + 危险): **`set_loc` 漏统计 → 常量传播静默错答案**。`mixed`（`x=1.0` 初始化 + 循环内 `x=x+y*2`）JIT 给 `60000005`，正确是 NaN（指数发散后 `Inf-Inf`）——`x` 被误判单赋值常量 `1` 重写循环体。根因：`assign_cnt` 只计 `put_loc/inc_dec`，不计 `set_loc`（存值又留栈）；与 <13> 的 `inc_loc` 漏统计同类。修法：预扫描加 `set_loc` 全形态。教训：任何写局部的 opcode 都必须进 `assign_cnt`。见 current.md <73 bug#3>
 
 <75>(SOLVED/部分): **peephole 常量折叠 + live 拒绝的常量例外**。双字面量 `+-*/` 编译期 double 求值（IEEE 一致，无 int 陷阱；小整数发 `wt_int` + 可继续传播）。`live` 拒绝让 peephole 对含常量表达式永不匹配 → 常量局部不拒绝；`local_inline` 对 flush 后常量发字面量。nested 90→73ms，其余持平。`(L0+L1)` 未折叠是 deferred 变量转发，需 `local_set` 透传 `lo_c`（下轮）。见 current.md <74>
+
+<76>(TIPS+未解): **fib 退化排查 + memo 关断回退 + A 收尾评估**。`by_flag` 死计数器删除（保留 `whale_entry_total`）。memo 关断（`pure1&&!selfref`）致 fib 16→349ms + deopt 暴涨，已回退，原因未明（疑 entry 选择与 memo 隐性交互）。A 收尾做不了：`wt_slot` 是单 ident token，生成器侧无 ident 表，无法反查变量号 → 排到 ELS（线性 IR 自带符号表）之后。见 current.md <76>
