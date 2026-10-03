@@ -2077,6 +2077,30 @@ SOLVED + SOLVED + TIPS
 ## 状态
 绿，待提交。
 
+# <79>: 布局去上限 + object free list 全复用
+SOLVED + SOLVED
+
+## 布局去上限（用户：16 不是截断线，静态越多越好）
+- `WHALE_STRUCT_FIELDS`(16) 只保留作 free list 分桶数；布局、栈数组、prologue
+  声明、`StructNew`/`Native` 检查全改 `WHALE_ATOM_MAX`(32)。
+- prologue 按固定 32 声明（不能按 `fn` 动态：布局在 emit 中期才定，prologue 在
+  开头，读不到——固定全宽是 <61> "声明与使用同源" 的延续，32 doubles 可接受）。
+- free list 分桶保持 16（超限不复用，直接释放；宽对象少，复用收益小）。
+- perftest 列数全 <16，无性能变化（预期内）；价值在未来宽对象。
+
+## object free list 全复用（hit=100%）
+- 第一版只收空对象 → escaped（死时已有 v/u）永不回链 → `hit=0`。
+- 改收非空普通对象：归还时释 prop 内容值 + 置 UNDEFINED（accessor 另走），
+  链指针存 `u.opaque`（普通对象未用；`p->prop` 存的是 prop 块，不能丢），
+  shape/prop 块保留。复用时 `DefineNum` 覆盖（shape 已有属性则无生长）。
+- `hit=8 miss=0`（2 的幂次采样）。objshape 577→529ms，immutable 285→236ms。
+- immutable 236-285ms 徘徊是 GC 时机噪声（repeat=5 回 249ms），非回归。
+
+## 验证
+`whale api test: ok`；25/25 全对，0 mismatch。
+## 状态
+绿，待提交。
+
 # <76>: fib 退化排查 + memo 关断回退 + A 收尾评估
 TIPS + 未解
 

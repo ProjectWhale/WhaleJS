@@ -1453,12 +1453,12 @@ int whale_fields;
    window lives here too, because the inlined body's define_field/put_field
    stores and get_field reads go through the same _sdp path as the main
    loop's. Reset at the top of the emit pass. */
-int whale_str_atoms[WHALE_STRUCT_FIELDS];
+int whale_str_atoms[WHALE_ATOM_MAX];
 int whale_str_n = 0;
 int whale_str_fresh = -1;
 int whale_str_fresh_n = 0;
-int whale_str_fresh_atoms[WHALE_STRUCT_FIELDS];
-int whale_inline_str_atoms[WHALE_STRUCT_FIELDS];
+int whale_str_fresh_atoms[WHALE_ATOM_MAX];
+int whale_inline_str_atoms[WHALE_ATOM_MAX];
 int whale_inline_str_n = 0;
 
 static int whale_str_col(const int *atoms, int n, int atom);
@@ -1855,8 +1855,8 @@ static int whale_struct_fields(unsigned off, int *atoms, int max)
         return 0;
     n = JS_WhaleProfShapes(whale_prof_now, off, shapes, 8);
     for (i = 0; i < n; i++) {
-        int fa[WHALE_STRUCT_FIELDS];
-        int fn = JS_WhaleShapeFields(shapes[i], fa, WHALE_STRUCT_FIELDS);
+        int fa[WHALE_ATOM_MAX];
+        int fn = JS_WhaleShapeFields(shapes[i], fa, WHALE_ATOM_MAX);
 
         for (j = 0; j < fn; j++) {
             int seen = 0, m;
@@ -1921,8 +1921,8 @@ static int whale_layout_from_sites(const int *sites, int nsites, int *atoms, int
         }
     }
     for (s = 0; s < nshapes; s++) {
-        int fa[WHALE_STRUCT_FIELDS];
-        int fn = JS_WhaleShapeFields(shapes[s], fa, WHALE_STRUCT_FIELDS);
+        int fa[WHALE_ATOM_MAX];
+        int fn = JS_WhaleShapeFields(shapes[s], fa, WHALE_ATOM_MAX);
         int q;
 
         for (q = 0; q < fn && n < WHALE_ATOM_MAX; q++) {
@@ -1936,9 +1936,9 @@ static int whale_layout_from_sites(const int *sites, int nsites, int *atoms, int
                 int c = 0, t;
 
                 for (t = 0; t < nshapes; t++) {
-                    int fb[WHALE_STRUCT_FIELDS];
+                    int fb[WHALE_ATOM_MAX];
                     int fm = JS_WhaleShapeFields(shapes[t], fb,
-                                                 WHALE_STRUCT_FIELDS);
+                                                 WHALE_ATOM_MAX);
                     int u;
 
                     for (u = 0; u < fm; u++)
@@ -1953,9 +1953,9 @@ static int whale_layout_from_sites(const int *sites, int nsites, int *atoms, int
                 int t;
 
                 for (t = 0; t < nshapes; t++) {
-                    int fb[WHALE_STRUCT_FIELDS];
+                    int fb[WHALE_ATOM_MAX];
                     int fm = JS_WhaleShapeFields(shapes[t], fb,
-                                                 WHALE_STRUCT_FIELDS);
+                                                 WHALE_ATOM_MAX);
                     int u;
 
                     for (u = 0; u < fm; u++)
@@ -2002,8 +2002,8 @@ static int whale_prof_one_shape(unsigned off)
         static int dbg;
 
         if (whale_dbg_env("WHALE_PROF_DBG") && dbg < 40) {
-            int fa[WHALE_STRUCT_FIELDS];
-            int fn = whale_struct_fields(off, fa, WHALE_STRUCT_FIELDS);
+            int fa[WHALE_ATOM_MAX];
+            int fn = whale_struct_fields(off, fa, WHALE_ATOM_MAX);
             int q;
 
             dbg++;
@@ -2381,7 +2381,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        whale_inline_body lays out and reads an inlined callee's object too, and
        it is a separate function. Reset at the top of the emit pass. */
     int whale_str_slot = -1;
-    int whale_str_L[WHALE_STRUCT_FIELDS];
+    int whale_str_L[WHALE_ATOM_MAX];
     /* Per closure slot: the object slot its value is parked in, or -1. Filled
        in the prologue for the slots this reading reads as values. */
     int whale_vr_slot[4];
@@ -2973,7 +2973,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     }
     if (whale_dbg_env("WHALE_STR_DBG")) {
         int cols = whale_layout_from_sites(whale_field_sites, whale_field_sites_n,
-                                           whale_str_atoms, WHALE_STRUCT_FIELDS,
+                                           whale_str_atoms, WHALE_ATOM_MAX,
                                            info->prefer_gcc ? 0 : 40);
         int si;
 
@@ -2992,9 +2992,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        actually lays an object out is decided per instruction (strn / call
        position / mono), and a declaration gated on a prologue hint diverges
        from that decision: the body then reads `L3` with no declaration, which
-       is exactly vnode_build's `L3 undeclared`. Sixteen doubles is the whole
-       cost of never diverging. */
-    for (i = 0; i < WHALE_STRUCT_FIELDS; i++) {
+       is exactly vnode_build's `L3 undeclared`. The layout itself is decided
+       later in the pass, so the count cannot come from there - declare the
+       full width (static columns are cheap) and let the layout use what it
+       needs. */
+    for (i = 0; i < WHALE_ATOM_MAX; i++) {
         whale_str_L[i] = var_count + i;
         wk(JS_WK_DOUBLE); wt_slot("L", whale_str_L[i]); wt('='); wt_int(0); wt(';');
     }
@@ -3006,7 +3008,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     wk(JS_WK_STRUCT); wt('{');
         wk(JS_WK_DOUBLE); wt_id("v"); wt('['); wt_int(stack_size + WHALE_VSER_MAX); wt(']'); wt(';');
         /* the atoms of the layout being built, handed to JS_WhaleStructNew */
-        wk(JS_WK_INT); wt_id("wa"); wt('['); wt_int(WHALE_STRUCT_FIELDS); wt(']'); wt(';');
+        wk(JS_WK_INT); wt_id("wa"); wt('['); wt_int(WHALE_ATOM_MAX); wt(']'); wt(';');
         wk(JS_WK_VOID); wt('*'); wt_id("fs"); wt('['); wt_int(WHALE_FIELD_CACHE); wt(']'); wt(';');
         wt_id("JSValue"); wt('*'); wt_id("fp"); wt('['); wt_int(WHALE_FIELD_CACHE); wt(']'); wt(';');
         wk(JS_WK_INT); wt_id("fver"); wt(';');
@@ -3019,8 +3021,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wk(JS_WK_INT); wt_id("oi"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
         /* unboxed struct fields, and a presence flag each: a field that only some of
            the observed shapes carry still gets its slot here */
-        wk(JS_WK_DOUBLE); wt_id("sv"); wt('['); wt_int(WHALE_STRUCT_SLOTS * WHALE_STRUCT_FIELDS); wt(']'); wt(';');
-        wk(JS_WK_UNSIGNED); wt_id("char"); wt_id("sp"); wt('['); wt_int(WHALE_STRUCT_SLOTS * WHALE_STRUCT_FIELDS); wt(']'); wt(';');
+        wk(JS_WK_DOUBLE); wt_id("sv"); wt('['); wt_int(WHALE_STRUCT_SLOTS * WHALE_ATOM_MAX); wt(']'); wt(';');
+        wk(JS_WK_UNSIGNED); wt_id("char"); wt_id("sp"); wt('['); wt_int(WHALE_STRUCT_SLOTS * WHALE_ATOM_MAX); wt(']'); wt(';');
     wt('}'); wt_id("_ws"); wt('='); wt('{'); wt_int(0); wt('}'); wt(';');
     /* 1, because a cached fv[] of 0 (from that zero initialiser) must not look
        like the current generation. */
@@ -3933,7 +3935,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         : whale_layout_from_sites(whale_field_sites,
                                                   whale_field_sites_n,
                                                   whale_str_atoms,
-                                                  WHALE_STRUCT_FIELDS,
+                                                  WHALE_ATOM_MAX,
                                                   info->prefer_gcc ? 0 : 40);
 
                     if (fn > 0) {
@@ -3990,7 +3992,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     int fn = whale_layout_from_sites(whale_field_sites,
                                                      whale_field_sites_n,
                                                      whale_str_atoms,
-                                                     WHALE_STRUCT_FIELDS,
+                                                     WHALE_ATOM_MAX,
                                                      info->prefer_gcc ? 0 : 40);
 
                     if (fn > 0) {
@@ -4807,7 +4809,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     int fn = whale_layout_from_sites(whale_field_sites,
                                                      whale_field_sites_n,
                                                      whale_str_atoms,
-                                                     WHALE_STRUCT_FIELDS,
+                                                     WHALE_ATOM_MAX,
                                                      info->prefer_gcc ? 0 : 40);
                     int slot = WHALE_SLOT(t);
 
@@ -5417,7 +5419,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                             if (csz <= 0 || cpos + csz > clen)
                                 break;
                             if (cop == OP_define_field &&
-                                whale_inline_str_n < WHALE_STRUCT_FIELDS)
+                                whale_inline_str_n < WHALE_ATOM_MAX)
                                 whale_inline_str_atoms[whale_inline_str_n++] =
                                     (int)whale_get_u32(cpc + cpos + 1);
                             cpos += csz;

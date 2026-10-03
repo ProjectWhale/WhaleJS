@@ -111,6 +111,10 @@ typedef struct JSWhaleFuncInfo {
    compile-time constant is the same single load, and it keeps the frame declaration
    from having to be built dynamically. */
 #define WHALE_STRUCT_SLOTS  4
+/* Free-list buckets only now, not a layout cap: reusing an object wider than
+   this saves little (wide objects are rare), so those free normally. Layouts
+   go up to WHALE_ATOM_MAX; static columns are cheap, and cutting them would
+   just push fields back to the map. */
 #define WHALE_STRUCT_FIELDS 16
 
 /* The unset marker for an unboxed field, and the shape of the initialisation.

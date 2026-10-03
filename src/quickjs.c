@@ -3144,7 +3144,7 @@ int JS_WhaleStructNew(JSContext *ctx, const int *atoms, int nslots, int slot)
         static long n;
         fprintf(stderr, "[str-stat] StructNew calls=%ld nslots=%d slot=%d\n", ++n, nslots, slot);
     }
-    if (nslots <= 0 || nslots > WHALE_STRUCT_FIELDS || !atoms)
+    if (nslots <= 0 || nslots > WHALE_ATOM_MAX || !atoms)
         return 0;
     if (slot < 0 || slot >= WHALE_OBJ_SLOTS)
         return 0;
@@ -8882,13 +8882,24 @@ int JS_WhaleObjNew(JSContext *ctx, int slot)
     JSObject *p = ctx->rt->whale_obj_free;
     JSValue o;
 
-    /* Free-list checkout: an empty shell, same as JS_NewObject would make
-       (empty shape, no properties). DefineNum regrows the shape from empty
-       exactly as on a fresh object. */
+    if (whale_str_stat_on()) {
+        static long hit, miss;
+
+        if (p)
+            hit++;
+        else
+            miss++;
+        if ((hit + miss) == 1 || ((hit + miss) & ((hit + miss) - 1)) == 0)
+            fprintf(stderr, "[str-stat] ObjNew free-list hit=%ld miss=%ld\n",
+                    hit, miss);
+    }
+    /* Free-list checkout: the shell keeps its shape and property block, with
+       clean undefined slots. DefineNum overwrites those slots - and when the
+       shape already carries the property there is no shape growth at all. */
     if (p) {
-        ctx->rt->whale_obj_free = (JSObject *)p->prop;
+        ctx->rt->whale_obj_free = (JSObject *)p->u.opaque;
         ctx->rt->whale_obj_free_n--;
-        p->prop = NULL;
+        p->u.opaque = NULL;
         p->free_mark = 0;
         JS_REF_COUNT(p) = 1;
         add_gc_object(ctx->rt, &p->header, JS_GC_OBJ_TYPE_JS_OBJECT);
@@ -9244,7 +9255,7 @@ typedef struct WhaleNative {
     uint32_t magic;                  /* WHALE_NATIVE_MAGIC while this is live */
     uint32_t n;                      /* live columns */
     void *shape;                     /* the shape these columns came from */
-    double vals[WHALE_STRUCT_FIELDS];
+    double vals[WHALE_ATOM_MAX];
 } WhaleNative;
 
 /* The native form of an object, or NULL. Safe on any value: non-objects, non-plain
@@ -9280,7 +9291,7 @@ WhaleNative *JS_WhaleNativeMake(JSContext *ctx, JSValueConst obj, const int *ato
     p = JS_VALUE_GET_OBJ(obj);
     if (p->class_id != JS_CLASS_OBJECT)
         return NULL;
-    if (n <= 0 || n > WHALE_STRUCT_FIELDS)
+    if (n <= 0 || n > WHALE_ATOM_MAX)
         return NULL;
     wn = JS_WhaleNativeGet(obj);
     if (!wn) {
@@ -9691,22 +9702,43 @@ static void free_object(JSRuntime *rt, JSObject *p)
             return;
         }
     }
-    /* WhaleJS plain-object free list, for the materialising path: an empty
-       ordinary object (no properties yet - anything with values needs its
-       property storage freed) returns to a single chain, and the next ObjNew
-       reuses the shell. DefineNum regrows the shape from empty exactly as it
-       would on a fresh object, so nothing it does can tell the difference. */
+    /* WhaleJS plain-object free list, for the materialising path: an ordinary
+       object returns to a single chain, and the next ObjNew reuses the shell.
+       The property values are released here and the slots reset to undefined,
+       so DefineNum overwrites clean slots exactly as on a fresh object - and
+       when the shape already carries the property (the common loop case) there
+       is no shape growth at all, just value stores. Objects with weak refs go
+       the normal way; depth-bounded, overflow frees normally. The chain link
+       lives in u.opaque (unused by plain objects); the property block stays
+       with the shell. */
     if (p->class_id == JS_CLASS_OBJECT && !rt->in_free &&
-        p->shape && p->shape->prop_count == 0 && !p->first_weak_ref &&
+        p->shape && !p->u.opaque && !p->first_weak_ref &&
         rt->whale_obj_free_n < WHALE_OBJ_FREE_DEPTH) {
-        js_free_rt(rt, p->prop);
-        p->free_mark = 0;
-        JS_REF_COUNT(p) = 0; /* still dead: ObjNew revives on checkout */
-        remove_gc_object(&p->header);
-        p->prop = (JSProperty *)rt->whale_obj_free;
-        rt->whale_obj_free = p;
-        rt->whale_obj_free_n++;
-        return;
+        JSShape *rsh = p->shape;
+        JSShapeProperty *rpr = get_shape_prop(rsh);
+        int ri, ok = 1;
+
+        /* Data properties only: an accessor's payload is not a plain value,
+           so anything carrying one frees normally. */
+        for (ri = 0; ri < rsh->prop_count; ri++, rpr++)
+            if ((rpr->flags & JS_PROP_TMASK) != JS_PROP_NORMAL) {
+                ok = 0;
+                break;
+            }
+        if (ok) {
+            rpr = get_shape_prop(rsh);
+            for (ri = 0; ri < rsh->prop_count; ri++, rpr++) {
+                JS_FreeValueRT(rt, p->prop[ri].u.value);
+                p->prop[ri].u.value = JS_UNDEFINED;
+            }
+            p->free_mark = 0;
+            JS_REF_COUNT(p) = 0; /* still dead: ObjNew revives on checkout */
+            remove_gc_object(&p->header);
+            p->u.opaque = rt->whale_obj_free;
+            rt->whale_obj_free = p;
+            rt->whale_obj_free_n++;
+            return;
+        }
     }
     /* free all the fields */
     sh = p->shape;
