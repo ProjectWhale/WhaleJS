@@ -1345,6 +1345,52 @@ static void local_flush_all(int n)
  * straight line, one `return <expression>`.
  * ------------------------------------------------------------------------- */
 static int whale_inline_argmap[4];   /* inlined callee's arg k -> caller stack slot */
+/* The body's own output. Every statement the body lowers commits on its own,
+   and those commits must not interleave with the call site's open fold mark:
+   an inner commit lands its tokens in the output before the outer mark's own
+   tokens (the guard), and the outer fold_commit then re-copies the whole
+   workspace range - body tokens a second time, plus the stray get_arg
+   expressions, which are not statements and stop the parser. So the body
+   writes into this buffer, appended to the real output only on success. A
+   refused body is discarded by dropping the buffer, which is also what makes
+   the call site's fallback sound: nothing the body emitted can survive it. */
+static int whale_inline_tok[WHALE_TOK_MAX];
+static double whale_inline_num[WHALE_TOK_MAX];
+static int whale_inline_len;
+
+/* Speculative var_ref inlining is correct and fully wired (the closure reading
+   of a call target expands behind an identity guard), but on the one case where
+   the inlined body is heavy - immutable_update's setField, four field reads
+   moved into the caller's loop - it measures SLOWER than the engine fast-call
+   it replaces: the body's ~40 extra statements all go through memory because
+   TinyCC has no register allocator, which costs more than the ~50ns call it
+   eliminates. Every helper count is equal, the guard is free (measured with
+   and without), the loss is code quality, not mechanism. Default off until the
+   generator-side ELS (notes <66 cont> route B) gives those statements
+   registers; the switch reads through whale_dbg_env, so in a release
+   binary it is hard-off - enabling needs a --whale_debug=y build. */
+static int whale_vr_inline_on(void)
+{
+    static int on = -1;
+
+    if (on < 0)
+        on = whale_dbg_env("WHALE_VR_INLINE") != NULL;
+    return on;
+}
+/* The argument slots as the call site saw them. The body evaluates straight into
+   the caller's stack above arg_base, so its own pushes and pops rewrite cur[],
+   whale_vexpr/whale_vmat/whale_vname and whale_vname for exactly those slots -
+   the second get_arg of the same parameter then read the first get_field's NUM
+   result as the object's type and refused. Reading the snapshot instead keeps
+   every argument the type it arrived with, no matter how far the body got.
+
+   The snapshot is also what a refused body puts back: the call site truncates
+   the tokens and falls back to the general call path, which re-reads those same
+   slots - un-restored, it would box an object argument as a number. */
+static uint8_t whale_inline_argt[4];
+static WhaleVExpr whale_inline_argexpr[4];
+static uint8_t whale_inline_argmat[4];
+static int whale_inline_argname[4];
 static int whale_inline_nested;      /* one level at a time: see the call site */
 /* Declared again further down with the generator's own state. The inliner hands
    out slots from both, which is safe because a single linear pass allocates from
@@ -1372,14 +1418,34 @@ static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
     int len = callee->byte_code_len;
     int pos, sp = 0, i, ret = -1;
     int saved_argmap[4];
+    int saved_objs = whale_objs, saved_fresh = whale_str_fresh;
+    int saved_vserial = whale_vserial;
+    int *saved_out_tok = whale_out_tok;
+    double *saved_out_num = whale_out_num;
+    int *saved_out_len = whale_out_len;
 
     if (callee->var_count != 0)
         return -1;                      /* locals would need slot remapping */
     if (callee->arg_count > 4)
         return -1;
+    /* Statements the body lowers go to its own buffer (see its declaration);
+       the switch also covers a body inside a loop body, where the enclosing
+       output is the loop's buffer. */
+    whale_inline_len = 0;
+    whale_out_tok = whale_inline_tok;
+    whale_out_num = whale_inline_num;
+    whale_out_len = &whale_inline_len;
     for (i = 0; i < 4; i++) {
         saved_argmap[i] = whale_inline_argmap[i];
         whale_inline_argmap[i] = (i < callee->arg_count) ? arg_base + i : -1;
+    }
+    for (i = 0; i < callee->arg_count && i < 4; i++) {
+        int cslot = arg_base + i;
+
+        whale_inline_argt[i] = cur[var_count + cslot];
+        whale_inline_argexpr[i] = whale_vexpr[cslot];
+        whale_inline_argmat[i] = whale_vmat[cslot];
+        whale_inline_argname[i] = whale_vname[cslot];
     }
 
     for (pos = 0; pos < len; ) {
@@ -1402,13 +1468,20 @@ static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
                    numeric stays a number, an object stays an object slot.
                    Hard-typing it WHALE_T_NUM (the old behaviour) refused every
                    callee whose parameter is an object: setField(o, v) died on
-                   its first get_field. */
-                t = cur[var_count + whale_inline_argmap[a]];
+                   its first get_field.
+
+                   The value comes from the snapshot too, not from the caller's
+                   live fold state: the body evaluates into those very slots, so
+                   a re-read would pick up whatever the body last pushed there. */
+                t = whale_inline_argt[a];
                 if (whale_dbg_env("WHALE_JIT_DUMP"))
                     fprintf(stderr, "[vr-inline] get_arg a=%d map=%d t=%d\n",
                             a, whale_inline_argmap[a], t);
                 fm = fold_mark();
-                fold_inline(whale_inline_argmap[a]);
+                if (whale_inline_argmat[a])
+                    wt_arr("v", whale_inline_argname[a]);
+                else
+                    fold_inline_expr(&whale_inline_argexpr[a]);
                 fold_set(sp, fm);
                 cur[var_count + sp] = (uint8_t)t;
                 sp++;
@@ -1436,7 +1509,8 @@ static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
                         wt_arr("wa", k); wt('='); wt_int(whale_inline_str_atoms[k]); wt(';');
                     }
                     wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleStructNew");
-                    wt('('); wt_id("_ws"); wt('.'); wt_id("wa"); wt(',');
+                    wt('('); wt_id("ctx"); wt(','); wt_id("_ws"); wt('.');
+                    wt_id("wa"); wt(',');
                     wt_int(whale_inline_str_n); wt(','); wt_int(os); wt(')'); wt(')');
                     wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
                     wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
@@ -1648,9 +1722,48 @@ static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
     if (whale_dbg_env("WHALE_JIT_DUMP") && ret < 0)
         fprintf(stderr, "[vr-inline] refused at pos=%d op=%d (%s) sp=%d\n",
                 pos, pc[pos], whale_op_name((int)pc[pos]), sp);
+    if (ret < 0) {
+        /* A refused body leaves its mark on the caller's state: the slots it
+           evaluated into, the object slot its OP_object may have taken, and a
+           fresh struct window whose StructNew tokens the caller is about to
+           truncate away. The call site falls back to the general call path,
+           which reads all of these as they were at entry - so put them back. */
+        for (i = 0; i < callee->arg_count && i < 4; i++) {
+            int cslot = arg_base + i;
+
+            cur[var_count + cslot] = whale_inline_argt[i];
+            whale_vexpr[cslot] = whale_inline_argexpr[i];
+            whale_vmat[cslot] = whale_inline_argmat[i];
+            whale_vname[cslot] = whale_inline_argname[i];
+        }
+        whale_objs = saved_objs;
+        whale_str_fresh = saved_fresh;
+        whale_vserial = saved_vserial;
+        whale_inline_len = 0;           /* a refused body's statements die here */
+    }
+    /* back to the enclosing output whatever happened: on success the buffer
+       stays filled and the call site appends it - after any guard it still has
+       to emit, which is why the append is not done here. The call site's
+       truncate of the workspace then drops nothing but stray argument tokens. */
+    whale_out_tok = saved_out_tok;
+    whale_out_num = saved_out_num;
+    whale_out_len = saved_out_len;
     for (i = 0; i < 4; i++)
         whale_inline_argmap[i] = saved_argmap[i];
     return ret;
+}
+/* Append a successful body's buffered statements to the enclosing output. The
+   call site calls this after emitting whatever must precede the body in program
+   order - the VRFN guard, whose emission had to wait until the body was known
+   to inline, because a committed statement cannot be taken back on refusal. */
+static void whale_inline_out_append(void)
+{
+    int i;
+
+    for (i = 0; i < whale_inline_len && *whale_out_len < WHALE_TOK_MAX; i++) {
+        whale_out_num[*whale_out_len] = whale_inline_num[i];
+        whale_out_tok[(*whale_out_len)++] = whale_inline_tok[i];
+    }
 }
 /* The observations for the function being generated: the generator compiles one
    function at a time, so this does not need to travel through every call. */
@@ -4818,7 +4931,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     } else {
                         void *fn = NULL;
 
-                        if (0 && JS_WhaleVarRefFuncInfo(ctx, idx, &fn,
+                        if (whale_vr_inline_on() &&
+                            JS_WhaleVarRefFuncInfo(ctx, idx, &fn,
                                                    &whale_vr_info[idx]) &&
                             whale_vr_info[idx].is_normal &&
                             whale_vr_info[idx].var_count == 0 &&
@@ -4827,6 +4941,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                             if (gi >= 0) {
                                 whale_vr_fn[idx] = fn;
+                                /* the guard's argument. Leaving this at -1 made
+                                   JS_WhaleVarRefIsFn answer 0 unconditionally,
+                                   so the compiled body deopted on every entry
+                                   and retired after eight tries - compiled, and
+                                   exactly as slow as the interpreter. */
+                                whale_vr_expect_slot[idx] = gi;
                                 cur[var_count + sp] = WHALE_VRFN_T(idx);
                                 sp++;
                                 break;
@@ -5062,13 +5182,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                                     (int)whale_get_u32(cpc + cpos + 1);
                             cpos += csz;
                         }
-                        fm = fold_mark();
-                        /* the guard itself: a statement, committed with the body */
-                        wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleVarRefIsFn");
-                        wt('('); wt_id("ctx"); wt(','); wt_id("var_refs"); wt(',');
-                        wt_int(vidx); wt(','); wt_int(whale_vr_expect_slot[vidx]); wt(')'); wt(')');
-                        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
-                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        fm = fold_mark();   /* the stray argument tokens start here */
                         whale_inline_nested = 1;
                         rtype = whale_inline_body(&whale_vr_info[vidx], cur,
                                                   var_count, sp - argc);
@@ -5077,14 +5191,29 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                             fprintf(stderr, "[vr-inline] pos=%d argc=%d rtype=%d\n",
                                     pos, argc, rtype);
                         if (rtype < 0) {
-                            /* the inliner refused this callee - drop the guard
-                               and the partial body, re-type the callee as the
-                               plain parked value and take the general path */
+                            /* the inliner refused this callee: its statements
+                               died with the body's buffer, so the truncate only
+                               drops the stray argument tokens. Re-type the
+                               callee as the plain parked value and take the
+                               general path. */
                             JS_WhaleTokSinkTruncate(fm);
                             cur[var_count + func_slot] =
                                 WHALE_VAL_T(whale_vr_slot[vidx]);
                         } else {
-                            fold_commit(fm);
+                            /* the guard can only be committed once the body is
+                               known to inline - a committed statement cannot be
+                               taken back on refusal - and it has to precede
+                               the body in the output, so: guard first, then
+                               the buffered body. */
+                            int gfm = fold_mark();
+
+                            wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleVarRefIsFn");
+                            wt('('); wt_id("ctx"); wt(','); wt_id("var_refs"); wt(',');
+                            wt_int(vidx); wt(','); wt_int(whale_vr_expect_slot[vidx]); wt(')'); wt(')');
+                            wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                            wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                            fold_commit(gfm);
+                            whale_inline_out_append();
                             cur[var_count + func_slot] = (uint8_t)rtype;
                             sp = func_slot + 1;
                             break;
@@ -5127,7 +5256,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                             JS_WhaleTokSinkTruncate(fm);
                             goto whale_call_fallback;
                         }
-                        fold_commit(fm);
+                        /* the body committed into its own buffer; appending it
+                           here replaces the fold_commit that used to re-copy the
+                           whole workspace range - body tokens twice, plus stray
+                           argument expressions the parser cannot take. */
+                        whale_inline_out_append();
                         cur[var_count + func_slot] = (uint8_t)rtype;
                         sp = func_slot + 1;
                         break;

@@ -1738,3 +1738,64 @@ bitops 150→70、nested 87→18、locals 102→24、minmax 110→35、sieve 165
 `effa8f0` 基线绿：25/25 编译、0 mismatch、immutable 367ms、props_diff 16ms。
 本轮探索性改动（vr-inline 修复 + _ws 选择性清零）已从工作区移除，详细修复清单
 与本节结论保留在此，供下轮继续。
+
+# <69>: vr-inline 机制修通、测量决定休眠 + 附带的 getenv 每调用探测 bug
+SOLVED（机制）/ 休眠（默认关）+ SOLVED（getenv）
+
+## 五个真 bug（上轮"三个修复也没转正"的答案）
+dump 第二读法 fn_2 的诊断，一层剥一层，共五个，每修一个露下一个：
+1. **内联体 `JS_WhaleStructNew` 少发 `ctx`**：主循环发 4 参、内联体发 3 参
+   → `too few arguments to function`，fn_2 在 TinyCC 层编译失败，整函数退回
+   CallValue 路径。这就是上轮 549ms + entries 归零的直接原因。
+2. **token 提交交错**：内联体各 op 各自 `fold_commit` 已直写输出，调用点最后又
+   `fold_commit(fm)` 把 [fm, now)（守卫 + 体 token + 悬空的 get_arg 表达式）
+   重复追加 → 守卫错位到体后、StructNew 块重复、`get_arg` 残片 `(L0)` 泄漏成残句
+   → `';' expected (got "if")`。修法：体改写独立缓冲
+   （`whale_inline_tok/num/len`，仿 loop_begin/loop_end 的输出切换），成功才由
+   调用点先提交守卫、再 `whale_inline_out_append()` 追加体；失败整段丢弃。
+   同一改动覆盖 cpool 内联路径（它原来也是 `fold_commit(fm)` 重拷整段）。
+3. **`whale_vr_expect_slot` 从未写入**（恒 -1）→ `JS_WhaleVarRefIsFn` 恒返回 0 →
+   编好也每次入口 deopt、8 次退役。补落库。症状与上轮"守卫永远失败"同款，
+   但位置不同（上轮是读错数组，这次是没存期望值）。
+4. **内联体复读调用点参数槽**：`{a:o.a,...}` 第一个 get_field 把装对象的栈槽
+   cur 重写成 NUM，后续参数读到 `ta=1`（NUM）→ 直接拒绝。修法：入口快照参数的
+   类型 + 表达式 + 物化状态（`whale_inline_argt/argexpr/argmat/argname`），
+   get_arg 只读快照。
+5. **失败体污染调用点**：`OP_object` 消耗 obj 槽、`whale_str_fresh` 等残留，
+   fallback 的 general call 误读。快照恢复（cur/vexpr/vmat/vname/objs/fresh，
+   另加此前漏的 `whale_vserial`）。
+
+## 测量结论：机制对，但转正反而慢 → 休眠
+- 内联全通：fn_2 `[vr-inline] rtype=40`、零 deopt、check=249985 正确。
+- 但 immutable 慢 40~80ms/1M 迭代（327→~400），entries 920（编过但 deopt？不，
+  是 policy：见下）。守卫成本已用开关隔离证明为零。
+- helper 聚合计数（临时插桩，已移除）：基线每迭代 fieldptr×7 + slotcopy×2 +
+  structnew/dataptr 各 1 + callvalue×1；vr 版 fieldptr×4 + shape×3 + 守卫 + 同样
+  的物化/拷贝。**总数相等（8/迭代）**——差额不在 helper 次数。
+- 生成码逐行对过：逻辑无冗余，6 次读里 4 次内联 + 2 次保留检查都是必要的
+  （st.a 跨迭代重读必须重解析）。
+- 所以差额 = **TCC 代码质量**：体内 ~40 条语句全走内存（VT_LVAL 每次
+  load/store，无寄存器分配），相对快帧 ~50ns 的开销是净负。objfields
+  （轻体内联，只差 2ms）佐证：体越重越亏。
+- 处置：`WHALE_VR_INLINE` 开关门控（whale_dbg_env，debug 构建可用，
+  release 硬关）。开关开 25/25 全对——正确性已验证，转正只等生成器侧 ELS
+  给体内语句寄存器（<66 续> 路线 B 的自然前置条件）。
+
+## 附带：getenv 每调用探测 bug（预存在，顺手修）
+- `JS_WhaleDeoptNote` 在 `WHALE_ENTER_COUNT` 未设置时，**每次编译函数返回都
+  走一次 getenv**（100 万次 × ~2.7µs ≈ +2.7s）。runner 恒设该变量所以历史测量
+  全"干净"；直接跑二进制（用户跑自己的 fib.js、裸跑 case）全在赔这个钱。
+- 现象曾伪装成"我的改动让默认路径退化"（同一二进制同一开关，裸跑 3000ms、
+  `WHALE_ENTER_COUNT=1` 跑 320ms)。定位手法：entries 计数 + 两变量对照，
+  排除 stderr 去向/僵尸进程/构建配置后只剩环境变量本身。
+- 修法：单次探测（`whale_entry_probed`），与 <61> 的"热路径 getenv 全缓存"
+  同款。裸跑 immutable 2950→~310ms。
+- 教训：**runner 口径 ≠ 用户口径**。任何只在 runner 下测的数字，都要补一次
+  裸跑对照；反之亦然（直跑受控制台/后台负载影响，裁决仍以 runner 为准）。
+
+## 验证（release 默认态）
+`whale api test: ok`；25/25 全对，0 mismatch；immutable 316ms/entries=1000920
+= 基线；debug 构建开关开 25/25 全对（immutable ~415ms/entries=920，预期内）。
+## 状态
+绿，待提交。下一步按 <68> 排序：分配器（struct 轻量路径/新生代）→ 两级 JIT
+→ 生成器侧 ELS（vr-inline 转正的前置）。

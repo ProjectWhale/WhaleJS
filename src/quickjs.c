@@ -3454,6 +3454,7 @@ int JS_WhaleCheckStack(JSContext *ctx)
    shows it next to the time. */
 static long whale_entry_total;
 static int whale_entry_registered;
+static int whale_entry_probed;
 
 static void whale_entry_at_exit(void)
 {
@@ -3470,9 +3471,19 @@ void JS_WhaleDeoptNote(JSContext *ctx, int flag)
     if (flag >= 0 && flag < 8)
         by_flag[flag]++;
     whale_entry_total++;
-    if (!whale_entry_registered && getenv("WHALE_ENTER_COUNT")) {
-        whale_entry_registered = 1;
-        atexit(whale_entry_at_exit);
+    if (!whale_entry_registered) {
+        /* Probe once. This runs on every compiled-call return; before the
+           probe flag, the getenv ran on every one of them - a million calls
+           paid a million environment-block walks, ~2.7s on immutable_update,
+           ten times the loop itself. The runner always sets WHALE_ENTER_COUNT
+           and never saw it; anything running whalejs directly did. */
+        if (!whale_entry_probed) {
+            whale_entry_probed = 1;
+            if (getenv("WHALE_ENTER_COUNT")) {
+                whale_entry_registered = 1;
+                atexit(whale_entry_at_exit);
+            }
+        }
     }
     /* Cached: this runs on every compiled call return, and a getenv per call
        was measurable all by itself (the CRT consults the process environment). */
