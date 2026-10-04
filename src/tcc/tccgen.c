@@ -959,6 +959,134 @@ void JS_WhaleDumpCode(FILE *f)
         fwrite(text_section->data, 1, text_section->data_offset, f);
 }
 
+/* Stack offset -> pinned register. A read has to recognise a pinned local
+   without looking at SValue.sym: unary() sets sym when an identifier is read,
+   but the initialiser of a declaration does not, and that mismatch had the
+   initialiser writing the frame slot while gv() later read the register - the
+   register then held whatever was left there. The map is per function and
+   reset by gen_function(). */
+static int whale_pin_loc[16];
+static int whale_pin_reg[16];
+static int whale_pin_n;
+
+/* ---- WhaleJS: extended live ranges (ELS) ---------------------------------
+ *
+ * TinyCC spills at every statement boundary: a local read always loads, a
+ * store always stores, so a loop counter crosses the memory bus twice per
+ * iteration. The JIT generator sees a whole loop body at once and can say
+ * which variables deserve better - with `register`, which the parser used to
+ * throw away. This is the TCC-side mechanism; the decision (which variables,
+ * from liveness analysis) lives in the generator.
+ *
+ * Only the float pool is used. RC_FLOAT covers xmm0-xmm5, so pinning one of
+ * them needs no change to reg_classes[]; the integer pool would (r8-r11 carry
+ * no RC_INT, and gv() reloads anything whose class does not match).
+ *
+ * Soundness across calls: every xmm is caller-saved, so a pinned value cannot
+ * survive one. save_reg_upstack() (which runs before every call) spills the
+ * register to its frame slot and CLEARS its bit in whale_pinned_regs - the bit
+ * is the validity flag. gv()/vstore()/gen_op() only take the shortcut while it
+ * is set; after a call the slot is authoritative until the next read reloads.
+ * ------------------------------------------------------------------------ */
+static int whale_pin_next;          /* set by the TOK_REGISTER case below */
+/* Non-zero while the JIT generator owns the pin map. gen_function then leaves
+   it alone, because every C function it is asked to compile belongs to the
+   same JS function. See the reset in gen_function. */
+static int whale_pin_scope;
+
+static unsigned whale_pinned_regs;  /* one bit per pinned register */
+
+static int whale_pin_alloc(int t)
+{
+    int r;
+
+    if (!is_float(t))
+        return -1;
+    /* At most 4 float registers: xmm0/xmm1 stay free for TinyCC's own
+       expression evaluation (constants, temporaries). Pinning up to the full
+       6 made get_reg() return -1 with nowhere to spill. */
+    {
+        int n = 0, b;
+
+        for (b = 0; b < 32; b++)
+            if (whale_pinned_regs & (1u << b))
+                n++;
+        if (n >= 4)
+            return -1;
+    }
+    for (r = 21; r >= 18; r--) {
+        if ((whale_pinned_regs & (1u << r)) == 0) {
+            whale_pinned_regs |= 1u << r;
+            return r;
+        }
+    }
+    return -1;
+}
+
+/* Claim the pin map for one JIT compilation. The generator calls this once
+   before it emits anything, so the map spans all the C functions it is about to
+   produce. Resetting here rather than never is what keeps one compile's stack
+   offsets from matching a later compile's. */
+void JS_WhalePinEnter(void);
+void JS_WhalePinEnter(void)
+{
+    whale_pinned_regs = 0;
+    whale_pin_n = 0;
+    whale_pin_scope = 1;
+}
+
+/* Release it. Without this whale_pin_scope stays 1 forever, so the reset inside
+   gen_function never runs again and the map (keyed by stack offset) survives from
+   one compilation into the next - including compilations the generator did not
+   ask for. JS_WhalePinEnter's comment claims "that call is the reset", which is
+   only true while every compilation calls it. */
+void JS_WhalePinLeave(void);
+void JS_WhalePinLeave(void)
+{
+    whale_pin_scope = 0;
+}
+
+static int whale_pin_find(int loc)
+{
+    int i;
+
+    for (i = 0; i < whale_pin_n; i++)
+        if (whale_pin_loc[i] == loc)
+            return whale_pin_reg[i];
+    return -1;
+}
+
+/* A real call destroys every xmm (all caller-saved), so every pinned value
+   is stale afterwards. Write each live pin back to its frame slot first -
+   save_reg_upstack() spills to TCC's temporary area, not to the home slot,
+   so without this the slot holds a stale value and the next read reloads
+   garbage. Called from gfunc_call(); the next read of a pin reloads it from
+   its slot (see gv()) and sets the bit again. */
+void JS_WhalePinInvalidate(void);
+void JS_WhalePinInvalidate(void)
+{
+    int i;
+
+    if (getenv("WHALE_PIN_DBG")) {
+        fprintf(stderr, "[pin-inv] n=%d mask=%x\n", whale_pin_n, whale_pinned_regs);
+        for (i = 0; i < whale_pin_n; i++)
+            fprintf(stderr, "  loc=%d reg=%d\n", whale_pin_loc[i], whale_pin_reg[i]);
+    }
+    for (i = 0; i < whale_pin_n; i++) {
+        int pr = whale_pin_reg[i];
+
+        if (whale_pinned_regs & (1u << pr)) {
+            SValue sv;
+
+            sv.type.t = VT_DOUBLE;
+            sv.r = VT_LOCAL | VT_LVAL;
+            sv.c.i = whale_pin_loc[i];
+            store(pr, &sv);
+        }
+    }
+    whale_pinned_regs = 0;
+}
+
 /* save registers up to (vtop - n) stack entry */
 ST_FUNC void save_regs(int n)
 {
@@ -985,6 +1113,12 @@ ST_FUNC void save_reg_upstack(int r, int n)
         return;
     if (nocode_wanted)
         return;
+    /* WhaleJS (ELS): spill the register, but do NOT clear the pin validity
+       bit here. This function also runs for non-call saves (?:, &&, argument
+       shuffling) that do not destroy registers - clearing there disabled
+       pinning for any loop containing a ternary. Real calls invalidate via
+       JS_WhalePinInvalidate() in gfunc_call(); a stale pin reloads from its
+       slot on the next read (see gv()). */
 
     /* modify all stack values */
     saved = 0;
@@ -1051,6 +1185,8 @@ ST_FUNC int get_reg_ex(int rc, int rc2)
     SValue *p;
     
     for(r=0;r<NB_REGS;r++) {
+        if (whale_pinned_regs & (1u << r))
+            continue;
         if (reg_classes[r] & rc2) {
             int n;
             n=0;
@@ -1075,6 +1211,8 @@ ST_FUNC int get_reg(int rc)
 
     /* find a free register */
     for(r=0;r<NB_REGS;r++) {
+        if (whale_pinned_regs & (1u << r))
+            goto notfound;
         if (reg_classes[r] & rc) {
             if (nocode_wanted)
                 return r;
@@ -1097,7 +1235,8 @@ ST_FUNC int get_reg(int rc)
         if (r < VT_CONST && (reg_classes[r] & rc))
             goto save_found;
         r = p->r & VT_VALMASK;
-        if (r < VT_CONST && (reg_classes[r] & rc)) {
+        if (r < VT_CONST && (reg_classes[r] & rc)
+            && !(whale_pinned_regs & (1u << r))) {
         save_found:
             save_reg(r);
             return r;
@@ -1328,6 +1467,42 @@ ST_FUNC int gv(int rc)
             rc2 = RC_QRET;
 #endif
 #endif
+        /* WhaleJS (ELS): a pinned local already owns its register, so there
+           is nothing to reload and no class to satisfy - the value is where
+           it belongs. Without this the pin did nothing but waste a register.
+           Swap only the location bits: every other flag the value carries
+           (VT_SYM, VT_MUSTBOUND, VT_MUSTCAST) still applies to it. */
+        if ((vtop->r & VT_VALMASK) == VT_LOCAL) {
+            {
+                int pr = whale_pin_find((int)vtop->c.i);
+
+                /* A call cleared the validity bit (see JS_WhalePinInvalidate
+                   in gfunc_call): the register is stale, so reload from the
+                   slot - the slot is authoritative, the spill wrote it - and
+                   set the bit again. Never load a stale pin without this. */
+                if (pr >= 0 && (whale_pinned_regs & (1u << pr)) == 0) {
+                    load(pr, vtop);
+                    whale_pinned_regs |= (1u << pr);
+                }
+                if (pr >= 0) {
+                    if ((reg_classes[pr] & rc) != 0) {
+                        vtop->r = (vtop->r & ~(VT_VALMASK | VT_LVAL)) | pr;
+                        return pr;
+                    }
+                    {
+                        /* class mismatch (e.g. a return value must be in the
+                           return register): move it out. Never load - a pinned
+                           local is never stored to memory, so a load would
+                           fetch a stale slot. */
+                        int nr = get_reg(rc);
+
+                        move_reg(nr, pr, vtop->type.t);
+                        vtop->r = (vtop->r & ~(VT_VALMASK | VT_LVAL)) | nr;
+                        return nr;
+                    }
+                }
+            }
+        }
         /* need to reload if:
            - constant
            - lvalue (need to dereference pointer)
@@ -2164,6 +2339,28 @@ ST_FUNC void gen_op(int op)
 {
     int u, t1, t2, bt1, bt2, t;
     CType type1;
+
+    /* WhaleJS (ELS): a pinned local's value lives in its register, not in its
+       frame slot, so it must never be taken as a memory reference. gen_opf()
+       and gen_opi() decide that from VT_LVAL, and the operand still looks like
+       an lvalue here - taking it as one makes the load read the frame slot
+       the value was never written to. Say what gv() would have said: both
+       operands are in their registers. A pin whose validity bit is clear (a
+       call killed it) is left alone: gv() will reload it on read. */
+    {
+        int wi;
+
+        for (wi = -1; wi <= 0; wi++) {
+            if ((vtop[wi].r & VT_VALMASK) == VT_LOCAL) {
+                int wp = whale_pin_find((int)vtop[wi].c.i);
+
+                if (wp >= 0 && (whale_pinned_regs & (1u << wp)) == 0)
+                    continue;
+                if (wp >= 0)
+                    vtop[wi].r = (vtop[wi].r & ~(VT_VALMASK | VT_LVAL)) | wp;
+            }
+        }
+    }
 
 redo:
     t1 = vtop[-1].type.t;
@@ -3201,6 +3398,29 @@ ST_FUNC void vstore(void)
 #endif
             }
             r = gv(rc);  /* generate value */
+            /* WhaleJS (ELS): a pinned destination keeps the value in its
+               register instead of writing it back to the stack frame. The tail
+               mirrors the store path: vswap() brings the value down over the
+               destination, and the register field is rewritten so later reads
+               know where the value actually lives. A pin whose validity bit is
+               clear (a call killed it) goes through the normal path: the store
+               lands in the slot, and the next read reloads the register. */
+            if ((vtop[-1].r & VT_VALMASK) == VT_LOCAL) {
+                int pr = whale_pin_find((int)vtop[-1].c.i);
+
+                if (pr >= 0 && (whale_pinned_regs & (1u << pr)) == 0)
+                    pr = -1;
+                if (pr >= 0) {
+                    if (r != pr)
+                        move_reg(pr, r, vtop->type.t);
+                    vswap();
+                    vtop--;
+                    /* the value is in a register now, so VT_LVAL has to go too */
+                    vtop->r = (vtop->r & ~(VT_VALMASK | VT_LVAL)) | pr;
+                    vtop->r |= delayed_cast;
+                    return;
+                }
+            }
             /* if lvalue was saved on stack, must read it */
             if ((vtop[-1].r & VT_VALMASK) == VT_LLOCAL) {
                 SValue sv;
@@ -4128,6 +4348,12 @@ static int parse_btype(CType *type, AttributeDef *ad)
             typespec_found = 1;
             break;
         case TOK_REGISTER:
+            /* WhaleJS (ELS): taken seriously rather than ignored. The next
+               local declared gets a register that get_reg() will not hand out
+               and that gv()/vstore() do not load and store through. */
+            whale_pin_next = 1;
+            next();
+            break;
         case TOK_AUTO:
         case TOK_RESTRICT1:
         case TOK_RESTRICT2:
@@ -6942,6 +7168,21 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
 #endif
             sym = sym_push(v, type, r, addr);
             sym->a = ad->a;
+            /* WhaleJS (ELS): a `register` local gets a register that
+               get_reg() will not hand out. Recorded by stack offset (not by
+               symbol: unary() sets sym on reads but not on the declaration's
+               own initialiser, so sym-based lookup disagreed between the two).
+               whale_pin_alloc refuses when the pool is full. */
+            if (whale_pin_next) {
+                int pr = whale_pin_alloc(type->t);
+
+                if (pr >= 0 && whale_pin_n < 16) {
+                    whale_pin_loc[whale_pin_n] = addr;
+                    whale_pin_reg[whale_pin_n] = pr;
+                    whale_pin_n++;
+                }
+                whale_pin_next = 0;
+            }
         } else {
             /* push local reference */
             vset(type, r, addr);
@@ -7062,6 +7303,15 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
    'cur_text_section' */
 static void gen_function(Sym *sym)
 {
+    /* WhaleJS (ELS): pinned registers belong to one function. A new one
+       starts with none, and the previous function's offset -> register map
+       would otherwise match a local of this one. (The JIT generator emits two
+       C functions per JS function sharing the locals, but their frame layouts
+       differ, so sharing the map across them misattributes variables -
+       stringcat/objshape went wrong exactly this way. Each C function gets
+       its own map.) */
+    whale_pinned_regs = 0;
+    whale_pin_n = 0;
     nocode_wanted = 0;
     ind = cur_text_section->data_offset;
     /* NOTE: we patch the symbol size later */

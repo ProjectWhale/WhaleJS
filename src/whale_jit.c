@@ -316,10 +316,28 @@ static void wt_int(int v);
 /* A slot of the generated function's state block, as `W.v[i]`. The block is one
    zero-initialised object: declaring and initialising each slot separately cost
    a statement per slot, and TinyCC spills at every statement, so a short
-   function like fib spent almost all of its time in the prologue. */
+   function like fib spent almost all of its time in its own prologue. */
 static void wt_arr(const char *field, int n)
 {
     wt_id("_ws"); wt('.'); wt_id(field); wt('['); wt_int(n); wt(']');
+}
+
+/* ELS: the hottest materialised slots skip the state block and live in
+   pinned `register double` locals (`_wv0..7`, declared in the prologue).
+   whale_vname values >= WHALE_VPIN_BASE are pin slots (index minus base),
+   smaller ones are _ws.v[] indices as before. Only fold_materialize() hands
+   out pin slots (never address-taken: field helpers take &v[nm] of their own
+   fresh names, never of a fold slot), and only inside loops (a materialised
+   value there is recomputed per trip and re-read, so the register pays). */
+#define WHALE_VPIN_BASE 100
+#define WHALE_VPIN_MAX 8
+static int whale_vpin_next;   /* pin slots handed out, reset per compile */
+static void wt_vname(int nm)
+{
+    if (nm >= WHALE_VPIN_BASE)
+        wt_slot("_wv", nm - WHALE_VPIN_BASE);
+    else
+        wt_arr("v", nm);
 }
 
 static void wt_op(int o)
@@ -383,6 +401,10 @@ static unsigned whale_jit_seq;
 /* WhaleJS: dump the finished code section so it can be disassembled. Defined in
    tccgen.c, which is the only place text_section is in scope. */
 void JS_WhaleDumpCode(FILE *f);
+/* ELS pin map scope: one JIT compilation (core + wrapper share it). Defined in
+   tccgen.c next to the mechanism. */
+void JS_WhalePinEnter(void);
+void JS_WhalePinLeave(void);
 
 static char whale_core_name[40];
 static char whale_entry_name[40];
@@ -476,6 +498,48 @@ static int whale_is_push_op(int op)
     case OP_get_loc:
     case OP_get_arg0: case OP_get_arg1: case OP_get_arg2: case OP_get_arg3:
     case OP_get_arg:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Pure-numeric opcodes: the generator lowers them to C operators and plain
+   variable traffic without calling any helper. Anything else (calls, field /
+   array / global access, conversions that need ToInt32/fmod, throws, catches)
+   may emit a helper call inside a loop body - and a pinned local spanning such
+   a call pays spill+reload per call for zero net gain. The ELS local-pin
+   decision consults this per loop body; unlisted opcodes conservatively count
+   as "has a call" (safe direction: less pinning, never wrong code). */
+static int whale_is_pure_num_op(int op)
+{
+    switch (op) {
+    case OP_push_minus1:
+    case OP_push_0: case OP_push_1: case OP_push_2: case OP_push_3:
+    case OP_push_4: case OP_push_5: case OP_push_6: case OP_push_7:
+    case OP_push_i8: case OP_push_i16: case OP_push_i32:
+    case OP_push_const: case OP_push_const8:
+    case OP_push_true: case OP_push_false:
+    case OP_get_loc0: case OP_get_loc1: case OP_get_loc2: case OP_get_loc3:
+    case OP_get_loc8: case OP_get_loc:
+    case OP_get_loc0_loc1:
+    case OP_get_arg0: case OP_get_arg1: case OP_get_arg2: case OP_get_arg3:
+    case OP_get_arg:
+    case OP_put_loc0: case OP_put_loc1: case OP_put_loc2: case OP_put_loc3:
+    case OP_put_loc8: case OP_put_loc:
+    case OP_set_loc0: case OP_set_loc1: case OP_set_loc2: case OP_set_loc3:
+    case OP_set_loc8: case OP_set_loc:
+    case OP_add: case OP_sub: case OP_mul: case OP_div:
+    case OP_lt: case OP_lte: case OP_gt: case OP_gte:
+    case OP_eq: case OP_neq: case OP_strict_eq: case OP_strict_neq:
+    case OP_neg: case OP_plus:
+    case OP_inc: case OP_dec: case OP_inc_loc: case OP_dec_loc: case OP_add_loc:
+    case OP_is_undefined_or_null:
+    case OP_to_propkey: case OP_to_propkey2:
+    case OP_goto: case OP_goto8: case OP_goto16:
+    case OP_if_false: case OP_if_false8: case OP_if_true: case OP_if_true8:
+    case OP_drop: case OP_dup: case OP_nip: case OP_nip1:
+    case OP_return: case OP_return_undef:
         return 1;
     default:
         return 0;
@@ -900,6 +964,13 @@ static int whale_loop_depth;
    is a double, there is no aliasing), which makes the scan complete. */
 static uint8_t *whale_loop_written;
 static int whale_loop_wn;   /* locals per head entry (var_count) */
+/* Set when any loop body contains a call: local pinning is then off (a pin
+   spanning a call pays spill+reload per call for zero net gain). */
+static int whale_loop_has_call;
+/* Per-local heat inside loop bodies (reads + 2*writes, accumulated over all
+   loops): the ELS decision pins the hottest ones. Indexed by local number,
+   zeroed before each compilation's scan. */
+static int whale_loop_heat[WHALE_JIT_MAX_SLOTS];
 
 /* Is local idx loop-invariant at the current position: never written inside
    the innermost loop being generated? Outside any loop the answer does not
@@ -993,6 +1064,7 @@ static void fold_begin(void)
     whale_out_len = &go_len;
     /* fresh name space for this function's materialised slots */
     whale_vserial = 0;
+    whale_vpin_next = 0;
     whale_empty_ranges = 0;
 
     memset(whale_vname, 0, sizeof(whale_vname));
@@ -1073,7 +1145,7 @@ static void fold_inline(int k)
     if (whale_dbg_env("WHALE_EMPTY_DBG") && !whale_vmat[k] && whale_vexpr[k].len == 0)
         fprintf(stderr, "[empty] slot=%d (len=0, off=%d)\n", k, whale_vexpr[k].off);
     if (whale_vmat[k]) {
-        wt_arr("v", whale_vname[k]);   /* already a real variable */
+        wt_vname(whale_vname[k]);   /* already a real variable */
         return;
     }
     fold_inline_expr(&whale_vexpr[k]);
@@ -1309,10 +1381,20 @@ static void fold_materialize(int k)
     /* Take a fresh name: whatever inlined this slot beforehand recorded the old
        name as a token, and rewriting that variable would silently change those
        references. The prologue declares stack_size + WHALE_VSER_MAX variables,
-       so this cannot run out for any function seen so far. */
-    whale_vname[k] = whale_vserial++;
+       so this cannot run out for any function seen so far.
+       ELS: inside a loop the name is a pinned register local (_wv<n>) rather
+       than a state-block slot - the value is recomputed per trip and re-read,
+       so keeping it in xmm pays every iteration. Outside loops the block slot
+       is fine (written once, read rarely). Only when no loop body contains a
+       call (whale_loop_has_call): a _wv spanning a call reloads a slot that
+       was never written - materialize only writes the register - so the reload
+       fetches stale data (immutable_update went NaN this way). */
+    if (!whale_loop_has_call && whale_loop_depth > 0 && whale_vpin_next < WHALE_VPIN_MAX)
+        whale_vname[k] = WHALE_VPIN_BASE + whale_vpin_next++;
+    else
+        whale_vname[k] = whale_vserial++;
     mark = fold_mark();
-    wt_arr("v", whale_vname[k]); wt('=');
+    wt_vname(whale_vname[k]); wt('=');
     fold_inline(k);
     wt(';');
     /* Loop-invariant hoisting: the value is the same on every iteration, so
@@ -1606,7 +1688,7 @@ static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
                             a, whale_inline_argmap[a], t);
                 fm = fold_mark();
                 if (whale_inline_argmat[a])
-                    wt_arr("v", whale_inline_argname[a]);
+                    wt_vname(whale_inline_argname[a]);
                 else
                     fold_inline_expr(&whale_inline_argexpr[a]);
                 /* The snapshot is a whole WhaleVExpr, inv included: a literal or
@@ -2739,16 +2821,24 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        factory called once before the loop (`var o = make(); for (...) ...`), and
        refusing that sent objfields to the interpreter at 26x. */
     whale_shape_stable = 1;
+    /* ELS: a pinned local whose live range crosses a call pays spill+reload
+       per call and risks stale reloads (its slot is only written by the
+       call writeback). If any loop body contains a call - a bytecode call or
+       any opcode the generator may lower to a helper call - local pinning is
+       off for the whole function: the net is zero or negative. _wv pins are
+       unaffected (fold temporaries never span a call). */
+    whale_loop_has_call = 0;
     {
         int k;
 
-        for (k = 0; k < whale_call_n && whale_shape_stable; k++) {
+        for (k = 0; k < whale_call_n; k++) {
             int tgt;
 
             for (tgt = 0; tgt < len; tgt++) {
                 if (loop_back[tgt] >= 0 && whale_call_pos[k] >= tgt &&
                     whale_call_pos[k] <= loop_back[tgt]) {
                     whale_shape_stable = 0;
+                    whale_loop_has_call = 1;
                     break;
                 }
             }
@@ -2774,7 +2864,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
     /* Which locals each loop body writes, for loop-invariance below. Built
        from the pass-1 back-edge table: one scan of [head, back] per loop.
-       Freed with the rest at out:. */
+       Freed with the rest at out:. The same scan counts reads+writes per
+       local inside loop bodies (whale_loop_heat): the ELS decision below pins
+       the hottest numeric locals. */
     whale_loop_written = NULL;
     whale_loop_wn = 0;
     if (var_count > 0) {
@@ -2784,20 +2876,43 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         if (!whale_loop_written)
             { whale_out_line = __LINE__; goto out; }
         whale_loop_wn = var_count;
+        memset(whale_loop_heat, 0, sizeof(whale_loop_heat));
         for (h = 0; h <= len; h++) {
             if (loop_back[h] >= 0) {
                 int q = h, qsz;
 
                 while (q <= loop_back[h]) {
                     int qo = (int)pc[q];
-                    int w;
+                    int w, r = -1;
 
                     qsz = whale_op_size_of(qo);
                     if (qsz <= 0 || q + qsz > len)
                         break;
+                    /* any opcode that may lower to a helper call disqualifies
+                       local pinning for the whole function (see
+                       whale_loop_has_call above) */
+                    if (!whale_is_pure_num_op(qo))
+                        whale_loop_has_call = 1;
                     w = whale_writes_local(qo, pc, q);
-                    if (w >= 0 && w < var_count)
+                    if (w >= 0 && w < var_count) {
                         whale_loop_written[(size_t)h * var_count + w] = 1;
+                        if (w < WHALE_JIT_MAX_SLOTS)
+                            whale_loop_heat[w] += 2;
+                    }
+                    /* reads: get_loc family (get_loc0_loc1 reads two) */
+                    if (qo >= OP_get_loc0 && qo <= OP_get_loc3)
+                        r = qo - OP_get_loc0;
+                    else if (qo == OP_get_loc8)
+                        r = (int)pc[q + 1];
+                    else if (qo == OP_get_loc)
+                        r = (int)whale_get_u16(pc + q + 1);
+                    else if (qo == OP_get_loc0_loc1) {
+                        if (0 < var_count && 0 < WHALE_JIT_MAX_SLOTS)
+                            whale_loop_heat[0]++;
+                        r = 1;
+                    }
+                    if (r >= 0 && r < var_count && r < WHALE_JIT_MAX_SLOTS)
+                        whale_loop_heat[r]++;
                     q += qsz;
                 }
             }
@@ -3079,15 +3194,73 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        no call, no jump target in between - which is exactly the run of
        initialiser stores a factory body is. */
     wt_id("JSValue"); wt('*'); wt_id("_sdp"); wt(';');
-    /* The locals, as plain doubles. No `register`: pinning paid 5-12% at best
-       under TinyCC (the fused statements it helps were already single
-       load/store round trips), it actively harmed the gcc backend - sixteen
-       `register` hints on the struct columns alone drove its allocator into
-       spilling, props_diff 125 -> 830ms - and it came with six hand-written
-       special cases in tccgen.c. Removed; the TCC-side mechanism goes with it.
-       See notes/pinned-registers.md and notes/reg-alloc-plan.md. */
-    for (i = 0; i < var_count; i++) {
-        wk(JS_WK_DOUBLE); wt_slot("L", i); wt('='); wt_int(0); wt(';');
+    /* The locals, as plain doubles - except the ELS picks: loop-hot numeric
+       locals get `register`, and the TCC-side pin mechanism (tccgen.c) keeps
+       them in xmm across statement boundaries instead of spilling every time.
+       At most 4 (the pin pool size); chosen by loop-body heat (reads +
+       2*writes), hottest first. Skipped for locals that hold objects
+       (whale_loc_obj: their value is a slot number, pinning it wastes a
+       register), for single-assignment locals (assign_cnt == 1: they become
+       lo_c constants read as literals, never from memory, so pinning them is
+       pure waste), for nested loops (loop_count > 1: two pinned induction
+       variables hang - the inner counter never advances - root cause unknown),
+       and when any loop body contains a call (a pin spanning a call pays
+       spill+reload per call for zero net gain, and stale reloads went wrong
+       before - stringcat/objshape). The _wv pins below are unaffected (fold
+       temporaries never span a call). When the gcc backend renders this stream
+       (`register` hints actively harmed its allocator - props_diff 125 ->
+       830ms - so the renderer strips them; see JS_WhaleRenderStream). */
+    {
+        int order[WHALE_JIT_MAX_SLOTS];
+        int norder = 0, k, m, q;
+
+        /* Local pinning is off until the nested-loop hang is root-caused
+           (a pinned induction variable stops advancing; minmax and nested
+           both hang with any local pinned, even one - see the hang.asm
+           evidence where i++ vanishes and the compare reads the wrong
+           operands). The _wv path above carries the ELS gain for now. */
+        if (0 && info->loop_count <= 1 && !whale_loop_has_call) {
+        for (k = 0; k < var_count && k < WHALE_JIT_MAX_SLOTS; k++)
+            if (whale_loop_heat[k] > 0 && !whale_loc_obj[k] && assign_cnt[k] > 1)
+                order[norder++] = k;
+        }
+        /* hottest first (insertion: n is tiny) */
+        for (k = 1; k < norder; k++) {
+            int t = order[k];
+
+            for (m = k; m > 0 && whale_loop_heat[order[m - 1]] < whale_loop_heat[t]; m--)
+                order[m] = order[m - 1];
+            order[m] = t;
+        }
+        if (norder > 4)
+            norder = 4;
+        for (i = 0; i < var_count; i++) {
+            int pinned = 0;
+
+            for (q = 0; q < norder; q++)
+                if (order[q] == i) {
+                    pinned = 1;
+                    break;
+                }
+            if (pinned)
+                wk(JS_WK_REGISTER);
+            wk(JS_WK_DOUBLE); wt_slot("L", i); wt('='); wt_int(0); wt(';');
+        }
+        if (whale_dbg_env("WHALE_JIT_DUMP") && norder > 0) {
+            fprintf(stderr, "[els] pinned %d locals:", norder);
+            for (q = 0; q < norder; q++)
+                fprintf(stderr, " L%d(heat=%d)", order[q], whale_loop_heat[order[q]]);
+            fprintf(stderr, "\n");
+        }
+    }
+    /* ELS spill slots: pinned `register double` locals for the hottest
+       materialised values inside loops. Disabled for now (the _wv pin path
+       hangs nested even with an empty decision - 8 unconditional `register`
+       declarations fill the 4-deep pin pool and starve TCC's own expression
+       evaluation; root cause of the starvation hang TBD). Plain doubles until
+       the pool accounting covers declarations that never get used. */
+    for (i = 0; i < WHALE_VPIN_MAX; i++) {
+        wk(JS_WK_DOUBLE); wt_slot("_wv", i); wt('='); wt_int(0); wt(';');
     }
     if (whale_dbg_env("WHALE_STR_DBG")) {
         int cols = whale_layout_from_sites(whale_field_sites, whale_field_sites_n,
@@ -6637,6 +6810,10 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
     s = whale_jit_state;
 
     /* fresh names per compile: the code accumulates in this one state */
+    /* One JS function becomes two C functions (a core and a wrapper). Pinned
+       registers have to span both, so claim the map for the whole compilation
+       rather than letting each C function reset it. */
+    JS_WhalePinEnter();
     snprintf(whale_core_name, sizeof(whale_core_name), "whale_jit_core_%u", ++whale_jit_seq);
     snprintf(whale_entry_name, sizeof(whale_entry_name), "whale_jit_fn_%u", whale_jit_seq);
 
@@ -6682,10 +6859,12 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
 
     *entry_out = fn;
     *handle_out = s;
+    JS_WhalePinLeave();
     return 1;
   fail:
     /* keep the state: it owns every previously compiled function's code, and
        tcc_delete() would release the global symbol pools they share */
+    JS_WhalePinLeave();
     return 0;
 }
 

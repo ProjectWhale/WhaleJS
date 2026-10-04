@@ -20,6 +20,10 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
+/* WhaleJS (ELS): invalidates pinned registers before a real call (defined in
+   tccgen.c, same translation unit). */
+void JS_WhalePinInvalidate(void);
+
 #ifdef TARGET_DEFS_ONLY
 
 /* number of available registers */
@@ -1018,6 +1022,9 @@ void gfunc_call(int nb_args)
         vtop--;
     }
     save_regs(0);
+    /* WhaleJS (ELS): the call destroys every xmm, so every pinned value is
+       stale from here on. Declared in tccgen.c (same translation unit). */
+    JS_WhalePinInvalidate();
     
     /* Copy R10 and R11 into RCX and RDX, respectively */
     if (nb_args > 0) {

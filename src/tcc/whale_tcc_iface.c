@@ -536,6 +536,11 @@ static void whale_render_one(WhaleText *t, int tok, double num)
 
     if (tok == TOK_EOF)
         return;                 /* the end marker is not C */
+    /* `register` is a TCC-side ELS hint (pinned registers). gcc has its own
+       allocator and the hints actively harmed it, so the gcc renderer drops
+       them - the declaration stays a plain double. */
+    if (tok == TOK_REGISTER)
+        return;
     /* Order matters: TOK_IDENT (256) and the CINT/CDOUBLE pseudo-tokens sit
        ABOVE 128, so they have to be recognised before anything reads the value
        as a character. */

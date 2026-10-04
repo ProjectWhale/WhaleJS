@@ -2211,3 +2211,52 @@ SOLVED
 `whale api test: ok`；25/25 全对，0 mismatch；nested 70ms（repeat=3）。
 ## 状态
 绿，待提交。下一步：ELS 路线 B（线性 IR + 分配，<67> 已调研）。
+
+# <82>: ELS 机制恢复 + 范围收缩（local pin hang 待查）
+PARTIAL（机制就绪，决策收缩，零收益零回归）
+
+## 探针结论（动手前先证伪）
+- `WHALE_EXPR_MAX` 24→200：nested/minmax/locals 反而慢 14-29%，只有 bitops
+  快 16%。瓶颈不是"语句太多"，而是 TCC 在表达式内部也 spill——单纯合并语句
+  无用（与 <74> 的 24 最优结论一致）。
+- TCC 语句边界 spill 是架构性的：`save_regs` 6 调用点全是语义必需（调用保存、
+  控制流合并），`vstore` 赋值必写内存，删任何一个都是错代码。TCC 侧无小改。
+- 用户纠正：gcc 不能假设存在，默认路径永远是 TCC，ELS 收益人人可拿；
+  且对象操作多的函数也有大量数值运算，不能因有对象操作就放弃 ELS。
+
+## 恢复的机制（TCC 侧 8 处 + 生成器侧决策）
+- TCC 侧（照抄删除 diff 的最终正确形态，避开 5 轮试错的坑）：
+  `whale_pin_alloc`（float 池 ≤4 个）+ 偏移反查表（不用 sym，声明初始化与读
+  的符号不一致坑）+ PinEnter/Leave + save_reg（spill 照做）+ get_reg×2 跳过
+  + gv（类检查 + move 回退 + 调用后重载）+ gen_op 归一化 + vstore shortcut
+  + TOK_REGISTER + decl 分配 + gen_function 重置。
+- 生成器侧 ELS 决策：`whale_loop_heat`（循环体内读+1/写+2）选 top-4，排除
+  对象 local（`whale_loc_obj`）与单赋值（`assign_cnt==1`，lo_c 字面量无需 pin）；
+  `_wv` pin（fold_materialize 在循环体内用 pin 位，不用 `_ws.v` 数组）。
+- gcc 侧：renderer  strips `register`（<61> 教训，props_diff 125→830ms 不重演）。
+
+## 修好的三个真 bug
+1. **Invalidate 放错 gfunc_call 版本**：加在 ELF 版（1347 行）而非 PE 版（921 行），
+   Windows 根本不编译它 → 调用后 pin 值失效且 slot 未更新 → bitops 错（287）、
+   stringcat 错。移到 PE 版后两者全对。
+2. **save_reg_upstack 无条件清 validity bit**：`?:`/`&&` 的非调用 save 也清，
+   pin 全失效（nested 反汇编全走内存）。改只在 gfunc_call 清（真破坏），
+   gv 读时重载（slot 权威）→ nested 70→31ms。
+3. **跨函数 pin 表误匹配**：core/wrapper 共享表但帧布局不同（已改每函数重置，
+   后证伪非主因，保留重置）。
+
+## 范围收缩（诚实记录未解的）
+- **local pin hang**：minmax（嵌套）与 nested（任 pin 一个 local 即 hang）——
+  归纳变量不前进 + 比较操作数错乱（hang.asm：`i++` 消失，`i<n` 读成 `i<s`）。
+  pin 的 gen_op 归一化与 TCC 比较/条件生成有未知交互，超出快速修复范围。
+  决策：local pin 全关（`if (0 && ...)`），下轮专项排查。
+- **_wv pin + 调用 = NaN**：_wv 的 slot 从不写入（materialize 只写寄存器），
+  调用后重载读旧值（immutable_update NaN）。决策：_wv pin 只在无调用函数开
+  （`whale_loop_has_call`，纯数值白名单 `whale_is_pure_num_op` 判定）。
+- 当前效果：25/25 全对 0 mismatch；nested 76、bitops 154、array 53、minmax 108
+  全是基线噪声内（零收益零回归）。31ms 的 local+_wv 全开形态因 hang 不能上线。
+
+## 验证
+`whale api test: ok`；25/25 全对，0 mismatch（repeat=1 全量 + repeat=3 关键 case）。
+## 状态
+绿，待提交。下一步：local pin hang 专项（gen_op 归一化与 gvtst/expr_cond 的交互）。
