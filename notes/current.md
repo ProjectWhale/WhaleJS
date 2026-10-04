@@ -2162,3 +2162,52 @@ TIPS + 未解
 `whale api test: ok`；fib 19ms（稳态）。
 ## 状态
 绿，待提交。
+
+# <81>: LICM 转正（inv 链修通 + 外提生效）
+SOLVED
+
+## 三处断链（全用 trace 实证定位，非猜测）
+1. **变量读 inv 恒 0**：`fold_set` 默认 0 后，任何含变量叶子的表达式 inv=0——
+   nested 的 `a..e` 全是循环内无写的变量，整链是 0。修法：`whale_loop_written`
+  （pass-1 back-edge 表建成后，对每循环头扫 `[head,back]` 收集写 local 位集，
+   `(len+1)*var_count` 字节，`out:` 处释放）+ `whale_local_invariant(idx)`
+   （只查最内层循环：外提目标是直接外层输出，每外层迭代重算，外层写也正确）。
+   用点三处：get_loc 变量读分支、get_loc0_loc1 双分支、peephole-1 的 SLOT
+   操作数（经新 `whale_load_inv` helper，INT/REAL/ARG 照旧 1）。
+   写点判定 `whale_writes_local`：put/set/add/inc/dec 全形态 + check 系 +
+   set_loc_uninitialized；其余（close/make/using_dispose/get）不是写——即使漏判，
+   JIT 在那些 opcode 上本就会 bail，written-set 用不上，安全。
+2. **mat-before-inv 时序**：`fold_set` 内超长即 materialize，外提读 inv，
+   但调用点的 AND 回写在 `fold_set` 返回后——nested 的 div（len=33>24）
+   实测 `[mat] inv=0` 而随后 `[gb] inv=1`。修法：`fold_set(k,mark,inv)` 改传参，
+   25 调用点全改（字面量传 1，算术传 AND，内存读/call 传 0，local 读先算 `li`
+   再传）。`whale_load_inv` 同时给 peephole-1 去重。
+3. **单目/vr-inline 的滞后回写并入参数**：neg/lnot/not/inc/dec 的 `inv` 局部量、
+   vr-inline get_arg 的快照 inv、binop 的双操作数 AND（旧 forwarding 只取右
+   操作数，左循环变量+右常量会误判不变——史上最险的一处），全部改在
+   `fold_set` 调用时传入。
+- 配套：`local_set(d,mark,inv)` 加参（put/set_loc 传栈顶 inv，add/inc_loc 传 0，
+  后者表达式含 `L<idx>` 变量叶）；vmat=1 的 10 处（call 结果/field/array/
+  length/var_ref/global/SELF/OBJ）显式 `inv=0`（stale 继承的 <80> 同类）；
+  `OP_swap` 的结构体整体交换 inv 跟走（正确，不动）；`OP_dup` 同理。
+- 时序铁证：trace 显示 `[gb] sp=1 a=1 b=1 inv=1` 后 `[mat] inv=0` 再 `[gb] inv=1`，
+  改传参后 `[mat] inv=1` + `[hoist]` 两次，check 不变。
+
+## 效果
+- nested 88-94→70-74ms（repeat=3 稳态 70ms，外提 2 次：33-token 与 28-token
+  子表达式各一次）；其余 case 基线噪声内（immutable 290、objshape 629 均为
+  已知波动位）；25/25 全对，0 mismatch；`whale api test: ok`。
+- 所有诊断 trace（`[mat]/[hoist]/[pe1]/[gb]/[loc]`）已删，无残留。
+
+## 教训
+- "回写"模式与"内部触发"不兼容：凡在 `fold_set` 内部读 `inv` 做决定的
+  （materialize 外提），`inv` 必须是参数，不能是事后回写。
+- 按 body 范围（而非当前位置之后）判写是正确的：回边使"写在读之后"仍影响
+  下次迭代读值，body 范围判正好等价于"下次迭代是否相同"。
+- trace 证据链：`[loc]` 确认 lo_c 置位正常 → `[pe1]` 确认 peephole inv=1 →
+  `[gb]` 全 1 但 `[mat]` 为 0 → 锁定 fold_set 内外时序。三段式隔离缺一不可。
+
+## 验证
+`whale api test: ok`；25/25 全对，0 mismatch；nested 70ms（repeat=3）。
+## 状态
+绿，待提交。下一步：ELS 路线 B（线性 IR + 分配，<67> 已调研）。

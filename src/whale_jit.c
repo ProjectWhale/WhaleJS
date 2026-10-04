@@ -497,6 +497,26 @@ static int whale_store_local(const uint8_t *pc, int len, int pos, int sz)
     return -1;
 }
 
+/* The local an instruction writes, or -1. put/set/add/inc/dec and the
+   check/uninitialized stores all write; reads and closure-cell writes do
+   not. Opcodes the generator does not handle need no entry: they bail the
+   whole function, so the written-set is never consulted for them. */
+static int whale_writes_local(int op, const uint8_t *pc, int pos)
+{
+    if (op >= OP_put_loc0 && op <= OP_put_loc3)
+        return op - OP_put_loc0;
+    if (op >= OP_set_loc0 && op <= OP_set_loc3)
+        return op - OP_set_loc0;
+    if (op == OP_put_loc8 || op == OP_set_loc8 ||
+        op == OP_inc_loc || op == OP_dec_loc || op == OP_add_loc)
+        return (int)pc[pos + 1];
+    if (op == OP_put_loc || op == OP_set_loc ||
+        op == OP_put_loc_check || op == OP_put_loc_check_init ||
+        op == OP_set_loc_uninitialized)
+        return (int)whale_get_u16(pc + pos + 1);
+    return -1;
+}
+
 /* Is the value this instruction pushes read as the *object* of a property
    access right after? `o.x` compiles to `get_arg0 o`, `get_field x`, so this is
    adjacency. Used to decide how an argument has to travel: a parameter that is
@@ -872,6 +892,34 @@ typedef struct WhaleLoop {
 
 static WhaleLoop whale_loops[WHALE_LOOP_MAX];
 static int whale_loop_depth;
+/* Per loop head: which locals its body writes. Indexed [head * n + d], built
+   once before the emit pass walks the bytecode. A variable read inside the
+   loop is loop-invariant when its bit is clear - the back edge re-runs the
+   whole body, so "written anywhere in the body" is exactly "not the same on
+   the next trip". Locals can only be written through these opcodes (a local
+   is a double, there is no aliasing), which makes the scan complete. */
+static uint8_t *whale_loop_written;
+static int whale_loop_wn;   /* locals per head entry (var_count) */
+
+/* Is local idx loop-invariant at the current position: never written inside
+   the innermost loop being generated? Outside any loop the answer does not
+   matter (nothing hoists there), so it reads 0. Only the innermost loop is
+   consulted: hoisting moves the value to the directly enclosing output, where
+   it is recomputed once per outer trip - correct even if an outer loop body
+   writes the local. */
+static int whale_local_invariant(int idx)
+{
+    int head;
+
+    if (idx < 0 || idx >= whale_loop_wn)
+        return 0;
+    if (whale_loop_depth <= 0 || !whale_loop_written)
+        return 0;
+    head = whale_loops[whale_loop_depth - 1].head_pos;
+    if (head < 0)
+        return 0;
+    return !whale_loop_written[(size_t)head * whale_loop_wn + idx];
+}
 
 static WhaleVExpr *whale_vexpr;   /* the pending expression of each stack slot */
 static uint8_t    *whale_vmat;    /* 1 = already forced into a variable */
@@ -971,19 +1019,37 @@ static int whale_expr_max = 24;
 static void fold_materialize(int k);
 static void fold_commit(int mark);
 
-/* Record [mark, now) as the value of stack slot k. inv defaults to 0: only
-   the emitters that can prove invariance (literal pushes, get_arg, binop AND,
-   constant-local reads) set it. In particular a helper/call result must never
-   inherit its arguments' invariance - hoisting a call out of a loop repeats
-   the first iteration's value forever. */
-static void fold_set(int k, int mark)
+/* Record [mark, now) as the value of stack slot k, with loop-invariance inv.
+   inv is a parameter rather than a post-hoc write-back for one reason: a
+   range that grew past the length ceiling is materialised right here, inside
+   this call, and the hoist decision reads inv then - a value written back
+   afterwards arrives one materialisation too late (measured: the div in
+   nested's chain materialised with inv=0 and never hoisted, because the
+   binop's AND landed after fold_set returned).
+
+   Only the emitters that can prove invariance pass nonzero (literal pushes,
+   get_arg, binop AND, constant/unwritten-local reads). In particular a
+   helper/call result must never inherit its arguments' invariance - hoisting
+   a call out of a loop repeats the first iteration's value forever. */
+static void fold_set(int k, int mark, int inv)
 {
     whale_vexpr[k].off = mark;
     whale_vexpr[k].len = JS_WhaleTokSinkLen() - mark;
     whale_vmat[k] = 0;
-    whale_vexpr[k].inv = 0;
+    whale_vexpr[k].inv = (uint8_t)(inv ? 1 : 0);
     if (whale_vexpr[k].len > whale_expr_max)
         fold_materialize(k);
+}
+
+/* Loop-invariance of a peephole load operand: literals and parameters are
+   constant; a local read is invariant iff the loop body never writes it. */
+static int whale_load_inv(int kind, int idx)
+{
+    if (kind == WLD_INT || kind == WLD_REAL || kind == WLD_ARG)
+        return 1;
+    if (kind == WLD_SLOT)
+        return whale_local_invariant(idx);
+    return 0;
 }
 
 /* Append an expression range to what is being built right now.
@@ -1341,13 +1407,19 @@ static void local_forget(int d)
 }
 
 /* Record the expression just built in the workspace as the pending value of
-   local d. Falls back to storing it when it grew too long to duplicate. */
-static void local_set(int d, int mark)
+   local d. Falls back to storing it when it grew too long to duplicate.
+
+   inv is the new pending expression's loop-invariance, decided by the caller:
+   a plain copy of the top of the stack keeps that slot's inv, while add_loc /
+   inc_loc build on the variable L<d> itself - a loop-carried leaf - so they
+   always pass 0. */
+static void local_set(int d, int mark, int inv)
 {
     WhaleLocal *m = &whale_lmem[d];
 
     m->expr.off = mark;
     m->expr.len = JS_WhaleTokSinkLen() - mark;
+    m->expr.inv = (uint8_t)inv;
     m->live = 1;
     m->used = 0;
     if (whale_dbg_env("WHALE_MEM_TRACE"))
@@ -1537,7 +1609,9 @@ static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
                     wt_arr("v", whale_inline_argname[a]);
                 else
                     fold_inline_expr(&whale_inline_argexpr[a]);
-                fold_set(sp, fm);
+                /* The snapshot is a whole WhaleVExpr, inv included: a literal or
+                   argument at the call site stays loop-invariant in the body. */
+                fold_set(sp, fm, whale_inline_argexpr[a].inv);
                 cur[var_count + sp] = (uint8_t)t;
                 sp++;
             }
@@ -1645,6 +1719,7 @@ static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
                 fold_obj_field_load(WHALE_SLOT(ta), atom, fc, nm, 0);
                 whale_vname[sp - 1] = nm;
                 whale_vmat[sp - 1] = 1;
+                whale_vexpr[sp - 1].inv = 0;   /* a memory read */
                 cur[var_count + sp - 1] = WHALE_T_NUM;
             }
             break;
@@ -1653,7 +1728,7 @@ static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
             {
                 fm = fold_mark();
                 wt_int(op - OP_push_0);
-                fold_set(sp, fm);
+                fold_set(sp, fm, 1);
                 cur[var_count + sp] = WHALE_T_ICONST;
                 sp++;
             }
@@ -1714,8 +1789,15 @@ static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
                 if (!whale_type_is_num(ta) || !whale_type_is_num(tb))
                     goto done;
                 fm = fold_mark();
-                fold_inline(sp - 2); wt_op(opid); fold_inline(sp - 1);
-                fold_set(sp - 2, fm);
+                {
+                    /* Both operands' invariance, not just the last one inlined:
+                       the result is invariant only if both sides are. */
+                    int inva = whale_vexpr[sp - 2].inv;
+                    int invb = whale_vexpr[sp - 1].inv;
+
+                    fold_inline(sp - 2); wt_op(opid); fold_inline(sp - 1);
+                    fold_set(sp - 2, fm, inva && invb);
+                }
                 cur[var_count + sp - 2] = WHALE_T_NUM;
                 sp--;
             }
@@ -2690,6 +2772,38 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        tokens into TinyCC's parser directly, so there is no lexer and no
        keyword table, and keywords are compile-time constants. */
 
+    /* Which locals each loop body writes, for loop-invariance below. Built
+       from the pass-1 back-edge table: one scan of [head, back] per loop.
+       Freed with the rest at out:. */
+    whale_loop_written = NULL;
+    whale_loop_wn = 0;
+    if (var_count > 0) {
+        int h;
+
+        whale_loop_written = calloc((size_t)(len + 1) * var_count, 1);
+        if (!whale_loop_written)
+            { whale_out_line = __LINE__; goto out; }
+        whale_loop_wn = var_count;
+        for (h = 0; h <= len; h++) {
+            if (loop_back[h] >= 0) {
+                int q = h, qsz;
+
+                while (q <= loop_back[h]) {
+                    int qo = (int)pc[q];
+                    int w;
+
+                    qsz = whale_op_size_of(qo);
+                    if (qsz <= 0 || q + qsz > len)
+                        break;
+                    w = whale_writes_local(qo, pc, q);
+                    if (w >= 0 && w < var_count)
+                        whale_loop_written[(size_t)h * var_count + w] = 1;
+                    q += qsz;
+                }
+            }
+        }
+    }
+
     /* preamble: types only. JSValue must match quickjs.h exactly, because it is
        passed *by value* across the JIT/host boundary (function arguments and
        return values). quickjs.h uses the {union, int64_t tag} form on 64-bit,
@@ -3347,7 +3461,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         } else {
                             if (id_keep == 0) whale_load_emit(k1, i1, cv1);
                             else whale_load_emit(k2, i2, cv2);
-                            fold_set(sp, fm);
+                            /* The result IS the kept operand, so its
+                               invariance travels with it. */
+                            fold_set(sp, fm, id_keep == 0
+                                     ? whale_load_inv(k1, i1)
+                                     : whale_load_inv(k2, i2));
                             cur[var_count + sp] = (uint8_t)(id_keep == 0 ? t1 : t2);
                             sp += 1;
                         }
@@ -3368,7 +3486,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         int fm = fold_mark();
 
                         wt('('); whale_load_emit(k1, i1, cv1); wt_op(opid); whale_load_emit(k2, i2, cv2); wt(')'); wt('?'); wt_int(1); wt(':'); wt_int(0);
-                        fold_set(sp, fm);
+                        fold_set(sp, fm, whale_load_inv(k1, i1) && whale_load_inv(k2, i2));
                         cur[var_count + sp] = WHALE_T_BOOL;
                         sp += 1;
                     }
@@ -3413,21 +3531,21 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                                 wt_int((int)cvr);
                             else
                                 wt_num(cvr);
-                            fold_set(sp, fm);
+                            fold_set(sp, fm, 1);   /* folded literals */
                             cur[var_count + sp] = WHALE_T_NUM;
-                            whale_vexpr[sp].inv = 1;   /* folded literals */
                             sp += 1;
                         }
                         pos = p4 + l4;
                         continue;
                     }
-                    /* inv tracks loop-invariance through the peephole: no SLOT
-                       on either side means neither operand can change in the
-                       loop (literals, parameters and constant locals arrive as
-                       INT/REAL/ARG kinds). */
+                    /* inv tracks loop-invariance through the peephole. A SLOT
+                       operand whose local the loop body never writes is as
+                       constant as a literal - `a` in
+                       `for (...) s = (a+b)*...` - so whale_load_inv counts
+                       INT/REAL/ARG and unwritten SLOTs alike. */
                     {
-                        int inv1 = (k1 == WLD_INT || k1 == WLD_REAL || k1 == WLD_ARG);
-                        int inv2 = (k2 == WLD_INT || k2 == WLD_REAL || k2 == WLD_ARG);
+                        int inv1 = whale_load_inv(k1, i1);
+                        int inv2 = whale_load_inv(k2, i2);
 
                         if (dst >= 0) {
                             int fm = fold_mark();
@@ -3440,9 +3558,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                             int fm = fold_mark();
 
                             whale_load_emit(k1, i1, cv1); wt_op(opid); whale_load_emit(k2, i2, cv2);
-                            fold_set(sp, fm);
+                            fold_set(sp, fm, inv1 && inv2);
                             cur[var_count + sp] = WHALE_T_NUM;
-                            whale_vexpr[sp].inv = (uint8_t)(inv1 && inv2);
                             sp += 1;
                         }
                     }
@@ -3516,9 +3633,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int fm = fold_mark();
 
                 wt_int(op == OP_push_minus1 ? -1 : op - OP_push_0);
-                fold_set(sp, fm);
+                fold_set(sp, fm, 1);
                 cur[var_count + sp] = WHALE_T_ICONST;
-                whale_vexpr[sp].inv = 1;
                 sp++;
             }
             break;
@@ -3527,9 +3643,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int fm = fold_mark();
 
                 wt_int((int)(int8_t)pc[pos + 1]);
-                fold_set(sp, fm);
+                fold_set(sp, fm, 1);
                 cur[var_count + sp] = WHALE_T_ICONST;
-                whale_vexpr[sp].inv = 1;
                 sp++;
             }
             break;
@@ -3538,9 +3653,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int fm = fold_mark();
 
                 wt_int((int)(int16_t)whale_get_u16(pc + pos + 1));
-                fold_set(sp, fm);
+                fold_set(sp, fm, 1);
                 cur[var_count + sp] = WHALE_T_ICONST;
-                whale_vexpr[sp].inv = 1;
                 sp++;
             }
             break;
@@ -3549,9 +3663,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int fm = fold_mark();
 
                 wt_int((int)(int32_t)whale_get_u32(pc + pos + 1));
-                fold_set(sp, fm);
+                fold_set(sp, fm, 1);
                 cur[var_count + sp] = WHALE_T_ICONST;
-                whale_vexpr[sp].inv = 1;
                 sp++;
             }
             break;
@@ -3590,9 +3703,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     wt_int((int)JS_VALUE_GET_INT(c));
                 else
                     wt_num(JS_VALUE_GET_FLOAT64(c));
-                fold_set(sp, fm);
+                fold_set(sp, fm, 1);
                 cur[var_count + sp] = WHALE_T_NUM;
-                whale_vexpr[sp].inv = 1;
                 sp++;
             }
             break;
@@ -3601,7 +3713,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int fm = fold_mark();
 
                 wt_int(1);
-                fold_set(sp, fm);
+                fold_set(sp, fm, 1);
                 cur[var_count + sp] = WHALE_T_BOOL;
                 sp++;
             }
@@ -3611,7 +3723,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int fm = fold_mark();
 
                 wt_int(0);
-                fold_set(sp, fm);
+                fold_set(sp, fm, 1);
                 cur[var_count + sp] = WHALE_T_BOOL;
                 sp++;
             }
@@ -3637,7 +3749,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int fm = fold_mark();
 
                 wt_int(0);
-                fold_set(sp - 1, fm);
+                fold_set(sp - 1, fm, 1);
                 cur[var_count + sp - 1] = WHALE_T_BOOL;
             }
             break;
@@ -3835,6 +3947,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         fold_commit(fm);
                         whale_vname[sp - 2] = nm;
                         whale_vmat[sp - 2] = 1;
+                        whale_vexpr[sp - 2].inv = 0;   /* a memory read */
                     }
                     cur[var_count + sp - 2] = WHALE_T_NUM;
                     sp--;
@@ -3864,6 +3977,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     fold_commit(fm);
                     whale_vname[sp - 2] = nm;
                     whale_vmat[sp - 2] = 1;
+                    whale_vexpr[sp - 2].inv = 0;   /* a memory read */
                 }
                 cur[var_count + sp - 2] = WHALE_T_NUM;
                 sp--;
@@ -4413,6 +4527,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     }
                     whale_vname[sp] = nm;
                     whale_vmat[sp] = 1;
+                    whale_vexpr[sp].inv = 0;   /* a memory read */
                     cur[var_count + sp] = WHALE_T_NUM;
                     sp++;
                     break;
@@ -4436,6 +4551,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         fold_commit(fm);
                         whale_vname[sp] = nm;
                         whale_vmat[sp] = 1;
+                        whale_vexpr[sp].inv = 0;   /* a memory read */
                     }
                     cur[var_count + sp] = WHALE_T_NUM;
                     sp++;
@@ -4498,6 +4614,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                             }
                             whale_vname[sp - 1] = nm;
                             whale_vmat[sp - 1] = 1;
+                            whale_vexpr[sp - 1].inv = 0;   /* a memory read */
                             cur[var_count + sp - 1] = WHALE_T_NUM;
                             break;
                         }
@@ -4515,6 +4632,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     }
                     whale_vname[sp - 1] = nm;
                     whale_vmat[sp - 1] = 1;
+                    whale_vexpr[sp - 1].inv = 0;   /* a memory read */
                     cur[var_count + sp - 1] = WHALE_T_NUM;
                     break;
                 }
@@ -4545,7 +4663,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                        block ends, and fold_materialize() gives it a real slot then. */
                     fm = fold_mark();
                     wt_slot("L", whale_str_L[col]);
-                    fold_set(sp - 1, fm);
+                    /* A memory read: the column can change between iterations
+                       (a store through another slot), so never invariant. */
+                    fold_set(sp - 1, fm, 0);
                     cur[var_count + sp - 1] = WHALE_T_NUM;
                     break;
                 }
@@ -4569,6 +4689,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                                     (whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1))) && WHALE_IS_OBJ(ta));
                 whale_vname[sp - 1] = nm;
                 whale_vmat[sp - 1] = 1;
+                whale_vexpr[sp - 1].inv = 0;   /* a memory read */
                 cur[var_count + sp - 1] = WHALE_T_NUM;
             }
             break;
@@ -4632,6 +4753,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     fold_commit(fm);
                     whale_vname[sp - 1] = nm;
                     whale_vmat[sp - 1] = 1;
+                    whale_vexpr[sp - 1].inv = 0;   /* a memory read */
                 }
                 cur[var_count + sp - 1] = WHALE_T_NUM;
             }
@@ -4756,14 +4878,25 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 }
                 {
                     int fm = fold_mark();
+                    int li = 0;
 
                     local_inline(idx);
-                    fold_set(sp, fm);
-                    /* A constant local inlines as its literal: the expression
-                       is loop-invariant iff the local is. */
-                    if (idx >= 0 && idx < WHALE_JIT_MAX_SLOTS &&
-                        whale_lo_c[idx])
-                        whale_vexpr[sp].inv = 1;
+                    /* Invariance of a local read: a constant local inlines as
+                       its literal (invariant); a still-pending expression keeps
+                       whatever it was when the local was stored; an already
+                       materialised local is a variable read, invariant only if
+                       the loop body never writes it. Decided before fold_set:
+                       a long pending expression materialises inside, and the
+                       hoist decision needs the value already in place. */
+                    if (idx >= 0 && idx < WHALE_JIT_MAX_SLOTS) {
+                        if (whale_lo_c[idx])
+                            li = 1;
+                        else if (whale_lmem[idx].live)
+                            li = whale_lmem[idx].expr.inv;
+                        else if (whale_local_invariant(idx))
+                            li = 1;
+                    }
+                    fold_set(sp, fm, li);
                 }
                 cur[var_count + sp] = (uint8_t)t;
                 sp++;
@@ -4938,7 +5071,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 local_forget(idx);
                 fm = fold_mark();
                 fold_inline(sp - 1);
-                local_set(idx, fm);
+                local_set(idx, fm, whale_vexpr[sp - 1].inv);
                 cur[idx] = (uint8_t)t;
                 whale_lo_c[idx] = 0;
                 sp--;
@@ -5013,7 +5146,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 local_forget(idx);
                 fm = fold_mark();
                 fold_inline(sp - 1);
-                local_set(idx, fm);
+                local_set(idx, fm, whale_vexpr[sp - 1].inv);
                 cur[idx] = (uint8_t)t;
                 whale_lo_c[idx] = 0;
                 /* sp unchanged */
@@ -5055,7 +5188,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 local_materialize(idx);
                 fm = fold_mark();
                 wt_slot("L", idx); wt('+'); fold_inline(sp - 1);
-                local_set(idx, fm);
+                /* The expression names L<idx>, a loop-carried variable: never
+                   invariant, whatever the right operand is. */
+                local_set(idx, fm, 0);
                 cur[idx] = WHALE_T_NUM;
                 whale_lo_c[idx] = 0;
                 sp--;
@@ -5066,16 +5201,25 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 { WHALE_STEP_INSTEAD_OF_BAILING(); }
             {
                 int fm = fold_mark();
+                int li0 = 0, li1 = 0;
 
                 local_inline(0);
-                fold_set(sp, fm);
                 if (whale_lo_c[0])
-                    whale_vexpr[sp].inv = 1;
+                    li0 = 1;
+                else if (whale_lmem[0].live)
+                    li0 = whale_lmem[0].expr.inv;
+                else if (whale_local_invariant(0))
+                    li0 = 1;
+                fold_set(sp, fm, li0);
                 fm = fold_mark();
                 local_inline(1);
-                fold_set(sp + 1, fm);
-                if (var_count > 1 && whale_lo_c[1])
-                    whale_vexpr[sp + 1].inv = 1;
+                if (whale_lo_c[1])
+                    li1 = 1;
+                else if (whale_lmem[1].live)
+                    li1 = whale_lmem[1].expr.inv;
+                else if (whale_local_invariant(1))
+                    li1 = 1;
+                fold_set(sp + 1, fm, li1);
             }
             cur[var_count + sp] = cur[0];
             cur[var_count + sp + 1] = cur[1];
@@ -5101,9 +5245,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 }
                 fm = fold_mark();
                 wt_slot("A", idx);
-                fold_set(sp, fm);
+                fold_set(sp, fm, 1);   /* arguments never change */
                 cur[var_count + sp] = WHALE_T_NUM;
-                whale_vexpr[sp].inv = 1;   /* arguments never change */
                 sp++;
             }
             break;
@@ -5146,6 +5289,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     fold_commit(fm);
                     whale_vname[sp] = nm;
                     whale_vmat[sp] = 1;
+                    whale_vexpr[sp].inv = 0;   /* captured state: not invariant */
                     cur[var_count + sp] = WHALE_T_NUM;
                     sp++;
                     break;
@@ -5207,8 +5351,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 cur[var_count + sp] = WHALE_T_SELF;
                 /* SELF has no value expression: mark the slot materialised so
                    a later use can never inline whatever was recorded there
-                   before (the slot is only ever consumed as a call target). */
+                   before (the slot is only ever consumed as a call target) -
+                   and clear whatever invariance that record had. */
                 whale_vmat[sp] = 1;
+                whale_vexpr[sp].inv = 0;
                 sp++;
             }
             break;
@@ -5299,6 +5445,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     fold_commit(fm);
                     whale_vname[sp] = nm;
                     whale_vmat[sp] = 1;   /* marks the fold slot dead; unused for objects */
+                    whale_vexpr[sp].inv = 0;
                     cur[var_count + sp] = WHALE_OBJ_T(slot);
                     sp++;
                     break;
@@ -5310,9 +5457,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
                     fold_commit(fm);
                     /* the helper wrote straight into the slot, so it is a real
-                       variable now rather than a folded expression */
+                       variable now rather than a folded expression - and a
+                       memory read, so never invariant */
                     whale_vname[sp] = nm;
                     whale_vmat[sp] = 1;
+                    whale_vexpr[sp].inv = 0;
                 }
                 cur[var_count + sp] = WHALE_T_NUM;
                 sp++;
@@ -5701,9 +5850,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                        materialised is what makes later uses refer to it: without
                        this the slot still held the expression of some earlier
                        value (a call argument, say) and would be inlined as that
-                       instead of as the call result. */
+                       instead of as the call result. The call result itself
+                       is a fresh value - whatever invariance the old expression
+                       had is gone with it. */
                     whale_vname[func_slot] = nm;
                     whale_vmat[func_slot] = 1;
+                    whale_vexpr[func_slot].inv = 0;
                 }
                 cur[var_count + func_slot] = WHALE_T_NUM;
                 sp = func_slot + 1;
@@ -5743,9 +5895,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     inva = whale_vexpr[sp - 2].inv;
                     invb = whale_vexpr[sp - 1].inv;
                     wt('('); fold_inline(sp - 2); wt_op(opid); fold_inline(sp - 1); wt(')'); wt('?'); wt_int(1); wt(':'); wt_int(0);
-                    fold_set(sp - 2, fm);
+                    fold_set(sp - 2, fm, inva && invb);
                     cur[var_count + sp - 2] = WHALE_T_BOOL;
-                    whale_vexpr[sp - 2].inv = (uint8_t)(inva && invb);
                 } else {
                     int fm = fold_mark();
                     int inva, invb;
@@ -5753,9 +5904,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     inva = whale_vexpr[sp - 2].inv;
                     invb = whale_vexpr[sp - 1].inv;
                     fold_inline(sp - 2); wt_op(opid); fold_inline(sp - 1);
-                    fold_set(sp - 2, fm);
+                    fold_set(sp - 2, fm, inva && invb);
                     cur[var_count + sp - 2] = WHALE_T_NUM;
-                    whale_vexpr[sp - 2].inv = (uint8_t)(inva && invb);
                 }
                 sp--;
             }
@@ -5822,8 +5972,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     } else {
                         fold_mod(sp - 2, sp - 1);
                     }
-                    fold_set(sp - 2, fm);
-                    whale_vexpr[sp - 2].inv = (uint8_t)(inva && invb);
+                    fold_set(sp - 2, fm, inva && invb);
                 }
             }
             cur[var_count + sp - 2] = WHALE_T_NUM;
@@ -5850,8 +5999,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 fold_toint32(sp - 1, whale_type_is_num(cur[var_count + sp - 1]),
                          cur[var_count + sp - 1] == WHALE_T_ICONST);
                 wt(')');
-                fold_set(sp - 2, fm);
-                whale_vexpr[sp - 2].inv = (uint8_t)(inva && invb);
+                fold_set(sp - 2, fm, inva && invb);
             }
             cur[var_count + sp - 2] = WHALE_T_I32;   /* & | ^ are int32 by definition */
             sp--;
@@ -5875,8 +6023,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 wt('('); fold_toint32(sp - 1, whale_type_is_num(cur[var_count + sp - 1]),
                          cur[var_count + sp - 1] == WHALE_T_ICONST); wt('&'); wt_int(31); wt(')');
                 wt(')');
-                fold_set(sp - 2, fm);
-                whale_vexpr[sp - 2].inv = (uint8_t)(inva && invb);
+                fold_set(sp - 2, fm, inva && invb);
             }
             /* >>> is unsigned, so its result can exceed int32; << and >> cannot */
             cur[var_count + sp - 2] = (op == OP_shr) ? WHALE_T_NUM : WHALE_T_I32;
@@ -5887,9 +6034,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 { WHALE_STEP_INSTEAD_OF_BAILING(); }
             {
                 int fm = fold_mark();
+                int inv = whale_vexpr[sp - 1].inv;
 
                 wt('-'); fold_inline(sp - 1);
-                fold_set(sp - 1, fm);
+                fold_set(sp - 1, fm, inv);
             }
             cur[var_count + sp - 1] = WHALE_T_NUM;
             break;
@@ -5907,12 +6055,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 { WHALE_STEP_INSTEAD_OF_BAILING(); }
             {
                 int fm = fold_mark();
+                int inv = whale_vexpr[sp - 1].inv;
 
                 /* !x is true for 0 and for NaN */
                 wt('('); wt('('); fold_inline(sp - 1); wt_op(JS_OP_NE); fold_inline(sp - 1); wt(')');
                 wt_op(JS_OP_OR); wt('('); fold_inline(sp - 1); wt_op(JS_OP_EQ); wt_int(0); wt(')'); wt(')');
                 wt('?'); wt_int(1); wt(':'); wt_int(0);
-                fold_set(sp - 1, fm);
+                fold_set(sp - 1, fm, inv);
             }
             cur[var_count + sp - 1] = WHALE_T_BOOL;
             break;
@@ -5921,10 +6070,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 { WHALE_STEP_INSTEAD_OF_BAILING(); }
             {
                 int fm = fold_mark();
+                int inv = whale_vexpr[sp - 1].inv;
 
                 wt('('); wk(JS_WK_DOUBLE); wt(')'); wt('~'); fold_toint32(sp - 1, whale_type_is_num(cur[var_count + sp - 1]),
                          cur[var_count + sp - 1] == WHALE_T_ICONST);
-                fold_set(sp - 1, fm);
+                fold_set(sp - 1, fm, inv);
             }
             cur[var_count + sp - 1] = WHALE_T_I32;
             break;
@@ -5933,9 +6083,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 { WHALE_STEP_INSTEAD_OF_BAILING(); }
             {
                 int fm = fold_mark();
+                int inv = whale_vexpr[sp - 1].inv;
 
                 fold_inline(sp - 1); wt(op == OP_inc ? '+' : '-'); wt_int(1);
-                fold_set(sp - 1, fm);
+                fold_set(sp - 1, fm, inv);
             }
             cur[var_count + sp - 1] = WHALE_T_NUM;
             break;
@@ -5947,11 +6098,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 if (idx < 0 || idx >= var_count || !whale_type_is_num(cur[idx]))
                     { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 /* `L++` folds like add_loc: the current value may still be a
-                   pending expression, so it is written out first. */
+                   pending expression, so it is written out first. The result
+                   names the variable L<idx> - never invariant. */
                 local_materialize(idx);
                 fm = fold_mark();
                 wt_slot("L", idx); wt('+'); wt_int(1);
-                local_set(idx, fm);
+                local_set(idx, fm, 0);
                 cur[idx] = WHALE_T_NUM;
                 whale_lo_c[idx] = 0;
             }
@@ -6038,8 +6190,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     wt_int(os); wt(')'); wt(';');
                     /* fold_set, not fold_commit: the slot's fold state has to say it
                        is materialised, or a later op inlining stack slot `sp` gets an
-                       empty expression - `v[0] = () ;`, which TinyCC refuses. */
-                    fold_set(sp, fm);
+                       empty expression - `v[0] = () ;`, which TinyCC refuses.
+                       An object slot, never a number: invariance is moot. */
+                    fold_set(sp, fm, 0);
                     cur[var_count + sp] = WHALE_VAL_T(os);
                 }
                 sp++;
@@ -6310,6 +6463,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     whale_vexpr = NULL;
     whale_vmat = NULL;
     whale_lmem = NULL;
+    if (whale_loop_written)
+        free(whale_loop_written);
+    whale_loop_written = NULL;
+    whale_loop_wn = 0;
     return ret;
 }
 
