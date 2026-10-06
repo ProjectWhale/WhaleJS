@@ -2246,15 +2246,26 @@ PARTIAL（机制就绪，决策收缩，零收益零回归）
    后证伪非主因，保留重置）。
 
 ## 范围收缩（诚实记录未解的）
-- **local pin hang**：minmax（嵌套）与 nested（任 pin 一个 local 即 hang）——
-  归纳变量不前进 + 比较操作数错乱（hang.asm：`i++` 消失，`i<n` 读成 `i<s`）。
-  pin 的 gen_op 归一化与 TCC 比较/条件生成有未知交互，超出快速修复范围。
-  决策：local pin 全关（`if (0 && ...)`），下轮专项排查。
+- **local pin hang**（未解，但证据链已闭合）：
+  - 四个归一化假设全部被实验证伪：手工改 vtop[].r（删）、gen_op 入口 gv 全路径
+    归一化（试）、vstore 后保持 lvalue 形态（试）、跨函数表隔离（试）——全不解决。
+  - **gv trace 决定性证据**（WHALE_PIN_DBG）：alloc 成功（loc=-104/-112 →
+    xmm5/xmm4）、Invalidate 写回清位正常、**gv 重载路径完全正常**（mask 从 0 →
+    0x100000 → 0x300000 逐位恢复）、wrapper 编译时表重置（n=0）也正常。
+    **pin 机制本身在 core 内无一处错误。**
+  - 新假设（下轮第一嫌疑）：**pin 占用寄存器池后，TCC 表达式求值的浮点临时不够，
+    `get_reg(RC_FLOAT)` 返回 -1，某个调用方把 -1 当寄存器号用** → 生成坏代码
+    （死循环/hang.asm 的 i++ 消失 + 比较错乱与此吻合：坏代码形态）。验证方法：
+    在 `get_reg` 返回 -1 处加打印/断言，pin 开跑 nested 即抓现行；若坐实，修法是
+    get_reg 失败时 spill 一个 pin（pin 位当"可回收"用，正如 cb87bf1 当年对
+    exhaustion 的处理），或者池再留一个余量。
+  - 另：31ms 的旧收益数据出自 debug 构建，release 下从未复现；local pin 的
+    hang 在纯 release 下确认（minmax 与 nested 都是）。
 - **_wv pin + 调用 = NaN**：_wv 的 slot 从不写入（materialize 只写寄存器），
   调用后重载读旧值（immutable_update NaN）。决策：_wv pin 只在无调用函数开
   （`whale_loop_has_call`，纯数值白名单 `whale_is_pure_num_op` 判定）。
 - 当前效果：25/25 全对 0 mismatch；nested 76、bitops 154、array 53、minmax 108
-  全是基线噪声内（零收益零回归）。31ms 的 local+_wv 全开形态因 hang 不能上线。
+  全是基线噪声内（零收益零回归）。
 
 ## 验证
 `whale api test: ok`；25/25 全对，0 mismatch（repeat=1 全量 + repeat=3 关键 case）。

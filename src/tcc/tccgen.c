@@ -2340,24 +2340,29 @@ ST_FUNC void gen_op(int op)
     int u, t1, t2, bt1, bt2, t;
     CType type1;
 
-    /* WhaleJS (ELS): a pinned local's value lives in its register, not in its
-       frame slot, so it must never be taken as a memory reference. gen_opf()
-       and gen_opi() decide that from VT_LVAL, and the operand still looks like
-       an lvalue here - taking it as one makes the load read the frame slot
-       the value was never written to. Say what gv() would have said: both
-       operands are in their registers. A pin whose validity bit is clear (a
-       call killed it) is left alone: gv() will reload it on read. */
+    /* WhaleJS (ELS): normalise pinned operands through gv()'s FULL path
+       before the backend sees them. gen_opf()/gen_opi() treat an operand
+       carrying VT_LVAL as a memory reference, and a pinned local must not be
+       one (its value lives in the register; the slot is stale). Doing this
+       through gv() - not by rewriting vtop[].r by hand - keeps every piece of
+       bookkeeping intact (register allocation side effects, r2, the vstack
+       state expr_cond/gvtst read afterwards); hand-rewriting here is exactly
+       what made a pinned loop counter stop advancing and a compare read the
+       wrong operand (hang.asm). Non-pinned operands are untouched. */
     {
         int wi;
 
-        for (wi = -1; wi <= 0; wi++) {
-            if ((vtop[wi].r & VT_VALMASK) == VT_LOCAL) {
-                int wp = whale_pin_find((int)vtop[wi].c.i);
-
-                if (wp >= 0 && (whale_pinned_regs & (1u << wp)) == 0)
-                    continue;
-                if (wp >= 0)
-                    vtop[wi].r = (vtop[wi].r & ~(VT_VALMASK | VT_LVAL)) | wp;
+        for (wi = 0; wi >= -1; wi--) {
+            if ((vtop[wi].r & VT_LVAL) &&
+                (vtop[wi].r & VT_VALMASK) == VT_LOCAL &&
+                whale_pin_find((int)vtop[wi].c.i) >= 0) {
+                if (wi == -1) {
+                    vswap();
+                    gv(is_float(vtop->type.t & VT_BTYPE) ? RC_FLOAT : RC_INT);
+                    vswap();
+                } else {
+                    gv(is_float(vtop->type.t & VT_BTYPE) ? RC_FLOAT : RC_INT);
+                }
             }
         }
     }
@@ -3399,12 +3404,15 @@ ST_FUNC void vstore(void)
             }
             r = gv(rc);  /* generate value */
             /* WhaleJS (ELS): a pinned destination keeps the value in its
-               register instead of writing it back to the stack frame. The tail
-               mirrors the store path: vswap() brings the value down over the
-               destination, and the register field is rewritten so later reads
-               know where the value actually lives. A pin whose validity bit is
-               clear (a call killed it) goes through the normal path: the store
-               lands in the slot, and the next read reloads the register. */
+               register instead of writing it back to the stack frame. The
+               value moves into pr; the assignment EXPRESSION still yields the
+               variable as an lvalue (VT_LOCAL|VT_LVAL) exactly like the normal
+               store path leaves it - rewriting the result to the register
+               destroyed the lvalue shape and every later use of the assignment
+               (`i = i + 1`, chained assignment) misbehaved, which is how a
+               pinned loop counter stopped advancing. A pin whose validity bit
+               is clear (a call killed it) goes through the normal path: the
+               store lands in the slot, and the next read reloads. */
             if ((vtop[-1].r & VT_VALMASK) == VT_LOCAL) {
                 int pr = whale_pin_find((int)vtop[-1].c.i);
 
@@ -3415,8 +3423,6 @@ ST_FUNC void vstore(void)
                         move_reg(pr, r, vtop->type.t);
                     vswap();
                     vtop--;
-                    /* the value is in a register now, so VT_LVAL has to go too */
-                    vtop->r = (vtop->r & ~(VT_VALMASK | VT_LVAL)) | pr;
                     vtop->r |= delayed_cast;
                     return;
                 }
@@ -7176,6 +7182,8 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
             if (whale_pin_next) {
                 int pr = whale_pin_alloc(type->t);
 
+                if (getenv("WHALE_PIN_DBG"))
+                    fprintf(stderr, "[pin] alloc loc=%d -> reg=%d\n", (int)addr, pr);
                 if (pr >= 0 && whale_pin_n < 16) {
                     whale_pin_loc[whale_pin_n] = addr;
                     whale_pin_reg[whale_pin_n] = pr;

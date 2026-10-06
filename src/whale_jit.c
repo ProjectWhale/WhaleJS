@@ -3214,11 +3214,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         int order[WHALE_JIT_MAX_SLOTS];
         int norder = 0, k, m, q;
 
-        /* Local pinning is off until the nested-loop hang is root-caused
-           (a pinned induction variable stops advancing; minmax and nested
-           both hang with any local pinned, even one - see the hang.asm
-           evidence where i++ vanishes and the compare reads the wrong
-           operands). The _wv path above carries the ELS gain for now. */
+        /* Local pinning is OFF (hang, unresolved - see notes <82> for the
+           full evidence chain: allocation succeeds, the validity bit is set,
+           the first call writeback clears it, and the bit is never observed
+           set again; four normalisation hypotheses were tried and falsified).
+           The _wv pin on call-free bodies is the surviving ELS gain. */
         if (0 && info->loop_count <= 1 && !whale_loop_has_call) {
         for (k = 0; k < var_count && k < WHALE_JIT_MAX_SLOTS; k++)
             if (whale_loop_heat[k] > 0 && !whale_loc_obj[k] && assign_cnt[k] > 1)
