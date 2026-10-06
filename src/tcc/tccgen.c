@@ -1242,6 +1242,37 @@ ST_FUNC int get_reg(int rc)
             return r;
         }
     }
+    /* WhaleJS (ELS): last resort - reclaim a pinned register. Its frame
+       slot is its home (pinned locals are ordinary declarations), so
+       spilling the value there is safe and the next read of the pin
+       reloads it (gv(), validity bit). Only a register no vstack entry
+       references can be taken - a vstack value in pr would be clobbered by
+       that later reload. Without this, exhausting the float pool made
+       get_reg return -1 and callers emitted code with register -1. */
+    if (rc & RC_FLOAT) {
+        int i;
+
+        for (i = 0; i < whale_pin_n; i++) {
+            int pr = whale_pin_reg[i];
+            SValue sv;
+
+            if (!(whale_pinned_regs & (1u << pr)))
+                continue;
+            for(p=vstack;p<=vtop;p++) {
+                if ((p->r & VT_VALMASK) == pr ||
+                    (p->r2 & VT_VALMASK) == pr)
+                    break;
+            }
+            if (p <= vtop)
+                continue;
+            sv.type.t = VT_DOUBLE;
+            sv.r = VT_LOCAL | VT_LVAL;
+            sv.c.i = whale_pin_loc[i];
+            store(pr, &sv);
+            whale_pinned_regs &= ~(1u << pr);
+            return pr;
+        }
+    }
     /* Should never comes here */
     return -1;
 }

@@ -1382,14 +1382,13 @@ static void fold_materialize(int k)
        name as a token, and rewriting that variable would silently change those
        references. The prologue declares stack_size + WHALE_VSER_MAX variables,
        so this cannot run out for any function seen so far.
-       ELS: inside a loop the name is a pinned register local (_wv<n>) rather
-       than a state-block slot - the value is recomputed per trip and re-read,
-       so keeping it in xmm pays every iteration. Outside loops the block slot
-       is fine (written once, read rarely). Only when no loop body contains a
-       call (whale_loop_has_call): a _wv spanning a call reloads a slot that
-       was never written - materialize only writes the register - so the reload
-       fetches stale data (immutable_update went NaN this way). */
-    if (!whale_loop_has_call && whale_loop_depth > 0 && whale_vpin_next < WHALE_VPIN_MAX)
+       ELS: inside a single call-free loop the name is a pinned register local
+       (_wv<n>) rather than a state-block slot - the value is recomputed per
+       trip and re-read, so keeping it in xmm pays every iteration. Outside
+       that shape the block slot is fine (written once, read rarely; nested
+       loops fight over the 4-deep pool). Conditions match the prologue
+       declaration gate exactly. */
+    if (!whale_loop_has_call && whale_loop_depth == 1 && whale_vpin_next < WHALE_VPIN_MAX)
         whale_vname[k] = WHALE_VPIN_BASE + whale_vpin_next++;
     else
         whale_vname[k] = whale_vserial++;
@@ -1567,24 +1566,12 @@ static int whale_inline_tok[WHALE_TOK_MAX];
 static double whale_inline_num[WHALE_TOK_MAX];
 static int whale_inline_len;
 
-/* Speculative var_ref inlining is correct and fully wired (the closure reading
-   of a call target expands behind an identity guard), but on the one case where
-   the inlined body is heavy - immutable_update's setField, four field reads
-   moved into the caller's loop - it measures SLOWER than the engine fast-call
-   it replaces: the body's ~40 extra statements all go through memory because
-   TinyCC has no register allocator, which costs more than the ~50ns call it
-   eliminates. Every helper count is equal, the guard is free (measured with
-   and without), the loss is code quality, not mechanism. Default off until the
-   generator-side ELS (notes <66 cont> route B) gives those statements
-   registers; the switch reads through whale_dbg_env, so in a release
-   binary it is hard-off - enabling needs a --whale_debug=y build. */
+/* Speculative var_ref inlining with a body-size gate (see whale_inline_body):
+   small callees expand behind an identity guard, heavy ones keep the engine
+   fast-call. Correct and fully wired; the gate keeps it profitable. */
 static int whale_vr_inline_on(void)
 {
-    static int on = -1;
-
-    if (on < 0)
-        on = whale_dbg_env("WHALE_VR_INLINE") != NULL;
-    return on;
+    return 1;
 }
 /* The argument slots as the call site saw them. The body evaluates straight into
    the caller's stack above arg_base, so its own pushes and pops rewrite cur[],
@@ -1636,6 +1623,13 @@ static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
     if (callee->var_count != 0)
         return -1;                      /* locals would need slot remapping */
     if (callee->arg_count > 4)
+        return -1;
+    /* Body-size gate: a heavy body costs more inlined (every statement through
+       memory under TCC) than the ~50ns call it replaces. createElement (20
+       bytes, 3 fields incl. an object value and null) already loses to the
+       fast call; setField (52 bytes) worse. Only tiny bodies inline. Refused
+       bodies fall back to the fast call, which is already in place. */
+    if (len > 12)
         return -1;
     /* Statements the body lowers go to its own buffer (see its declaration);
        the switch also covers a body inside a loop body, where the enclosing
@@ -1753,8 +1747,25 @@ static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
                     goto done;
                 ta = cur[var_count + sp - 2];
                 tb = cur[var_count + sp - 1];
-                if (!WHALE_IS_OBJ(ta) || !whale_type_is_num(tb))
+                if (!WHALE_IS_OBJ(ta))
                     goto done;
+                /* An object value (a nested props object, a string key): hand
+                   it to the engine like the main loop's ObjDefineValue arm
+                   does. Only parked values travel - anything else refuses. */
+                if (!whale_type_is_num(tb)) {
+                    if (!WHALE_IS_VAL(tb) && !WHALE_IS_OBJ(tb))
+                        goto done;
+                    fm = fold_mark();
+                    wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjDefineValue"); wt('(');
+                    wt_id("ctx"); wt(','); wt_int(WHALE_OBJ_SLOT(ta)); wt(','); wt_int(atom);
+                    wt(','); wt_int(WHALE_IS_VAL(tb) ? WHALE_VAL_SLOT(tb) : WHALE_OBJ_SLOT(tb));
+                    wt(')'); wt(')');
+                    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    fold_commit(fm);
+                    sp--;
+                    break;
+                }
                 /* The fresh window covers the inlined initialiser too. */
                 if (whale_str_fresh == WHALE_OBJ_SLOT(ta)) {
                     int col = whale_str_col(whale_str_fresh_atoms, whale_str_fresh_n, atom);
@@ -1812,6 +1823,26 @@ static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
                 wt_int(op - OP_push_0);
                 fold_set(sp, fm, 1);
                 cur[var_count + sp] = WHALE_T_ICONST;
+                sp++;
+            }
+            break;
+
+        /* null / "" as a field value (vnode records hold both): park it like
+           the main loop does, so the following define_field sees a VAL. */
+        case OP_null: case OP_push_empty_string:
+            {
+                int os;
+
+                if (whale_objs >= WHALE_CALL_BASE)
+                    goto done;
+                os = whale_objs++;
+                fm = fold_mark();
+                wt_id(op == OP_null ? "JS_WhaleObjSlotNull"
+                                    : "JS_WhaleObjSlotEmptyString");
+                wt('('); wt_id("ctx"); wt(',');
+                wt_int(os); wt(')'); wt(';');
+                fold_commit(fm);
+                cur[var_count + sp] = WHALE_VAL_T(os);
                 sp++;
             }
             break;
@@ -3194,73 +3225,22 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        no call, no jump target in between - which is exactly the run of
        initialiser stores a factory body is. */
     wt_id("JSValue"); wt('*'); wt_id("_sdp"); wt(';');
-    /* The locals, as plain doubles - except the ELS picks: loop-hot numeric
-       locals get `register`, and the TCC-side pin mechanism (tccgen.c) keeps
-       them in xmm across statement boundaries instead of spilling every time.
-       At most 4 (the pin pool size); chosen by loop-body heat (reads +
-       2*writes), hottest first. Skipped for locals that hold objects
-       (whale_loc_obj: their value is a slot number, pinning it wastes a
-       register), for single-assignment locals (assign_cnt == 1: they become
-       lo_c constants read as literals, never from memory, so pinning them is
-       pure waste), for nested loops (loop_count > 1: two pinned induction
-       variables hang - the inner counter never advances - root cause unknown),
-       and when any loop body contains a call (a pin spanning a call pays
-       spill+reload per call for zero net gain, and stale reloads went wrong
-       before - stringcat/objshape). The _wv pins below are unaffected (fold
-       temporaries never span a call). When the gcc backend renders this stream
-       (`register` hints actively harmed its allocator - props_diff 125 ->
-       830ms - so the renderer strips them; see JS_WhaleRenderStream). */
-    {
-        int order[WHALE_JIT_MAX_SLOTS];
-        int norder = 0, k, m, q;
-
-        /* Local pinning is OFF (hang, unresolved - see notes <82> for the
-           full evidence chain: allocation succeeds, the validity bit is set,
-           the first call writeback clears it, and the bit is never observed
-           set again; four normalisation hypotheses were tried and falsified).
-           The _wv pin on call-free bodies is the surviving ELS gain. */
-        if (0 && info->loop_count <= 1 && !whale_loop_has_call) {
-        for (k = 0; k < var_count && k < WHALE_JIT_MAX_SLOTS; k++)
-            if (whale_loop_heat[k] > 0 && !whale_loc_obj[k] && assign_cnt[k] > 1)
-                order[norder++] = k;
-        }
-        /* hottest first (insertion: n is tiny) */
-        for (k = 1; k < norder; k++) {
-            int t = order[k];
-
-            for (m = k; m > 0 && whale_loop_heat[order[m - 1]] < whale_loop_heat[t]; m--)
-                order[m] = order[m - 1];
-            order[m] = t;
-        }
-        if (norder > 4)
-            norder = 4;
-        for (i = 0; i < var_count; i++) {
-            int pinned = 0;
-
-            for (q = 0; q < norder; q++)
-                if (order[q] == i) {
-                    pinned = 1;
-                    break;
-                }
-            if (pinned)
-                wk(JS_WK_REGISTER);
-            wk(JS_WK_DOUBLE); wt_slot("L", i); wt('='); wt_int(0); wt(';');
-        }
-        if (whale_dbg_env("WHALE_JIT_DUMP") && norder > 0) {
-            fprintf(stderr, "[els] pinned %d locals:", norder);
-            for (q = 0; q < norder; q++)
-                fprintf(stderr, " L%d(heat=%d)", order[q], whale_loop_heat[order[q]]);
-            fprintf(stderr, "\n");
-        }
+    /* The locals, as plain doubles. ELS local pinning is OFF (hang,
+       unresolved - see notes <82> for the evidence chain). */
+    for (i = 0; i < var_count; i++) {
+        wk(JS_WK_DOUBLE); wt_slot("L", i); wt('='); wt_int(0); wt(';');
     }
-    /* ELS spill slots: pinned `register double` locals for the hottest
-       materialised values inside loops. Disabled for now (the _wv pin path
-       hangs nested even with an empty decision - 8 unconditional `register`
-       declarations fill the 4-deep pin pool and starve TCC's own expression
-       evaluation; root cause of the starvation hang TBD). Plain doubles until
-       the pool accounting covers declarations that never get used. */
-    for (i = 0; i < WHALE_VPIN_MAX; i++) {
-        wk(JS_WK_DOUBLE); wt_slot("_wv", i); wt('='); wt_int(0); wt(';');
+    /* ELS spill slots: `register double` locals for the hottest materialised
+       values inside loops. Declared ONLY when they can be used - a function
+       with no loops (recursive fib) or with calls in its loops must not pay
+       8 zero-init stores per call for slots nothing will ever name; nested
+       loops are also out (the pin pool is only 4 deep and two loop levels
+       fighting over it spill more than they save - minmax regressed 20%).
+       The conditions match fold_materialize()'s assignment exactly. */
+    if (info->loop_count == 1 && !whale_loop_has_call) {
+        for (i = 0; i < WHALE_VPIN_MAX; i++) {
+            wk(JS_WK_REGISTER); wk(JS_WK_DOUBLE); wt_slot("_wv", i); wt('='); wt_int(0); wt(';');
+        }
     }
     if (whale_dbg_env("WHALE_STR_DBG")) {
         int cols = whale_layout_from_sites(whale_field_sites, whale_field_sites_n,
@@ -5756,8 +5736,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                                                   var_count, sp - argc);
                         whale_inline_nested = saved_nested;
                         if (whale_dbg_env("WHALE_JIT_DUMP"))
-                            fprintf(stderr, "[vr-inline] pos=%d argc=%d rtype=%d\n",
-                                    pos, argc, rtype);
+                            fprintf(stderr, "[vr-inline] pos=%d argc=%d rtype=%d clen=%d\n",
+                                    pos, argc, rtype, whale_vr_info[vidx].byte_code_len);
                         if (rtype < 0) {
                             /* the inliner refused this callee: its statements
                                died with the body's buffer, so the truncate only
@@ -5812,8 +5792,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         rtype = whale_inline_body(&ci, cur, var_count, sp - argc);
                         whale_inline_nested = saved_nested;
                         if (whale_dbg_env("WHALE_JIT_DUMP"))
-                            fprintf(stderr, "[inline] pos=%d argc=%d rtype=%d (num=%d slot=%d obj=%d)\n",
-                                    pos, argc, rtype, rtype == WHALE_T_NUM,
+                            fprintf(stderr, "[inline] pos=%d argc=%d rtype=%d clen=%d (num=%d slot=%d obj=%d)\n",
+                                    pos, argc, rtype, ci.byte_code_len, rtype == WHALE_T_NUM,
                                     WHALE_IS_SLOT(rtype), WHALE_IS_OBJ(rtype));
                         if (rtype < 0) {
                             /* the inliner could not expand this callee - it has

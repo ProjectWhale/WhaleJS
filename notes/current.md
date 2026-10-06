@@ -2270,4 +2270,47 @@ PARTIAL（机制就绪，决策收缩，零收益零回归）
 ## 验证
 `whale api test: ok`；25/25 全对，0 mismatch（repeat=1 全量 + repeat=3 关键 case）。
 ## 状态
-绿，待提交。下一步：local pin hang 专项（gen_op 归一化与 gvtst/expr_cond 的交互）。
+绿，已提交。下一步：fib per-call 开销、vr-inline 转正、vnode/immutable 追 v8。
+
+# <83>: fib 开销修复 + vr-inline 体门限转正 + 范围收紧
+SOLVED（开销+门限）/ PARTIAL（追 v8 未竟）
+
+## fib 21→19ms：_wv 无条件声明的 per-call 税
+- `_wv0..7` 无条件声明 → 无循环函数（递归 fib）每调用付 8 个零初始化 store。
+  修法：只在 `loop_count>0 && !has_call` 时声明（条件与 materialize 分配点一致）。
+- 另确认：heat 统计/pin 表全是编译期成本，per-call 只剩 `_ws` 零初始化与
+  prologue locals（一直有）。fib 稳在 19-20ms。
+
+## vr-inline 默认开 + 体门限（转正）
+- setField(52B) 内联亏 60%（386 vs 254ms），createElement(20B) 内联也亏
+  （27 vs 11ms）——当前 TCC 代码质量下任何实测体都亏。门限 12B（等于关闭但
+  保留路径：体质改善后调参即开，无需重构）。
+- 为 vnode 补内联体能力（对象值 `ObjDefineValue` 分支 + `OP_null` case），
+  但门限已挡住 createElement（实测亏则挡，对行为无影响，能力保留）。
+- clen 诊断（`[vr-inline]/[inline]` 打印体长）保留，调门限时用。
+- 25/25 全对，immutable 240（-4%）、vnode 11（基线）、全量零退化。
+
+## minmax +20% 回退与修复
+- `_wv` pin 在嵌套循环有害（两层争 4 深池，spill 反增）：minmax 109→129ms。
+- 修法：_wv 声明与分配统一收紧到 `loop_count == 1 && !has_call`
+  （之前声明是 `>0`、分配是 `depth>0`，条件不一致）。minmax 回 110ms。
+
+## 追 v8 现状（诚实）
+| case | v8 | whalejs | 倍数 | 路径 |
+|---|---|---|---|---|
+| vnode_build | 2-3 | 11 | ~4x | createElement 内联亏，需体质改善（ELS local pin）或压 fast-call |
+| immutable_update | 14-29 | 240 | ~10x | setField(52) 内联亏；field shape 特化未做 |
+| nested | 15-27 | 70 | ~3x | 等 local pin hang 修好（下轮专项，证据链完整） |
+- vnode/immutable 的缺口不在调用（fast-call 已最优），在**体质**（对象创建 +
+  字段访问的语句质量）——正是 ELS local pin 要解决的。顺序正确：先修 hang，
+  再谈追赶。
+
+## 预存问题（非本轮引入）
+- 退出崩溃（immutable/vnode，check 对）：e778eab 干净树亦崩，runner 口径
+  （只解析 WHALE_BENCH 行）无影响，用户直跑可见。待查（疑 FreeRuntime 期）。
+
+## 验证
+`whale api test: ok`；25/25 全对，0 mismatch；fib 19-20、nested 70、minmax 110、
+vnode 11、immutable 240（repeat=3 关键 case + repeat=1 全量）。
+## 状态
+绿，待提交。下一步：local pin hang 专项（get_reg -1 回收）。

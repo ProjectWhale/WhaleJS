@@ -2015,6 +2015,19 @@ static void gen_sse_prefix(int ext, int is_double, int is_arith)
    saved lvalue first, which is why they are two parameters rather than one. */
 static void gen_sse_modrm(int reg, int rmem, int r_mem, Sym *sym, int fc)
 {
+    /* WhaleJS (ELS): a pinned local carries VT_LVAL (it IS a variable) but
+       its value lives in its register, not in its frame slot. Taking it as a
+       memory reference here reads stale data - `i++` then never advances and
+       the loop hangs. Recognise the pin and use the register. (Declared in
+       tccgen.c, same translation unit.) */
+    extern int whale_pin_find(int loc);
+    extern unsigned whale_pinned_regs;
+    if ((rmem & VT_LVAL) && (rmem & VT_VALMASK) == VT_LOCAL) {
+        int pr = whale_pin_find(fc);
+
+        if (pr >= 0 && (whale_pinned_regs & (1u << pr)))
+            rmem = (rmem & ~(VT_VALMASK | VT_LVAL)) | pr;
+    }
     if (rmem & VT_LVAL)
         gen_modrm(reg, r_mem, sym, fc);
     else
