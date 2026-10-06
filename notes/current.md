@@ -2314,3 +2314,34 @@ SOLVED（开销+门限）/ PARTIAL（追 v8 未竟）
 vnode 11、immutable 240（repeat=3 关键 case + repeat=1 全量）。
 ## 状态
 绿，待提交。下一步：local pin hang 专项（get_reg -1 回收）。
+
+# <84>: fib per-call 开销 + local pin 重开验证
+SOLVED（开销）/ CONFIRMED-OFF（pin）
+
+## fib 21→14ms：三处 per-call 税
+1. **`_ws.sv[128]` 死存储删除**：frame-column 布局后列住在 `L[]` 变量，sv 数组
+   无一处读写（只剩声明）→ 删声明，_ws 缩 1KB。fib 20→16ms（best-of-5）。
+   `sp[128]` 保留（presence 还在用）。
+2. `_wv0..7` 条件声明（<83> 已做）：无循环函数不再付 8 个零初始化。
+3. struct 列 32 个零初始化门控（<83> 已做）：fib 无对象，跳过。
+- 三管齐下 fib 稳在 14-16ms（repeat=1 全量 14ms，best-of-5 16ms）。7ms 时代
+  的剩余差距在 `_ws` 整体（v/wa/fs/fp/fv/ap/an/ai/op/on/oi，fib 大部分不用但
+  `{0}` 整块初始化）——拆 struct 是大改，下轮评估按需清零 vs 拆分。
+- 用户原话验证：2ms 波动是误差，7ms 是地板；中间加入的内容（sv 死存储、
+  无条件 _wv/struct 列声明）确实是 per-call 税，已清。
+
+## local pin 重开验证（get_reg 回收已就位）
+- 重开 local pin → **连 whale_test 的 fibi 都 hang**（卡在 `[tcc]` 之后）。
+  get_reg -1 回收假设被证伪：hang 与池耗尽无关（whale_test 的小函数也 hang）。
+- 决策：local pin 保持关闭。hang 的完整证据链见 <82>；新补充：单 pin 也 hang、
+  重开即 hang 测试套。gen_op 入口的 gv 全路径归一化保留在树上（无害：无 pin
+  时 pin_find 全返回 -1，零行为变化），gen_sse_modrm 的 pin 识别保留（同理）。
+- 下轮专项方向修正：不再是"池耗尽"，而是 pin 变量进入表达式求值后的 vstack
+  状态错乱（hang.asm：i++ 消失 + 比较错乱）。从 `i++` 的 `L6 = L6 + 1` 在
+  pin 下的 vstore→gen_op→vstore 序列单步跟（token 级，不是猜）。
+
+## 验证
+`whale api test: ok`；25/25 全对，0 mismatch；fib 14、nested 75、minmax 118、
+vnode 11、immutable 247（repeat=1 全量）。
+## 状态
+绿，待提交。下一步：local pin hang 专项（表达式求值 vstack 跟踪）。

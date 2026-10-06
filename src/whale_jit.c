@@ -3225,8 +3225,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        no call, no jump target in between - which is exactly the run of
        initialiser stores a factory body is. */
     wt_id("JSValue"); wt('*'); wt_id("_sdp"); wt(';');
-    /* The locals, as plain doubles. ELS local pinning is OFF (hang,
-       unresolved - see notes <82> for the evidence chain). */
+    /* The locals, as plain doubles. ELS local pinning stays OFF: reopening
+       it hangs even whale_test's fibi (get_reg reclaim did not help - the
+       hang is not pool exhaustion). See notes <82>/<84> for the evidence. */
     for (i = 0; i < var_count; i++) {
         wk(JS_WK_DOUBLE); wt_slot("L", i); wt('='); wt_int(0); wt(';');
     }
@@ -3259,17 +3260,30 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             fprintf(stderr, "%s%d", si ? "," : "", whale_field_sites[si]);
         fprintf(stderr, "]\n");
     }
-    /* The struct-column variables, declared unconditionally. Which put_loc
-       actually lays an object out is decided per instruction (strn / call
-       position / mono), and a declaration gated on a prologue hint diverges
-       from that decision: the body then reads `L3` with no declaration, which
-       is exactly vnode_build's `L3 undeclared`. The layout itself is decided
-       later in the pass, so the count cannot come from there - declare the
-       full width (static columns are cheap) and let the layout use what it
-       needs. */
-    for (i = 0; i < WHALE_ATOM_MAX; i++) {
-        whale_str_L[i] = var_count + i;
-        wk(JS_WK_DOUBLE); wt_slot("L", whale_str_L[i]); wt('='); wt_int(0); wt(';');
+    /* The struct-column variables. Declared only when the function can use
+       them (field accesses or object-holding locals, both known from the
+       pre-scan): a pure numeric function like recursive fib must not pay 32
+       zero-init stores per call for columns nothing will ever name - at
+       ~240M calls (fib(26)x20) that was the 7ms-to-20ms gap. The gate covers
+       every use (unboxed-struct paths all require a field site or an object
+       local first), so no `Lundeclared` divergence like vnode_build's. */
+    {
+        int need_cols = (whale_field_sites_n > 0);
+        int d;
+
+        if (!need_cols) {
+            for (d = 0; d < var_count && d < WHALE_JIT_MAX_SLOTS; d++)
+                if (whale_loc_obj[d]) {
+                    need_cols = 1;
+                    break;
+                }
+        }
+        for (i = 0; i < WHALE_ATOM_MAX; i++) {
+            whale_str_L[i] = var_count + i;
+            if (need_cols) {
+                wk(JS_WK_DOUBLE); wt_slot("L", whale_str_L[i]); wt('='); wt_int(0); wt(';');
+            }
+        }
     }
     /* All of the generator's scratch state in one zero-initialised block: the
        value slots (stack_size plus the spare names fold_materialize() hands out,
@@ -3290,9 +3304,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wk(JS_WK_UNSIGNED); wt_id("char"); wt('*'); wt_id("op"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
         wk(JS_WK_DOUBLE); wt_id("on"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
         wk(JS_WK_INT); wt_id("oi"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
-        /* unboxed struct fields, and a presence flag each: a field that only some of
-           the observed shapes carry still gets its slot here */
-        wk(JS_WK_DOUBLE); wt_id("sv"); wt('['); wt_int(WHALE_STRUCT_SLOTS * WHALE_ATOM_MAX); wt(']'); wt(';');
+        /* unboxed struct presence flags, one per layout slot: a field that
+           only some of the observed shapes carry still gets its slot here.
+           (The old `sv` value array is gone: columns live in frame variables
+           L[whale_str_L[]] since the frame-column layout, so sv was 1KB of
+           dead zero-init per call - fib paid it 240M times.) */
         wk(JS_WK_UNSIGNED); wt_id("char"); wt_id("sp"); wt('['); wt_int(WHALE_STRUCT_SLOTS * WHALE_ATOM_MAX); wt(']'); wt(';');
     wt('}'); wt_id("_ws"); wt('='); wt('{'); wt_int(0); wt('}'); wt(';');
     /* 1, because a cached fv[] of 0 (from that zero initialiser) must not look
