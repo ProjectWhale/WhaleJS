@@ -2487,11 +2487,87 @@ SOLVED（profile）/ PLAN（线性 IR）
 - 非目标：不动 tccgen 本体（<67> 路线 A 永不）；不调 expr_max（本轮证伪）；
   不重开 L pin（<86> 定案）。
 
+## 状态
+绿，已提交 5060148。下一步：immutable/objshape 压到 100ms 线 + 退出崩溃修复。
+
+# <88>: 退出崩溃修复 + objshape escaped 相转正 + fver 语义收紧
+SOLVED ×3（崩溃 / escaped / 缓存语义）/ PARTIAL（immutable 未到 100ms 线）
+
+## bug#1：退出崩溃根因 = free-list drain 读错链指针（已修）
+- 现象：任何"函数内建对象字面量"（`var st={a:0}` + 循环读写，无需调用、
+  无需返回对象）的程序 check 对但 exit -1073741819（gdb：崩在
+  `JS_FreeRuntime` +627，`mov -0x4(%rdx),%eax` 读野指针）。
+- 根因：plain-object free list 的链指针存 `u.opaque`
+  （`free_object:9739`，因 prop 块随 shell 保留），但 `JS_FreeRuntime` 的
+  drain 仍按旧约定读 `p->prop`（struct 链的约定）→ 把 prop 块当链走，
+  逐个 `js_free_shape/js_free_rt` 释放 prop 块与对象体 → 堆破坏。
+  struct 链不受影响（它本来就走 `p->prop`）。
+- 修法（quickjs.c 一处）：drain 改读 `p->u.opaque` + 补上 `js_free_rt(p->prop)`
+ （prop 块随 shell 保留，drain 时才真正释放）。gdb 反汇编 + 二分 repro
+  （`temp/crash_repro*.js` 六组）定位；修后全部 status=0。
+- 教训：两条 free list 链指针约定不同（struct 用 prop、plain 用 opaque），
+  drain 与 checkout 必须同源。此前 <83>/<86> 记为"预存 FreeRuntime 问题"，
+  实为 <79> 引入 plain free list 时的配套遗漏。
+
+## bug#2：跨编译 speculative 状态泄漏（已修）
+- `whale_vr_fn[]/vr_expect_slot[]` 是文件级 static，只在首次 resolve 时写入、
+  从不重置 → 后编译的函数复用前一个函数的 callee 身份与 guard 下标，
+  新体编译进错误的 identity 检查。另 `whale_loc_obj[]/obj_pending/ret_obj_g`
+  同样跨编译残留（`whale_ret_obj_g` 一旦置 1 永不回 0 → 后续无对象函数
+  也走 struct 路径）。
+- 修法：`whale_jit_gen` pass-1 前统一重置（jit.c 一处 +4 行）。`whale_loc_fn/
+  slot_fn` 已在 2537 行重置，不动。
+- 行为变化：零（之前恰好因编译顺序未触发错答案，但 vnode 的 fn_3 等
+  struct 路径选择受其影响）。
+
+## objshape escaped 相：474→112ms（转正，进全量）
+- 症状：`escaped()`（`out[i&7]=t`，t 为对象）整函数拒编
+ （`gave up at pos=60 op=72 put_array_el, bail=4973`），400k 迭代跑解释器。
+- 根因：`t` 是 frame-column STRUCT（无 JSValue 在槽里），而 ArrSetVal 快速路
+  要求 `WHALE_IS_SLOT(tc)` → `WHALE_STEP_INSTEAD_OF_BAILING`；step 的
+  value-position fence 同样拒非数值 → 双重拒绝。
+- 修法：STRUCT 值先物化进共享对象槽（复用 `whale_str_obj_slot` + ObjNew +
+ 逐列 DefineNum，与 call-argument 的 mat-arg 同模式），再走 ArrSetVal。
+ `t` 的两列经 L 列直写已是数值，物化即两次 DefineNum。
+- 效果：escaped 相 474→112ms；objshape 全量 596→209ms（repeat=1 三引擎对照），
+  25/25 全对 0 mismatch。剩余 gap：两相对象读写仍是逐字段 helper
+ （twoShapes 49 vs node 17，见下）。
+
+## fver 语义收紧：put/set_loc 的对象赋值不再 bump（objshape 209→193ms）
+- 原语义：`put_loc/set_loc` 的对象槽统一路（ObjSlotCopy + `oi=0`）后无条件
+  `_ws.fver++`。`fver` 是**全局**版本号，一 bump 全函数 24 对缓存全部失效，
+  下一迭代逐个 re-resolve（ObjShape + ObjFieldPtr + hash 查找）。
+- 错误所在：局部变量换名（`st` 从槽 A 换到槽 B）没有改变任何 property
+  table——字段解析缓存的有效性只依赖"属性增删"，不依赖"局部变量名"。
+  前者才 bump（put_field/define_field/call 仍保留），后者免除。
+- 修法：删两处 `fver++`（put_loc 对象臂 + set_loc 对象��），注释写明不变��。
+  twoShapes/growsShape/writeOrder 均为"对象不出循环 + 字段固定"形态，直接受益。
+- 效果：objshape 213→193ms（全量），escaped 相 128→112ms；immutable 281→279
+  （调用链主导，几乎无感，符合预期）；25/25 全对。
+
+## immutable 现状：279ms，100ms 线路径已论证（未动手）
+- 编译形态（immutable_src.c 实测）：`step` 循环体 = CallSelfValue（整套
+  fast-call：arg 借槽 + 最小帧 + entry + 28 槽位清理）+ ObjFieldNum ×3 +
+  fp 直接写回；`setField` 本体 = StructNew + 4×ObjFieldPtr 解析 + `_sdp` 直写。
+  vr-inline `rtype=40 clen=52` 因 12B 体门限拒绝（放开验证过：364-423ms 更慢，
+  TCC 体质撑不起 52B 体，已回退）。
+- 每迭代成本拆分（100 万次迭代）：setField 侧 StructNew×1（含 free-list
+  checkout + 5 列重写 + GC 挂链）+ 4 次字段解析；step 侧 3 次字段解析 +
+  fast-call 全套。v8 13ms 说明此形状可拆箱到寄存器——我们当前每步都在堆上。
+- 100ms 线的两条路（均未动手，本轮只论证）：
+  1. **原地更新语义**（用户方向）：`st = setField(st, v)` 且 shape 不变时，
+     不建新对象，直接写旧对象列 + 触发 proxy/setter。需引擎语义层支持，
+     与 CStruct 列存储天然契合，预期直达 ~30ms 量级；
+  2. **调用融合**（线性 IR 第一刀）：props/setField 在调用点 StructNew +
+     工厂内联，但前提是体质（_wv/寄存器化）先行，否则重蹈 52B 内联更慢。
+- 本轮不动的原因：两者都是语义/架构级改动，需单独一轮。当前 279ms 已是
+  "全编译 + 零解释器"的正确形态，check 全对。
+
 ## 验证
 `whale api test: ok`；25/25 全对，0 mismatch（node/qjs/whalejs 三引擎对照，
-`temp/bench_87.json`）；fib 29（runner 噪声，基线 15-17）、minmax 150、
-immutable 254、vnode 11、nested 78、object 4（反超 node 32）、fib 反超
-node（29 vs 37）、objshape 622（escaped 相 GC 墙，见 <63>）。
+`temp/bench_88.json`）；immutable 282、objshape 209、vnode 11、nested 87、
+object 4（反超 node 24）、fib 19（反超 node 36）。
 ## 状态
-绿，待提交。下一步：线性 IR 实现（先调用链融合）/ immutable 原地更新
-（用户方向，优先级在 pin 之后——pin 已定案，可排期）。
+绿，待提交。下一步：immutable 原地更新语义 / 线性 IR 调用融合（二选一，
+用户定）；twoShapes 类"对象不出循环"形态的字段解析提升（fver 已收紧，
+下一步是 fs/fp 进寄存器）。

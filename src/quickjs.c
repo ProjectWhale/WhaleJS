@@ -2778,16 +2778,18 @@ void JS_FreeRuntime(JSRuntime *rt)
                 p = next;
             }
         }
-        /* Plain-object chain: empty shells, same treatment minus the columns
-           (no finalizer - JS_CLASS_OBJECT has none - and the prop block went
-           back when the object chained off). */
+        /* Plain-object chain: shells whose values were released and reset at
+           chain-off time (no finalizer - JS_CLASS_OBJECT has none). The prop
+           block stays with the shell, so it must NOT be freed here; the chain
+           link lives in u.opaque (see free_object), so the walk reads that. */
         p = rt->whale_obj_free;
         rt->whale_obj_free = NULL;
         rt->whale_obj_free_n = 0;
         while (p) {
-            next = (JSObject *)p->prop;
+            next = (JSObject *)p->u.opaque;
 
             js_free_shape(rt, p->shape);
+            js_free_rt(rt, p->prop);
             js_free_rt(rt, p);
             p = next;
         }

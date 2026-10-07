@@ -2628,11 +2628,22 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         loop_back[i] = -1;
     memset(whale_lo_c, 0, sizeof(whale_lo_c));
     memset(whale_lo_cv, 0, sizeof(whale_lo_cv));
-    /* the file-level struct-layout state: one compilation owns it at a time */
+    memset(whale_loc_obj, 0, sizeof(whale_loc_obj));
+    whale_obj_pending = 0;
+    whale_ret_obj_g = 0;
+    /* the file-level struct-layout state: one compilation owns it at a time.
+       whale_vr_fn/vr_expect_slot are the previous compilation's speculative
+       resolutions - a callee resolved for one function is meaningless for the
+       next, and reusing its guard index would compile the wrong identity
+       check into the new body. */
     whale_str_n = 0;
     whale_str_fresh = -1;
     whale_str_fresh_n = 0;
     whale_inline_str_n = 0;
+    for (i = 0; i < 4; i++) {
+        whale_vr_fn[i] = NULL;
+        whale_vr_expect_slot[i] = -1;
+    }
 
     /* pass 1: jump targets + which arguments are read */
     /* The previous opcode, for the one shallow test this pass makes about a return
@@ -4960,8 +4971,39 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                            one helper store out of the slot. This is the shape
                            objshape's escaped() phase is - without it every
                            function that keeps an object in an array is
-                           refused. */
-                        if (!WHALE_IS_SLOT(tc))
+                           refused. A STRUCT value (frame columns, no JSValue
+                           in any slot) cannot travel this way: materialise it
+                           into the shared object slot first (same pattern as
+                           the call-argument case above), then store that. */
+                        int mtc = tc;
+
+                        if (WHALE_IS_STRUCT(tc)) {
+                            if (whale_str_obj_slot < 0) {
+                                if (whale_objs >= WHALE_CALL_BASE)
+                                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
+                                whale_str_obj_slot = whale_objs++;
+                            }
+                            {
+                                int mfm = fold_mark();
+                                int mms = whale_str_obj_slot, mm;
+
+                                wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjNew"); wt('(');
+                                wt_id("ctx"); wt(','); wt_int(mms); wt(')'); wt(')');
+                                wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                                wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                                for (mm = 0; mm < whale_str_n; mm++) {
+                                    wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjDefineNum");
+                                    wt('('); wt_id("ctx"); wt(','); wt_int(mms); wt(',');
+                                    wt_int(whale_str_atoms[mm]); wt(',');
+                                    wt_slot("L", whale_str_L[mm]); wt(')'); wt(')');
+                                    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                                    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                                }
+                                fold_commit(mfm);
+                            }
+                            mtc = WHALE_OBJ_T(whale_str_obj_slot);
+                        }
+                        if (!WHALE_IS_SLOT(mtc))
                             { WHALE_STEP_INSTEAD_OF_BAILING(); }
                         os = WHALE_OBJ_SLOT(ta);
                         tk = whale_vserial++;      /* the index, evaluated once */
@@ -4975,7 +5017,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                             wt_arr("v", tk); wt('='); fold_inline(sp - 2); wt(';');
                             wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleArrSetVal");
                             wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(',');
-                            wt_arr("v", tk); wt(','); wt_int(WHALE_SLOT(tc)); wt(')'); wt(')');
+                            wt_arr("v", tk); wt(','); wt_int(WHALE_SLOT(mtc)); wt(')'); wt(')');
                             wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
                             wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
                             fold_commit(fm);
@@ -5236,10 +5278,17 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     fold_commit(fm);
                     local_forget(idx);
                     cur[idx] = (uint8_t)t;
-                    whale_lo_c[idx] = 0;                    fm = fold_mark();
-                    wt_id("_ws"); wt('.'); wt_id("fver"); wt('=');
-                    wt_id("_ws"); wt('.'); wt_id("fver"); wt_op(JS_OP_ADD); wt_int(1); wt(';');
-                    fold_commit(fm);
+                    whale_lo_c[idx] = 0;
+                    /* No fver bump: assigning an object only swaps which heap
+                       object the local names. No property table changed - no
+                       field was added, removed, or reordered - so every cached
+                       value pointer stays valid. The bump used to sit here
+                       unconditionally, and a loop-carried object local (the
+                       Redux `st`, reassigned from a call every iteration) then
+                       re-resolved every field on every trip for nothing. A
+                       store *through* the object (put_field/define_field on a
+                       heap object, or a call that may do either) still bumps -
+                       see those sites. */
                     sp--;
                     break;
                 }
@@ -5314,10 +5363,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     local_forget(idx);
                     cur[idx] = WHALE_VAL_T(loc_slot[idx]);
                     cur[var_count + sp - 1] = WHALE_VAL_T(loc_slot[idx]);
-                    whale_lo_c[idx] = 0;                    fm = fold_mark();
-                    wt_id("_ws"); wt('.'); wt_id("fver"); wt('=');
-                    wt_id("_ws"); wt('.'); wt_id("fver"); wt_op(JS_OP_ADD); wt_int(1); wt(';');
-                    fold_commit(fm);
+                    whale_lo_c[idx] = 0;
+                    /* No fver bump here either - same reason as put_loc above:
+                       only the identity in the local changed, no property
+                       table. */
                     break;
                 }
                 local_forget(idx);
