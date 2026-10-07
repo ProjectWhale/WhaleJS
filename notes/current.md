@@ -2420,4 +2420,78 @@ SOLVED（定案）/ 方向记录
 `whale api test: ok`；25/25 全对，0 mismatch；fib 15、minmax 110、
 immutable 242、vnode 11、nested 74（repeat=1 全量）。
 ## 状态
-绿，待提交。下一步：nested 融合检查 / vnode StructNew 开销 / 生成器侧分配。
+绿，已提交 720092b。下一步：nested 融合检查 / vnode StructNew 开销 /
+生成器侧分配。
+
+# <87>: nested 融合与 vnode 调用链 profile（零代码改动）+ 线性 IR 计划
+SOLVED（profile）/ PLAN（线性 IR）
+
+## nested：融合已完成，瓶颈是 TCC 语句级 spill（证据：nested_src.c）
+- `deep()` 的循环体在生成源码里就是**两条语句**：
+  `_wv0 = (LICM 外提的两段常量)；_wv1 = (..._wv0...)；L5 = _wv1；L6++`。
+  33-token 与 28-token 子表达式各外提一次（<81> 的 2 hoists），`whale_expr_max=24`
+  的物化点没有过密——反而正是 LICM 把 24 切出来的。
+- 循环内每迭代的真实工作：2 次 `_wv` 写 + 4 次 L 读写（`L5/L6` 各一读一写）。
+  对照 gcc-O2 同函数 6x（<73>），数值循环的 1.5-4x 上限里 ELS 只占分配维度。
+- 结论：前端无事可做。nested 的剩余差距等**生成器侧线性 IR 分配**
+  （见下），不再调 expr_max / 融合。
+
+## vnode：createElement 11-18ms 的构成（证据：create_src.c ×3 份生成源码）
+- `createElement(type,props)` 本体的编译形态已是最优：StructNew + `_sdp` 直写
+  3 列（type/props 的 double 化 + key 的 ObjDefineValue），无 helper 扫描。
+- 循环体（closure-reading，fn_1/fn_2）每迭代的调用链实测：
+  props `{id,cls}` 走**普通对象路径**（ObjNew + DefineNum + ObjSlotAtom +
+  BinopVal + DefineValue）→ createElement 经 CallValue/fast-call →
+  返回 struct → `v.type+v.props.id` 经 **ObjFieldNum ×5（含保留的 L3/L5
+  死读）** → `+` 经 StepRun fallback。约 15 个 helper/迭代，其中一半是
+  **props 小对象自身的创建与销毁**（cls 字符串拼接 + BinopVal）。
+- 关键反证：`object` case（同 loop800 万次对象读写）4ms 反超 node 25ms——
+  同一套 helper 在"对象不出循环"的形状下是赢的。vnode 慢不在 StructNew
+  （free-list 命中 + 单块分配已兑现），而在**每迭代 2 个对象的分配 +
+  跨函数调用链**（props + vnode + fast-call + 5 次字段解析）。
+- 用户指出的两条 vnode 检查结论：
+  1. "列创建繁琐固定开销"——证伪：StructNew 是 free-list 复用 + 单块
+     分配 + 3 次直写，固定步骤无可省（`JS_NewObjectClass` 只在 miss 时走，
+     实测 `hit=1 miss=0` 起步）。
+  2. createElement 20B > 12 门限挡内联——维持：门限实测 27 vs 11ms（<83>），
+     内联体的 _wv/寄存器体质不变之前调参即亏。
+- 真解（与 immutable 同构）：props 字面量内联进 createElement（同一
+  vr-inline 框架，`{id,cls}` 在调用点直接 StructNew）或调用点与工厂
+  一起做"同 shape 原地写"。记入 vr-inline 转正条件。
+
+## 本轮副产品（已验证行为，无代码改动）
+- 真 release（`xmake clean -a` 后全量重建）是静默的：WHALE_* 诊断只进
+  `--whale_debug=y`（<62> 契约成立）；`xmake -r` 的"cache compiling"是
+  缓存命中式增量，诊断开关的变更必须 `clean -a` 才能生效——之前"release
+  仍有打印"即此原因。
+- 退出崩溃（immutable/vnode，check 对，exit -1073741819）：runner 口径
+  （只解析 WHALE_BENCH 行）无影响；`WHALE_ENTER_COUNT` 下无 WHALE_ENTRIES
+  行，deopt 计数 9 次 flag=1 后即切换 reading——与 <62> 的"8 次退役"一致，
+  属同一预存问题（疑 FreeRuntime 期），本轮不动。
+- vr-inline 拒绝链：createElement `rtype=-1 clen=20` 是 12B 体门限（`len>12`
+  早返，`whale_inline_body:1632`），不是 define_field/get_field 能力问题
+  （ObjDefineValue + OP_null 分支 <83> 已补）。
+
+## 线性 IR 计划（<67> 路线 B 的具体化，下轮输入）
+- 目标：生成器直接做寄存器分配，绕开 TCC vstore/gv 机制（L pin 判死刑后
+  nested/immutable/vnode 三个缺口的共同解）。
+- 输入面：自产规则子集 + 全函数体已在缓冲（loop 缓冲 + 循环表 + fold 链），
+  与 <67> 论证一致，估 800-1500 行。
+- 第一刀（按本轮证据排序）：
+  1. **调用链融合**（vnode/immutable）：props 字面量在调用点 StructNew +
+     工厂内联（vr-inline 门限放开的前提：体质先行）；
+  2. **循环内 live-range 分配**（nested）：`_wv` 已是单写点 pin，下一步是
+     L5/L6 的循环 carried 分配 + `_ws.v` 链的寄存器化（当前每条语句 spill）；
+  3. **字段解析提升**（vnode）：ObjFieldNum 的 fs/fp 缓存提到循环外
+     （shape_stable 时零检查，<61> 已有语义基础）。
+- 非目标：不动 tccgen 本体（<67> 路线 A 永不）；不调 expr_max（本轮证伪）；
+  不重开 L pin（<86> 定案）。
+
+## 验证
+`whale api test: ok`；25/25 全对，0 mismatch（node/qjs/whalejs 三引擎对照，
+`temp/bench_87.json`）；fib 29（runner 噪声，基线 15-17）、minmax 150、
+immutable 254、vnode 11、nested 78、object 4（反超 node 32）、fib 反超
+node（29 vs 37）、objshape 622（escaped 相 GC 墙，见 <63>）。
+## 状态
+绿，待提交。下一步：线性 IR 实现（先调用链融合）/ immutable 原地更新
+（用户方向，优先级在 pin 之后——pin 已定案，可排期）。
