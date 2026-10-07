@@ -2345,3 +2345,43 @@ SOLVED（开销）/ CONFIRMED-OFF（pin）
 vnode 11、immutable 247（repeat=1 全量）。
 ## 状态
 绿，待提交。下一步：local pin hang 专项（表达式求值 vstack 跟踪）。
+
+# <85>: local pin 根因链闭合（hang→错答案）+ pool 预算定案
+PARTIAL（根因锁定，修复留待下轮）/ fib 15ms 稳住
+
+## 最小复现与证据链（WHALE_PIN_DBG trace + 反汇编对齐）
+- 最小复现：fibi(30)×100（`temp/fibi_min.js`）。编译完成后 hang；单次调用
+  不触发（阈值 50）。`temp/fibi_hang.asm` 为 hang 时的完整反汇编。
+- pin 分配 trace：4 个 register 声明（4 L + 8 _wv 中前 4 个成功）→ **a/b/i/t
+  全 pin（xmm5/4/3/2），_wv 全部失败**。之前以为 _wv 先声明抢 pool——顺序
+  实际是 L 在前。
+- **pool 耗尽坐实**：a+b、i<n、重载 n 全要 xmm，4 pin 占满 → `get_reg`
+  返回 -1。加回收后不 hang 了，但**变成错答案**（fibi 返回 1 而非 832040）：
+  回收要求"整个 vstack 无引用"太保守，表达式中间态引用 pr 时回收失败。
+- 2-pin 预算（pool 上限 2，`whale_pin_alloc` 改）：不 hang，仍错答案。
+  vstore shortcut 把新值留在 pin 寄存器不写内存，而 gv 读在 vstack 重排
+  （`?:` 的 save_regs、归一化的 gv）之后重载 stale slot → `a=b; b=t` 丢更新。
+  **读写不对称是机制级缺陷**：vstore 假设"值在 pr，gv 下次走 shortcut"，
+  但 gv 并不总是走。
+- 结论：local pin 保持关闭。机制的各部件单独验证全对（alloc/重载/
+  Invalidate/回收），组合语义有一个未解的洞。gen_op 归一化、modrm pin
+  识别、回收逻辑都保留在树上（无 pin 时零行为变化），下轮从
+  "vstore 后 vtop 形态与 gv 读路径的交互"单步跟（token 级）。
+
+## pool 预算定案
+- `whale_pin_alloc` 上限 **2**（6 个 RC_FLOAT 中留 4 个给 TCC 表达式求值）。
+- `_wv` 声明 8 个但仅前 2 个带 `register`（与 pool 一致）。
+- 此预算下 `_wv` pin（fold 临时值，单写点）保持开启且全量验证正确。
+
+## 用户提醒记录：immutable 的正确形态（前端语义，非本轮）
+- `st = setField(st, v)` 与 `{...items, k: v}` 应做成**原地修改 + 触发
+  proxy/setter**，而不是真建新对象——shape 没变就不该走慢路径。
+- 现状 235ms 的构成：每迭代 StructNew（free list 已优化）+ 快帧调用。
+  上限改造 = 引擎侧"同 shape 原地写"的语义层（record update 融合），
+  与 CStruct 的列存储天然契合。记为方向，优先级在 local pin 之后。
+
+## 验证
+`whale api test: ok`；25/25 全对，0 mismatch；fib 15、immutable 235、
+vnode 11、nested 77（repeat=1 全量）。
+## 状态
+绿，待提交。下一步：local pin 的 vstore/gv 不对称修复；immutable 原地更新。

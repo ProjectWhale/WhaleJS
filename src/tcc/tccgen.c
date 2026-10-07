@@ -1002,16 +1002,18 @@ static int whale_pin_alloc(int t)
 
     if (!is_float(t))
         return -1;
-    /* At most 4 float registers: xmm0/xmm1 stay free for TinyCC's own
-       expression evaluation (constants, temporaries). Pinning up to the full
-       6 made get_reg() return -1 with nowhere to spill. */
+    /* At most 2 float registers, leaving 2 of the 6 free: TinyCC's expression
+       evaluation needs spare registers, and pinning more exhausted the pool -
+       get_reg returned -1 for a plain constant load and the generated loop
+       hung. (xmm0/xmm1 stay desirable for TCC too; 2 pins of the 4-deep
+       RC_FLOAT pool keep 2 free.) */
     {
         int n = 0, b;
 
         for (b = 0; b < 32; b++)
             if (whale_pinned_regs & (1u << b))
                 n++;
-        if (n >= 4)
+        if (n >= 2)
             return -1;
     }
     for (r = 21; r >= 18; r--) {
@@ -7214,7 +7216,8 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
                 int pr = whale_pin_alloc(type->t);
 
                 if (getenv("WHALE_PIN_DBG"))
-                    fprintf(stderr, "[pin] alloc loc=%d -> reg=%d\n", (int)addr, pr);
+                    fprintf(stderr, "[pin] alloc loc=%d -> reg=%d (n=%d)\n",
+                            (int)addr, pr, whale_pin_n + (pr >= 0 ? 1 : 0));
                 if (pr >= 0 && whale_pin_n < 16) {
                     whale_pin_loc[whale_pin_n] = addr;
                     whale_pin_reg[whale_pin_n] = pr;

@@ -3225,9 +3225,14 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        no call, no jump target in between - which is exactly the run of
        initialiser stores a factory body is. */
     wt_id("JSValue"); wt('*'); wt_id("_sdp"); wt(';');
-    /* The locals, as plain doubles. ELS local pinning stays OFF: reopening
-       it hangs even whale_test's fibi (get_reg reclaim did not help - the
-       hang is not pool exhaustion). See notes <82>/<84> for the evidence. */
+    /* The locals, as plain doubles. ELS local pinning stays OFF: with a
+       2-pin budget (pool capped at 2, everything else verified sound) fibi
+       no longer hangs but computes wrong values - the vstore shortcut keeps
+       the new value in the pin register while some gv read path reloads the
+       stale slot, so `a=b; b=t` loses updates. The asymmetry is between
+       vstore (write-through to register only) and gv reads that bypass the
+       shortcut after vstack reshuffling; see notes <84>. The _wv pins below
+       (fold temporaries, single-writer) stay on and are verified. */
     for (i = 0; i < var_count; i++) {
         wk(JS_WK_DOUBLE); wt_slot("L", i); wt('='); wt_int(0); wt(';');
     }
@@ -3235,12 +3240,15 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        values inside loops. Declared ONLY when they can be used - a function
        with no loops (recursive fib) or with calls in its loops must not pay
        8 zero-init stores per call for slots nothing will ever name; nested
-       loops are also out (the pin pool is only 4 deep and two loop levels
-       fighting over it spill more than they save - minmax regressed 20%).
-       The conditions match fold_materialize()'s assignment exactly. */
+       loops are also out. Only TWO carry `register`: the pin pool is 4 deep
+       and TinyCC's expression evaluation needs spare float registers - pinning
+       all four exhausted the pool (get_reg -1) and the loop hung. The rest
+       are plain doubles. Conditions match fold_materialize()'s assignment. */
     if (info->loop_count == 1 && !whale_loop_has_call) {
         for (i = 0; i < WHALE_VPIN_MAX; i++) {
-            wk(JS_WK_REGISTER); wk(JS_WK_DOUBLE); wt_slot("_wv", i); wt('='); wt_int(0); wt(';');
+            if (i < 2)
+                wk(JS_WK_REGISTER);
+            wk(JS_WK_DOUBLE); wt_slot("_wv", i); wt('='); wt_int(0); wt(';');
         }
     }
     if (whale_dbg_env("WHALE_STR_DBG")) {
