@@ -2385,3 +2385,39 @@ PARTIAL（根因锁定，修复留待下轮）/ fib 15ms 稳住
 vnode 11、nested 77（repeat=1 全量）。
 ## 状态
 绿，待提交。下一步：local pin 的 vstore/gv 不对称修复；immutable 原地更新。
+
+# <86>: local pin 定案（trace 全链）+ _wv 2-pin 验证 + 两个检查方向
+SOLVED（定案）/ 方向记录
+
+## trace 全链（WHALE_PIN_DBG：RESET/alloc/gv/Invalidate 四点）
+- 顺序：RESET(core) → alloc ×2（-96/-104，reg 21/20）→ [core body 的 gv 读
+  全是 -64/-72/-80/-88（L0-3），pr=-1 ✓ L 无 pin] → RESET(wrapper) → 16×
+  Invalidate n=0。
+- **gv 读的偏移与 alloc 的偏移完全错开**：alloc 的是 _wv0/1（L 之后声明），
+  gv 读的是 L0-3。之前"alloc 成功但 find 失败"的矛盾不存在——alloc 的
+  根本不是 L。上一轮"fibi 输出 1"跑的是 **L pin 开 + 2 预算**的中间态。
+- 当前配置（L 无 pin + _wv 2 pin）：fibi_min 832040 ✓、whale_test 全绿、
+  25/25 全对 0 mismatch、minmax 110（恢复基线）。
+
+## 定案
+- **L pin 判死刑**：4/2/1 pin、回收、归一化、lvalue 形态全部试过，要么 hang
+  要么错答案。vstore 只写寄存器 + gv 在 vstack 重排后读内存的不对称是
+  机制级的，在 TCC 的 vstore/gv/expr_cond 交互里修不动（每轮修一个露一个）。
+  nested 的收益等换思路：生成器直接做寄存器分配（线性 IR + 直接发 token/
+  指令，绕开 vstore 机制），那是 <67> 路线 B 的正题。
+- **_wv pin（2 个）保留**：fold 临时值单写点、生存期不跨调用，语义安全，
+  全量验证正确。这是 ELS 在 TCC 机制下能安全拿到的部分。
+
+## 用户提的两个检查方向（记录）
+1. **nested 77ms vs v8 15ms**：多重表达式，怀疑前端融合（语句合并/链式
+   求值）或后端质量不到位。LICM 已做；下一步看 fold 链是否把整个表达式
+   融成最少语句（`whale_expr_max=24` 的物化点是否过密）。
+2. **vnode 11ms vs v8 3ms**：怀疑 CStruct 创建的固定流程开销（StructNew 的
+   header+atoms+data 单块分配 + offset map + GC 挂链）。值得 profile
+   `JS_WhaleStructNew` 的每次成本构成，看有没有可省的固定步骤。
+
+## 验证
+`whale api test: ok`；25/25 全对，0 mismatch；fib 15、minmax 110、
+immutable 242、vnode 11、nested 74（repeat=1 全量）。
+## 状态
+绿，待提交。下一步：nested 融合检查 / vnode StructNew 开销 / 生成器侧分配。

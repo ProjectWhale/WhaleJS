@@ -1509,6 +1509,10 @@ ST_FUNC int gv(int rc)
             {
                 int pr = whale_pin_find((int)vtop->c.i);
 
+                if (getenv("WHALE_PIN_DBG") && whale_pin_n > 0)
+                    fprintf(stderr, "[pin-gv] loc=%d pr=%d bit=%d rc=%x\n",
+                            (int)vtop->c.i, pr,
+                            pr >= 0 ? (whale_pinned_regs >> pr) & 1 : -1, rc);
                 /* A call cleared the validity bit (see JS_WhalePinInvalidate
                    in gfunc_call): the register is stale, so reload from the
                    slot - the slot is authoritative, the spill wrote it - and
@@ -7354,6 +7358,8 @@ static void gen_function(Sym *sym)
        its own map.) */
     whale_pinned_regs = 0;
     whale_pin_n = 0;
+    if (getenv("WHALE_PIN_DBG"))
+        fprintf(stderr, "[pin] RESET fn=%s\n", get_tok_str(sym->v, NULL));
     nocode_wanted = 0;
     ind = cur_text_section->data_offset;
     /* NOTE: we patch the symbol size later */
