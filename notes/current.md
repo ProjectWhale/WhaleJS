@@ -2607,4 +2607,31 @@ SOLVED（复盘+安全赢）/ PARTIAL（immutable 未到 100ms，需守卫内联
 `temp/bench_89.json`）；immutable 273、objshape 201、vnode 13、nested 70、
 object 4（反超 node 25）、fib 15（反超 node 32）。
 ## 状态
-绿，待提交。下一步：守卫内联实现（fusion 三件套）/ immutable 100ms 验证。
+绿，已提交 b6377af。
+
+# <90>: vr-inline 通用化证伪：12B 门限对 factory 放行反而更慢
+SOLVED（证伪）/ 维持现状
+
+## 做的事（前端通用化，按用户方向）
+- 用户拍板：对象操作写回的一律内联、原地做、别正常走；核心是前端的事。
+- 落点：`whale_inline_body` 的 `len > 12` 门限对 struct-factory 放行
+  （`whale_inline_str_n > 0` 即 call site 预扫描出字面量列）。
+  一行改动，无其他配套。
+
+## 测量（证伪）
+- inline 成功：`[vr-inline] rtype=40 clen=52`，guard 有、call 无，体展开。
+- 但 immutable 271→410ms（更慢 51%），objshape 持平 192→194ms，
+  vnode 持平。check 全对。
+- 展开体：StructNew + 4×field-cache 解析 + `_sdp` 直写 + ObjSlotCopy ×3
+  （inline return 的槽搬离 + put_loc 统一）+ loop 体 3 解析。
+  52B 体在 TCC 下全走内存，不如 fast-call 的 50ns。
+- 结论：12B 门限维持关闭（已回退，树干净）。体质（_wv/寄存器化）不变之前，
+  任何 factory 放行都是亏——与 <83> createElement 27 vs 11ms 同一结论。
+  通用化内联的前提是体质，不是门限。
+
+## 验证
+`whale api test: ok`；25/25 全对，0 mismatch（node/qjs/whalejs 三引擎对照，
+`temp/bench_90.json`）；immutable 295、objshape 200、vnode 11、nested 74、
+object 4（反超 node 36）、fib 15（反超 node 35）。
+## 状态
+绿，待提交。下一步：体质（线性 IR / 寄存器化）先行，再谈内联通用化。

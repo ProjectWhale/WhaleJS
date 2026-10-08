@@ -365,3 +365,5 @@ Reverted to 38579bc; both findings are recorded rather than half-fixed.- `<56>` 
 <88>(SOLVED×3/PARTIAL): **退出崩溃修复 + escaped 相转正 + fver 语义收紧**。① 崩溃根因 = plain free-list drain 读错链指针（读 p->prop 而链在 u.opaque）+ 漏释 prop 块，gdb + 六组二分 repro 定位，修后全 status=0（此前误记为预存问题，实为 <79> 配套遗漏）。② 跨编译 speculative 状态泄漏（vr_fn/expect_slot/loc_obj/ret_obj_g 永不重置），pass-1 前统一重置。③ escaped 相 STRUCT 物化进共享槽再 ArrSetVal：474→112ms，objshape 596→209ms。④ put/set_loc 对象赋值免 fver++（换名不变表）：objshape 209→193ms。immutable 279ms 未到 100ms 线，两条路已论证（原地更新语义 / 调用融合，需单独一轮）。25/25 全对 0 mismatch。见 current.md <88>
 
 <89>(SOLVED+PARTIAL): **fusion 完整复盘 + checkout 安全赢**。callee-side InPlace 与 caller-side fusion 双双证伪回退（aliasing：共享列读-写同地址污染 + fused return 搬离读写分家；正确形态是守卫内联，需单独一轮）。安全赢：StructNew checkout 数字列免 FreeValueRT（immutable 279→273ms，零风险）。实测分解：调用链占大头、手写内联 whalejs 0-1ms——fusion 消调用即进 100ms 线。25/25 全对 0 mismatch。见 current.md <89>
+
+<90>(SOLVED): **vr-inline 通用化证伪：12B 门限对 factory 放行反而更慢**。按用户方向（对象写回一律内联原地）放行 struct-factory：inline 成功（rtype=40，guard 有、call 无）但 immutable 271→410ms（+51%），52B 体 TCC 全走内存不如 fast-call 50ns。门限维持关闭（已回退，树干净）。通用化内联的前提是体质（线性 IR/寄存器化），不是门限。25/25 全对 0 mismatch。见 current.md <90>
