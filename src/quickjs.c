@@ -3171,12 +3171,26 @@ int JS_WhaleStructNew(JSContext *ctx, const int *atoms, int nslots, int slot)
             ws = (WhaleStruct *)p->u.opaque;
             /* The columns still hold the previous generation's values (the
                free-list path skipped the finalizer that would have freed
-               them); release them before the fill below overwrites. */
+               them); release them before the fill below overwrites. The fill
+               overwrites EVERY column unconditionally, so a value that needs
+               no release can be skipped here: int/bool/null/undefined/float64
+               columns own nothing. Only strings/objects/arrays need the
+               runtime call - and in a numeric record loop (a/b/c/d/e all
+               numbers) that is zero calls per checkout. */
             {
                 uint32_t k;
 
-                for (k = 0; k < ws->nslots; k++)
-                    JS_FreeValueRT(ctx->rt, ws->data[k]);
+                for (k = 0; k < ws->nslots; k++) {
+                    JSValue v = ws->data[k];
+
+                    if (JS_VALUE_GET_TAG(v) == JS_TAG_INT ||
+                        JS_VALUE_GET_TAG(v) == JS_TAG_FLOAT64 ||
+                        JS_VALUE_GET_TAG(v) == JS_TAG_UNDEFINED ||
+                        JS_VALUE_GET_TAG(v) == JS_TAG_NULL ||
+                        JS_VALUE_GET_TAG(v) == JS_TAG_BOOL)
+                        continue;
+                    JS_FreeValueRT(ctx->rt, v);
+                }
             }
             obj = JS_MKPTR(JS_TAG_OBJECT, p);
             goto fill;

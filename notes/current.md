@@ -2568,6 +2568,43 @@ SOLVED ×3（崩溃 / escaped / 缓存语义）/ PARTIAL（immutable 未到 100m
 `temp/bench_88.json`）；immutable 282、objshape 209、vnode 11、nested 87、
 object 4（反超 node 24）、fib 19（反超 node 36）。
 ## 状态
-绿，待提交。下一步：immutable 原地更新语义 / 线性 IR 调用融合（二选一，
-用户定）；twoShapes 类"对象不出循环"形态的字段解析提升（fver 已收紧，
-下一步是 fs/fp 进寄存器）。
+绿，已提交 5a5d4d3。下一步：immutable 原地更新（用户已确认做）。
+
+# <89>: 原地更新 fusion 完整复盘 + 安全赢落地
+SOLVED（复盘+安全赢）/ PARTIAL（immutable 未到 100ms，需守卫内联）
+
+## fusion 两轮证伪（均已回退，树干净）
+- **callee-side InPlace**（`JS_WhaleStructInPlace`）：工厂在 callee 跑，
+  可复用存储在 caller——callee 永远看不到匹配源，恒走 StructNew 回退，
+  白付 slot + 检查。已删。
+- **caller-side fusion**（vr-inline OP_object 复用实参列 + 12B 门限放行）：
+  inline 成功（`rtype=40 clen=52`），但 check=undefined。根因是 aliasing：
+  StructFuse 让新旧对象共享列存储，4 个拷贝列的 get_field 读与随后的
+  define_field 写是同一地址——读的"旧值"在写后变"新值"，`st.a` 累加链读到
+  被污染的列。改读 field-cache（source slot）后正确性仍坏：fused return
+  的 ObjSlotCopy 把结果搬离 fused slot，而 put_loc 写 fused slot——读写
+  分家。aliasing 在"读-写同地址 + 返回搬离"两处不可收敛，已回退。
+- 教训：fusion 的正确形态不是"共享存储"，而是"守卫内联"——callee 体展开时
+  每个 get_field 读 caller 列、每个 define_field 写 caller 列，读-写都经
+  field-cache，不共享、不搬离。需单独一轮（inline get_field 认 STRUCT +
+  12B 门限对 factory 放行 + return 搬 fused slot）。
+
+## 安全赢：StructNew checkout 数字列免 FreeValueRT
+- free-list checkout 的列释放循环对每列调 `JS_FreeValueRT`——数字列
+  （int/float64/bool/null/undefined）不拥有引用，白付调用。加 tag 检查，
+  仅引用列走 runtime。immutable 279→273ms（-2%），objshape 201ms 持平，
+  25/25 全对。小但是零风险。
+
+## immutable 100ms 线设计（本轮结论，下轮输入）
+- 实测分解（100 万迭代）：base 263ms；同调用链但 callee 原地改（mutate）
+  112ms；手写内联（无调用）whalejs 0-1ms / node 5ms。结论：调用链占大头，
+  体质（TCC 语句 spill）占小头——fusion 消掉调用即到 100ms 线内。
+- 路径：守卫内联（上节）+ 字段解析进寄存器（fver 已收紧，fs/fp 提循环外）。
+  不做语义层原地更新（proxy/setter 触发面太大），不做 callee-side 复用。
+
+## 验证
+`whale api test: ok`；25/25 全对，0 mismatch（node/qjs/whalejs 三引擎对照，
+`temp/bench_89.json`）；immutable 273、objshape 201、vnode 13、nested 70、
+object 4（反超 node 25）、fib 15（反超 node 32）。
+## 状态
+绿，待提交。下一步：守卫内联实现（fusion 三件套）/ immutable 100ms 验证。
