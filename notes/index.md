@@ -367,3 +367,5 @@ Reverted to 38579bc; both findings are recorded rather than half-fixed.- `<56>` 
 <89>(SOLVED+PARTIAL): **fusion 完整复盘 + checkout 安全赢**。callee-side InPlace 与 caller-side fusion 双双证伪回退（aliasing：共享列读-写同地址污染 + fused return 搬离读写分家；正确形态是守卫内联，需单独一轮）。安全赢：StructNew checkout 数字列免 FreeValueRT（immutable 279→273ms，零风险）。实测分解：调用链占大头、手写内联 whalejs 0-1ms——fusion 消调用即进 100ms 线。25/25 全对 0 mismatch。见 current.md <89>
 
 <90>(SOLVED): **vr-inline 通用化证伪：12B 门限对 factory 放行反而更慢**。按用户方向（对象写回一律内联原地）放行 struct-factory：inline 成功（rtype=40，guard 有、call 无）但 immutable 271→410ms（+51%），52B 体 TCC 全走内存不如 fast-call 50ns。门限维持关闭（已回退，树干净）。通用化内联的前提是体质（线性 IR/寄存器化），不是门限。25/25 全对 0 mismatch。见 current.md <90>
+
+<91>(SOLVED/PARTIAL): **真原地 fusion 落地：same-shape factory 在 call site 展开为旧列写**。按用户定稿（不建新对象、旧列上改、proxy 触发、前端做）：probe 纯类型模拟判形 + emit 单列 field-cache 原地写（无 StructNew、无调用、无拷贝列重写、无返回搬离），immutable 273→31ms 进 100ms 线（node 15ms，剩 loop 体 3 解析）；objshape 持平 204ms（无此形状未触发）。25/25 全对 0 mismatch。见 current.md <91>

@@ -2635,3 +2635,53 @@ SOLVED（证伪）/ 维持现状
 object 4（反超 node 36）、fib 15（反超 node 35）。
 ## 状态
 绿，待提交。下一步：体质（线性 IR / 寄存器化）先行，再谈内联通用化。
+
+# <91>: 真原地 fusion 落地：same-shape factory 在 call site 展开为旧列写
+SOLVED（immutable 进 100ms 线）/ PARTIAL（objshape 未动，需另起形状）
+
+## 用户方向（三次纠偏后的定稿）
+- 不创建新对象，直接在旧对象上改 + proxy 触发（不走 StructNew 慢路径，
+  变成一行的属性修改）。
+- 只要对对象操作并写回去的都内联成原地操作；核心是前端的事。
+
+## 做的事（全前端，C++14，无模板无异常）
+- `whale_fuse_probe`（`src/whale_jit.c`）：纯类型模拟判 same-shape
+  factory——单对象实参喂所有 get_field、n-1 列拷贝 + 1 列数字实参更新、
+  每字面量列恰定义一次。`argc != callee->arg_count` 先拒（位置映射前提）；
+  `csrc` 全初始化 -1（fresh literal/ICONST 不能冒充实参）；
+  copy 列要求 `value == source-fed && fed == srcarg`（旧逻辑"任意数字都算
+  拷贝"把更新列也算成拷贝，是第一版 probe 的错）；
+  update 列要求 `other-arg && fed == -2`（恰一列）；
+  落点要求 source 实参是 caller-owned SLOT、update 实参是 NUM。
+- `whale_fuse_emit`：resolve 先、materialize 中、store 后——resolve 自带
+  deopt（accessor/缺列/旧值非数字），committed store 不可回滚，顺序即正确性。
+  发 guard（VRFN 身份）+ 一对 field-cache resolve/store（update 列写源 slot），
+  拷贝列零发射（源列本就对），结果即源类型，无返回搬离。
+  `fields_p`/`expect_slot` 显式传参（`whale_jit_gen` 内 `whale_fields` 是
+  遮蔽局部，emitter 够不到文件作用域计数器——C 作用域坑）。
+- call site（VRFN 路径）：`fm` 提前到 probe 之前（probe/consumes 前截断点一致），
+  probe 命中即 emit + break，不再进 `whale_inline_body`。
+- proxy/setter 语义：resolve 即触发器——accessor 使 find_own_property 答 NULL，
+  ObjFieldPtr deopt；触发只跑在源对象上一次，即语言规定的 store 位置。
+
+## aliasing 为什么这次收敛（<89> 两证伪的对照）
+- 不共享存储：无 StructFuse、无新对象，读-写同地址污染不存在。
+- 不搬离返回：结果即源 slot，无 ObjSlotCopy 读写分家。
+- 不重写拷贝列：拷贝列的 get_field 读与"重写"写是同一列——写了即脏，
+  <89> caller-side fusion 的 check=undefined 即此。零发射即正确。
+
+## 测量
+- immutable 273→31~33ms（三跑 31/34/33，check=249985 与 node 一致），
+  进 100ms 线（优秀线内），约为 node 15ms 的 2 倍——剩余是 loop 体 3 解析
+  + field-cache 形态（`_ws.fv/fs/fp`），非调用链。
+- objshape 持平 204ms（四相无 same-shape factory 形状，未触发 fuse；
+  check=864036481260 一致）。vnode 17、nested 73、object 5、fib 14。
+- 25/25 全对，0 mismatch（node 对照逐 case 跑完，check 逐一对过）。
+- 生成源码证：loop 体 `VarRefIsFn guard + fv/fs/fp resolve + fp[e]=v`，
+  无 StructNew、无 CallSelf/CallValue、无 ObjSlotCopy。
+
+## 验证
+`whale api test: ok`；immutable×3 + objshape/vnode/nested/object/fib +
+其余 19 case whalejs 跑完 + node 25 case 全对对表。
+## 状态
+绿，待提交。下一步：objshape 另起形状（四相 profile 定点）/ 提交本轮。

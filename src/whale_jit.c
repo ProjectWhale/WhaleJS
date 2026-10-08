@@ -1605,8 +1605,29 @@ int whale_str_fresh_n = 0;
 int whale_str_fresh_atoms[WHALE_ATOM_MAX];
 int whale_inline_str_atoms[WHALE_ATOM_MAX];
 int whale_inline_str_n = 0;
+/* In-place factory fusion at the vr-inline call site: when the callee is a
+   same-shape factory (`return { a: o.a, ... }`, result columns == one object
+   argument's columns), the call site skips whale_inline_body entirely and
+   emits, behind the same VRFN identity guard, a single field-cache store of
+   the changed column into the SOURCE object. No StructNew, no call, and no
+   copy stores at all: the copied columns already hold the right values, so
+   rewriting them would only dirty the columns later reads need. The result
+   IS the source slot, so no return copy and no read-write aliasing. A
+   proxy/setter receiver fails the column resolve and deopts, which is the
+   trigger. State set by the detector, read by the emitter. */
+static int whale_fuse_vidx = -1;
+static int whale_fuse_argc = 0;
+static int whale_fuse_srcslot = -1;
+static int whale_fuse_srcarg = -1;   /* which caller argument is the source */
+static int whale_fuse_n = 0;
+static int whale_fuse_atoms[WHALE_ATOM_MAX];
+static int whale_fuse_numk = -1;     /* which caller argument is the update */
+static int whale_fuse_upd = -1;      /* which literal column takes the update */
 
 static int whale_str_col(const int *atoms, int n, int atom);
+static int whale_fuse_probe(const JSWhaleFuncInfo *callee, const uint8_t *cpc,
+                            int clen, uint8_t *cur, int var_count, int sp,
+                            int argc, int vidx);
 static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
                              int var_count, int arg_base)
 {
@@ -2080,6 +2101,246 @@ static int whale_str_col(const int *atoms, int n, int atom)
         if (atoms[i] == atom)
             return i;
     return -1;
+}
+
+/* Same-shape factory probe for in-place update at the vr-inline call site.
+   Answers whether the callee `return { a: o.a, ... }` copies every field from
+   one object argument (the source) except one column that takes a numeric
+   argument (the update) - the setField shape. Simulates the body's stack with
+   types only (no emission): get_arg takes the caller's slot type, get_field
+   requires the source slot, define_field on the fresh literal records which
+   argument fed each column. On success fills whale_fuse_* (vidx/argc/src
+   slot/src arg/literal columns/changed-column index) and returns 1; the
+   emitter then expands the call into one field-cache store on the source
+   slot, with no call and no allocation. Anything else returns 0 for the
+   normal vr-inline / fast-call path. */
+static int whale_fuse_probe(const JSWhaleFuncInfo *callee, const uint8_t *cpc,
+                            int clen, uint8_t *cur, int var_count, int sp,
+                            int argc, int vidx)
+{
+    int cpos, csz, ndef = 0;
+    int atoms[WHALE_ATOM_MAX];
+    int fed[WHALE_ATOM_MAX];
+    int k, csp = 0;
+    uint8_t ctyp[WHALE_JIT_MAX_SLOTS];
+    int8_t csrc[WHALE_JIT_MAX_SLOTS];
+    int srcarg = -1, numarg = -1;
+
+    for (k = 0; k < WHALE_JIT_MAX_SLOTS; k++)
+        csrc[k] = -1;
+
+    if (argc != callee->arg_count || argc <= 0 || argc > 4)
+        return 0;   /* positional mapping below assumes an exact match */
+    for (k = 0; k < WHALE_ATOM_MAX; k++)
+        fed[k] = -2;
+    /* pass 1: the literal columns, in definition order */
+    for (cpos = 0; cpos < clen; ) {
+        int cop = cpc[cpos];
+
+        csz = whale_op_size_of(cop);
+        if (csz <= 0 || cpos + csz > clen)
+            return 0;
+        if (cop == OP_define_field) {
+            if (ndef >= WHALE_ATOM_MAX)
+                return 0;
+            atoms[ndef++] = (int)whale_get_u32(cpc + cpos + 1);
+        } else if (cop != OP_object && cop != OP_get_arg &&
+                   cop != OP_get_arg0 && cop != OP_get_arg1 &&
+                   cop != OP_get_arg2 && cop != OP_get_arg3 &&
+                   cop != OP_get_field && cop != OP_return) {
+            return 0;   /* not a pure factory body */
+        }
+        cpos += csz;
+    }
+    if (ndef <= 0 || ndef > WHALE_ATOM_MAX)
+        return 0;
+    /* pass 2: simulate types. Exactly one object argument may feed fields. */
+    for (cpos = 0; cpos < clen; ) {
+        int cop = cpc[cpos];
+
+        csz = whale_op_size_of(cop);
+        if (csz <= 0 || cpos + csz > clen)
+            return 0;
+        if (cop == OP_object) {
+            if (csp >= WHALE_JIT_MAX_SLOTS)
+                return 0;
+            ctyp[csp++] = WHALE_T_UNKNOWN + 1;  /* fresh literal marker */
+        } else if (cop == OP_get_arg || (cop >= OP_get_arg0 &&
+                   cop < OP_get_arg0 + 4)) {
+            int a = (cop == OP_get_arg) ? (int)whale_get_u16(cpc + cpos + 1)
+                                        : cop - OP_get_arg0;
+            int t;
+
+            if (a < 0 || a >= callee->arg_count || a >= 4)
+                return 0;
+            t = cur[var_count + sp - argc + a];
+            if (csp >= WHALE_JIT_MAX_SLOTS)
+                return 0;
+            /* record the argument INDEX on a side stack: the type alone
+               cannot tell two object arguments apart. csrc mirrors ctyp. */
+            ctyp[csp] = (uint8_t)t;
+            csrc[csp] = a;
+            csp++;
+        } else if (cop == OP_get_field) {
+            int at = (int)whale_get_u32(cpc + cpos + 1);
+            int di = -1, q;
+
+            if (csp < 1)
+                return 0;
+            if (!WHALE_IS_SLOT(ctyp[csp - 1]))
+                return 0;
+            if (srcarg >= 0 && csrc[csp - 1] != srcarg)
+                return 0;   /* two object arguments feed fields: not our shape */
+            srcarg = csrc[csp - 1];
+            for (q = 0; q < ndef; q++)
+                if (atoms[q] == at) { di = q; break; }
+            if (di < 0)
+                return 0;
+            if (fed[di] != -2)
+                return 0;   /* same column defined twice */
+            fed[di] = csrc[csp - 1];
+            ctyp[csp - 1] = WHALE_T_NUM;
+        } else if (cop == OP_define_field) {
+            int at = (int)whale_get_u32(cpc + cpos + 1);
+            int di = -1, q;
+
+            if (csp < 2)
+                return 0;
+            for (q = 0; q < ndef; q++)
+                if (atoms[q] == at) { di = q; break; }
+            if (di < 0)
+                return 0;
+            /* the value side decides: a source-fed number means "copied
+               from the source" (its get_field already recorded the column),
+               the OTHER argument fed as a number means the update. An
+               ICONST/small-int temporary or any other feeder is neither:
+               not our shape. */
+            if (ctyp[csp - 1] == WHALE_T_NUM && csrc[csp - 1] == srcarg &&
+                fed[di] == srcarg) {
+                /* copy column already recorded by its get_field: nothing
+                   to do, the value below IS the source's column */
+            } else if (whale_type_is_num(ctyp[csp - 1]) &&
+                       csrc[csp - 1] >= 0 && csrc[csp - 1] != srcarg &&
+                       (numarg < 0 || csrc[csp - 1] == numarg) &&
+                       fed[di] == -2) {
+                fed[di] = -3;   /* the one updated column */
+                numarg = csrc[csp - 1];
+            } else {
+                return 0;
+            }
+            csp--;  /* object stays */
+        } else if (cop == OP_return) {
+            break;
+        }
+        cpos += csz;
+    }
+    /* every literal column defined exactly once; all but one copy the single
+       source argument; the remaining one takes a numeric argument. */
+    {
+        int ncopy = 0, nupd = 0, j;
+
+        if (srcarg < 0)
+            return 0;
+        /* in-place means shared storage: the arguments must be caller-owned.
+           A slot the callee's own evaluation produced (an un-parked fresh
+           literal, a folded temporary) would be clobbered or aliased by the
+           store that follows. Only the patterns the loop actually feeds are
+           accepted: the source is a parked object (a local, or a value the
+           loop carried), the update is a plain number. */
+        if (!WHALE_IS_SLOT(cur[var_count + sp - argc + srcarg]))
+            return 0;
+        if (numarg < 0 || numarg == srcarg)
+            return 0;
+        if (!whale_type_is_num(cur[var_count + sp - argc + numarg]))
+            return 0;
+        for (j = 0; j < ndef; j++) {
+            if (fed[j] == srcarg)
+                ncopy++;
+            else if (fed[j] == -3)
+                nupd++;
+            else
+                return 0;
+        }
+        if (ncopy != ndef - 1 || nupd != 1)
+            return 0;
+    }
+    whale_fuse_vidx = vidx;
+    whale_fuse_argc = argc;
+    whale_fuse_srcslot = WHALE_SLOT(cur[var_count + sp - argc + srcarg]);
+    whale_fuse_srcarg = srcarg;
+    whale_fuse_n = ndef;
+    for (k = 0; k < ndef; k++)
+        whale_fuse_atoms[k] = atoms[k];
+    whale_fuse_numk = numarg;
+    /* the one literal column the numeric argument fed */
+    for (k = 0; k < ndef; k++)
+        if (fed[k] == -3) { whale_fuse_upd = k; break; }
+    return 1;
+}
+
+/* In-place emitter for a probed same-shape factory call: `st = setField(st, v)`
+   becomes one field-cache store of column `whale_fuse_upd` into the SOURCE
+   slot, behind the same VRFN identity guard the normal vr-inline path emits.
+   No StructNew, no call, no copy stores: columns the factory copied already
+   hold the source's values, so rewriting them is pure waste - and worse, it
+   would dirty the columns the loop's later reads resolve through the same
+   field cache. The result slot IS the source slot: the fused call returns the
+   object it was given, mutated, which is exactly what the interpreter's fresh
+   object contains column-for-column.
+
+   Proxy/setter detection is the resolve itself: find_own_property answers
+   NULL for an accessor and ObjFieldPtr deopts, so a trigger runs only where
+   the language says a store runs - on the source object, once.
+
+   Emits the guard first (it must precede the store), then the resolve+store
+   through one fresh cache pair, then fixes up the call-site stack: the stray
+   argument tokens die at `fm`, the result is the source type, sp collapses
+   to func_slot+1 - the same contract the vr-inline success path honours.
+   `fields_p` is the generator's own cache counter (the file-scope
+   whale_fields is shadowed inside whale_jit_gen, so the emitter cannot name
+   it); `expect_slot` is the guard-table index for the same reason. */
+static void whale_fuse_emit(int *sp, uint8_t *cur, int var_count,
+                            int func_slot, int fm, int vidx, int expect_slot,
+                            int *fields_p)
+{
+    int fc, srcslot = whale_fuse_srcslot;
+    int updat = whale_fuse_atoms[whale_fuse_upd];
+    int stk = *sp - whale_fuse_argc + whale_fuse_numk;
+    int gfm;
+
+    fc = (*fields_p)++;
+    /* guard: the slot must still hold the probed function */
+    gfm = fold_mark();
+    wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleVarRefIsFn");
+    wt('('); wt_id("ctx"); wt(','); wt_id("var_refs"); wt(',');
+    wt_int(vidx); wt(','); wt_int(expect_slot); wt(')'); wt(')');
+    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+    fold_commit(gfm);
+    /* resolve first: the resolve emits its own deopts (accessor, missing
+       column, non-numeric old value), and a committed store cannot be taken
+       back - so the guard ordering the vr-inline path relies on applies here
+       too, resolve before store, both preceded by the guard. */
+    {
+        int sfm = fold_mark();
+
+        fold_obj_field_resolve(srcslot, updat, fc, 0);
+        fold_commit(sfm);
+    }
+    /* the update value must survive as a C variable: it is read inside the
+       store statement, past the argument tokens' truncation point */
+    fold_materialize(stk);
+    {
+        int sfm = fold_mark();
+
+        wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt('='); wt_int(8); wt(';');
+        wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64"); wt('=');
+        fold_inline(stk); wt(';');
+        fold_commit(sfm);
+    }
+    JS_WhaleTokSinkTruncate(fm);
+    cur[var_count + func_slot] = cur[var_count + *sp - whale_fuse_argc + whale_fuse_srcarg];
+    *sp = func_slot + 1;
 }
 
 /* The layout a settled object has: the attributes its observed shapes carry
@@ -5782,14 +6043,32 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                             guard_ok = 0;
                     }
                     if (guard_ok) {
-                        /* The callee's own field names, in definition order -
-                           its object literal is built as a real struct with
-                           these columns (the same thing the scan pass does
-                           for a whole function). */
+                        /* Same-shape factory first: `st = setField(st, v)` is not
+                           a body to expand but a store to emit - one field-cache
+                           write of the changed column into the source object,
+                           no StructNew, no call, no copy. The probe decides;
+                           a 0 falls through to the normal body-inline path. */
                         const uint8_t *cpc = whale_vr_info[vidx].byte_code;
                         int clen = whale_vr_info[vidx].byte_code_len, cpos;
                         int csz;
 
+                        fm = fold_mark();   /* the stray argument tokens start here */
+                        if (whale_fields < WHALE_FIELD_CACHE &&
+                            whale_fuse_probe(&whale_vr_info[vidx], cpc, clen,
+                                             cur, var_count, sp, argc, vidx)) {
+                            if (whale_dbg_env("WHALE_JIT_DUMP"))
+                                fprintf(stderr, "[vr-fuse] pos=%d argc=%d src=%d upd_col=%d\n",
+                                        pos, argc, whale_fuse_srcslot,
+                                        whale_fuse_atoms[whale_fuse_upd]);
+                            whale_fuse_emit(&sp, cur, var_count, func_slot, fm,
+                                            vidx, whale_vr_expect_slot[vidx],
+                                            &whale_fields);
+                            break;
+                        }
+                        /* The callee's own field names, in definition order -
+                           its object literal is built as a real struct with
+                           these columns (the same thing the scan pass does
+                           for a whole function). */
                         whale_inline_str_n = 0;
                         for (cpos = 0; cpos < clen; ) {
                             int cop = cpc[cpos];
