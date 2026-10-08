@@ -2684,4 +2684,62 @@ SOLVED（immutable 进 100ms 线）/ PARTIAL（objshape 未动，需另起形状
 `whale api test: ok`；immutable×3 + objshape/vnode/nested/object/fib +
 其余 19 case whalejs 跑完 + node 25 case 全对对表。
 ## 状态
-绿，待提交。下一步：objshape 另起形状（四相 profile 定点）/ 提交本轮。
+绿，已提交 eb712c8。
+
+# <92>: 固有开销复盘 + fuse_emit 重复提交修复（本轮）
+SOLVED（复盘+实修一处）/ PARTIAL（大头未动，需 struct 化）
+
+## 用户方向
+- fib 7→22→14 链路说明优化有顾此失彼：找固有开销降，不要再拆东墙补西墙。
+- 本轮继续优化。
+
+## 基线（本轮实测，node 对照在后）
+- fib 17、immutable 33、objshape 202、vnode 11、nested 75、object 4、
+  objfields 68、minmax 103~153（抖动大）。
+- node：fib 34（反超）、immutable 13、objshape 46、vnode 2、nested 16~24、
+  object 25（反超）、objfields 21、minmax 48。
+
+## 顾此失彼链复盘（<83>/<84> 证据）
+- 7→22：`_wv0..7` 无条件声明 + struct 列 32 零初始化 + `_ws.sv[128]` 死存储——
+  全是 per-call 税，fib（~240M 调用）全额赔付。
+- 22→14：三税清零（门控 _wv/列声明、删 sv）回到 14~16。7ms 地板在 `_ws`
+  整体 `{0}`（v/wa/fs/fp/fv/ap/an/ai/op/on/oi/sp 近 3KB，每调用 memset 语义）。
+- 教训：任何"所有函数都付"的改动先问 per-call 税；门控条件必须与分配点一致
+  （minmax 109→129 回退即声明/分配条件不一致）。
+
+## 固有开销清单（按"谁在付"排）
+1. **`_ws` 整块 `{0}`（最大，递归 fib 主税）**：fib core 仅用 v[0..1]，
+   却付 68+32+24+24+1+24+28×6+128 ≈ 3KB 零初始化 × 240M 调用。
+   拆分（按需清零/分块声明）是大改——<84> 已评估，留待 struct 化专项。
+2. **field-cache 形态（loop 内大头）**：每解析 `fv/fver+fs/shape` 双分支 +
+   `ObjFieldPtr` 调用 + `fv=fver` 回写。immutable loop 体 4 解析（fuse 写
+   1 + 读 3）。stable 位本可消形状检查，但 step 的 loop 体全是 call（含已
+   fuse 的 `CallSelfValue`——fuse 只在第二版编译 firing，第一版仍带调用），
+   `loop_has_call` 恒真 → stable 恒假。根治 = call-free 循环的解析提升
+   （fver/fs/fp 提循环外），需线性 IR 分配面，另起一轮。
+3. **entry 税（每编译调用一次）**：CheckStack + unbox + VarRefIsSelf +
+   DeoptNote + box，共 5 helper。fib 仅 12 entries（entry 级），可忽略；
+   不得为省它动语义（CheckStack 保栈、IsSelf 保双读正确）。
+4. **guard/重复发射（本轮实修）**：`whale_fuse_emit` 在外层 `fold_mark` 后又
+   对 `fold_obj_field_resolve`（内部自带 mark/commit）包一层 mark/commit——
+   resolve 语句在 loop 体提交两次。生成源码 loop 体 `fv/fs/fp resolve ×2`
+   为证。修法：直接调 resolve，不再外包。immutable 31~33→27~29ms（-13%），
+   objfields 68→59ms（fill 路径同享 resolve，同减一解析）。
+   另试过 value-materialize 前置 guard（value→guard→resolve→store），
+   31→38ms 反而更慢：materialize 语句把 guard 挤出 LICM 提升位，
+   guard 留 loop 内每迭代付一次。已回退——顺序即性能，注释留了证据。
+5. **prologue 杂税（已门控，无事可做）**：`_p0..3`（4 指针声明，无初始化，
+   零成本）、`_sdp`（1 指针，零成本）、`L` 列（fib 零列；对象函数按需）、
+   `_wv`（单循环无调用才 8 个；minmax 嵌套 loop_count=2 不付）、`A`（按需）。
+   再砍只能动 `_ws` 本体（即第 1 条）。
+
+## 测量（本轮修后）
+- immutable 27~29ms（三跑 27/29/27，check=249985），node 13。
+- objfields 59（-13%，同享 resolve 路径），fib 15、objshape 195、
+  vnode 11、nested 73、object 4、minmax 121。
+- 25/25 全对，0 mismatch（node 25 case 逐一对表）。
+
+## 验证
+`whale api test: ok`；19+6 case whalejs 全跑 + node 全对表。
+## 状态
+绿，待提交。下一步：`_ws` 拆分 / call-free 循环解析提升（线性 IR 面）。

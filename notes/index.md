@@ -369,3 +369,5 @@ Reverted to 38579bc; both findings are recorded rather than half-fixed.- `<56>` 
 <90>(SOLVED): **vr-inline 通用化证伪：12B 门限对 factory 放行反而更慢**。按用户方向（对象写回一律内联原地）放行 struct-factory：inline 成功（rtype=40，guard 有、call 无）但 immutable 271→410ms（+51%），52B 体 TCC 全走内存不如 fast-call 50ns。门限维持关闭（已回退，树干净）。通用化内联的前提是体质（线性 IR/寄存器化），不是门限。25/25 全对 0 mismatch。见 current.md <90>
 
 <91>(SOLVED/PARTIAL): **真原地 fusion 落地：same-shape factory 在 call site 展开为旧列写**。按用户定稿（不建新对象、旧列上改、proxy 触发、前端做）：probe 纯类型模拟判形 + emit 单列 field-cache 原地写（无 StructNew、无调用、无拷贝列重写、无返回搬离），immutable 273→31ms 进 100ms 线（node 15ms，剩 loop 体 3 解析）；objshape 持平 204ms（无此形状未触发）。25/25 全对 0 mismatch。见 current.md <91>
+
+<92>(SOLVED/PARTIAL): **固有开销复盘 + fuse_emit 重复提交修复**。复盘 fib 7→22→14 顾此失彼链（per-call 税教训）；开销按"谁在付"排序：`_ws` 整块 `{0}`（最大，留 struct 化专项）、field-cache 形态（需 call-free 解析提升，另起一轮）、entry 税（可忽略不动）、prologue 杂税（已门控无事可做）。实修：fuse_emit 对自带 commit 的 resolve 又包一层 mark/commit，loop 体 resolve ×2；去外包后 immutable 31→27ms（-13%）、objfields 68→59ms。另证顺序即性能（value 前置 guard 反而 31→38ms，已回退）。25/25 全对 0 mismatch。见 current.md <92>

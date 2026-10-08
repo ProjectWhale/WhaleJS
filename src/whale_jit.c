@@ -2317,16 +2317,14 @@ static void whale_fuse_emit(int *sp, uint8_t *cur, int var_count,
     wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
     wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
     fold_commit(gfm);
-    /* resolve first: the resolve emits its own deopts (accessor, missing
-       column, non-numeric old value), and a committed store cannot be taken
-       back - so the guard ordering the vr-inline path relies on applies here
-       too, resolve before store, both preceded by the guard. */
-    {
-        int sfm = fold_mark();
-
-        fold_obj_field_resolve(srcslot, updat, fc, 0);
-        fold_commit(sfm);
-    }
+    /* resolve next: it emits its own deopts (accessor, missing column,
+       non-numeric old value), and a committed store cannot be taken back -
+       so the guard ordering the vr-inline path relies on applies here too,
+       resolve before store, both preceded by the guard. Note the resolve
+       commits itself (fold_obj_field_resolve marks and commits internally),
+       so no outer mark/commit here - wrapping one around it emitted the
+       resolve twice per iteration. */
+    fold_obj_field_resolve(srcslot, updat, fc, 0);
     /* the update value must survive as a C variable: it is read inside the
        store statement, past the argument tokens' truncation point */
     fold_materialize(stk);
