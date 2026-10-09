@@ -972,6 +972,53 @@ static int whale_loop_has_call;
    zeroed before each compilation's scan. */
 static int whale_loop_heat[WHALE_JIT_MAX_SLOTS];
 
+/* Presence-flag check dedup, one straight-line segment at a time. Bit col of
+   the innermost open loop's word means "sp[col] is already proven 1 on this
+   path" - by an earlier check or by a store that set it. A later read of the
+   same column then skips its `if (!sp[col])` branch. Sound because sp[] only
+   ever goes 0->1 (stores set, nothing clears except a fresh OP_object, which
+   resets the words outright), and because the word resets at every jump
+   target - so a set bit always dominates the read it excuses. In particular a
+   check inside one `if` branch never excuses a read after the join. */
+static unsigned whale_sp_seen[WHALE_LOOP_MAX];
+
+static int whale_sp_known(int col)
+{
+    if (col < 0 || col >= 32)
+        return 0;
+    if (whale_loop_depth <= 0 || whale_loop_depth > WHALE_LOOP_MAX)
+        return 0;
+    return (whale_sp_seen[whale_loop_depth - 1] & (1u << col)) != 0;
+}
+
+static void whale_sp_note(int col)
+{
+    if (col < 0 || col >= 32)
+        return;
+    if (whale_loop_depth <= 0 || whale_loop_depth > WHALE_LOOP_MAX)
+        return;
+    whale_sp_seen[whale_loop_depth - 1] |= 1u << col;
+}
+
+/* A new straight-line segment starts: nothing is proven on it yet. */
+static void whale_sp_reset(void)
+{
+    if (whale_loop_depth <= 0 || whale_loop_depth > WHALE_LOOP_MAX)
+        return;
+    whale_sp_seen[whale_loop_depth - 1] = 0;
+}
+
+/* A fresh object clears every presence flag, on every open level: a check
+   proven before the creation says nothing about the new object. Creation is
+   rare (literals live before loops), so wiping all levels is cheap. */
+static void whale_sp_reset_all(void)
+{
+    int d;
+
+    for (d = 0; d < WHALE_LOOP_MAX; d++)
+        whale_sp_seen[d] = 0;
+}
+
 /* Is local idx loop-invariant at the current position: never written inside
    the innermost loop being generated? Outside any loop the answer does not
    matter (nothing hoists there), so it reads 0. Only the innermost loop is
@@ -2899,6 +2946,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     whale_str_fresh = -1;
     whale_str_fresh_n = 0;
     whale_inline_str_n = 0;
+    whale_sp_reset_all();
     for (i = 0; i < 4; i++) {
         whale_vr_fn[i] = NULL;
         whale_vr_expect_slot[i] = -1;
@@ -3699,8 +3747,14 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         /* A loop head opens a buffer for its body; the back edge closes it.
            The head label goes inside the buffer, because that is where the back
            edge jumps to. Nesting uses the loop stack. */
-        if (loop_back[pos] >= 0)
+        if (loop_back[pos] >= 0) {
             loop_begin(pos, loop_back[pos]);
+            /* A new loop body starts: no presence flag is proven on entry -
+               the back edge re-runs the body, and a flag proven on one trip
+               says nothing about the next. Set after loop_begin, which is
+               what fixes the depth. */
+            whale_sp_reset();
+        }
 
         /* dead code after an unconditional return/goto is not emitted */
         if (unreachable && !targets[pos]) {
@@ -3712,9 +3766,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
         /* A basic-block boundary: the value of every deferred local has to be in
            its variable again, because the code that reaches this point may not
-           be the code that set the pending expression. */
-        if (targets[pos])
+           be the code that set the pending expression. A join also ends the
+           straight-line segment the presence-flag dedup reasons about: a flag
+           proven on one incoming edge is not proven on the other. */
+        if (targets[pos]) {
             local_flush_all(var_count);
+            whale_sp_reset();
+        }
 
         /* The fresh-struct window closes at any boundary a jump can reach or
            any call: past either, the object in the slot may not be the one
@@ -4723,6 +4781,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         wt_slot("L", whale_str_L[col]); wt('='); fold_inline(sp - 1); wt(';');
                         wt_arr("sp", col); wt('='); wt_int(1); wt(';');
                         fold_commit(fm);
+                        whale_sp_note(col);
                         sp--;   /* the object stays on the stack */
                         break;
                     }
@@ -4869,7 +4928,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 }
                 /* A struct field is a frame variable: the store is one
                    assignment - no shape check, no pointer chase, no tag branch.
-                   That is the whole point of laying the object out. */
+                   That is the whole point of laying the object out. The flag
+                   write stays: it is what later reads in this segment rely on
+                   (whale_sp_note below), and a store is what proves presence. */
                 if (WHALE_IS_STRUCT(ta)) {
                     int col = whale_str_col(whale_str_atoms, whale_str_n, atom);
 
@@ -4881,6 +4942,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         wt_slot("L", whale_str_L[col]); wt('='); fold_inline(sp - 1); wt(';');
                         wt_arr("sp", col); wt('='); wt_int(1); wt(';');
                         fold_commit(fm);
+                        whale_sp_note(col);
                     }
                     sp -= 2;
                     break;
@@ -4991,9 +5053,16 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     {
                         int fm = fold_mark();
 
-                        wk(JS_WK_IF); wt('('); wt('!'); wt_arr("sp", col); wt(')'); wt('{');
-                        wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
-                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        /* Skip the check when this segment already proved the
+                           column present (whale_sp_known/note) - objfields'
+                           read-after-write of one column then compiles to just
+                           the copy, with no branch at all. */
+                        if (!whale_sp_known(col)) {
+                            wk(JS_WK_IF); wt('('); wt('!'); wt_arr("sp", col); wt(')'); wt('{');
+                            wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                            wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                            whale_sp_note(col);
+                        }
                         wt_arr("v", nm); wt('='); wt_slot("L", whale_str_L[col]); wt(';');
                         fold_commit(fm);
                         whale_vname[sp] = nm;
@@ -5095,12 +5164,17 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         { WHALE_STEP_INSTEAD_OF_BAILING(); }
                     /* The presence flag is a statement, so it is emitted on its own,
                        closed off with a commit. It also has to come first: it reads
-                       sp[col], which nothing in the expression below touches. */
-                    fm = fold_mark();
-                    wk(JS_WK_IF); wt('('); wt('!'); wt_arr("sp", col); wt(')'); wt('{');
-                    wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
-                    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
-                    fold_commit(fm);
+                       sp[col], which nothing in the expression below touches.
+                       Skip it when this segment already proved the column (same
+                       rule as the get_field2 arm above). */
+                    if (!whale_sp_known(col)) {
+                        fm = fold_mark();
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_arr("sp", col); wt(')'); wt('{');
+                        wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        fold_commit(fm);
+                        whale_sp_note(col);
+                    }
                     /* The column is the value. It is a register scalar already, so
                        reading it where it is used costs one operand - copying it into
                        _ws.v[] first put a store and a reload on every field access,
@@ -5434,7 +5508,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         for (k = 0; k < fn; k++) {
                             /* Read each field once, into its column. The object
                                itself is left alone - these are what the accesses
-                               below use. */
+                               below use. A fill proves every column it reads,
+                               so note them all for the presence-flag dedup. */
                             wt_slot("L", whale_str_L[k]); wt('=');
                             wt_id("JS_WhaleObjFieldNum");
                             wt('('); wt_id("ctx"); wt(','); wt_int(slot); wt(',');
@@ -5445,6 +5520,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                             wt_arr("sp", k); wt('='); wt_int(1); wt(';');
                         }
                         fold_commit(pfm);
+                        for (k = 0; k < fn; k++)
+                            whale_sp_note(k);
                         whale_str_n = fn;
                         whale_str_slot = slot;
                         local_forget(idx);

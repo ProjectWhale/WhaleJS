@@ -2742,4 +2742,37 @@ SOLVED（复盘+实修一处）/ PARTIAL（大头未动，需 struct 化）
 ## 验证
 `whale api test: ok`；19+6 case whalejs 全跑 + node 全对表。
 ## 状态
-绿，待提交。下一步：`_ws` 拆分 / call-free 循环解析提升（线性 IR 面）。
+绿，已提交 b034520。
+
+# <93>: presence-flag 检查去重（sp[col] 同段只查一次）
+SOLVED（objfields loop 体 4 检查→1，零回归）/ PARTIAL（大头仍是 field-cache）
+
+## 落点（读已落盘生成代码定的）
+- objfields `run()` 的 loop 体（`temp/cur_of.c`）：4 列布局下每迭代
+  `if (!sp[c])` ×4，其中 3 个是读-写同列的重复（写后读、读后读）。
+  sp[] 只 0→1（store 置位，无清零；新对象重建布局），同段内已证即恒真。
+- 修法：`whale_sp_seen[WHALE_LOOP_MAX]`——每 open loop 一字，位 col 表
+  "本段已证"。读（get_field/get_field2 STRUCT 臂）先查字，命中则整段
+  `if (!sp[col])` 不发；store（define/put_field STRUCT 臂 + fill 臂）置位。
+  loop_head/任何 jump target 处清字（join 后不可沿用一边结论；back edge
+  重进 body 亦清——下 trip 不沿用上 trip）。新对象（OP_object 两布局臂）
+  全清（旧证属旧对象）。32 位字故 col≥32 不记（布局上限 32，`sp` 数组
+  `4×32`，够用；超限即不去重，保守正确）。
+- 证伪记录（已回退）：去 store 的 `sp=1` 写——objshape 202→404ms 翻倍。
+  原因不是 flag 写本身贵，而是写与读在 TCC 下是 load-store 转发的锚：
+  去写后读臂的 `if (!sp[c])` 读到的是 `{0}` 初值语义，TCC 把跨语句的
+  `sp[c]` 每次重载，分支预测全崩。写保留、只去重复读，才是正确方向。
+
+## 测量
+- objfields loop 体 `if (!sp[c])` 4→1（落盘 `temp/cur_ded.c` 为证：
+  仅剩 `flags` 列首次读一次；`tag/key` 写后读全消，`depth` 读后读消）。
+- objfields 59ms 持平（check=4799933）：分支 4→1 但体仍是 field-cache
+  形态（fill 走 `ObjFieldNum` helper，loop 体走 STRUCT 列+L spill），
+  分支只占小头——与 <92> "field-cache 是大头"一致，无矛盾。
+- 其余：fib 17、immutable 31、objshape 197、vnode 11、nested 70、
+  object 5、minmax 119。25/25 全对，0 mismatch（node 25 case 逐一对表）。
+
+## 验证
+`whale api test: ok`；8 关键 + 17 其余 whalejs 全跑 + node 全对表。
+## 状态
+绿，待提交。下一步：field-cache 形态（call-free 循环解析提升）/ `_ws` 拆分。
