@@ -2850,3 +2850,51 @@ repeat=3 关键 case + repeat=1 全量。
 绿，待提交。下一步：线性 IR 后端（bitops/locals/nested 的共同解，
 <67> 路线 B）；nested +13% 重测；`_`ws` 拆分（fib per-call 税）。
 
+# <95>: ELS/ISA 现状审计 + 小 trip 循环展开（minmax 追平 node）
+SOLVED（minmax 81→49ms = node）/ TIPS（FMA/cmov/AVX/roundsd 全部证伪）
+
+## ELS + ISA 现状（动手前先审计，避免重复造）
+- TCC 侧 pin 机制 8 处全在树上（`whale_pin_*` + modrm 识别 + `whale_isa_*`），
+  AVX2 VEX 分支在 `gen_opf`（2244 行），CPUID + `WHALE_ISA` 覆盖全就位。
+- 生成器侧只剩 `_wv` 2-pin（L pin <86> 已判死刑）。
+- 但 ISA 分级是空转的（<45> 早写过）：产物只有 `+-*/` 比较转换，无
+  `roundsd` 目标；AVX 三操作数因 `dst==src1` 恒成立零收益。
+
+## 四个候选的证伪结论（每个都有具体理由，不是"以后再说"）
+- **FMA 死刑（语义）**：`fma(a,b,c)` 单舍入 vs JS 双舍入，check 精确比对必
+  mismatch。除非运行时证明 `a*b` 精确，不可编译期证明。V8 敢用是有守卫，
+  我们没有。
+- **cmov 无落点**：TCC `expr_cond` 是跳转实现（gvtst+gjmp+gsym），双分支归并
+  处改 cmov 要动寄存器归并，单遍下无低风险点。生成器侧发 `?:` 同样是分支。
+- **AVX/roundsd 无目标**：见上。`roundsd` 要等 `Math.*` 进 JIT。
+- **跳转缩短高风险**：`gsym_addr` 长跳转回填改短要压缩代码 + 修正已回填地址，
+  单遍下风险大收益小（icache）。跳过。
+- **PE callee-save 无事可做**：PE 版 prolog 只 `push rbp/mov/sub`，根本不存
+  非易失寄存器（tcc_to_optimize.md 第 10 条在 PE 版不存在）。
+
+## 落地的：小 trip-count 循环展开（生成器侧 loop buffer）
+- `whale_loop_trip_of`（pass-1 后）：只认 `g=0; g<K; g++`（K≤8）+ 单一 inc 写
+  + 无调用 + 无外跳（head test exit / 回边除外）+ 无内层循环头。跳转目标
+  公式照 pass-1（`pos+1+offset`，第一次写成 `+2` 全拒，定位手段是 `[trip]`
+  打印）。
+- `whale_loop_unroll`（`loop_end` 处）：头 flush 留一次、删头标签/条件/回边、
+  体复制 K 份（`Lg` 读换字面量、`Lg=...` 整句删、内部 label 逐份重命名
+  `Q<id>_<k>`、`goto exit` 出现即拒）。iface 加 `JS_WhaleTokIsKw` +
+  `JS_WhaleTokCInt` 两个 5 行导出。
+- 附带修两个真 bug：① `loop_end` 触发条件 `pos == back_pos` 永不成立
+  （`pos += sz` 在检查前，2 字节 goto 让 pos 超过 back 2）→ 改 `pos - sz`，
+  原来所有 buffer 全开到函数尾（LICM 不依赖它故无人发现）；② 该修复让
+  嵌套循环外层余部 depth 回到 1，撞上 `_wv` pin 门与声明门不一致
+  （materialize 缺 `loop_count==1`）→ 补上，否则嵌套函数发未声明 `_wv`
+  直接编译失败。教训：门控条件必须与声明点逐字一致（<83> minmax 回退同款）。
+- 效果：minmax 81→**49ms（追平 node 48ms）**，`j*7` 全变字面量（TCC 常量折叠
+  免费吃掉），8 份标签重命名验证正确，25/25 全对。
+- bitops 全量口径 234ms 是机器负载（单测 repeat=3 回 150ms），非回归。
+
+## 验证
+`whale api test: ok`；25/25 全对 0 mismatch；minmax repeat=3 追平 node。
+## 状态
+绿，待提交。下一步：SIMD（sieve，生成器侧循环识别 + 步长展开，最大单项）；
+`_ws` 拆分；线性 IR（bitops/locals/nested 共同解）。
+
+

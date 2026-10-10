@@ -899,6 +899,24 @@ void JS_WhaleTokKw(int w)
         JS_WhaleTokPush(kwtok[w], 0);
 }
 
+/* Is this token stream entry the keyword `w` (a JS_WK_* id)? The generator
+   needs to recognise `if`/`goto` when rewriting a buffered loop body
+   (unrolling), and the token values are TinyCC's own - so the comparison
+   lives here, next to the table. */
+int JS_WhaleTokIsKw(int tok, int w)
+{
+    static const int kwtok[] = {
+        TOK_INT, TOK_CHAR, TOK_VOID, TOK_LONG, TOK_UNSIGNED, TOK_FLOAT,
+        TOK_DOUBLE, TOK_STATIC, TOK_EXTERN, TOK_TYPEDEF, TOK_STRUCT, TOK_RETURN,
+        TOK_IF, TOK_ELSE, TOK_WHILE, TOK_FOR, TOK_DO, TOK_BREAK, TOK_CONTINUE,
+        TOK_GOTO, TOK_SWITCH, TOK_CASE, TOK_DEFAULT, TOK_SIZEOF, TOK_REGISTER,
+        TOK_UNION, TOK_ENUM, TOK_SHORT,
+    };
+    if (w < 0 || w >= (int)(sizeof(kwtok) / sizeof(kwtok[0])))
+        return 0;
+    return tok == kwtok[w];
+}
+
 void JS_WhaleTokIdent2(const char *name)
 {
     JS_WhaleTokPush(whale_tok_ident(name), 0);
@@ -915,6 +933,13 @@ void JS_WhaleTokSlot(const char *prefix, int n)
 void JS_WhaleTokInt(int v)
 {
     JS_WhaleTokPush(TOK_CINT, (double)v);
+}
+
+/* The integer-literal token, for the generator's loop-body rewriting (an
+   unrolled induction variable is spelled as a literal). */
+int JS_WhaleTokCInt(void)
+{
+    return TOK_CINT;
 }
 
 void JS_WhaleTokDouble(double v)

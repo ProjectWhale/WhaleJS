@@ -1069,6 +1069,237 @@ static int whale_local_invariant(int idx)
     return !whale_loop_written[(size_t)head * whale_loop_wn + idx];
 }
 
+/* Function loop count for the pin gate below (fold_materialize has no info).
+   Set once per compilation next to the loop scans. */
+static int whale_emit_loop_count;
+/* Small-trip-count unrolling: per-head trip count (0 = do not unroll), the
+   induction local, and the head test's exit. Indexed by bytecode head
+   position like loop_back[]; allocated with it, filled once before the
+   emit pass, freed with the rest at out:. */
+static int *whale_loop_trip;
+static int *whale_loop_trip_g;
+static int *whale_loop_trip_exit;
+
+/* A small integer literal push at pos: value in *out, length in *ln. Only the
+   immediate forms (push_0..7/i8/i16); the constant pool is needless here. */
+static int whale_push_lit(const uint8_t *pc, int len, int pos, double *out, int *ln)
+{
+    int op;
+
+    if (pos < 0 || pos >= len)
+        return 0;
+    op = pc[pos];
+    if (op >= OP_push_0 && op <= OP_push_7) {
+        *out = (double)(op - OP_push_0);
+        *ln = 1;
+        return 1;
+    }
+    if (op == OP_push_i8 && pos + 1 < len) {
+        *out = (double)(int)(int8_t)pc[pos + 1];
+        *ln = 2;
+        return 1;
+    }
+    if (op == OP_push_i16 && pos + 2 < len) {
+        *out = (double)(int)(int16_t)whale_get_u16(pc + pos + 1);
+        *ln = 3;
+        return 1;
+    }
+    if (op == OP_push_minus1) {
+        *out = -1;
+        *ln = 1;
+        return 1;
+    }
+    return 0;
+}
+
+/* A get_loc at pos: local index in *out, length in *ln. */
+static int whale_get_loc_at(const uint8_t *pc, int len, int pos, int var_count,
+                            int *out, int *ln)
+{
+    int op, idx = -1, l = 0;
+
+    if (pos < 0 || pos >= len)
+        return 0;
+    op = pc[pos];
+    if (op >= OP_get_loc0 && op <= OP_get_loc3) {
+        idx = op - OP_get_loc0;
+        l = 1;
+    } else if (op == OP_get_loc8 && pos + 1 < len) {
+        idx = (int)pc[pos + 1];
+        l = 2;
+    } else if (op == OP_get_loc && pos + 2 < len) {
+        idx = (int)whale_get_u16(pc + pos + 1);
+        l = 3;
+    } else {
+        return 0;
+    }
+    if (idx < 0 || idx >= var_count)
+        return 0;
+    *out = idx;
+    *ln = l;
+    return 1;
+}
+
+/* Trip count of the loop [head, back], or 0. Recognises only
+   `g = 0; head: ... g < K ...; inc g; goto head` with K <= 8, a single
+   incrementing write, no call, and no exit except the head test's. Every
+   rejection is conservative: an unrecognised loop is emitted as before. */
+static int whale_loop_trip_of(const uint8_t *pc, int len, int head, int back,
+                              int var_count, const int *loop_back,
+                              const uint8_t *targets,
+                              const int *call_pos, int call_n,
+                              int *g_out, int *exit_out)
+{
+    int g = -1, gl = 0, kl = 0, cond, ifop, exitp = -1;
+    double kv = 0;
+    int q, qsz, writes = 0;
+
+    if (head < 0 || back <= head || back >= len)
+        return 0;
+    /* back edge is `...; inc_loc g; goto head` with the goto at `back`.
+       Target = opcode offset + 1 + displacement (the interpreter's pc points
+       at the operand when it adds, same as pass 1's loop_back fill). */
+    {
+        int nop = pc[back], ntgt = -1;
+
+        if (nop == OP_goto8 && back + 1 < len)
+            ntgt = back + 1 + (int8_t)pc[back + 1];
+        else if (nop == OP_goto && back + 4 < len)
+            ntgt = back + 1 + (int32_t)whale_get_u32(pc + back + 1);
+        else
+            return 0;
+        if (ntgt != head)
+            return 0;
+    }
+    if (back < 2 || pc[back - 2] != OP_inc_loc)
+        return 0;
+    g = (int)pc[back - 1];
+    if (g < 0 || g >= var_count)
+        return 0;
+    /* head test is `get_loc g; push K; lt; if_false exit` */
+    {
+        int gg = -1;
+
+        if (!whale_get_loc_at(pc, len, head, var_count, &gg, &gl) || gg != g)
+            return 0;
+    }
+    {
+        int kp = head + gl;
+
+        if (!whale_push_lit(pc, len, kp, &kv, &kl))
+            return 0;
+        if (kv < 1 || kv > 8 || kv != (double)(int)kv)
+            return 0;
+    }
+    {
+        int lp = head + gl + kl;
+
+        if (lp >= len || pc[lp] != OP_lt)
+            return 0;
+        {
+            int ip = lp + 1;
+
+            if (ip >= len)
+                return 0;
+            ifop = pc[ip];
+            if (ifop == OP_if_false8 && ip + 1 < len)
+                exitp = ip + 1 + (int8_t)pc[ip + 1];
+            else if (ifop == OP_if_false && ip + 4 < len)
+                exitp = ip + 1 + (int32_t)whale_get_u32(pc + ip + 1);
+            else
+                return 0;
+            if (exitp < 0 || exitp > len)
+                return 0;
+        }
+    }
+    /* `g = 0` right before the head */
+    {
+        int pp = head - 1, vp = -1, vl = 0;
+
+        if (head < 2)
+            return 0;
+        if (pc[head - 1] >= OP_put_loc0 && pc[head - 1] <= OP_put_loc3)
+            vp = pc[head - 1] - OP_put_loc0;
+        else if (pc[head - 1] == OP_put_loc8 && head - 1 + 1 < len)
+            vp = (int)pc[head];
+        else
+            return 0;
+        if (vp != g)
+            return 0;
+        pp = head - 2;
+        if (!whale_push_lit(pc, len, pp, &kv, &vl) || kv != 0)
+            return 0;
+        (void)cond;
+    }
+    /* single incrementing write, no call, no foreign exit inside */
+    for (q = head; q <= back; ) {
+        int qo = (int)pc[q];
+        int w;
+
+        qsz = whale_op_size_of(qo);
+        if (qsz <= 0 || q + qsz > len)
+            return 0;
+        if (qo == OP_goto8 || qo == OP_goto || qo == OP_if_false8 ||
+            qo == OP_if_false || qo == OP_if_true8 || qo == OP_if_true) {
+            int t2 = -1;
+
+            if ((qo == OP_goto8 || qo == OP_if_false8 || qo == OP_if_true8) &&
+                q + 1 < len)
+                t2 = q + 1 + (int8_t)pc[q + 1];
+            else if (q + 4 < len)
+                t2 = q + 1 + (int32_t)whale_get_u32(pc + q + 1);
+            if (t2 < head || t2 > back) {
+                /* leaving the body: only the head test's exit and the back
+                   edge's return to head are allowed */
+                int is_head_test = (q + qsz == head + gl + kl + 1 + 2) ||
+                                   (q + qsz == head + gl + kl + 1 + 5);
+                int is_back_edge = (q == back);
+
+                if (!((t2 == exitp && is_head_test) || (t2 == head && is_back_edge)))
+                    return 0;
+            }
+        }
+        w = whale_writes_local(qo, pc, q);
+        if (w == g) {
+            if (q == back - 2)
+                writes++;
+            else
+                return 0;
+        }
+        q += qsz;
+    }
+    if (writes != 1)
+        return 0;
+    {
+        int k;
+
+        for (k = 0; k < call_n; k++)
+            if (call_pos[k] >= head && call_pos[k] <= back)
+                return 0;
+    }
+    /* nested loops inside are fine to leave looping (only the innermost with
+       a proven trip is expanded); but an inner loop head inside would need
+       its own buffer handling - the expander only takes a body with no
+       inner loop head of its own. */
+    {
+        int qq;
+
+        for (qq = head + 1; qq <= back; qq++)
+            if (loop_back[qq] >= 0)
+                return 0;
+    }
+    *g_out = g;
+    *exit_out = exitp;
+    {
+        double k2 = 0;
+        int kl2 = 0;
+
+        if (!whale_push_lit(pc, len, head + gl, &k2, &kl2))
+            return 0;
+        return (int)k2;
+    }
+}
+
 static WhaleVExpr *whale_vexpr;   /* the pending expression of each stack slot */
 static uint8_t    *whale_vmat;    /* 1 = already forced into a variable */
 
@@ -1411,6 +1642,7 @@ static int loop_begin(int head_pos, int back_pos)
 
 /* Finish the innermost loop and hand its body on. This is where a loop-level
    optimisation would run - it gets the complete body at once. */
+static int whale_loop_unroll(WhaleLoop *l, int trip, int g, int exitp);
 static void loop_end(void)
 {
     WhaleLoop *l, *p;
@@ -1432,6 +1664,15 @@ static void loop_end(void)
         whale_out_num = p->num;
         whale_out_len = &p->len;
     }
+    /* Small-trip-count unrolling: the body is complete in l->tok, so a proven
+       `for (g = 0; g < K; g++)` (K <= 8) is expanded inline here instead of
+       being emitted as a loop. Anything unexpected falls through to the
+       plain append below - unrolling is best-effort, never load-bearing. */
+    if (whale_loop_trip && l->head_pos >= 0 &&
+        whale_loop_unroll(l, whale_loop_trip[l->head_pos],
+                          whale_loop_trip_g[l->head_pos],
+                          whale_loop_trip_exit[l->head_pos]))
+        return;
     n = l->len;
     if (n > WHALE_LOOP_BUF)
         n = WHALE_LOOP_BUF;
@@ -1439,6 +1680,189 @@ static void loop_end(void)
         whale_out_num[*whale_out_len] = l->num[i];
         whale_out_tok[(*whale_out_len)++] = l->tok[i];
     }
+}
+
+/* Expand the completed body of a proven small loop inline: `for (g = 0;
+   g < K; g++) body` becomes K copies of body with g spelled as 0..K-1.
+   Returns 1 when the body was consumed (loop_end appends nothing more).
+
+   Buffer shape (emitted in order): `Lhead:`, head flush stores, the head
+   test branch `if (..) goto Lexit;`, the body, the back-edge `goto Lhead;`.
+   The expansion keeps the head flush once, drops the head label, the test
+   and the back edge, deletes the induction increment `Lg = (Lg+1);`, and
+   renames every other inner label (`Ln:` / `goto Ln`) per copy so copies do
+   not collide. The exit edge vanishes with the test: every copy runs, which
+   is exactly what K trips do. Any shape surprise bails to 0 and the loop is
+   emitted as before. */
+static int whale_loop_unroll(WhaleLoop *l, int trip, int g, int exitp)
+{
+    int head, n, i;
+    int headid, exitid, lgid;
+    int cond_end, body_start, body_end, back_start;
+    char lgname[32];
+
+    if (trip <= 1 || trip > 8 || g < 0 || exitp < 0)
+        return 0;
+    head = l->head_pos;
+    if (head < 0)
+        return 0;
+    n = l->len;
+    if (n <= 0 || n > WHALE_LOOP_BUF)
+        return 0;
+    snprintf(lgname, sizeof(lgname), "L%d", head);
+    headid = JS_WhaleTokIdent(lgname);
+    snprintf(lgname, sizeof(lgname), "L%d", exitp);
+    exitid = JS_WhaleTokIdent(lgname);
+    snprintf(lgname, sizeof(lgname), "L%d", g);
+    lgid = JS_WhaleTokIdent(lgname);
+    /* [0] must be the head label `Lhead:` */
+    if (n < 2 || l->tok[0] != headid || l->tok[1] != ':') {
+        return 0;
+    }
+    /* first `if` after the label ends the head part (flush stores + test) */
+    cond_end = -1;
+    for (i = 2; i < n; i++) {
+        if (JS_WhaleTokIsKw(l->tok[i], JS_WK_IF)) {
+            int j = i;
+
+            while (j < n && l->tok[j] != ';')
+                j++;
+            if (j >= n)
+                return 0;
+            cond_end = j + 1;
+            break;
+        }
+    }
+    if (cond_end < 0)
+        return 0;
+    body_start = cond_end;
+    /* trailing `goto Lhead;` is the back edge: exactly the last statement */
+    back_start = -1;
+    if (n - 3 >= body_start && l->tok[n - 1] == ';' &&
+        l->tok[n - 2] == headid &&
+        JS_WhaleTokIsKw(l->tok[n - 3], JS_WK_GOTO))
+        back_start = n - 3;
+    if (back_start < 0)
+        return 0;
+    body_end = back_start;
+    {
+        int k, j;
+
+        /* inner labels first: every `Ln:` in the body (other than head and
+           exit) is collected once, so both its definition and any forward
+           `goto Ln` before it map to the same per-copy name. */
+        int lab_old[32];
+        int nlab = 0;
+
+        for (j = body_start; j + 1 < body_end; j++) {
+            if (l->tok[j + 1] == ':' && l->tok[j] != headid &&
+                l->tok[j] != exitid && l->tok[j] != lgid) {
+                int m, found = 0;
+
+                for (m = 0; m < nlab; m++)
+                    if (lab_old[m] == l->tok[j]) {
+                        found = 1;
+                        break;
+                    }
+                if (!found && nlab < 32)
+                    lab_old[nlab++] = l->tok[j];
+            }
+        }
+        /* `goto Lexit` must not appear (only the head test may leave, and it
+           is deleted with the test); any other `goto Ln` must name a
+           collected inner label. Otherwise the body has control flow this
+           expander does not understand. */
+        for (j = body_start; j + 2 < body_end; j++) {
+            if (JS_WhaleTokIsKw(l->tok[j], JS_WK_GOTO) &&
+                l->tok[j + 2] == ';') {
+                int t = l->tok[j + 1];
+                int m, ok = 0;
+
+                if (t == exitid)
+                    return 0;
+                for (m = 0; m < nlab; m++)
+                    if (lab_old[m] == t) {
+                        ok = 1;
+                        break;
+                    }
+                if (!ok)
+                    return 0;
+            }
+        }
+        /* head flush stores ([2, if_start)) go out once: they carry the
+           values from before the loop. The head test itself (`if ... goto
+           exit;`) dies with the loop (every copy runs). Find where the `if`
+           starts so copies begin after it. */
+        {
+            int if_start = -1;
+
+            for (if_start = 2; if_start < body_start; if_start++)
+                if (JS_WhaleTokIsKw(l->tok[if_start], JS_WK_IF))
+                    break;
+            if (if_start >= body_start)
+                return 0;
+            for (j = 2; j < if_start && *whale_out_len < WHALE_TOK_MAX; j++) {
+                whale_out_num[*whale_out_len] = l->num[j];
+                whale_out_tok[(*whale_out_len)++] = l->tok[j];
+            }
+        }
+        for (k = 0; k < trip; k++) {
+            int lab_new[32];
+            int m;
+
+            for (m = 0; m < nlab; m++) {
+                char nb[48];
+
+                snprintf(nb, sizeof(nb), "Q%x_%d", (unsigned)lab_old[m], k);
+                lab_new[m] = JS_WhaleTokIdent(nb);
+            }
+            for (j = body_start; j < body_end; j++) {
+                int t = l->tok[j];
+                double v = l->num[j];
+
+                if (t == lgid) {
+                    /* induction increment `Lg = ...;` dies (g is the literal
+                       k in this copy); any other store to Lg would have
+                       refused the trip, so `Lg =` always opens it. */
+                    if (j + 1 < body_end && l->tok[j + 1] == '=') {
+                        while (j < body_end && l->tok[j] != ';')
+                            j++;
+                        continue;
+                    }
+                    /* a read of the induction variable: the trip literal */
+                    if (*whale_out_len < WHALE_TOK_MAX) {
+                        whale_out_num[*whale_out_len] = (double)k;
+                        whale_out_tok[(*whale_out_len)++] =
+                            JS_WhaleTokCInt();
+                    }
+                    continue;
+                }
+                /* a collected inner label (definition or goto target) */
+                {
+                    int found = -1;
+
+                    for (m = 0; m < nlab; m++)
+                        if (lab_old[m] == t) {
+                            found = m;
+                            break;
+                        }
+                    if (found >= 0) {
+                        if (*whale_out_len < WHALE_TOK_MAX) {
+                            whale_out_num[*whale_out_len] = v;
+                            whale_out_tok[(*whale_out_len)++] =
+                                lab_new[found];
+                        }
+                        continue;
+                    }
+                }
+                if (*whale_out_len < WHALE_TOK_MAX) {
+                    whale_out_num[*whale_out_len] = v;
+                    whale_out_tok[(*whale_out_len)++] = t;
+                }
+            }
+        }
+    }
+    return 1;
 }
 
 /* Force slot k into a variable (`v<k> = <expr>;`) and commit it. Only needed
@@ -1458,8 +1882,11 @@ static void fold_materialize(int k)
        trip and re-read, so keeping it in xmm pays every iteration. Outside
        that shape the block slot is fine (written once, read rarely; nested
        loops fight over the 4-deep pool). Conditions match the prologue
-       declaration gate exactly. */
-    if (!whale_loop_has_call && whale_loop_depth == 1 && whale_vpin_next < WHALE_VPIN_MAX)
+       declaration gate exactly (including loop_count == 1: without it a
+       nested loop's outer remainder would name an undeclared _wv after an
+       inner loop_end() dropped the depth back to 1). */
+    if (!whale_loop_has_call && whale_loop_depth == 1 &&
+        whale_emit_loop_count == 1 && whale_vpin_next < WHALE_VPIN_MAX)
         whale_vname[k] = WHALE_VPIN_BASE + whale_vpin_next++;
     else
         whale_vname[k] = whale_vserial++;
@@ -2958,10 +3385,14 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     whale_vmat = calloc(1, stack_size);
     whale_lmem = calloc(var_count > 0 ? var_count : 1, sizeof(WhaleLocal));
     loop_back = malloc((len + 1) * sizeof(*loop_back));
+    whale_loop_trip = calloc(len + 1, sizeof(*whale_loop_trip));
+    whale_loop_trip_g = malloc((len + 1) * sizeof(*whale_loop_trip_g));
+    whale_loop_trip_exit = malloc((len + 1) * sizeof(*whale_loop_trip_exit));
     if (!targets || !seen || !snap || !cur || !args_used || !assign_cnt ||
         !args_obj || !args_arr ||
         !whale_vexpr || !whale_vmat ||
-        !whale_lmem || !loop_back)
+        !whale_lmem || !loop_back || !whale_loop_trip ||
+        !whale_loop_trip_g || !whale_loop_trip_exit)
         { whale_out_line = __LINE__; goto out; }
     for (i = 0; i <= len; i++)
         loop_back[i] = -1;
@@ -3259,6 +3690,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             { whale_out_line = __LINE__; goto out; }
         whale_loop_wn = var_count;
         memset(whale_loop_heat, 0, sizeof(whale_loop_heat));
+        whale_emit_loop_count = info->loop_count;
         for (h = 0; h <= len; h++) {
             if (loop_back[h] >= 0) {
                 int q = h, qsz;
@@ -3296,6 +3728,37 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     if (r >= 0 && r < var_count && r < WHALE_JIT_MAX_SLOTS)
                         whale_loop_heat[r]++;
                     q += qsz;
+                }
+            }
+        }
+    }
+
+    /* Small-trip-count loop unrolling table, indexed by loop head position.
+       whale_loop_trip[h] > 0 means the loop at h runs exactly that many times
+       and loop_end() expands its body inline instead of emitting the loop.
+       Only the narrow shape is recognised: `g = 0` right before the head,
+       `g < K` (K a small integer literal, K <= 8) as the head test, `g++` at
+       the back edge, no other write to g inside, no call inside, and no jump
+       that leaves the body except through the head test's exit. Anything else
+       leaves 0 and the loop is emitted as before. */
+    {
+        int h;
+
+        memset(whale_loop_trip, 0, sizeof(whale_loop_trip));
+        memset(whale_loop_trip_g, 0xff, sizeof(whale_loop_trip_g));
+        memset(whale_loop_trip_exit, 0xff, sizeof(whale_loop_trip_exit));
+        for (h = 0; h <= len; h++) {
+            if (loop_back[h] >= 0) {
+                int trip = 0, g = -1, exitp = -1;
+
+                trip = whale_loop_trip_of(pc, len, h, loop_back[h], var_count,
+                                          loop_back, targets,
+                                          whale_call_pos, whale_call_n,
+                                          &g, &exitp);
+                if (trip > 0 && h <= len) {
+                    whale_loop_trip[h] = trip;
+                    whale_loop_trip_g[h] = g;
+                    whale_loop_trip_exit[h] = exitp;
                 }
             }
         }
@@ -7064,9 +7527,14 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         whale_next_op:
         pos += sz;
 
-        /* the back edge of the innermost open loop closes its buffer */
+        /* the back edge of the innermost open loop closes its buffer. `pos`
+           already advanced past the jump, so compare against where it was
+           (`pos - sz` is the jump itself). Comparing `pos` itself never
+           fires (a 2-byte goto leaves pos 2 past the back edge) - which used
+           to leave every loop buffer open until end of function, silently
+           disabling anything that reads a closed body (unrolling). */
         if (whale_loop_depth > 0 &&
-            pos == whale_loops[whale_loop_depth - 1].back_pos)
+            pos - sz == whale_loops[whale_loop_depth - 1].back_pos)
             loop_end();
     }
 
@@ -7192,6 +7660,15 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         free(loc_slot);
     if (loop_back)
         free(loop_back);
+    if (whale_loop_trip)
+        free(whale_loop_trip);
+    if (whale_loop_trip_g)
+        free(whale_loop_trip_g);
+    if (whale_loop_trip_exit)
+        free(whale_loop_trip_exit);
+    whale_loop_trip = NULL;
+    whale_loop_trip_g = NULL;
+    whale_loop_trip_exit = NULL;
     if (assign_cnt)
         free(assign_cnt);
     if (whale_vexpr)

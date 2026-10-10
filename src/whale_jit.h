@@ -393,5 +393,12 @@ void JS_WhaleTokInt(int v);
 void JS_WhaleTokDouble(double v);
 void JS_WhaleTokChar(int ch);
 void JS_WhaleTokOp(int o);
+/* is this token the keyword `w` (a JS_WK_* id)? for rewriting a buffered
+   loop body (unrolling needs to find `if`/`goto`). */
+int JS_WhaleTokIsKw(int tok, int w);
+/* the integer-literal token, for spelling an unrolled induction variable. */
+int JS_WhaleTokCInt(void);
+/* the token id for an identifier (token-table lookup, same id for same name). */
+int JS_WhaleTokIdent(const char *name);
 
 #endif /* WHALE_JIT_H */
