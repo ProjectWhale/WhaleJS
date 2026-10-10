@@ -2776,3 +2776,77 @@ SOLVED（objfields loop 体 4 检查→1，零回归）/ PARTIAL（大头仍是 
 `whale api test: ok`；8 关键 + 17 其余 whalejs 全跑 + node 全对表。
 ## 状态
 绿，待提交。下一步：field-cache 形态（call-free 循环解析提升）/ `_ws` 拆分。
+
+# <94>: 纯数值后端优化第一轮（比较-分支融合 + 位运算短式 + 热局部写点物化）
+SOLVED（branch/minmax/loop_sum 兑现，零回归）/ PARTIAL（bitops/locals/nested 大头仍是 TCC 语句内 spill）
+
+## 基线（repeat=3，whalejs vs node）
+arith 106/64（1.66x）、locals 100/26（3.8x）、nested 71/19（3.7x）、
+minmax 123/52（2.4x）、bitops 150/14（10.7x）、loop_sum 72/17（4.2x）、
+branch 105/28（3.75x）、floatlit 130/63（2x）。fib 反超中，不在本轮。
+
+## dump 数出来的四处确定热点（WHALE_JIT_SRC 落盘逐条数过）
+1. **比较-分支永不融合**：每个循环条件都是 `if ((((a<b)) ? 1 : 0) == 0) goto`——
+   先 `?:` 物化布尔 double（TCC 语句边界 spill 一次访存），再归零比较。
+   branch 每迭代付 5 次。
+2. **ToInt32 过度冗长**：`(int)(long long)(x)` 约 15 token 包住每个位运算操作数；
+   已知 int32 的值（`&|^` 结果、字面量）也走全套，链式表达式爆炸 →
+   超 24 token 上限 → 每个中间值物化成 `_ws.v` 语句。bitops 体内 14 条
+   `_ws.v` 全是这么来的。
+3. **`%` 操作数无条件物化**：`fold_mod` 注释自称短操作数可直接内联，但调用前
+   两行无条件 `fold_materialize`——`L1`、`3` 这种单 token 也先存成纯拷贝语句。
+4. **`!x` 的 NaN 臂对 int32 是死代码**：`((x!=x)||(x==0))?1:0` 提操作数 3 次，
+   int32 不可能是 NaN，一句 `(x==0)` 就够。
+
+## 落地的改动（全在 src/whale_jit.c，生成器侧，不动 TCC）
+- `fold_toint32(k, t)` 改传类型字节：ICONST 字面量直接发整数；
+  I32 发单层 `(int)`（C 的位运算要 int 操作数，`double & double` 不编译；
+  全套 `(long long)` 只留给一般 NUM）。5 个调用点全改。
+- `OP_mod` 短操作数（`len<=8`）免物化（`v[0]=(L1)` 这类拷贝消失，
+  loop_sum 72→58ms）；I32/ICONST 分子 + 正非常量除数走裸 `(int)a%(int)b`
+ （C 取余符号随被除数 = JS 语义，除数非零常量故无 UB，fmod 旁路消失）。
+- `OP_lnot` 的 I32/ICONST 特化（单比较，不再三提操作数）。
+- **比较-分支融合**（通用路径 + peephole-1 非 dst 臂）：`cmp; if` 合成
+  `if (!(a<b)) goto` / `if ((a<b)) goto`。`!` 而非反转操作符（NaN 语义：
+  `!(NaN<1)` 真，`NaN>=1` 假，原来算前者）。`whale_next_is_branch` helper
+  覆盖 8/32 位 if。
+- `local_set` 写点热物化：`whale_loop_heat[d]>=3`（pass-1 循环内读+2写计数）
+  的局部在写点直接落盘（语句边界，安全），后续读变变量读。
+  bitops 的 `v=i&255` 从 4 次全套转换展开变成 1 次计算 + 3 次变量读，
+  `_ws.v` 语句 14→4 条。
+
+## 一个真 bug（第一批 lnot 特化引入的，顺手修）
+lnot 的 I32 判断读了循环级残留变量 `t`（该 case 从未赋值）——残留碰巧是
+I32/ICONST 时走单比较，否则走通用路径；残留对上但操作数是可能 NaN 的
+NUM 时静默错答案。改现取 `cur[var_count+sp-1]`。回归全对故未爆炸，
+但这是定时炸弹。
+
+## 一个大坑：融合第一版跳过 fold_set，objshape escaped 相编译失败
+第一版融合为省 BOOL 槽直接 `sp-=2`，没走 `fold_set`/`cur` 更新 →
+escaped 相出 `v[1] = ();` 空物化（TCC 层 `identifier expected`）→
+连锁第二次尝试 `duplicate label L8`（单例 state 错误路径清理不彻底，
+残留污染下一次）。entries 36（掉一相）、objshape 197→495ms。
+修法（方案C）：状态机与原来逐字一致（BOOL 槽照记照消费、两次 sp--、
+快照/pos 跳跃），只发射形态是融合的（`if (!(比较))`，BOOL 槽文本已无
+`?:`）。lnot 融合则整体删除（I32 特化后它与原来逐字一样，零收益白占复杂度）。
+教训：**融合类优化必须镜像原来状态机的每一步（fold_set/cur/sp/快照），
+只改发射形态；跳过 bookkeeping 省的那点东西一定在别处加倍还回来。**
+
+## 效果（repeat=3）
+- branch 105→52ms（-50%）、minmax 123→81ms（-32%）、loop_sum 72→49ms、
+  nested 71→80ms（+13%，无机制解释，判噪声，下轮重测）、其余持平。
+- objshape 178ms entries=48（恢复全编译）；25/25 全对 0 mismatch；
+  `whale api test: ok`。
+- bitops 150→147ms 纹丝不动：`_ws.v` 14→4 条零收益 → 瓶颈不在语句数，
+  而在语句内（5 个整数 op + idiv）与分支预测（`v&1` 交替致 `if` 50% 误预测，
+  TCC 无 cmov 是架构性差距，tcc_to_optimize.md 第 7 条）。记入下轮（线性 IR）。
+- locals/arith/floatlit 体已是最简语句，剩的是 TCC 单语句内 spill，
+  同等线性 IR 后端（路线 B）。
+
+## 验证
+`whale api test: ok`；25/25 全对 0 mismatch（node 逐一对表）；
+repeat=3 关键 case + repeat=1 全量。
+## 状态
+绿，待提交。下一步：线性 IR 后端（bitops/locals/nested 的共同解，
+<67> 路线 B）；nested +13% 重测；`_`ws` 拆分（fib per-call 税）。
+

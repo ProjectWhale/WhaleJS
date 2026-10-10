@@ -720,6 +720,36 @@ static int whale_binop_op(int op, int *is_cmp)
     default: return -1;
     }
 }
+/* A conditional jump seen from the instruction before it: opcode, target and
+   polarity, or 0 when the next instruction is not one. Lets a comparison fold
+   itself into the branch (`cmp; if` -> one `if (!(a<b)) goto`) instead of
+   materialising a boolean double first. */
+static int whale_next_is_branch(const uint8_t *pc, int len, int pos, int sz,
+                                int *tgt_out, int *is_true_out, int *isz_out)
+{
+    int nop, ntgt, nis_true, nisz;
+
+    if (pos + sz >= len)
+        return 0;
+    nop = pc[pos + sz];
+    if (nop == OP_if_false8 || nop == OP_if_true8) {
+        nis_true = (nop == OP_if_true8);
+        ntgt = pos + sz + 1 + (int8_t)pc[pos + sz + 1];
+        nisz = 2;
+    } else if (nop == OP_if_false || nop == OP_if_true) {
+        nis_true = (nop == OP_if_true);
+        ntgt = pos + sz + 1 + (int32_t)whale_get_u32(pc + pos + sz + 1);
+        nisz = 5;
+    } else {
+        return 0;
+    }
+    if (ntgt < 0 || ntgt > len)
+        return 0;
+    *tgt_out = ntgt;
+    *is_true_out = nis_true;
+    *isz_out = nisz;
+    return 1;
+}
 /* A load-like opcode, resolved. The emitter needs two steps because the
    peepholes must look at two loads before deciding what to emit, and tokens
    cannot be pushed speculatively. */
@@ -1207,31 +1237,25 @@ static void fold_inline(int k)
    is a plain variable or a short expression, which is exactly the shape the
    bitwise operators see. Without this, every bitwise operand paid a helper
    call whose fmod() dominated the loop. */
-static void fold_toint32(int k, int is_num, int is_iconst)
+static void fold_toint32(int k, int t)
 {
-    /* A literal already in range needs the cast and nothing else. Bitwise code is
-       full of these. */
-    if (is_iconst && !whale_vmat[k] && whale_vexpr[k].len == 1) {
-        wt('('); wk(JS_WK_INT); wt(')');
+    /* A literal int32 constant needs no conversion at all: emit it as an
+       integer literal. Bitwise code is full of these (255, 3, 1, 0xffff). */
+    if (t == WHALE_T_ICONST && !whale_vmat[k] && whale_vexpr[k].len == 1) {
         wt_int((int)gw_num[whale_vexpr[k].off]);
         return;
     }
-
-    /* A number already known to be a double. (int32_t)(long long)d is exactly
-       ToInt32(d) for every double: within 2^63 long long holds it, so the cast
-       truncates and the low 32 bits are the modulo-2^32 wrap; outside that range,
-       and for NaN and the infinities, x86's cvttsd2si yields INT64_MIN, whose low
-       32 bits are 0 - which is what ToInt32 gives for NaN, +/-Inf, and for any
-       float large enough to be a multiple of 2^32 (everything past 2^63 is).
-
-       The cast names the operand exactly once, so the `repeat` guard that used to
-       live here - which exists to stop a long pending expression being inlined
-       several times - does not apply. That guard was the whole reason `bitops`
-       called the helper: the left operand of `&` in `(acc + v % 7) & 0xffff` is a
-       plain NUM, and a long expression was refused the cast and sent to
-       JS_WhaleToInt32. That helper calls fmod, so a bitwise loop came out 10x
-       slower than the equivalent C. */
-    if (is_num) {
+    /* A value already known to be an in-range int32 truncates to itself, so
+       a single (int) cast is the whole conversion - the (long long) step
+       only exists to wrap out-of-range doubles. The C operator needs an int
+       operand either way (double & double does not compile), and this keeps
+       chained bitwise expressions short enough to stay out of _ws.v[]
+       temporaries. */
+    if (t == WHALE_T_I32 || t == WHALE_T_ICONST) {
+        wt('('); wk(JS_WK_INT); wt(')'); wt('('); fold_inline(k); wt(')');
+        return;
+    }
+    if (whale_type_is_num(t)) {
         wt('('); wk(JS_WK_INT); wt(')'); wt('('); wk(JS_WK_LONG); wk(JS_WK_LONG); wt(')');
         wt('('); fold_inline(k); wt(')');
         return;
@@ -1552,7 +1576,16 @@ static void local_set(int d, int mark, int inv)
     m->used = 0;
     if (whale_dbg_env("WHALE_MEM_TRACE"))
         fprintf(stderr, "[set] L%d off=%d len=%d\n", d, m->expr.off, m->expr.len);
-    if (m->expr.len > whale_expr_max)
+    /* A local read several times inside a loop must not stay deferred: every
+       read inlines the whole pending expression, so `v = i & 255` read four
+       times becomes four copies of the full conversion chain. The pass-1 heat
+       (reads + 2*writes inside loop bodies) names those locals, and storing
+       at the write point - a statement boundary, where materialising is safe -
+       turns the later reads into variable loads. 3 means at least three reads,
+       or a read plus a write: below that the deferred form is shorter. */
+    if (m->expr.len > whale_expr_max ||
+        (whale_loop_depth > 0 && d >= 0 && d < WHALE_JIT_MAX_SLOTS &&
+         whale_loop_heat[d] >= 3))
         local_materialize(d);
 }
 
@@ -3988,12 +4021,47 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         fold_commit(fm);
                         cur[dst] = WHALE_T_BOOL;
                     } else {
-                        int fm = fold_mark();
+                        int btgt = 0, bis_true = 0, bisz = 0;
 
-                        wt('('); whale_load_emit(k1, i1, cv1); wt_op(opid); whale_load_emit(k2, i2, cv2); wt(')'); wt('?'); wt_int(1); wt(':'); wt_int(0);
-                        fold_set(sp, fm, whale_load_inv(k1, i1) && whale_load_inv(k2, i2));
-                        cur[var_count + sp] = WHALE_T_BOOL;
-                        sp += 1;
+                        /* Same compare-into-branch as the general path, for the
+                           peephole shape: `<load> <load> <cmp>; if` folds to one
+                           branch with no boolean temporary. State machine
+                           mirrors the unfused push-plus-if (a BOOL slot is
+                           recorded and then consumed): only the emitted shape
+                           differs. */
+                        if (whale_next_is_branch(pc, len, p4 + l4, 0, &btgt, &bis_true, &bisz)) {
+                            int fm, cf;
+
+                            local_flush_all(var_count);
+                            fm = fold_mark();
+                            wt('('); whale_load_emit(k1, i1, cv1); wt_op(opid); whale_load_emit(k2, i2, cv2); wt(')');
+                            fold_set(sp, fm, whale_load_inv(k1, i1) && whale_load_inv(k2, i2));
+                            cur[var_count + sp] = WHALE_T_BOOL;
+                            sp += 1;
+                            cf = fold_mark();
+                            wk(JS_WK_IF); wt('(');
+                            if (!bis_true)
+                                wt('!');
+                            wt('('); fold_inline(sp - 1); wt(')');
+                            wt(')'); wk(JS_WK_GOTO); wt_slot("L", btgt); wt(';');
+                            fold_commit(cf);
+                            sp--;
+                            if ((btgt >= 0) && (btgt <= len) && (!seen[btgt])) {
+                                cur[state_len - 1] = (uint8_t)sp;
+                                seen[btgt] = 1;
+                                memcpy(snap + (size_t)btgt * state_len, cur, state_len);
+                            }
+                            pos = p4 + l4 + bisz;
+                            continue;
+                        }
+                        {
+                            int fm = fold_mark();
+
+                            wt('('); whale_load_emit(k1, i1, cv1); wt_op(opid); whale_load_emit(k2, i2, cv2); wt(')'); wt('?'); wt_int(1); wt(':'); wt_int(0);
+                            fold_set(sp, fm, whale_load_inv(k1, i1) && whale_load_inv(k2, i2));
+                            cur[var_count + sp] = WHALE_T_BOOL;
+                            sp += 1;
+                        }
                     }
                 } else {
                     /* Constant folding: both sides are literals, so evaluate
@@ -6469,14 +6537,64 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     break;
                 }
                 if (is_cmp) {
-                    int fm = fold_mark();
-                    int inva, invb;
+                    int btgt = 0, bis_true = 0, bisz = 0;
 
-                    inva = whale_vexpr[sp - 2].inv;
-                    invb = whale_vexpr[sp - 1].inv;
-                    wt('('); fold_inline(sp - 2); wt_op(opid); fold_inline(sp - 1); wt(')'); wt('?'); wt_int(1); wt(':'); wt_int(0);
-                    fold_set(sp - 2, fm, inva && invb);
-                    cur[var_count + sp - 2] = WHALE_T_BOOL;
+                    /* Compare-into-branch: `cmp; if_false/if_true` comes out as
+                       one `if (!(a<b)) goto` instead of a boolean temporary
+                       plus a test against zero. The temporary costs a statement
+                       (spilled by TinyCC at every statement boundary) on every
+                       iteration; the fused form costs the comparison alone.
+                       `!(...)` rather than a flipped operator: for NaN the two
+                       differ (`!(NaN<1)` is true, `NaN>=1` is false), and the
+                       unfused form computes the former. Deferred locals are
+                       flushed first - the branch leaves this position, and a
+                       pending counter update would otherwise never be stored
+                       (the loop would not terminate).
+                       State machine mirrors the unfused two steps exactly (a
+                       BOOL slot is recorded and then consumed, two pops): only
+                       the emitted shape differs, so jump-target merges and
+                       block-boundary materialisation see what they always saw.
+                       That mirroring is load-bearing - skipping the fold_set
+                       left stale slot types behind and broke objshape's
+                       escaped phase with an empty `v[] = ()` store. */
+                    if (whale_next_is_branch(pc, len, pos, sz, &btgt, &bis_true, &bisz)) {
+                        int fm, cf;
+                        int inva, invb;
+
+                        local_flush_all(var_count);
+                        inva = whale_vexpr[sp - 2].inv;
+                        invb = whale_vexpr[sp - 1].inv;
+                        fm = fold_mark();
+                        wt('('); fold_inline(sp - 2); wt_op(opid); fold_inline(sp - 1); wt(')');
+                        fold_set(sp - 2, fm, inva && invb);
+                        cur[var_count + sp - 2] = WHALE_T_BOOL;
+                        sp--;
+                        cf = fold_mark();
+                        wk(JS_WK_IF); wt('(');
+                        if (!bis_true)
+                            wt('!');
+                        wt('('); fold_inline(sp - 1); wt(')');
+                        wt(')'); wk(JS_WK_GOTO); wt_slot("L", btgt); wt(';');
+                        fold_commit(cf);
+                        sp--;
+                        if ((btgt >= 0) && (btgt <= len) && (!seen[btgt])) {
+                            cur[state_len - 1] = (uint8_t)sp;
+                            seen[btgt] = 1;
+                            memcpy(snap + (size_t)btgt * state_len, cur, state_len);
+                        }
+                        pos += sz + bisz;
+                        continue;
+                    }
+                    {
+                        int fm = fold_mark();
+                        int inva, invb;
+
+                        inva = whale_vexpr[sp - 2].inv;
+                        invb = whale_vexpr[sp - 1].inv;
+                        wt('('); fold_inline(sp - 2); wt_op(opid); fold_inline(sp - 1); wt(')'); wt('?'); wt_int(1); wt(':'); wt_int(0);
+                        fold_set(sp - 2, fm, inva && invb);
+                        cur[var_count + sp - 2] = WHALE_T_BOOL;
+                    }
                 } else {
                     int fm = fold_mark();
                     int inva, invb;
@@ -6513,17 +6631,52 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         pow2 = (int)bv;
                 }
 
+                /* Both sides already int32 with a nonzero constant divisor: a
+                   bare C remainder is the whole operation. C's % takes the
+                   dividend's sign exactly like JS, both sides are in int range
+                   so there is no UB (INT_MIN % -1 needs a -1 divisor, and only
+                   positive constants qualify), and the fmod fallback is dead -
+                   so unlike fold_mod this emits no guard at all. This is the
+                   shape `v % 7` has when v is a bitwise result. */
+                if (pow2 == 0 &&
+                    (ta == WHALE_T_I32 || ta == WHALE_T_ICONST) &&
+                    tb == WHALE_T_ICONST && !whale_vmat[sp - 1] &&
+                    whale_vexpr[sp - 1].len == 1) {
+                    double bv = gw_num[whale_vexpr[sp - 1].off];
+
+                    if (bv > 0 && bv <= 2147483647.0 && bv == (double)(int)bv) {
+                        int fm = fold_mark();
+                        int inva = whale_vexpr[sp - 2].inv;
+
+                        wt('('); wk(JS_WK_DOUBLE); wt(')');
+                        wt('('); wt('('); wk(JS_WK_INT); wt(')');
+                        if (ta == WHALE_T_ICONST && !whale_vmat[sp - 2] &&
+                            whale_vexpr[sp - 2].len == 1)
+                            wt_int((int)gw_num[whale_vexpr[sp - 2].off]);
+                        else {
+                            wt('('); fold_inline(sp - 2); wt(')');
+                        }
+                        wt('%'); wt_int((int)bv); wt(')');
+                        fold_set(sp - 2, fm, inva);
+                        cur[var_count + sp - 2] = WHALE_T_I32;
+                        sp--;
+                        break;
+                    }
+                }
+
                 /* The form fold_mod emits mentions each operand up to four times
-                   (two range tests, the fast path, the fmod fallback), so give
-                   both names first: inlining a pending expression into all those
-                   copies copies it, copies of copies included. One `%` in a loop
-                   generated kilobytes of C that way. This has to happen before
-                   fold_mark(): materialising appends statements, and anything
-                   inside the marked range would be treated as part of the
-                   expression. */
-                if (!whale_vmat[sp - 2])
+                   (two range tests, the fast path, the fmod fallback), so a long
+                   pending expression gets a name first: inlining it into all
+                   those copies copies it, copies of copies included. One `%` in
+                   a loop generated kilobytes of C that way. A short operand (a
+                   variable or a few tokens) inlines directly - naming it first
+                   only adds a pure-copy statement (`v[n] = (L1)`) per % per
+                   iteration. This has to happen before fold_mark():
+                   materialising appends statements, and anything inside the
+                   marked range would be treated as part of the expression. */
+                if (!whale_vmat[sp - 2] && whale_vexpr[sp - 2].len > 8)
                     fold_materialize(sp - 2);
-                if (!whale_vmat[sp - 1])
+                if (!whale_vmat[sp - 1] && whale_vexpr[sp - 1].len > 8)
                     fold_materialize(sp - 1);
                 fm = fold_mark();
                 {
@@ -6573,11 +6726,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int invb = whale_vexpr[sp - 1].inv;
 
                 wt('('); wk(JS_WK_DOUBLE); wt(')'); wt('(');
-                fold_toint32(sp - 2, whale_type_is_num(cur[var_count + sp - 2]),
-                     cur[var_count + sp - 2] == WHALE_T_ICONST);
+                fold_toint32(sp - 2, cur[var_count + sp - 2]);
                 wt(op == OP_and ? '&' : op == OP_or ? '|' : '^');
-                fold_toint32(sp - 1, whale_type_is_num(cur[var_count + sp - 1]),
-                         cur[var_count + sp - 1] == WHALE_T_ICONST);
+                fold_toint32(sp - 1, cur[var_count + sp - 1]);
                 wt(')');
                 fold_set(sp - 2, fm, inva && invb);
             }
@@ -6596,12 +6747,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                 wt('('); wk(JS_WK_DOUBLE); wt(')'); wt('(');
                 if (op == OP_shr) { wk(JS_WK_UNSIGNED); wk(JS_WK_INT); wt(')'); }   /* >>> is logical */
-                fold_toint32(sp - 2, whale_type_is_num(cur[var_count + sp - 2]),
-                     cur[var_count + sp - 2] == WHALE_T_ICONST);
+                fold_toint32(sp - 2, cur[var_count + sp - 2]);
                 /* one token, not two '<' - there is no lexer to join them */
                 wt_op(op == OP_shl ? JS_OP_SHL : JS_OP_SAR);
-                wt('('); fold_toint32(sp - 1, whale_type_is_num(cur[var_count + sp - 1]),
-                         cur[var_count + sp - 1] == WHALE_T_ICONST); wt('&'); wt_int(31); wt(')');
+                wt('('); fold_toint32(sp - 1, cur[var_count + sp - 1]); wt('&'); wt_int(31); wt(')');
                 wt(')');
                 fold_set(sp - 2, fm, inva && invb);
             }
@@ -6636,11 +6785,23 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             {
                 int fm = fold_mark();
                 int inv = whale_vexpr[sp - 1].inv;
+                int topt = cur[var_count + sp - 1];
 
-                /* !x is true for 0 and for NaN */
-                wt('('); wt('('); fold_inline(sp - 1); wt_op(JS_OP_NE); fold_inline(sp - 1); wt(')');
-                wt_op(JS_OP_OR); wt('('); fold_inline(sp - 1); wt_op(JS_OP_EQ); wt_int(0); wt(')'); wt(')');
-                wt('?'); wt_int(1); wt(':'); wt_int(0);
+                /* No branch fusion for `!x`: the int32 single-comparison form
+                   already removed the NaN arm at the lnot itself, so a fused
+                   branch would emit exactly what the unfused path does. */
+                /* !x is true for 0 and for NaN. An int32 is never NaN, so a
+                   known-int32 operand folds to a single comparison (and stops
+                   tripling the operand's tokens - the untyped form names it
+                   three times). */
+                if (topt == WHALE_T_I32 || topt == WHALE_T_ICONST) {
+                    wt('('); fold_inline(sp - 1); wt_op(JS_OP_EQ); wt_int(0); wt(')');
+                    wt('?'); wt_int(1); wt(':'); wt_int(0);
+                } else {
+                    wt('('); wt('('); fold_inline(sp - 1); wt_op(JS_OP_NE); fold_inline(sp - 1); wt(')');
+                    wt_op(JS_OP_OR); wt('('); fold_inline(sp - 1); wt_op(JS_OP_EQ); wt_int(0); wt(')'); wt(')');
+                    wt('?'); wt_int(1); wt(':'); wt_int(0);
+                }
                 fold_set(sp - 1, fm, inv);
             }
             cur[var_count + sp - 1] = WHALE_T_BOOL;
@@ -6652,8 +6813,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int fm = fold_mark();
                 int inv = whale_vexpr[sp - 1].inv;
 
-                wt('('); wk(JS_WK_DOUBLE); wt(')'); wt('~'); fold_toint32(sp - 1, whale_type_is_num(cur[var_count + sp - 1]),
-                         cur[var_count + sp - 1] == WHALE_T_ICONST);
+                wt('('); wk(JS_WK_DOUBLE); wt(')'); wt('~'); fold_toint32(sp - 1, cur[var_count + sp - 1]);
                 fold_set(sp - 1, fm, inv);
             }
             cur[var_count + sp - 1] = WHALE_T_I32;
