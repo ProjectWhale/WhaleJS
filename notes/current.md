@@ -2936,8 +2936,40 @@ SOLVED（sieve 144→111ms，25/25 全绿）/ TIPS（类型保证清单）
 ## 验证
 `whale api test: ok`；25/25 全对 0 mismatch；sieve repeat=3 112ms。
 ## 状态
-绿，待提交。下一步：计数归约向量化（`psadbw` byte 求和）/ `_ws` 拆分 /
-线性 IR。
+绿，已提交 a4702ea。下一步见 <97>。
+
+# <97>: 计数归约整成单次 helper 调用（sieve 累计 -47%）
+SOLVED（sieve 111→77ms，累计 144→77ms，node 42ms 到 1.8x）
+
+## 落地的：`for (g=C0; g<=K; g++) if (arr[g]) acc++` → 单次 CountNZ
+- 引擎侧 `JS_WhaleTAU8CountNZ(ctx, slot, lo, hi)`（quickjs.c，照 `TAU8Ptr`
+  的槽/类检查模板，-1 = deopt）：`[lo,hi]` 非零 byte 计数。普通 C 循环，
+  gcc -O2 自带向量化（`psadbw` 自动出来）—— 向量化在 C 侧免费实现，
+  生成器侧只做循环消除。这正是类型统一地基的用法：无需逐元素 guard。
+- `whale_loop_count_of`（字节码识别）：骨架同 memset（`g=C0` + 界字面量/
+  参数 + `g++` 回边 + 无调用无内层头），体要求 `get_array_el` 一次
+  （`get_loc arr; get_loc g` 紧邻三形态回找，读路径无洗牌）+ `if_false`
+  inner join（零跳过）+ `inc_loc acc`（acc≠g）+ 其余纯数值。`dec` 不认
+  （语义是 `-popcount`，别混）。
+- `whale_loop_count_emit`（`loop_end` 处，TAU8 确认同 memset：一次 resolve
+  + 一次 `op[os][` 读，同槽）：`acc` 先 materialize（pending 增量落盘，
+  否则丢增量）再 `acc = acc + CountNZ(...)` + `g` 终值 + length/非正 guard
+  （同 memset）。HOST_SYM + 自有原型（double 返回，防隐式声明取整陷阱）。
+- 两个坑：① `get_array_el` 不在 `whale_is_pure_num_op` 表里 → 体扫描先拒，
+  加例外（TAU8 身份由 emit 确认，扫描只放行）；② 三处 `g=C0` 紧邻检查的
+  `put_loc8` 形态全写反（`pc[head-1]==OP_put_loc8` 读 `pc[head]`，实为
+  `pc[head-2]` 读 `pc[head-1]`）—— `k` 是局部 5（put_loc8，2B）才暴露，
+  `i/j`（put_loc0..3）全碰巧通过。教训：多字节 opcode 的"前一条"有两种
+  宽度，测试只覆盖 1B 形态等于没测。
+- 效果：计数循环（30 万迭代）→ 1 resolve + 1 guard + 1 调用，
+  **sieve 111→77ms（本轮 -31%，累计 144→77ms -47%）**，node 42ms 到 1.8x，
+  check 对，25/25 全绿。剩余 sieve 时间在筛循环（步长 scatter，无解）。
+
+## 验证
+`whale api test: ok`；25/25 全对 0 mismatch；sieve repeat=3 77ms。
+## 状态
+绿，待提交。下一步：`_ws` 拆分（fib per-call 税）/ 线性 IR（bitops 等）。
+
 
 
 

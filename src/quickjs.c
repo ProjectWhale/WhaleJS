@@ -4443,6 +4443,39 @@ uint8_t *JS_WhaleTAU8Ptr(JSContext *ctx, int slot, double *len_out)
     return p->u.array.u.uint8_ptr;
 }
 
+/* Count the nonzero bytes of a Uint8Array in `slot` over [lo, hi] (inclusive),
+   for a JIT loop of the shape `for (g = C0; g <= K; g++) if (arr[g]) acc++`.
+   One call replaces the whole loop: the bounds check is the caller's guard
+   (the generator emits it from the literal bound and the cached length), so
+   here out-of-range clamps to nothing - a NULL return deopts instead. The
+   plain C loop is what vectorises: gcc -O2 turns it into psadbw on its own,
+   which is the whole point of doing the reduction here rather than in the
+   generated code (TinyCC has no vector codegen at all). */
+double JS_WhaleTAU8CountNZ(JSContext *ctx, int slot, double lo, double hi)
+{
+    JSValue arr = whale_frame_obj_slots(ctx)[slot];   /* borrowed: nothing is freed */
+    JSObject *p;
+    const uint8_t *base;
+    uint32_t n, i, c = 0;
+
+    if (!(lo >= 0 && lo <= 4294967295.0) || !(hi >= 0 && hi <= 4294967295.0))
+        return (double)-1;
+    if (JS_VALUE_GET_TAG(arr) != JS_TAG_OBJECT)
+        return (double)-1;
+    p = JS_VALUE_GET_OBJ(arr);
+    if (p->class_id != JS_CLASS_UINT8_ARRAY || typed_array_is_oob(p))
+        return (double)-1;
+    n = (uint32_t)p->u.array.count;
+    if ((uint32_t)lo >= n || (uint32_t)hi >= n)
+        return (double)-1;
+    if (lo > hi)
+        return 0;
+    base = p->u.array.u.uint8_ptr;
+    for (i = (uint32_t)lo; i <= (uint32_t)hi; i++)
+        c += (base[i] != 0);
+    return (double)c;
+}
+
 /* ToInt32 for the JIT. The bitwise operators are defined on int32, so the
    generated code cannot just cast a double: JS specifies a truncation towards
    zero followed by a modulo-2^32 wrap (and 0 for the non-finite values).

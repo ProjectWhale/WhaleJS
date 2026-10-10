@@ -285,6 +285,10 @@ int JS_WhaleTAU8Set(JSContext *ctx, int slot, double idx, double v);
    element. NULL means deopt. */
 uint8_t *JS_WhaleTAU8Ptr(JSContext *ctx, int slot, double *len_out);
 
+/* Nonzero-byte count over [lo, hi] (inclusive) of the Uint8Array in `slot`,
+   for whole-loop `if (arr[g]) acc++` reduction. Negative means deopt. */
+double JS_WhaleTAU8CountNZ(JSContext *ctx, int slot, double lo, double hi);
+
 /* Plain-object fields, for the JIT's object-literal path. `JS_WhaleObjShape`
    gives an opaque key the generated code caches; `JS_WhaleObjFieldPtr` resolves
    a property against it and returns the address of its value, or NULL to deopt
