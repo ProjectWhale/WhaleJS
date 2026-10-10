@@ -4,7 +4,9 @@
 -- thirdparty/tcc-runtime TCC 运行时支持（config.h / include / libtcc1-64.a / *.def）
 -- temp/                   临时数据（下载物、baseline 构建目录），不入 git
 set_project("WhaleJS")
-set_version("0.0.1")
+-- WhaleJS 自己的版本，与 QuickJS-ng 解耦（上游升级不跟它的号）。
+-- MAJOR=接口/ABI 不兼容，MINOR=新优化/新覆盖，PATCH=修 bug。见 CHANGELOG.md。
+set_version("0.1.0")
 set_languages("c11", "c++14")
 add_rules("mode.debug", "mode.release")
 

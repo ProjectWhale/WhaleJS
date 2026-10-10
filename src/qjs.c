@@ -35,6 +35,7 @@
 #include "cutils.h"
 #include "quickjs.h"
 #include "quickjs-libc.h"
+#include "whalejs.h"
 
 #ifdef QJS_USE_MIMALLOC
 #include <mimalloc.h>
@@ -478,7 +479,8 @@ int main(int argc, char **argv)
                 help(0);
             }
             if (opt == 'v' || !strcmp(longopt, "version")) {
-                printf("%s\n",JS_GetVersion());
+                printf("WhaleJS %s (QuickJS-ng %s)\n",
+                       JS_WhaleGetVersion(), JS_GetVersion());
                 return 0;
             }
             if (opt == 'e' || !strcmp(longopt, "eval")) {

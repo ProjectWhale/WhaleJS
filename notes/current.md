@@ -2934,9 +2934,51 @@ SOLVED（sieve 144→111ms，25/25 全绿）/ TIPS（类型保证清单）
 - bitops 全量口径 234ms 是负载（repeat=3 回 150ms）。
 
 ## 验证
-`whale api test: ok`；25/25 全对 0 mismatch；sieve repeat=3 112ms。
+`whale api test: ok`；25/25 全对 0 mismatch；sieve repeat=3 77ms。
 ## 状态
-绿，已提交 a4702ea。下一步见 <97>。
+绿，已提交 bc4fb15。下一步见 <98>。
+
+# <98>: 版本号解耦 + `_ws` 拆分（fib 12→3ms 反超 node 10 倍）
+SOLVED ×2（版本 0.1.0 落地；fib per-call 税清零）
+
+## 版本号（用户要求，与 QuickJS-ng 解耦）
+- `whalejs.h` 加 `WHALE_VERSION_MAJOR/MINOR/PATCH`（0/1/0）+
+  `JS_WhaleGetVersion()`（quickjs.c 实现，自有 `STRINGIFY`，不动上游宏）；
+  `qjs.c --version` 改双版本（`WhaleJS 0.1.0 (QuickJS-ng 0.16.2)`）；
+  `xmake.lua set_version("0.1.0")`；`CHANGELOG.md` 起头。
+- 规则：MAJOR=接口/ABI 不兼容，MINOR=新优化/新覆盖，PATCH=修 bug；
+  上游升级只合代码，不跟号。
+
+## `_ws` 拆分：`_wsv` 裸数组 + `_wsc` 条件组
+- 现状：`_ws` 整块 `{0}` 约 3KB（v/wa/fs/fp/fver/fv/ap/an/ai/op/on/oi/sp），
+  fib 240M 调用 × 3KB = 720GB 内存写，是 12ms 的大头。
+- 第一步：`wt_arr` 本体分流（`v` → `_wsv[n]`，其他 → `_wsc.<f>[n]`）+
+  prologue 发 `double _wsv[N];`（**不零初始化**，槽先写后读，零初始化纯税）+
+  其余保持 `_wsc = {0}`。8 处手写 `wt_id("_ws")`（fver/wa）全改 `_wsc`；
+  memset/count 的 body 扫描同步认 `_wsc.op`（否则整循环优化永不触发）。
+- 第二步：`_wsc` 按组条件声明 —— field 组（wa/fs/fp/fver/fv/sp，
+  `need_cols` 复用）+ shared `oi`（对象槽复用清零位 + TAU8 flag，两边都要）
+  + array 组（ap/an/ai/op/on，`whale_has_array` 新标记，pass-1 见
+  array_el 即置位）。三组全无 → struct 声明整体消失（fib 只剩 `_wsv`）。
+- 两个坑：① `ap/an/ai` 初划给 call 组（名误导，实为 packed 数组缓存；
+  `oi` 初划给 array 组（实为槽复用协议，对象函数也清它）→ `field not
+  found: oi/ai` 连崩对象/array 全族。教训：字段归属看**写它的代码**，
+  不看名字。② `struct {} _wsc = {0}` 空 struct 非法（三组全假的 fib
+  直接 `too many field init`）→ 外层门控。③ `put_loc8` 紧邻检查三处全
+  写反（读 `pc[head]` 实为 `pc[head-2]` 读 `pc[head-1]`）—— `k`=局部 5
+  才暴露（同 <97> 教训）。
+- 未解之谜（记录）：pass-1 主循环开头的直接 `if (op == ...)` 置位 work，
+  同一条件的链尾 `else if` 永不跑 —— 链中间必有吃掉它的分支但没找到，
+  直接 `if` 更简单，保留现状。
+- 效果：**fib 12→3ms（反超 node 32ms 近 11 倍）**，sieve 62/minmax 48/
+  objshape 178 全保持，25/25 全绿。
+
+## 验证
+`whale api test: ok`；25/25 全对 0 mismatch（repeat=1 全量 + repeat=3
+关键 case：fib 3、sieve 62、minmax 48、objshape 178）。
+## 状态
+绿，待提交。下一步：线性 IR（bitops/locals/nested 共同解）；SIMD 等
+数组面扩大后再做。
 
 # <97>: 计数归约整成单次 helper 调用（sieve 累计 -47%）
 SOLVED（sieve 111→77ms，累计 144→77ms，node 42ms 到 1.8x）

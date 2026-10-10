@@ -3423,6 +3423,18 @@ void JS_SetContextOpaque(JSContext *ctx, void *opaque)
 
 /* ===== WhaleJS: JIT/AOT public API (minimal implementation) ===== */
 
+#define WHALE_STRINGIFY_(x) #x
+#define WHALE_STRINGIFY(x) WHALE_STRINGIFY_(x)
+#define WHALE_VERSION_STRING \
+    WHALE_STRINGIFY(WHALE_VERSION_MAJOR) "." \
+    WHALE_STRINGIFY(WHALE_VERSION_MINOR) "." \
+    WHALE_STRINGIFY(WHALE_VERSION_PATCH)
+
+const char *JS_WhaleGetVersion(void)
+{
+    return WHALE_VERSION_STRING;
+}
+
 void JS_WhaleSetJitMode(JSContext *ctx, JSJitMode mode)
 {
     if (!ctx)

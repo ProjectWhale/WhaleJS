@@ -313,13 +313,20 @@ static void wt_slot(const char *prefix, int n)
 
 static void wt_int(int v);
 
-/* A slot of the generated function's state block, as `W.v[i]`. The block is one
-   zero-initialised object: declaring and initialising each slot separately cost
-   a statement per slot, and TinyCC spills at every statement, so a short
-   function like fib spent almost all of its time in its own prologue. */
+/* A slot of the generated function's scratch state. Value temporaries live
+   in a bare `_wsv[]` array (never zero-initialised: every slot is assigned
+   before it is read, so initialising it is pure per-call tax - fib paid ~3KB
+   of it 240M times). Everything else (field caches, call slots, TAU8
+   caches, presence flags) lives in the zero-initialised `_wsc` block, whose
+   zero state is load-bearing (fv[] == 0 means "uncached", fver starts at 1
+   to differ from it). */
 static void wt_arr(const char *field, int n)
 {
-    wt_id("_ws"); wt('.'); wt_id(field); wt('['); wt_int(n); wt(']');
+    if (field[0] == 'v' && field[1] == '\0') {
+        wt_id("_wsv"); wt('['); wt_int(n); wt(']');
+        return;
+    }
+    wt_id("_wsc"); wt('.'); wt_id(field); wt('['); wt_int(n); wt(']');
 }
 
 /* ELS: the hottest materialised slots skip the state block and live in
@@ -2035,16 +2042,16 @@ static void fold_obj_field_load(int os, int atom, int fc, int nm, int stable)
        interpreter and merely matching it. */
     if (stable) {
         wk(JS_WK_IF); wt('('); wt('!'); wt_arr("fs", fc); wt_op(JS_OP_OR);
-        wt_arr("fv", fc); wt_op(JS_OP_NE); wt_id("_ws"); wt('.'); wt_id("fver"); wt(')'); wt('{');
+        wt_arr("fv", fc); wt_op(JS_OP_NE); wt_id("_wsc"); wt('.'); wt_id("fver"); wt(')'); wt('{');
     } else {
-        wk(JS_WK_IF); wt('('); wt_arr("fv", fc); wt_op(JS_OP_NE); wt_id("_ws"); wt('.'); wt_id("fver");
+        wk(JS_WK_IF); wt('('); wt_arr("fv", fc); wt_op(JS_OP_NE); wt_id("_wsc"); wt('.'); wt_id("fver");
         wt_op(JS_OP_OR); wt_arr("fs", fc); wt_op(JS_OP_NE);
         wt_id("JS_WhaleObjShape"); wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(')'); wt(')');
         wt('{');
     }
     wt_arr("fp", fc); wt('='); wt_id("JS_WhaleObjFieldPtr"); wt('(');
     wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_int(atom); wt(','); wt('&'); wt_arr("fs", fc); wt(')'); wt(';');
-    wt_arr("fv", fc); wt('='); wt_id("_ws"); wt('.'); wt_id("fver"); wt(';');
+    wt_arr("fv", fc); wt('='); wt_id("_wsc"); wt('.'); wt_id("fver"); wt(';');
     wk(JS_WK_IF); wt('('); wt('!'); wt_arr("fp", fc); wt(')'); wt('{');
     wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
     wt('}');
@@ -2070,16 +2077,16 @@ static void fold_obj_field_resolve(int os, int atom, int fc, int stable)
 
     if (stable) {
         wk(JS_WK_IF); wt('('); wt('!'); wt_arr("fs", fc); wt_op(JS_OP_OR);
-        wt_arr("fv", fc); wt_op(JS_OP_NE); wt_id("_ws"); wt('.'); wt_id("fver"); wt(')'); wt('{');
+        wt_arr("fv", fc); wt_op(JS_OP_NE); wt_id("_wsc"); wt('.'); wt_id("fver"); wt(')'); wt('{');
     } else {
-        wk(JS_WK_IF); wt('('); wt_arr("fv", fc); wt_op(JS_OP_NE); wt_id("_ws"); wt('.'); wt_id("fver");
+        wk(JS_WK_IF); wt('('); wt_arr("fv", fc); wt_op(JS_OP_NE); wt_id("_wsc"); wt('.'); wt_id("fver");
         wt_op(JS_OP_OR); wt_arr("fs", fc); wt_op(JS_OP_NE);
         wt_id("JS_WhaleObjShape"); wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(')'); wt(')');
         wt('{');
     }
     wt_arr("fp", fc); wt('='); wt_id("JS_WhaleObjFieldPtr"); wt('(');
     wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_int(atom); wt(','); wt('&'); wt_arr("fs", fc); wt(')'); wt(';');
-    wt_arr("fv", fc); wt('='); wt_id("_ws"); wt('.'); wt_id("fver"); wt(';');
+    wt_arr("fv", fc); wt('='); wt_id("_wsc"); wt('.'); wt_id("fver"); wt(';');
     wk(JS_WK_IF); wt('('); wt('!'); wt_arr("fp", fc); wt(')'); wt('{');
     wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
     wt('}');
@@ -2434,7 +2441,7 @@ static int whale_loop_memset_emit(WhaleLoop *l, const WhaleMemsetLoop *ms)
     if (n <= 0 || n > WHALE_LOOP_BUF)
         return 0;
     tauptr_id = JS_WhaleTokIdent("JS_WhaleTAU8Ptr");
-    ws_id = JS_WhaleTokIdent("_ws");
+    ws_id = JS_WhaleTokIdent("_wsc");
     op_id = JS_WhaleTokIdent("op");
     oi_id = JS_WhaleTokIdent("oi");
     on_id = JS_WhaleTokIdent("on");
@@ -2610,7 +2617,7 @@ static int whale_loop_count_emit(WhaleLoop *l, const WhaleCountLoop *cs)
     if (n <= 0 || n > WHALE_LOOP_BUF)
         return 0;
     tauptr_id = JS_WhaleTokIdent("JS_WhaleTAU8Ptr");
-    ws_id = JS_WhaleTokIdent("_ws");
+    ws_id = JS_WhaleTokIdent("_wsc");
     op_id = JS_WhaleTokIdent("op");
     oi_id = JS_WhaleTokIdent("oi");
     on_id = JS_WhaleTokIdent("on");
@@ -3125,7 +3132,7 @@ static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
                         wt_arr("wa", k); wt('='); wt_int(whale_inline_str_atoms[k]); wt(';');
                     }
                     wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleStructNew");
-                    wt('('); wt_id("ctx"); wt(','); wt_id("_ws"); wt('.');
+                    wt('('); wt_id("ctx"); wt(','); wt_id("_wsc"); wt('.');
                     wt_id("wa"); wt(',');
                     wt_int(whale_inline_str_n); wt(','); wt_int(os); wt(')'); wt(')');
                     wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
@@ -4200,6 +4207,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     int ret_is_bool = -1;
     int whale_objs = 0;   /* object slots handed out; each new object takes one */
     int whale_has_call = 0; /* a call clobbers registers, so no pinning then */
+    int whale_has_array = 0; /* typed-array element access: keep its cache group */
     int whale_fields = 0;   /* object-property cache pairs handed out */    int whale_shape_stable = 0; /* object shapes cannot change after this point */
     int whale_ret_obj = 0;      /* the function can return an array or object */
     int whale_def_atoms[WHALE_ATOM_MAX];
@@ -4312,6 +4320,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
         if (sz <= 0 || pos + sz > len)
             { whale_out_line = __LINE__; goto out; }
+        if (op == OP_put_array_el || op == OP_get_array_el)
+            whale_has_array = 1;
         if (op == OP_goto8 || op == OP_if_false8 || op == OP_if_true8) {
             int tgt = pos + 1 + (int8_t)pc[pos + 1];
 
@@ -5037,30 +5047,56 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        see whale_vname) and the per-slot caches. Declaring these as individual
        variables cost one statement each, and TinyCC spills at every statement -
        a short function spent nearly all of its time in its own prologue. */
-    wk(JS_WK_STRUCT); wt('{');
-        wk(JS_WK_DOUBLE); wt_id("v"); wt('['); wt_int(stack_size + WHALE_VSER_MAX); wt(']'); wt(';');
-        /* the atoms of the layout being built, handed to JS_WhaleStructNew */
-        wk(JS_WK_INT); wt_id("wa"); wt('['); wt_int(WHALE_ATOM_MAX); wt(']'); wt(';');
-        wk(JS_WK_VOID); wt('*'); wt_id("fs"); wt('['); wt_int(WHALE_FIELD_CACHE); wt(']'); wt(';');
-        wt_id("JSValue"); wt('*'); wt_id("fp"); wt('['); wt_int(WHALE_FIELD_CACHE); wt(']'); wt(';');
-        wk(JS_WK_INT); wt_id("fver"); wt(';');
-        wk(JS_WK_INT); wt_id("fv"); wt('['); wt_int(WHALE_FIELD_CACHE); wt(']'); wt(';');
-        wt_id("JSValue"); wt('*'); wt_id("ap"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
-        wk(JS_WK_DOUBLE); wt_id("an"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
-        wk(JS_WK_INT); wt_id("ai"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
-        wk(JS_WK_UNSIGNED); wt_id("char"); wt('*'); wt_id("op"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
-        wk(JS_WK_DOUBLE); wt_id("on"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
-        wk(JS_WK_INT); wt_id("oi"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
-        /* unboxed struct presence flags, one per layout slot: a field that
-           only some of the observed shapes carry still gets its slot here.
-           (The old `sv` value array is gone: columns live in frame variables
-           L[whale_str_L[]] since the frame-column layout, so sv was 1KB of
-           dead zero-init per call - fib paid it 240M times.) */
-        wk(JS_WK_UNSIGNED); wt_id("char"); wt_id("sp"); wt('['); wt_int(WHALE_STRUCT_SLOTS * WHALE_ATOM_MAX); wt(']'); wt(';');
-    wt('}'); wt_id("_ws"); wt('='); wt('{'); wt_int(0); wt('}'); wt(';');
-    /* 1, because a cached fv[] of 0 (from that zero initialiser) must not look
-       like the current generation. */
-    wt_id("_ws"); wt('.'); wt_id("fver"); wt('='); wt_int(1); wt(';');
+    /* Value temporaries: a bare array, deliberately NOT zero-initialised
+       (every slot is assigned before it is read - see wt_arr). */
+    wk(JS_WK_DOUBLE); wt_id("_wsv"); wt('['); wt_int(stack_size + WHALE_VSER_MAX); wt(']'); wt(';');
+    /* The rest lives in one zero-initialised block, but only the groups this
+       function can touch: field caches (object work), call slots (calls),
+       TAU8 caches (array access). Each group is load-bearing-zero only when
+       present (fv[] == 0 means "uncached"), so absent groups simply vanish -
+       a pure numeric function like fib keeps nothing but _wsv[]. */
+    {
+        int need_field = 0, d;
+
+        need_field = (whale_field_sites_n > 0);
+        if (!need_field) {
+            for (d = 0; d < var_count && d < WHALE_JIT_MAX_SLOTS; d++)
+                if (whale_loc_obj[d]) {
+                    need_field = 1;
+                    break;
+                }
+        }
+        if (need_field || whale_has_array) {
+            wk(JS_WK_STRUCT); wt('{');
+            if (need_field) {
+                /* the atoms of the layout being built, handed to JS_WhaleStructNew */
+                wk(JS_WK_INT); wt_id("wa"); wt('['); wt_int(WHALE_ATOM_MAX); wt(']'); wt(';');
+                wk(JS_WK_VOID); wt('*'); wt_id("fs"); wt('['); wt_int(WHALE_FIELD_CACHE); wt(']'); wt(';');
+                wt_id("JSValue"); wt('*'); wt_id("fp"); wt('['); wt_int(WHALE_FIELD_CACHE); wt(']'); wt(';');
+                wk(JS_WK_INT); wt_id("fver"); wt(';');
+                wk(JS_WK_INT); wt_id("fv"); wt('['); wt_int(WHALE_FIELD_CACHE); wt(']'); wt(';');
+                /* unboxed struct presence flags, one per layout slot */
+                wk(JS_WK_UNSIGNED); wt_id("char"); wt_id("sp"); wt('['); wt_int(WHALE_STRUCT_SLOTS * WHALE_ATOM_MAX); wt(']'); wt(';');
+            }
+            /* slot-cache generation: cleared whenever a local takes an
+               object/array value (the slot may hold an array next) and read
+               by the TAU8 resolve, so it belongs to either group. */
+            wk(JS_WK_INT); wt_id("oi"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
+            if (whale_has_array) {
+                wt_id("JSValue"); wt('*'); wt_id("ap"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
+                wk(JS_WK_DOUBLE); wt_id("an"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
+                wk(JS_WK_INT); wt_id("ai"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
+                wk(JS_WK_UNSIGNED); wt_id("char"); wt('*'); wt_id("op"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
+                wk(JS_WK_DOUBLE); wt_id("on"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
+            }
+            wt('}'); wt_id("_wsc"); wt('='); wt('{'); wt_int(0); wt('}'); wt(';');
+            /* 1, because a cached fv[] of 0 (from that zero initialiser) must not look
+               like the current generation. */
+            if (need_field) {
+                wt_id("_wsc"); wt('.'); wt_id("fver"); wt('='); wt_int(1); wt(';');
+            }
+        }
+    }
     /* Per-property-access cache for object literals: the shape the property was
        resolved against and the address of its value. One pair per access site,
        and a site always touches the same property, so this is a compile-time
@@ -6044,7 +6080,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                             wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleStructNew");
                             wt('('); wt_id("ctx"); wt(',');
-                            wt_id("_ws"); wt('.'); wt_id("wa"); wt(',');
+                            wt_id("_wsc"); wt('.'); wt_id("wa"); wt(',');
                             wt_int(fn); wt(','); wt_int(os); wt(')'); wt(')');
                             wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
                             wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
