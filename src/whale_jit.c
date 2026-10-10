@@ -1076,6 +1076,24 @@ static int whale_emit_loop_count;
    induction local, and the head test's exit. Indexed by bytecode head
    position like loop_back[]; allocated with it, filled once before the
    emit pass, freed with the rest at out:. */
+/* Memset-able loop descriptor: `for (g = C0; g <= K / g < K; g++) arr[g] = C`.
+   Filled by whale_loop_memset_of (0 = not this shape). The array's TAU8 slot
+   is NOT resolved here (pass 1 has no types) - loop_end confirms the body
+   really is a TAU8 store before emitting the call. The bound K is either a
+   literal (k_is_arg = 0, k = value) or a parameter (k_is_arg = 1, k_arg =
+   its index, read as An[] at run time). */
+typedef struct {
+    int g;        /* induction local */
+    double c0;    /* start (a literal) */
+    double k;     /* bound literal (when k_is_arg == 0) */
+    int k_is_arg; /* bound is parameter k_arg */
+    int k_arg;    /* bound parameter index */
+    int le;       /* 1 = `<=` (inclusive), 0 = `<` */
+    double c;     /* stored value (a 0..255 integer literal) */
+    int exitp;    /* head test's exit */
+} WhaleMemsetLoop;
+
+static WhaleMemsetLoop *whale_loop_memset;
 static int *whale_loop_trip;
 static int *whale_loop_trip_g;
 static int *whale_loop_trip_exit;
@@ -1298,6 +1316,241 @@ static int whale_loop_trip_of(const uint8_t *pc, int len, int head, int back,
             return 0;
         return (int)k2;
     }
+}
+
+/* Recognise `for (g = C0; g <= K / g < K; g++) arr[g] = C` at [head, back].
+   The body must contain nothing but the induction increment, the bound test,
+   and one `arr[g] = C` store (loads/pushes feeding exactly that, plus the
+   back-edge goto). C must be a 0..255 integer (a byte store); the bound must
+   keep the trip under 2^31 (memset takes a size_t, but a huge trip is a
+   deopt-guard away from being wrong - refuse it here instead). Like the trip
+   recogniser, every rejection is conservative. */
+static int whale_loop_memset_of(const uint8_t *pc, int len, int head, int back,
+                                int var_count, const int *loop_back,
+                                const int *call_pos, int call_n,
+                                WhaleMemsetLoop *out)
+{
+    int g = -1, gl = 0, kl = 0, ip = -1, ifop = -1, exitp = -1, le = -1;
+    double kv = 0, c0v = 0, cv = 0;
+    int q, qsz, writes = 0, puts = 0;
+
+    if (head < 0 || back <= head || back >= len)
+        return 0;
+    /* back edge is `...; inc_loc g; goto head` with the goto at `back` */
+    {
+        int nop = pc[back], ntgt = -1;
+
+        if (nop == OP_goto8 && back + 1 < len)
+            ntgt = back + 1 + (int8_t)pc[back + 1];
+        else if (nop == OP_goto && back + 4 < len)
+            ntgt = back + 1 + (int32_t)whale_get_u32(pc + back + 1);
+        else
+            return 0;
+        if (ntgt != head)
+            return 0;
+    }
+    if (back < 2 || pc[back - 2] != OP_inc_loc)
+        return 0;
+    g = (int)pc[back - 1];
+    if (g < 0 || g >= var_count)
+        return 0;
+    /* head test is `get_loc g; (push K | get_arg K); (lt|lte); if_false exit`.
+       The bound may be a literal or a parameter (sieve bounds by `n`). */
+    {
+        int gg = -1;
+
+        if (!whale_get_loc_at(pc, len, head, var_count, &gg, &gl) || gg != g)
+            return 0;
+    }
+    {
+        int kp = head + gl;
+        int ka = -1, kal = 0;
+
+        if (whale_push_lit(pc, len, kp, &kv, &kl)) {
+            if (kv < 1 || kv > 2147483647.0 || kv != (double)(int)kv)
+                return 0;
+            out->k_is_arg = 0;
+            out->k = kv;
+        } else {
+            int op = (kp < len) ? pc[kp] : -1;
+
+            if (op >= OP_get_arg0 && op < OP_get_arg0 + 4) {
+                ka = op - OP_get_arg0;
+                kal = 1;
+            } else if (op == OP_get_arg && kp + 2 < len) {
+                ka = (int)whale_get_u16(pc + kp + 1);
+                kal = 3;
+            } else {
+                return 0;
+            }
+            out->k_is_arg = 1;
+            out->k_arg = ka;
+            out->k = 0;
+            kl = kal;
+        }
+    }
+    {
+        int lp = head + gl + kl;
+
+        if (lp >= len)
+            return 0;
+        if (pc[lp] == OP_lt)
+            le = 0;
+        else if (pc[lp] == OP_lte)
+            le = 1;
+        else
+            return 0;
+        ip = lp + 1;
+        if (ip >= len)
+            return 0;
+        ifop = pc[ip];
+        if (ifop == OP_if_false8 && ip + 1 < len)
+            exitp = ip + 1 + (int8_t)pc[ip + 1];
+        else if (ifop == OP_if_false && ip + 4 < len)
+            exitp = ip + 1 + (int32_t)whale_get_u32(pc + ip + 1);
+        else
+            return 0;
+        if (exitp < 0 || exitp > len)
+            return 0;
+    }
+    /* `g = C0` right before the head */
+    {
+        int vp = -1, vl = 0;
+
+        if (head < 2)
+            return 0;
+        if (pc[head - 1] >= OP_put_loc0 && pc[head - 1] <= OP_put_loc3)
+            vp = pc[head - 1] - OP_put_loc0;
+        else if (pc[head - 1] == OP_put_loc8 && head < len)
+            vp = (int)pc[head];
+        else
+            return 0;
+        if (vp != g)
+            return 0;
+        if (!whale_push_lit(pc, len, head - 2, &c0v, &vl) || c0v < 0 ||
+            c0v > 2147483647.0 || c0v != (double)(int)c0v)
+            return 0;
+        /* literal bound: refuse statically-empty trips here; a parameter
+           bound is guarded at run time (non-positive length skips the store,
+           which is exactly what zero trips do). */
+        if (!out->k_is_arg && (le ? c0v > kv : c0v >= kv))
+            return 0;
+    }
+    /* body: the head test's own loads are not the store's - start counting
+       after the `if` (ip + its size). Exactly two get_loc (one must read g,
+       the other the container), exactly one literal push 0..255, exactly one
+       put, and nothing else but shuffling/skeleton. */
+    {
+        int loc_g = 0, loc_other = 0, lits = 0;
+        double litval = 0;
+        int body = ip + (ifop == OP_if_false8 ? 2 : 5);
+
+        for (q = body; q <= back; ) {
+            int qo = (int)pc[q];
+
+            qsz = whale_op_size_of(qo);
+            if (qsz <= 0 || q + qsz > len)
+                return 0;
+            if (qo == OP_goto8 || qo == OP_goto || qo == OP_if_false8 ||
+                qo == OP_if_false || qo == OP_if_true8 || qo == OP_if_true) {
+                int t2 = -1;
+
+                if ((qo == OP_goto8 || qo == OP_if_false8 || qo == OP_if_true8) &&
+                    q + 1 < len)
+                    t2 = q + 1 + (int8_t)pc[q + 1];
+                else if (q + 4 < len)
+                    t2 = q + 1 + (int32_t)whale_get_u32(pc + q + 1);
+                if (t2 < head || t2 > back) {
+                    int is_head_test = (q == ip);
+                    int is_back_edge = (q == back);
+
+                    if (!((t2 == exitp && is_head_test) || (t2 == head && is_back_edge)))
+                        return 0;
+                }
+                q += qsz;
+                continue;
+            }
+            if (qo == OP_put_array_el) {
+                if (puts != 0)
+                    return 0;
+                puts++;
+                q += qsz;
+                continue;
+            }
+            {
+                int li = -1, ll = 0;
+                double pv = 0;
+                int pl = 0;
+
+                if (whale_get_loc_at(pc, len, q, var_count, &li, &ll)) {
+                    if (li == g)
+                        loc_g++;
+                    else
+                        loc_other++;
+                    q += qsz;
+                    continue;
+                }
+                if (whale_push_lit(pc, len, q, &pv, &pl)) {
+                    if (pv < 0 || pv > 255 || pv != (double)(int)pv)
+                        return 0;
+                    lits++;
+                    litval = pv;
+                    q += qsz;
+                    continue;
+                }
+            }
+            {
+                int w = whale_writes_local(qo, pc, q);
+
+                if (w == g) {
+                    if (q == back - 2)
+                        writes++;
+                    else
+                        return 0;
+                } else if (w >= 0) {
+                    return 0;
+                }
+            }
+            /* stack shuffling around the store is fine; calls and anything
+               with effects is not */
+            switch (qo) {
+            case OP_swap: case OP_dup: case OP_nip: case OP_nip1:
+            case OP_drop: case OP_to_propkey: case OP_to_propkey2:
+            case OP_is_undefined_or_null:
+                break;
+            default:
+                if (!whale_is_pure_num_op(qo))
+                    return 0;
+                break;
+            }
+            q += qsz;
+        }
+        if (writes != 1 || puts != 1 || loc_g != 1 || loc_other != 1 ||
+            lits != 1)
+            return 0;
+        cv = litval;
+    }
+    {
+        int k;
+
+        for (k = 0; k < call_n; k++)
+            if (call_pos[k] >= head && call_pos[k] <= back)
+                return 0;
+    }
+    {
+        int qq;
+
+        for (qq = head + 1; qq <= back; qq++)
+            if (loop_back[qq] >= 0)
+                return 0;
+    }
+    out->g = g;
+    out->c0 = c0v;
+    out->k = kv;
+    out->le = le;
+    out->c = cv;
+    out->exitp = exitp;
+    return 1;
 }
 
 static WhaleVExpr *whale_vexpr;   /* the pending expression of each stack slot */
@@ -1643,6 +1896,7 @@ static int loop_begin(int head_pos, int back_pos)
 /* Finish the innermost loop and hand its body on. This is where a loop-level
    optimisation would run - it gets the complete body at once. */
 static int whale_loop_unroll(WhaleLoop *l, int trip, int g, int exitp);
+static int whale_loop_memset_emit(WhaleLoop *l, const WhaleMemsetLoop *ms);
 static void loop_end(void)
 {
     WhaleLoop *l, *p;
@@ -1672,6 +1926,13 @@ static void loop_end(void)
         whale_loop_unroll(l, whale_loop_trip[l->head_pos],
                           whale_loop_trip_g[l->head_pos],
                           whale_loop_trip_exit[l->head_pos]))
+        return;
+    /* Memset loop: `for (g = C0; g <= K; g++) arr[g] = C` over a Uint8Array
+       becomes one memset call. The TAU8 slot is confirmed from the body
+       itself (the base-pointer resolve + the byte store), never from the
+       typeless pass-1 scan. */
+    if (whale_loop_memset && l->head_pos >= 0 &&
+        whale_loop_memset_emit(l, &whale_loop_memset[l->head_pos]))
         return;
     n = l->len;
     if (n > WHALE_LOOP_BUF)
@@ -1861,6 +2122,197 @@ static int whale_loop_unroll(WhaleLoop *l, int trip, int g, int exitp)
                 }
             }
         }
+    }
+    return 1;
+}
+
+/* Replace `for (g = C0; g <= K / g < K; g++) arr[g] = C` over a Uint8Array
+   with one memset call. Returns 1 when the body was consumed.
+
+   The TAU8 slot is confirmed from the body tokens themselves: exactly one
+   `JS_WhaleTAU8Ptr(ctx, os, &on[os])` resolve and exactly one byte store
+   through `_ws.op[os]`, both naming the same slot, and no other helper call
+   or store in the body. The pass-1 scan only proved the loop skeleton
+   (`ms`); the array's identity comes from here, where the slot numbers are
+   real. Anything unexpected bails to 0 and the loop is emitted as before.
+
+   Emitted shape (all run once, in order): the base resolve (copied from the
+   body, so the cache protocol is unchanged), a length guard
+   (`K+1 > len` deopts - memset must not run past the buffer), the memset
+   itself over `[C0, K]`, and the induction variable's exit value. Types are
+   uniform by construction (entry unboxing + deopt on any non-number), so no
+   per-element guard is needed - that is what the signature-versioned
+   compilation buys. */
+static int whale_loop_memset_emit(WhaleLoop *l, const WhaleMemsetLoop *ms)
+{
+    int n, i, os = -1, stores = 0, calls = 0;
+    int tauptr_id, ws_id, op_id, oi_id, on_id;
+    int head;
+
+    if (!ms || ms->g < 0 || ms->exitp < 0)
+        return 0;
+    if (ms->c < 0 || ms->c > 255 || ms->c != (double)(int)ms->c)
+        return 0;
+    if (!ms->k_is_arg) {
+        double trips = ms->le ? ms->k - ms->c0 + 1 : ms->k - ms->c0;
+
+        if (trips < 1 || trips > 2147483647.0)
+            return 0;
+    }
+    head = l->head_pos;
+    if (head < 0)
+        return 0;
+    n = l->len;
+    if (n <= 0 || n > WHALE_LOOP_BUF)
+        return 0;
+    tauptr_id = JS_WhaleTokIdent("JS_WhaleTAU8Ptr");
+    ws_id = JS_WhaleTokIdent("_ws");
+    op_id = JS_WhaleTokIdent("op");
+    oi_id = JS_WhaleTokIdent("oi");
+    on_id = JS_WhaleTokIdent("on");
+    /* one resolve, one byte store through the same slot, nothing else that
+       calls out or stores */
+    for (i = 0; i < n; i++) {
+        int t = l->tok[i];
+
+        if (t == tauptr_id) {
+            /* `JS_WhaleTAU8Ptr(ctx, os, &on[os])`: os is the CINT after ctx */
+            int j = i + 1, depth = 0, slot = -1;
+
+            if (j >= n || l->tok[j] != '(')
+                return 0;
+            j++;
+            /* skip `ctx` */
+            while (j < n && l->tok[j] != ',' && l->tok[j] != ')')
+                j++;
+            if (j >= n || l->tok[j] != ',')
+                return 0;
+            j++;
+            if (j < n && l->tok[j] == JS_WhaleTokCInt()) {
+                slot = (int)l->num[j];
+                j++;
+            } else {
+                return 0;
+            }
+            if (slot < 0 || slot >= WHALE_OBJ_SLOTS)
+                return 0;
+            if (os < 0)
+                os = slot;
+            else if (os != slot)
+                return 0;
+            calls++;
+            continue;
+        }
+        /* byte store `_ws.op[os][..] = ..`: `_ws . op [ os ] [`. The base
+           resolve (`_ws.op[os] = ..`, single bracket) must not match - demand
+           the second `[`. */
+        if (t == ws_id && i + 6 < n && l->tok[i + 1] == '.' &&
+            l->tok[i + 2] == op_id && l->tok[i + 3] == '[' &&
+            l->tok[i + 4] == JS_WhaleTokCInt() && l->tok[i + 5] == ']' &&
+            l->tok[i + 6] == '[') {
+            int s2 = (int)l->num[i + 4];
+
+            if (s2 < 0 || s2 >= WHALE_OBJ_SLOTS)
+                return 0;
+            if (os < 0)
+                os = s2;
+            else if (os != s2)
+                return 0;
+            stores++;
+            continue;
+        }
+        /* any other call-looking `ident (` is foreign: an identifier
+           directly followed by `(`. Punctuation and single-char operators
+           live below 256 and never match; keywords are excluded by table;
+           what remains is a real ident call, and the only one this shape
+           allows is the resolve above. */
+        if (t >= 0 && i + 1 < n && l->tok[i + 1] == '(') {
+            int w, iskw = 0;
+
+            if (t == tauptr_id)
+                continue;
+            if (t < 256)
+                continue;
+            for (w = 0; w < 28; w++) {
+                if (JS_WhaleTokIsKw(t, w)) {
+                    iskw = 1;
+                    break;
+                }
+            }
+            if (iskw)
+                continue;
+            return 0;
+        }
+    }
+    if (os < 0 || stores != 1 || calls < 1)
+        return 0;
+    (void)oi_id;
+    (void)on_id;
+    {
+        int fm = fold_mark();
+        char lgname[32];
+
+        /* base resolve, copied from the body's own protocol */
+        wk(JS_WK_IF); wt('('); wt('!'); wt_arr("oi", os); wt(')'); wt('{');
+        wt_arr("op", os); wt('='); wt('('); wk(JS_WK_UNSIGNED); wt_id("char"); wt('*'); wt(')');
+        wt_id("JS_WhaleTAU8Ptr"); wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(','); wt('&'); wt_arr("on", os); wt(')'); wt(';');
+        wt_arr("oi", os); wt('='); wt_int(1); wt(';'); wt('}');
+        /* length guard: the bound must fit the buffer (`<=K` needs K+1 <=
+           len, `<K` needs K <= len). A parameter bound is read from An[]. */
+        wk(JS_WK_IF); wt('('); wt('(');
+        if (ms->k_is_arg) {
+            wt_id("An"); wt('['); wt_int(ms->k_arg); wt(']');
+        } else {
+            wt_num(ms->k);
+        }
+        if (ms->le)
+            wt('+'); wt_int(1);
+        wt(')'); wt_op(JS_OP_GT); wt_arr("on", os); wt(')');
+        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+        /* zero/negative length skips the store (exactly what zero trips do);
+           the exit value below still runs. */
+        wk(JS_WK_IF); wt('('); wt('(');
+        if (ms->k_is_arg) {
+            wt_id("An"); wt('['); wt_int(ms->k_arg); wt(']');
+        } else {
+            wt_num(ms->k);
+        }
+        wt('-'); wt_num(ms->c0); wt('+'); wt_int(ms->le ? 1 : 0); wt(')');
+        wt_op(JS_OP_GT); wt_int(0); wt(')'); wt('{');
+        /* the memset itself over [C0, K] (`<=` stores K-C0+1 bytes,
+           `<` stores K-C0) */
+        wt_id("memset"); wt('('); wt_arr("op", os); wt('+'); wt_int((int)ms->c0); wt(',');
+        wt_int((int)ms->c); wt(','); wt('('); wk(JS_WK_UNSIGNED); wk(JS_WK_LONG); wk(JS_WK_LONG); wt(')');
+        wt('(');
+        if (ms->k_is_arg) {
+            wt_id("An"); wt('['); wt_int(ms->k_arg); wt(']');
+        } else {
+            wt_num(ms->k);
+        }
+        wt('-'); wt_num(ms->c0); wt('+'); wt_int(ms->le ? 1 : 0); wt(')'); wt(')');
+        wt(';');
+        wt('}');
+        /* induction exit value (`<=` leaves g at K+1, `<` at K) */
+        snprintf(lgname, sizeof(lgname), "L%d", ms->g);
+        wt_id(lgname); wt('=');
+        if (ms->le) {
+            wt('(');
+            if (ms->k_is_arg) {
+                wt_id("An"); wt('['); wt_int(ms->k_arg); wt(']');
+            } else {
+                wt_num(ms->k);
+            }
+            wt('+'); wt_int(1); wt(')');
+        } else {
+            if (ms->k_is_arg) {
+                wt_id("An"); wt('['); wt_int(ms->k_arg); wt(']');
+            } else {
+                wt_num(ms->k);
+            }
+        }
+        wt(';');
+        fold_commit(fm);
     }
     return 1;
 }
@@ -3388,6 +3840,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     whale_loop_trip = calloc(len + 1, sizeof(*whale_loop_trip));
     whale_loop_trip_g = malloc((len + 1) * sizeof(*whale_loop_trip_g));
     whale_loop_trip_exit = malloc((len + 1) * sizeof(*whale_loop_trip_exit));
+    whale_loop_memset = calloc(len + 1, sizeof(*whale_loop_memset));
     if (!targets || !seen || !snap || !cur || !args_used || !assign_cnt ||
         !args_obj || !args_arr ||
         !whale_vexpr || !whale_vmat ||
@@ -3744,9 +4197,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     {
         int h;
 
-        memset(whale_loop_trip, 0, sizeof(whale_loop_trip));
-        memset(whale_loop_trip_g, 0xff, sizeof(whale_loop_trip_g));
-        memset(whale_loop_trip_exit, 0xff, sizeof(whale_loop_trip_exit));
+        /* NB: these are heap arrays (len+1 ints), not statics - sizeof the
+           pointer would only clear 8 bytes. */
+        memset(whale_loop_trip, 0, ((size_t)len + 1) * sizeof(*whale_loop_trip));
+        memset(whale_loop_trip_g, 0xff, ((size_t)len + 1) * sizeof(*whale_loop_trip_g));
+        memset(whale_loop_trip_exit, 0xff, ((size_t)len + 1) * sizeof(*whale_loop_trip_exit));
+        memset(whale_loop_memset, 0, ((size_t)len + 1) * sizeof(*whale_loop_memset));
         for (h = 0; h <= len; h++) {
             if (loop_back[h] >= 0) {
                 int trip = 0, g = -1, exitp = -1;
@@ -3759,6 +4215,17 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     whale_loop_trip[h] = trip;
                     whale_loop_trip_g[h] = g;
                     whale_loop_trip_exit[h] = exitp;
+                }
+                {
+                    WhaleMemsetLoop ms;
+
+                    memset(&ms, 0, sizeof(ms));
+                    if (whale_loop_memset_of(pc, len, h, loop_back[h],
+                                             var_count, loop_back,
+                                             whale_call_pos, whale_call_n,
+                                             &ms) &&
+                        h <= len)
+                        whale_loop_memset[h] = ms;
                 }
             }
         }
@@ -4002,6 +4469,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        while the real result is in xmm0, and every `%` silently yields 0. */
     wk(JS_WK_EXTERN); wk(JS_WK_DOUBLE); wt_id("fmod"); wt('(');
         wk(JS_WK_DOUBLE); wt_id("x"); wt(','); wk(JS_WK_DOUBLE); wt_id("y"); wt(')'); wt(';');
+    /* memset for whole-loop Uint8Array fills (see whale_loop_memset_emit).
+       Same implicit-declaration trap: the pointer return and the size_t
+       argument both need a prototype. */
+    wk(JS_WK_EXTERN); wk(JS_WK_VOID); wt('*'); wt_id("memset"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("s"); wt(','); wk(JS_WK_INT); wt_id("c"); wt(',');
+        wk(JS_WK_UNSIGNED); wk(JS_WK_LONG); wk(JS_WK_LONG); wt_id("n"); wt(')'); wt(';');
     /* the bitwise operators need JS ToInt32 semantics, not a C cast */
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleToInt32"); wt('(');
         wk(JS_WK_DOUBLE); wt_id("d"); wt(')'); wt(';');
@@ -7669,6 +8142,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     whale_loop_trip = NULL;
     whale_loop_trip_g = NULL;
     whale_loop_trip_exit = NULL;
+    if (whale_loop_memset)
+        free(whale_loop_memset);
+    whale_loop_memset = NULL;
     if (assign_cnt)
         free(assign_cnt);
     if (whale_vexpr)
@@ -7803,6 +8279,10 @@ WHALE_HOST_SYM(JS_WhaleCallMethodValue),
     WHALE_HOST_SYM(JS_WhaleStepOutNum),
     WHALE_HOST_SYM(JS_WhaleStepOutSlot),
     WHALE_HOST_SYM(JS_WhaleStepClear),
+    /* libc memset, for Uint8Array fill loops the generator lowers wholesale.
+       Registered like every other host symbol; the generated code declares
+       its own prototype. */
+    { "memset", (void *)memset },
 };
 #define WHALE_HOST_SYM_COUNT \
     ((int)(sizeof(whale_host_syms) / sizeof(whale_host_syms[0])))

@@ -2897,4 +2897,47 @@ SOLVED（minmax 81→49ms = node）/ TIPS（FMA/cmov/AVX/roundsd 全部证伪）
 绿，待提交。下一步：SIMD（sieve，生成器侧循环识别 + 步长展开，最大单项）；
 `_ws` 拆分；线性 IR（bitops/locals/nested 共同解）。
 
+# <96>: 类型统一地基确认 + Uint8Array fill 循环整成 memset（sieve -24%）
+SOLVED（sieve 144→111ms，25/25 全绿）/ TIPS（类型保证清单）
+
+## 用户提醒的确认：类型统一是分版本 + 守卫保证的
+- 参数入口 `whale_jit_unbox_num` 守卫（非数值 → deopt 整帧重跑）；
+  闭包 self/closure 双读法 + 入口 `VarRefIsSelf/IsFn` 守卫（deopt==3 换版本）；
+  跳转目标类型快照合并（差异 → 整函数拒编，绝不混类型）；
+  对象走独立槽/类型，NUM 通道恒 double。
+- 结论：**纯数值函数体内 NUM 槽恒 double，循环变量类型不变** —— 向量化
+  不用逐元素 guard（入口 + length guard 足够），寄存器分配不用处理类型
+  变化。这正是本轮 memset 与下轮 SIMD 的地基。
+
+## 落地的：`for (g=C0; g<=K; g++) arr[g]=C` → 单次 memset
+- `whale_loop_memset_of`（字节码骨架识别）：`g=C0` 紧邻头 + `g<=K/<K`
+  （K 字面量**或参数**，sieve 界是参数 n）+ `g++` 回边 + 体内恰好
+  两个 get_loc（一读 g、一读容器）+ 一个 0..255 字面量 push + 一个 put
+  + 其余只许栈洗牌（`arr[i]=v` 编译带 swap/dup/to_propkey/undefined 检查，
+  第一版"紧邻三连"假设直接撞墙）+ 无调用无内层头。
+- `whale_loop_memset_emit`（`loop_end` 处，TAU8 身份由 body token 确认：
+  恰好一次 `TAU8Ptr` resolve + 一次 `_ws.op[os][..]` 双层下标存储，同槽，
+  其他 `ident (` 全拒）：resolve 照抄体协议 + length guard
+  （`(K+1)>len` deopt，K 参数时读 `An[]`）+ 非正长度跳过存储（零 trip
+  语义）+ `memset(op+C0, C, K-C0+1)` + 归纳终值。
+- `memset` 经 `WHALE_HOST_SYM` 接 libc + preamble 自有原型（`void*,
+  int, unsigned long long`，防 C89 隐式声明陷阱，同 fmod 教训）。
+- 三个定位花的坑：① 跳转目标公式照 pass-1（`pos+1+offset`，沿用 <95>
+  教训）；② store 模式必须双层下标（单层会把 resolve 自身数进去，
+  stores=2）；③ foreign-call 检查误伤 `!(`（操作符<256 直接放行，
+  关键字 28 个逐一排除，剩下的才是真 ident 调用）。
+- 附带修：trip/memset 三表 `memset(ptr, 0, sizeof(ptr))` 只清 8 字节
+  （堆数组，要 `(len+1)*sizeof(int)`）—— 无声 bug，sieve 碰巧没炸。
+- 效果：sieve 初始化循环（30 万迭代）→ 1 resolve + 1 guard + 1 memset，
+  **144→111ms（-24%）**，check 对，25/25 全绿。内层步长循环不动
+  （scatter 无解）、计数归约不动（向量化复杂），记下轮。
+- bitops 全量口径 234ms 是负载（repeat=3 回 150ms）。
+
+## 验证
+`whale api test: ok`；25/25 全对 0 mismatch；sieve repeat=3 112ms。
+## 状态
+绿，待提交。下一步：计数归约向量化（`psadbw` byte 求和）/ `_ws` 拆分 /
+线性 IR。
+
+
 
