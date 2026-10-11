@@ -3214,9 +3214,62 @@ SOLVED（分支型优化必须有门，<101> 策略的实例）/ 证伪×1（I32
 ident 54×3、bitops 144。node 列缺（`node1.exe` 改名，perftest 认 `node`；
 qjs 列即解释器基线，结论不受影响）。
 ## 状态
-绿，待提交。下一步：tier1 纯数值已见顶（arith/floatlit/minmax 持平或超，
-bitops/ident 到表示税墙）；tier2（双轨栈值/线性 IR）或混合场景（mixed/
-nested/objshape 的对象段）。
+绿，已提交 0a16999。下一步见 <104>。
+
+# <104>: int-region 落地（循环整数子区：int 镜像 + 入口 guard + 出口装箱）
+SOLVED（单方案，无切换无重编译，编译期一次决定）/ 真 bug ×2（`++` token + peephole 旁路）
+
+## 用户方向（转化问题，不是绕路）
+- bitops 的主因确认是 int/double 域错位：每 trip 约 8 次域穿越
+ （变体实验证明 idiv/分支共 4ms，剩余 130ms 全是穿越 + spill）。
+- 做 int-region：识别循环体内"必须 double"的污染点，没有污染的
+  局部变量跑 C `int` 镜像，循环内零转换，出口一次性装箱。
+- for 判断是关键：`g=0` + `inc_loc` + `g < K` + 无调用无内外出，
+  bound 字面量 ≤2^30 免 guard，参数 bound 入口一次 guard
+ （`K > 2^30 → deopt` 整函数退解释器，循环外一次，免费）。
+
+## 落地（全 src/whale_jit.c，单发射管线）
+- 识别 `whale_loop_int_of`（仿 trip_of 结构）：back-edge goto、
+  back-2 inc、head `get_loc g; X; lt; if_false exit`（`<` only）、
+  `g=0` 紧邻 head 前；体内 g 仅 back-2 一写；镜像候选 = int 位运算
+  生产的 `put_loc v`（`set_loc/add_loc` 进黑名单不杀整循环，bitops
+  的 acc 就是 set 存的）；v/g 的每个读点 triple 检查
+ （单目 not 紧邻 / 双目 [load, binop]，binop ∈ and/or/xor/shl/sar/mod，
+  `>>>` 与 `+ - * /` 比较一律出局）。
+- 发射 6 处：prologue `int I<d>`（前缀 I 确认空闲）+ 入口 guard
+  （pos==0 一次）+ get 镜像读（循环内 I，类型 I32）+ inc `I=I+1`
+  + put `(int)` 包存（emitter 零改）+ materialize 存 I
+  + exit 精确装箱（`pos == exitp`，体内 join 不碰）。
+- soundness 边界：`& | ^ ~ << >>` 留 int 安全（JS 定值 int32）；
+  `>>>` 排除（超 int32）；`+ - *` 留 double（C int 溢出 UB）；
+  `I++` 溢出由 guard 封顶。
+
+## 两个真 bug（全是实证定位）
+1. **`++` token 不存在**：`wt('+'); wt('+')` 发成两个独立 `+`，
+   TCC 解析成二元加 + 一元加 → `expected expression before ';'`，
+   连带 `duplicate label`（解析错位）。修法 `I = I + 1`
+   （加新 operator id 不值得）。教训：token 流没有"相邻即组合"，
+   `<<` 之类走 wt_op 就是因为这个。
+2. **peephole 旁路镜像**：head 测试走 peephole-1（load_analyze +
+   load_emit 直发 `L2`），不经 get_loc 通用路径 → 测试读 L、回边
+   步进 I → 无限循环（400×fibi hang，单次调用因不 JIT 而正常，
+   极具迷惑性）。修法：load_analyze 对循环内镜像拒绝 WLD_SLOT
+   （退回通用路径）+ local_inline 非 live 镜像发 I（ covering
+   get_loc0_loc1 双读）。教训：读路径有三条（peephole/通用/双读），
+   加新表示必须三条全堵。
+
+## 测量（repeat=3）
+- bitops 144ms 持平：dump 确认镜像生效（`I1<A0`、`I1=I1+1`、
+  `I2=(int)...`、出口装箱），但访存结构没变（7 语句、_wv、acc 的
+  double 家）——转换 ALU 只占小头，spill 是主体。**前端转换优化
+  到墙**，剩下的要么语句合并（线性 IR，后端活），要么接受。
+- 意外两胜：branch 66→42ms，nested 71→20ms（3.5x，嵌套内层命中）。
+- 全量 25/25 check 全一致；`whale api test: ok`（TCC + gcc 双路径）。
+
+## 状态
+绿，待提交。下一步：线性 IR（语句合并，动 spill 主体）或混合场景；
+int-region 可扩（`<=`、多 region、IBIT 裸核消 `(int)` 噪音——但都是
+ALU 级别，优先级低于 spill）。
 
 
 

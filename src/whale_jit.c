@@ -788,6 +788,23 @@ typedef struct WhaleLocal {
 
 static WhaleLocal *whale_lmem;
 
+/* Int-region mirrors, indexed by local: 1 = local d runs on a C `int` mirror
+   (I<d>) inside the recognised loop, 0 = plain double path. Valid only when
+   whale_int_ok is set (exactly one int-region in the function); zeroed per
+   compilation next to the loop scans. Up here (not with the other loop
+   state) because whale_load_analyze() below must refuse mirror reads. */
+static uint8_t whale_int_mirror[WHALE_JIT_MAX_SLOTS];
+static int whale_int_ok;
+static int whale_int_head;
+static int whale_int_exit;
+static int whale_int_g;
+static int whale_int_need_guard;
+static int whale_int_k_arg;
+/* Current loop-buffer depth (the WhaleLoop stack itself stays below with the
+   other loop state). Needed here for the same mirror refusal: outside any
+   loop the exit edge has boxed the mirror back, so a plain L read is right. */
+static int whale_loop_depth;
+
 /* Decide what this load means. Returns 0 if it is not a simple load. */
 static int whale_load_analyze(const JSWhaleFuncInfo *info, const uint8_t *pc, int pos, const uint8_t *cur,
                               int var_count, const uint8_t *loc_c, const double *loc_cv,
@@ -842,6 +859,15 @@ static int whale_load_analyze(const JSWhaleFuncInfo *info, const uint8_t *pc, in
                a constant local reads as its literal either way, so there is
                nothing stale to protect. */
             if (idx >= 0 && idx < var_count && whale_lmem && whale_lmem[idx].live &&
+                !(idx >= 0 && idx < var_count && loc_c && loc_c[idx]))
+                return 0;
+            /* An int-region mirror must not be read as `L<idx>` inside the
+               loop - the loop runs on I<idx> (the head test reads the mirror
+               while the back edge steps it; mixing the two is an infinite
+               loop). Refuse, so the switch path emits the mirror read. A
+               constant local is still a literal either way. */
+            if (idx >= 0 && idx < WHALE_JIT_MAX_SLOTS && whale_int_ok &&
+                whale_int_mirror[idx] && whale_loop_depth > 0 &&
                 !(idx >= 0 && idx < var_count && loc_c && loc_c[idx]))
                 return 0;
             *type_out = tt;
@@ -994,7 +1020,8 @@ typedef struct WhaleLoop {
 } WhaleLoop;
 
 static WhaleLoop whale_loops[WHALE_LOOP_MAX];
-static int whale_loop_depth;
+/* (whale_loop_depth lives above, next to whale_lmem: the load analyser
+   needs it before this point in the file.) */
 /* Per loop head: which locals its body writes. Indexed [head * n + d], built
    once before the emit pass walks the bytecode. A variable read inside the
    loop is loop-invariant when its bit is clear - the back edge re-runs the
@@ -1010,6 +1037,8 @@ static int whale_loop_has_call;
    loops): the ELS decision pins the hottest ones. Indexed by local number,
    zeroed before each compilation's scan. */
 static int whale_loop_heat[WHALE_JIT_MAX_SLOTS];
+/* (whale_int_mirror and friends live above, next to whale_lmem: the load
+   analyser below needs them before this point in the file.) */
 
 /* Presence-flag check dedup, one straight-line segment at a time. Bit col of
    the innermost open loop's word means "sp[col] is already proven 1 on this
@@ -1123,6 +1152,34 @@ static WhaleCountLoop *whale_loop_countrec;
 static int *whale_loop_trip;
 static int *whale_loop_trip_g;
 static int *whale_loop_trip_exit;
+
+/* Integer-region loop descriptor: `for (g = 0; g < K; g++) <int-pure body>`.
+   The induction local g and every `put_loc v` whose value is produced by an
+   int bitwise op get a C `int` mirror (I<d>) for the whole loop trip: reads
+   and writes inside the loop run on the mirror with zero conversion, and the
+   exit edge boxes each mirror back once (`L<d> = (double)I<d>`). The bound K
+   is a literal (<= 2^30, so `I<g>++` can never overflow) or a parameter (then
+   need_guard = 1 and the entry emits `if (K > 2^30) deopt`). `<=` is not taken
+   yet (exit value g = K+1 needs the same boxing, just unwired).
+
+   Only the narrow shape is recognised: `g = 0` right before the head, head
+   test `get_loc g; X; lt; if_false exit`, `inc_loc g` at back-2, `goto head`
+   at back, no call, no other write to g, no exit except the head test's, and
+   every mirror candidate written only by int-producing puts and read only
+   next to bitwise consumers (see the triple check below). Anything else
+   refuses and the loop is emitted as before. */
+typedef struct {
+    int ok;       /* recognised (calloc zeroes impersonate local 0) */
+    int g;        /* induction local */
+    double k;     /* bound literal (when k_is_arg == 0) */
+    int k_is_arg; /* bound is parameter k_arg */
+    int k_arg;    /* bound parameter index */
+    int exitp;    /* head test's exit */
+    int need_guard; /* bound is a parameter: entry guard required */
+    uint8_t mirror[WHALE_JIT_MAX_SLOTS]; /* 1 = int mirror (g + int-pure puts) */
+} WhaleIntLoop;
+
+static WhaleIntLoop *whale_loop_intreg;
 
 /* A small integer literal push at pos: value in *out, length in *ln. Only the
    immediate forms (push_0..7/i8/i16); the constant pool is needless here. */
@@ -1344,6 +1401,340 @@ static int whale_loop_trip_of(const uint8_t *pc, int len, int head, int back,
             return 0;
         return (int)k2;
     }
+}
+
+/* A `get_loc v` at q whose value feeds a bitwise consumer directly: either a
+   single-operand int op right after (`get_loc v; not`), or a binary int op
+   with the other operand loaded in between (`get_loc v; push K; and`). Only
+   the int-bitwise family plus mod qualifies - `+ - * /` and comparisons take
+   doubles, and `>>>` (shr) can exceed int32. Returns 1 with the consumer
+   opcode in *cop when the triple matches. */
+static int whale_int_consumer_at(const uint8_t *pc, int len, int q, int *cop)
+{
+    int n1 = (q + 1 < len) ? pc[q + 1] : -1;
+    int n2 = (q + 2 < len) ? pc[q + 2] : -1;
+    int n3 = (q + 3 < len) ? pc[q + 3] : -1;
+
+    /* single-operand: `get_loc v; not` (lnot is `!`, excluded: boolean) */
+    if (n1 == OP_not) {
+        *cop = n1;
+        return 1;
+    }
+    /* binary: `get_loc v; <right-operand load>; <binop>`. The right operand
+       is any load (push/get/const); the consumer must be int-bitwise or mod.
+       `get_loc v; get_loc w; not` (sub's left read followed by another load)
+       fails here because not is single-operand, not a binary consumer. */
+    if (n1 == OP_push_minus1 ||
+        (n1 >= OP_push_0 && n1 <= OP_push_7) || n1 == OP_push_i8 ||
+        n1 == OP_push_i16 || n1 == OP_push_i32 || n1 == OP_push_const ||
+        n1 == OP_push_const8 || n1 == OP_push_true || n1 == OP_push_false ||
+        (n1 >= OP_get_loc0 && n1 <= OP_get_loc3) || n1 == OP_get_loc8 ||
+        n1 == OP_get_loc || n1 == OP_get_arg0 || n1 == OP_get_arg1 ||
+        n1 == OP_get_arg2 || n1 == OP_get_arg3 || n1 == OP_get_arg) {
+        int nl = whale_op_size_of(n1);
+
+        if (nl > 0) {
+            int bop = (q + 1 + nl < len) ? pc[q + 1 + nl] : -1;
+
+            if (bop == OP_and || bop == OP_or || bop == OP_xor ||
+                bop == OP_shl || bop == OP_sar || bop == OP_mod) {
+                *cop = bop;
+                return 1;
+            }
+        }
+    }
+    (void)n2;
+    (void)n3;
+    return 0;
+}
+
+/* Recognise `for (g = 0; g < K; g++) <int-pure body>` at [head, back] and
+   fill the int-region descriptor: the induction local plus every `put_loc v`
+   produced by an int bitwise op and consumed only by bitwise triples (see
+   whale_int_consumer_at). `set_loc`/`add_loc` writes to a candidate refuse
+   (set leaves a double-meaning value on the stack); `+ - * /`, comparisons
+   consuming a candidate refuse (they need doubles); `>>>` refuses (exceeds
+   int32). The bound is a small literal (<= 2^30, no overflow possible) or a
+   parameter (need_guard = 1). Every rejection is conservative. */
+static int whale_loop_int_of(const uint8_t *pc, int len, int head, int back,
+                             int var_count, const int *loop_back,
+                             const int *call_pos, int call_n,
+                             WhaleIntLoop *out)
+{
+    int g = -1, gl = 0, kl = 0, ifop, exitp = -1;
+    double kv = 0;
+    int q, qsz;
+    int put_prod[WHALE_JIT_MAX_SLOTS];
+    int put_cnt[WHALE_JIT_MAX_SLOTS];
+    int no_mirror[WHALE_JIT_MAX_SLOTS];
+    int i;
+
+    if (head < 0 || back <= head || back >= len)
+        return 0;
+    /* back edge is `...; inc_loc g; goto head` */
+    {
+        int nop = pc[back], ntgt = -1;
+
+        if (nop == OP_goto8 && back + 1 < len)
+            ntgt = back + 1 + (int8_t)pc[back + 1];
+        else if (nop == OP_goto && back + 4 < len)
+            ntgt = back + 1 + (int32_t)whale_get_u32(pc + back + 1);
+        else
+            return 0;
+        if (ntgt != head)
+            return 0;
+    }
+    if (back < 2 || pc[back - 2] != OP_inc_loc)
+        return 0;
+    g = (int)pc[back - 1];
+    if (g < 0 || g >= var_count || g >= WHALE_JIT_MAX_SLOTS)
+        return 0;
+    /* head test is `get_loc g; X; lt; if_false exit` (`<` only) */
+    {
+        int gg = -1;
+
+        if (!whale_get_loc_at(pc, len, head, var_count, &gg, &gl) || gg != g)
+            return 0;
+    }
+    {
+        int kp = head + gl;
+        int op;
+
+        if (whale_push_lit(pc, len, kp, &kv, &kl)) {
+            if (kv < 1 || kv > 1073741824.0 || kv != (double)(int)kv)
+                return 0;
+            out->k_is_arg = 0;
+            out->k = kv;
+            out->need_guard = 0;
+        } else {
+            op = (kp < len) ? pc[kp] : -1;
+            if (op >= OP_get_arg0 && op < OP_get_arg0 + 4) {
+                out->k_is_arg = 1;
+                out->k_arg = op - OP_get_arg0;
+                kl = 1;
+            } else if (op == OP_get_arg && kp + 2 < len) {
+                out->k_is_arg = 1;
+                out->k_arg = (int)whale_get_u16(pc + kp + 1);
+                kl = 3;
+            } else {
+                return 0;
+            }
+            out->k = 0;
+            out->need_guard = 1;
+        }
+    }
+    {
+        int lp = head + gl + kl;
+
+        if (lp >= len || pc[lp] != OP_lt)
+            return 0;
+        {
+            int ip = lp + 1;
+
+            if (ip >= len)
+                return 0;
+            ifop = pc[ip];
+            if (ifop == OP_if_false8 && ip + 1 < len)
+                exitp = ip + 1 + (int8_t)pc[ip + 1];
+            else if (ifop == OP_if_false && ip + 4 < len)
+                exitp = ip + 1 + (int32_t)whale_get_u32(pc + ip + 1);
+            else
+                return 0;
+            if (exitp < 0 || exitp > len)
+                return 0;
+            /* the exit leaves the loop body */
+            if (exitp >= head && exitp <= back)
+                return 0;
+        }
+    }
+    /* `g = 0` right before the head */
+    {
+        int pp = -1, vp = -1, vl = 0;
+        double zv = 0;
+
+        if (head < 2)
+            return 0;
+        if (pc[head - 1] >= OP_put_loc0 && pc[head - 1] <= OP_put_loc3) {
+            vp = pc[head - 1] - OP_put_loc0;
+            pp = head - 2;
+        } else if (head >= 3 && pc[head - 2] == OP_put_loc8) {
+            vp = (int)pc[head - 1];
+            pp = head - 3;
+        } else {
+            return 0;
+        }
+        if (vp != g)
+            return 0;
+        if (!whale_push_lit(pc, len, pp, &zv, &vl) || zv != 0)
+            return 0;
+    }
+    for (i = 0; i < WHALE_JIT_MAX_SLOTS; i++) {
+        put_prod[i] = -1;
+        put_cnt[i] = 0;
+        no_mirror[i] = 0;
+    }
+    /* body scan: no call, no foreign exit, no inner head; g written only at
+       back-2; record each put_loc's producer (the opcode right before it). */
+    for (q = head; q <= back; ) {
+        int qo = (int)pc[q];
+        int w;
+
+        qsz = whale_op_size_of(qo);
+        if (qsz <= 0 || q + qsz > len)
+            return 0;
+        if (qo == OP_goto8 || qo == OP_goto || qo == OP_if_false8 ||
+            qo == OP_if_false || qo == OP_if_true8 || qo == OP_if_true) {
+            int t2 = -1;
+
+            if ((qo == OP_goto8 || qo == OP_if_false8 || qo == OP_if_true8) &&
+                q + 1 < len)
+                t2 = q + 1 + (int8_t)pc[q + 1];
+            else if (q + 4 < len)
+                t2 = q + 1 + (int32_t)whale_get_u32(pc + q + 1);
+            if (t2 < head || t2 > back) {
+                int is_head_test = (q == head + gl + kl + 1);
+                int is_back_edge = (q == back);
+
+                if (!((t2 == exitp && is_head_test) || (t2 == head && is_back_edge)))
+                    return 0;
+            }
+        }
+        w = whale_writes_local(qo, pc, q);
+        if (w == g) {
+            if (q == back - 2)
+                ; /* the induction increment */
+            else
+                return 0;
+        } else if (w >= 0) {
+            /* set_loc/add_loc leave a double-meaning value on the stack (set)
+               or read-modify-write a double (add): that local can never run
+               on an int mirror - blacklist it, but keep the loop. Only g
+               must have the single induction write. bitops' acc (set_loc0
+               after xor/or, then `+`-polluted) is exactly this case. */
+            if (qo == OP_put_loc || qo == OP_put_loc8 ||
+                (qo >= OP_put_loc0 && qo <= OP_put_loc3)) {
+                if (w >= WHALE_JIT_MAX_SLOTS)
+                    return 0;
+                put_cnt[w]++;
+                /* producer = opcode ending right at q (the value on top).
+                   Only single-byte puts can read it off at q-1: a put_loc8's
+                   q-1 is its own slot operand, not the producer. Multi-byte
+                   puts keep -2 (double path, always safe). */
+                if (qo >= OP_put_loc0 && qo <= OP_put_loc3 && q > head) {
+                    int po = (int)pc[q - 1];
+
+                    /* single-byte producers (all int bitwise ops are) */
+                    if (po == OP_and || po == OP_or || po == OP_xor ||
+                        po == OP_shl || po == OP_sar || po == OP_not)
+                        put_prod[w] = po;
+                    else
+                        put_prod[w] = -2; /* non-int producer */
+                } else {
+                    put_prod[w] = -2;
+                }
+            } else {
+                /* set/add/inc/dec on a non-g local: blacklist the mirror but
+                   keep the loop (see above). */
+                if (w >= WHALE_JIT_MAX_SLOTS)
+                    return 0;
+                no_mirror[w] = 1;
+            }
+        }
+        q += qsz;
+    }
+    {
+        int k;
+
+        for (k = 0; k < call_n; k++)
+            if (call_pos[k] >= head && call_pos[k] <= back)
+                return 0;
+    }
+    {
+        int qq;
+
+        for (qq = head + 1; qq <= back; qq++)
+            if (loop_back[qq] >= 0)
+                return 0;
+    }
+    /* mirror set: g plus puts produced by int bitwise ops. `mod` is not a
+       producer (its emitter may keep fmod on the cold branch - a double),
+       but it is a consumer (its fast path takes ints). */
+    out->mirror[g] = 1;
+    /* g's own reads must also be int-clean: the head test's `get_loc g` is
+       the bound compare (exempt - `I<g> < X` promotes exactly like JS), but
+       any other read next to a `+` or comparison refuses the whole loop. */
+    {
+        int qq2, ok = 1;
+
+        for (qq2 = head; qq2 <= back && ok; ) {
+            int qo2 = (int)pc[qq2];
+            int qsz2 = whale_op_size_of(qo2);
+            int r = -1, cop = -1;
+
+            if (qsz2 <= 0 || qq2 + qsz2 > len) {
+                ok = 0;
+                break;
+            }
+            if (qo2 >= OP_get_loc0 && qo2 <= OP_get_loc3)
+                r = qo2 - OP_get_loc0;
+            else if (qo2 == OP_get_loc8 && qq2 + 1 < len)
+                r = (int)pc[qq2 + 1];
+            else if (qo2 == OP_get_loc && qq2 + 2 < len)
+                r = (int)whale_get_u16(pc + qq2 + 1);
+            if (r == g && qq2 != head) {
+                if (!whale_int_consumer_at(pc, len, qq2, &cop))
+                    return 0;
+            }
+            qq2 += qsz2;
+        }
+    }
+    for (i = 0; i < var_count && i < WHALE_JIT_MAX_SLOTS; i++) {
+        int po;
+
+        if (i == g || put_cnt[i] == 0 || no_mirror[i])
+            continue;
+        po = put_prod[i];
+        if (po != OP_and && po != OP_or && po != OP_xor && po != OP_shl &&
+            po != OP_sar && po != OP_not)
+            continue;
+        /* every read of i inside the body must sit next to a bitwise
+           consumer (triple check); a `+` or comparison load refuses. */
+        {
+            int qq2, ok = 1;
+
+            for (qq2 = head; qq2 <= back && ok; ) {
+                int qo2 = (int)pc[qq2];
+                int qsz2 = whale_op_size_of(qo2);
+                int r = -1, cop = -1;
+
+                if (qsz2 <= 0 || qq2 + qsz2 > len) {
+                    ok = 0;
+                    break;
+                }
+                if (qo2 >= OP_get_loc0 && qo2 <= OP_get_loc3)
+                    r = qo2 - OP_get_loc0;
+                else if (qo2 == OP_get_loc8 && qq2 + 1 < len)
+                    r = (int)pc[qq2 + 1];
+                else if (qo2 == OP_get_loc && qq2 + 2 < len)
+                    r = (int)whale_get_u16(pc + qq2 + 1);
+                if (r == i) {
+                    /* the head test's own `get_loc g` is the bound compare,
+                       not a bitwise consumer - g is exempt, candidates are
+                       never read there (their store comes later anyway). */
+                    if (!whale_int_consumer_at(pc, len, qq2, &cop))
+                        ok = 0;
+                }
+                qq2 += qsz2;
+            }
+            if (!ok)
+                continue;
+        }
+        out->mirror[i] = 1;
+    }
+    out->ok = 1;
+    out->g = g;
+    out->exitp = exitp;
+    return 1;
 }
 
 /* Recognise `for (g = C0; g <= K; g++) if (arr[g]) acc++` at [head, back].
@@ -2848,7 +3239,16 @@ static void local_materialize(int d)
     if (whale_dbg_env("WHALE_MEM_TRACE"))
         fprintf(stderr, "[mat] L%d off=%d len=%d\n", d, m->expr.off, m->expr.len);
     mark = fold_mark();
-    wt_slot("L", d); wt('=');
+    /* Int-region mirror: inside the loop the pending expression is an int
+       expression (mirror stores wrap `(int)`), so it goes to I<d>, not L<d>.
+       Storing it to L<d> would leave later in-loop reads loading a stale
+       mirror. Outside the loop the exit edge has boxed the mirror already. */
+    if (whale_int_ok && d >= 0 && d < WHALE_JIT_MAX_SLOTS &&
+        whale_int_mirror[d] && whale_loop_depth > 0)
+        wt_slot("I", d);
+    else
+        wt_slot("L", d);
+    wt('=');
     fold_inline_expr(&m->expr);
     wt(';');
     fold_commit(mark);
@@ -2871,6 +3271,14 @@ static void local_inline(int d)
     if (!whale_lmem[d].live) {
         if (d >= 0 && d < WHALE_JIT_MAX_SLOTS && whale_lo_c[d]) {
             wt_num(whale_lo_cv[d]);
+            return;
+        }
+        /* Int-region mirror: inside the loop the running value is I<d>.
+           (A pending expression inlines as-is either way - mirror stores
+           already wrap `(int)`.) */
+        if (whale_int_ok && d >= 0 && d < WHALE_JIT_MAX_SLOTS &&
+            whale_int_mirror[d] && whale_loop_depth > 0) {
+            wt_slot("I", d);
             return;
         }
         wt_slot("L", d);
@@ -4322,12 +4730,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     whale_loop_trip_exit = malloc((len + 1) * sizeof(*whale_loop_trip_exit));
     whale_loop_memset = calloc(len + 1, sizeof(*whale_loop_memset));
     whale_loop_countrec = calloc(len + 1, sizeof(*whale_loop_countrec));
+    whale_loop_intreg = calloc(len + 1, sizeof(*whale_loop_intreg));
     if (!targets || !seen || !snap || !cur || !args_used || !assign_cnt ||
         !args_obj || !args_arr ||
         !whale_vexpr || !whale_vmat ||
         !whale_lmem || !loop_back || !whale_loop_trip ||
         !whale_loop_trip_g || !whale_loop_trip_exit || !whale_loop_memset ||
-        !whale_loop_countrec)
+        !whale_loop_countrec || !whale_loop_intreg)
         { whale_out_line = __LINE__; goto out; }
     for (i = 0; i <= len; i++)
         loop_back[i] = -1;
@@ -4726,6 +5135,52 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         h <= len)
                         whale_loop_countrec[h] = cs;
                 }
+                {
+                    WhaleIntLoop ir;
+
+                    memset(&ir, 0, sizeof(ir));
+                    ir.g = -1;
+                    ir.exitp = -1;
+                    if (whale_loop_int_of(pc, len, h, loop_back[h],
+                                            var_count, loop_back,
+                                            whale_call_pos, whale_call_n,
+                                            &ir) &&
+                        h <= len)
+                        whale_loop_intreg[h] = ir;
+                }
+            }
+        }
+        /* Int-region summary: enabled only with exactly one recognised loop
+           (mirrors are per-function globals; two regions could name the same
+           local). The emit pass consults whale_int_mirror/depth, the exit
+           edge consults whale_int_exit, the entry guard whale_int_need_guard.
+           Zeroed every compilation - a stale mirror is a wrong answer. */
+        memset(whale_int_mirror, 0, sizeof(whale_int_mirror));
+        whale_int_ok = 0;
+        whale_int_head = -1;
+        whale_int_exit = -1;
+        whale_int_g = -1;
+        whale_int_need_guard = 0;
+        whale_int_k_arg = -1;
+        {
+            int nh = 0, fh = -1, hh;
+
+            for (hh = 0; hh <= len; hh++)
+                if (whale_loop_intreg[hh].ok) {
+                    nh++;
+                    fh = hh;
+                }
+            if (nh == 1 && fh >= 0) {
+                int d;
+
+                for (d = 0; d < var_count && d < WHALE_JIT_MAX_SLOTS; d++)
+                    whale_int_mirror[d] = whale_loop_intreg[fh].mirror[d];
+                whale_int_ok = 1;
+                whale_int_head = fh;
+                whale_int_exit = whale_loop_intreg[fh].exitp;
+                whale_int_g = whale_loop_intreg[fh].g;
+                whale_int_need_guard = whale_loop_intreg[fh].need_guard;
+                whale_int_k_arg = whale_loop_intreg[fh].k_arg;
             }
         }
     }
@@ -5058,6 +5513,17 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             wk(JS_WK_DOUBLE); wt_slot("L", i); wt('='); wt_int(0); wt(';');
         }
     }
+    /* Int-region mirrors: one C `int` per mirrored local, zero-initialised
+       with the rest. Only when exactly one int-region was recognised (the
+       whale_int_ok gate above); otherwise nothing names them and the stores
+       would be pure per-call tax. `I<d>` is free (no other prefix uses it). */
+    if (whale_int_ok) {
+        for (i = 0; i < var_count && i < WHALE_JIT_MAX_SLOTS; i++) {
+            if (whale_int_mirror[i]) {
+                wk(JS_WK_INT); wt_slot("I", i); wt('='); wt_int(0); wt(';');
+            }
+        }
+    }
     /* ELS spill slots: `register double` locals for the hottest materialised
        values inside loops. Declared ONLY when they can be used - a function
        with no loops (recursive fib) or with calls in its loops must not pay
@@ -5274,6 +5740,24 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         int c1 = 0, c2 = 0;
         double cv1 = 0, cv2 = 0;
 
+        /* Int-region entry guard, emitted once before the first opcode: a
+           parameter bound is unproven, and `I<g>++` past INT_MAX is UB while
+           JS would carry on as a double. One test per call (never in the
+           loop), and on the cold path the whole function deopts to the
+           interpreter - which is where an unproven function would have run
+           anyway. Literal bounds were capped at 2^30 during recognition, so
+           they need no guard. */
+        if (pos == 0 && whale_int_ok && whale_int_need_guard) {
+            int fm = fold_mark();
+
+            wk(JS_WK_IF); wt('(');
+            wt_id("An"); wt('['); wt_int(whale_int_k_arg); wt(']');
+            wt_op(JS_OP_GT); wt_num(1073741824.0);
+            wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+            wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+            fold_commit(fm);
+        }
+
         /* A loop head opens a buffer for its body; the back edge closes it.
            The head label goes inside the buffer, because that is where the back
            edge jumps to. Nesting uses the loop stack. */
@@ -5302,6 +5786,27 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         if (targets[pos]) {
             local_flush_all(var_count);
             whale_sp_reset();
+            /* Int-region exit boxing: the loop is left through pos, so every
+               mirror is boxed back once (`L<d> = (double)I<d>`). The flush
+               above already wrote pending expressions to I<d> (materialise
+               honours mirrors inside the loop); this runs after it, on real
+               variables only. It fires exactly at the head test's exit - a
+               body-internal join shares targets[] but never equals exitp
+               (recognition refused exits inside [head, back]). */
+            if (whale_int_ok && pos == whale_int_exit) {
+                int dd;
+
+                for (dd = 0; dd < var_count && dd < WHALE_JIT_MAX_SLOTS; dd++) {
+                    if (whale_int_mirror[dd]) {
+                        int fm = fold_mark();
+
+                        wt_slot("L", dd); wt('=');
+                        wt('('); wk(JS_WK_DOUBLE); wt(')');
+                        wt_slot("I", dd); wt(';');
+                        fold_commit(fm);
+                    }
+                }
+            }
         }
 
         /* The fresh-struct window closes at any boundary a jump can reach or
@@ -6997,6 +7502,26 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     int fm = fold_mark();
                     int li = 0;
 
+                    /* Int-region mirror read: inside the loop a mirrored
+                       local runs on I<idx> (a C int, zero conversion). A
+                       pending expression, if any, is itself an int
+                       expression (mirror stores wrap `(int)`), so inlining
+                       it keeps int meaning. Outside the loop the exit edge
+                       has boxed the mirror back, so L<idx> is current.
+                       The value is int32 by construction: type I32, which
+                       makes every bitwise consumer take the short form. */
+                    if (whale_int_ok && idx >= 0 && idx < WHALE_JIT_MAX_SLOTS &&
+                        whale_int_mirror[idx] && whale_loop_depth > 0 &&
+                        whale_lmem) {
+                        if (whale_lmem[idx].live)
+                            fold_inline_expr(&whale_lmem[idx].expr);
+                        else
+                            wt_slot("I", idx);
+                        fold_set(sp, fm, 0);
+                        cur[var_count + sp] = WHALE_T_I32;
+                        sp++;
+                        break;
+                    }
                     local_inline(idx);
                     /* Invariance of a local read: a constant local inlines as
                        its literal (invariant); a still-pending expression keeps
@@ -7197,6 +7722,22 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                    read, or until the basic block ends. */
                 local_forget(idx);
                 fm = fold_mark();
+                /* Int-region mirror store: the pending expression must read
+                   as an int inside the loop (mirror reads inline it or load
+                   I<idx>), so wrap the value in `(int)` here. The value is
+                   int32 by recognition (int bitwise producer), so the cast
+                   is exact - and the materialise path below stores the same
+                   wrapped expression into I<idx>. Non-mirrors are untouched. */
+                if (whale_int_ok && idx >= 0 && idx < WHALE_JIT_MAX_SLOTS &&
+                    whale_int_mirror[idx] && whale_loop_depth > 0) {
+                    wt('('); wk(JS_WK_INT); wt(')');
+                    wt('('); fold_inline(sp - 1); wt(')');
+                    local_set(idx, fm, whale_vexpr[sp - 1].inv);
+                    cur[idx] = WHALE_T_I32;
+                    whale_lo_c[idx] = 0;
+                    sp--;
+                    break;
+                }
                 fold_inline(sp - 1);
                 local_set(idx, fm, whale_vexpr[sp - 1].inv);
                 cur[idx] = (uint8_t)t;
@@ -8334,6 +8875,27 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                 if (idx < 0 || idx >= var_count || !whale_type_is_num(cur[idx]))
                     { WHALE_STEP_INSTEAD_OF_BAILING(); }
+                /* Int-region induction step: `I<g>++`, no conversion, no
+                   deferred expression (the mirror is always a plain
+                   variable). Type stays I32 - the value cannot leave int32:
+                   the entry guard capped the trip count at 2^30. */
+                if (whale_int_ok && idx >= 0 && idx < WHALE_JIT_MAX_SLOTS &&
+                    whale_int_mirror[idx] && whale_loop_depth > 0 &&
+                    idx == whale_int_g) {
+                    local_materialize(idx);
+                    fm = fold_mark();
+                    /* `I<g> = I<g> + 1`, not `I<g>++`: the token stream has
+                       no `++` token (two separate `+` pushes parse as binary
+                       plus then unary plus, i.e. `expected expression`), and
+                       a new operator id is not worth it for one site. */
+                    wt_slot("I", idx); wt('=');
+                    wt_slot("I", idx); wt('+'); wt_int(1);
+                    wt(';');
+                    fold_commit(fm);
+                    cur[idx] = WHALE_T_I32;
+                    whale_lo_c[idx] = 0;
+                    break;
+                }
                 /* `L++` folds like add_loc: the current value may still be a
                    pending expression, so it is written out first. The result
                    names the variable L<idx> - never invariant. */
@@ -8709,6 +9271,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     if (whale_loop_countrec)
         free(whale_loop_countrec);
     whale_loop_countrec = NULL;
+    if (whale_loop_intreg)
+        free(whale_loop_intreg);
+    whale_loop_intreg = NULL;
     if (assign_cnt)
         free(assign_cnt);
     if (whale_vexpr)
