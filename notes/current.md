@@ -3267,9 +3267,45 @@ SOLVED（单方案，无切换无重编译，编译期一次决定）/ 真 bug �
 - 全量 25/25 check 全一致；`whale api test: ok`（TCC + gcc 双路径）。
 
 ## 状态
-绿，待提交。下一步：线性 IR（语句合并，动 spill 主体）或混合场景；
-int-region 可扩（`<=`、多 region、IBIT 裸核消 `(int)` 噪音——但都是
-ALU 级别，优先级低于 spill）。
+绿，已提交 87cbda5。下一步见 <105>。
+
+# <105>: IBIT 裸核落地（bitops 144→128ms，-11%）
+SOLVED（单管线：新类型 + 生产/消费两分支，无新管线无切换）
+
+## 打法（<104> 定的两步，第一步）
+- 现状对齐：TCC 语句级 spill 架构性无小改（<82>）；ELS 安全部分已拿完
+ （_wv 2-pin + L-pin write-through）；bitops 130ms 主体是 7 语句×spill。
+- 语句合并（87 行 use-count + 总长门）ROI 重估后放弃：IBIT 把链内
+  噪音消完后，可合的只剩 2 对 store/load（约 5ms），实现要动上限
+  体系（<82> 证伪过无脑放），风险/收益不对。
+- IBIT（WHALE_T_IBIT=12，纯编译期 hint）：位运算双操作数 int-clean
+  时生产裸 int（无 `(double)` 包），消费零转换（fold_toint32 直接
+  inline）；NUM 操作数走老路（`(long long)` 语义负载）；`>>>` 永不；
+  merge 降 NUM（两 arms + type_is_num，三处缺一即拒编）；
+  `+ - * /` 比较 return put 跨块全无需改（C 提升/隐转语义自洽）；
+  `%` bare 短路 + lnot 单比较补 IBIT（漏网各一）。
+- int-region get/put 镜像类型 I32→IBIT（裸 int 更精确，消费全零转换）。
+
+## dump 对比（cur_bitops11 → cur_bitops13）
+- `^` 右：`(double)((int)(I2)<<3)` → `((I2)<<(3&31))` 裸；
+- `|` 双 int-clean → 裸生产，直接 `L0=(...)`（`_wv` 落地消失一级）；
+- `~`：`((double)~(int)(L2))` → `((~(I2))&15)` 裸；
+- lnot：`((I2)&1)` 三份 NaN 展开 → 单比较（`==0?1:0` 一份）；
+- 语句 7→6（`_wv3/4` 独立落地消失）。
+- 剩余转换全在 acc 的 double 家（NUM，老路，认了）与 `+`/`&0xffff`
+  的边界（语义必需）。
+
+## 测量（repeat=3）
+- bitops 144→**128~131**（-11%）；branch 42→39，nested 20→19（保持）；
+  ident 55（61 是单次噪声，repeat=3 回到线）。
+- 全量 25/25 check 全一致；API 双路径绿。
+- 到 node 15ms 还有 8.5x：剩余全是语句级 spill（线性 IR 的活，
+  800-1500 行，见 <87>；本轮证明前端转换税已基本收净）。
+
+## 状态
+绿，待提交。下一步：线性 IR（<87> 三刀：调用链融合/循环 live-range/字段
+提升）或混合场景；IBIT 自然扩散（sieve/loop_sum 的位运算自动吃到，
+无额外工作）。
 
 
 

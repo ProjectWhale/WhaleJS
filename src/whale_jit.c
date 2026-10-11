@@ -163,6 +163,12 @@ enum {
                           expanded inline behind an identity guard: if the slot
                           no longer holds that function, the guard deopts. The
                           byte carries the var_ref index, not a slot number. */
+    WHALE_T_IBIT = 12, /* a bare int expression (no `(double)` wrapper): produced
+                          by a bitwise op whose operands were all int-clean, or
+                          by an int-region mirror read. Consuming it is zero
+                          conversion (it already is an int); anything needing a
+                          double (arithmetic, compare promotion aside) wraps it.
+                          Merges down to NUM like I32 - it is a hint, not a value. */
 };
 
 /* The object slot a type carries, packed into the same byte as the type.
@@ -704,9 +710,18 @@ static int whale_var_ref_feeds_call(const uint8_t *pc, int len, int pos, int sz)
 static int whale_type_is_num(int t)
 {
     /* WHALE_T_I32 counts as a number: it only adds the knowledge that the value
-       is already an in-range int32. */
+       is already an in-range int32. IBIT is the same promise in bare-int form
+       (a bitwise result without the `(double)` wrapper). */
     return t == WHALE_T_NUM || t == WHALE_T_BOOL || t == WHALE_T_I32 ||
-           t == WHALE_T_ICONST;
+           t == WHALE_T_ICONST || t == WHALE_T_IBIT;
+}
+
+/* An int-clean operand: its value is already an int32, so a bitwise op can
+   consume it with at most a cast - and when every operand of a bitwise op is
+   int-clean the whole op can stay a bare int expression (WHALE_T_IBIT). */
+static int whale_type_is_intclean(int t)
+{
+    return t == WHALE_T_I32 || t == WHALE_T_ICONST || t == WHALE_T_IBIT;
 }
 
 /* numeric binary opcode -> C operator. Returns NULL when the opcode is not a
@@ -2388,6 +2403,13 @@ static void fold_toint32(int k, int t)
        integer literal. Bitwise code is full of these (255, 3, 1, 0xffff). */
     if (t == WHALE_T_ICONST && !whale_vmat[k] && whale_vexpr[k].len == 1) {
         wt_int((int)gw_num[whale_vexpr[k].off]);
+        return;
+    }
+    /* A bare-int expression needs no conversion at all - it already is an
+       int. This is the IBIT payoff: chained bitwise ops inline each other
+       with zero casts between them. */
+    if (t == WHALE_T_IBIT) {
+        fold_inline(k);
         return;
     }
     /* A value already known to be an in-range int32 truncates to itself, so
@@ -5834,14 +5856,17 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                        here, so merge them down to the plain number. Treating the
                        difference as a conflict refused to compile the whole
                        function - which is how `acc` (NUM down one branch of an
-                       `if`, I32 down the other) lost bitops to the interpreter. */
-                    if (sv == WHALE_T_I32 || sv == WHALE_T_ICONST) {
+                       `if`, I32 down the other) lost bitops to the interpreter.
+                       IBIT rides the same arms: a bare-int hint merges down too. */
+                    if (sv == WHALE_T_I32 || sv == WHALE_T_ICONST ||
+                        sv == WHALE_T_IBIT) {
                         if (whale_type_is_num(cv)) {
                             snap[base + k] = WHALE_T_NUM;
                             continue;
                         }
                     }
-                    if (cv == WHALE_T_I32 || cv == WHALE_T_ICONST) {
+                    if (cv == WHALE_T_I32 || cv == WHALE_T_ICONST ||
+                        cv == WHALE_T_IBIT) {
                         if (whale_type_is_num(sv)) {
                             snap[base + k] = WHALE_T_NUM;
                             continue;
@@ -7518,7 +7543,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         else
                             wt_slot("I", idx);
                         fold_set(sp, fm, 0);
-                        cur[var_count + sp] = WHALE_T_I32;
+                        /* IBIT, not I32: a mirror read is a bare int (the
+                           variable itself, or an `(int)`-wrapped pending
+                           expression), so bitwise consumers skip every cast. */
+                        cur[var_count + sp] = WHALE_T_IBIT;
                         sp++;
                         break;
                     }
@@ -7733,7 +7761,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     wt('('); wk(JS_WK_INT); wt(')');
                     wt('('); fold_inline(sp - 1); wt(')');
                     local_set(idx, fm, whale_vexpr[sp - 1].inv);
-                    cur[idx] = WHALE_T_I32;
+                    /* IBIT: the pending expression is `(int)(...)`, a bare
+                       int - mirror reads inline it with zero conversion. */
+                    cur[idx] = WHALE_T_IBIT;
                     whale_lo_c[idx] = 0;
                     sp--;
                     break;
@@ -8677,7 +8707,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                    so unlike fold_mod this emits no guard at all. This is the
                    shape `v % 7` has when v is a bitwise result. */
                 if (pow2 == 0 &&
-                    (ta == WHALE_T_I32 || ta == WHALE_T_ICONST) &&
+                    (ta == WHALE_T_I32 || ta == WHALE_T_ICONST ||
+                     ta == WHALE_T_IBIT) &&
                     tb == WHALE_T_ICONST && !whale_vmat[sp - 1] &&
                     whale_vexpr[sp - 1].len == 1) {
                     double bv = gw_num[whale_vexpr[sp - 1].off];
@@ -8758,6 +8789,27 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             tb = cur[var_count + sp - 1];
             if (!whale_type_is_num(ta) || !whale_type_is_num(tb))
                 { WHALE_STEP_INSTEAD_OF_BAILING(); }
+            /* Bare-int production: when both operands are int-clean the C
+               operands are already ints (fold_toint32 of I32/ICONST is a cast,
+               of IBIT nothing at all), so the `(double)` wrapper is pure
+               noise - skip it and mark the result IBIT. A NUM operand keeps
+               the old wrapped form (I32): its `(long long)` truncation is
+               semantically load-bearing. */
+            if (whale_type_is_intclean(ta) && whale_type_is_intclean(tb)) {
+                int fm = fold_mark();
+                int inva = whale_vexpr[sp - 2].inv;
+                int invb = whale_vexpr[sp - 1].inv;
+
+                wt('(');
+                fold_toint32(sp - 2, cur[var_count + sp - 2]);
+                wt(op == OP_and ? '&' : op == OP_or ? '|' : '^');
+                fold_toint32(sp - 1, cur[var_count + sp - 1]);
+                wt(')');
+                fold_set(sp - 2, fm, inva && invb);
+                cur[var_count + sp - 2] = WHALE_T_IBIT;
+                sp--;
+                break;
+            }
             {
                 int fm = fold_mark();
                 int inva = whale_vexpr[sp - 2].inv;
@@ -8778,6 +8830,24 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             tb = cur[var_count + sp - 1];
             if (!whale_type_is_num(ta) || !whale_type_is_num(tb))
                 { WHALE_STEP_INSTEAD_OF_BAILING(); }
+            /* Bare-int production for `<<`/`>>` (never `>>>`: unsigned, may
+               exceed int32). Same deal as `& | ^` above. */
+            if (op != OP_shr && whale_type_is_intclean(ta) &&
+                whale_type_is_intclean(tb)) {
+                int fm = fold_mark();
+                int inva = whale_vexpr[sp - 2].inv;
+                int invb = whale_vexpr[sp - 1].inv;
+
+                wt('(');
+                fold_toint32(sp - 2, cur[var_count + sp - 2]);
+                wt_op(op == OP_shl ? JS_OP_SHL : JS_OP_SAR);
+                wt('('); fold_toint32(sp - 1, cur[var_count + sp - 1]); wt('&'); wt_int(31); wt(')');
+                wt(')');
+                fold_set(sp - 2, fm, inva && invb);
+                cur[var_count + sp - 2] = WHALE_T_IBIT;
+                sp--;
+                break;
+            }
             {
                 int fm = fold_mark();
                 int inva = whale_vexpr[sp - 2].inv;
@@ -8831,8 +8901,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 /* !x is true for 0 and for NaN. An int32 is never NaN, so a
                    known-int32 operand folds to a single comparison (and stops
                    tripling the operand's tokens - the untyped form names it
-                   three times). */
-                if (topt == WHALE_T_I32 || topt == WHALE_T_ICONST) {
+                   three times). IBIT rides along: a bare int is never NaN. */
+                if (topt == WHALE_T_I32 || topt == WHALE_T_ICONST ||
+                    topt == WHALE_T_IBIT) {
                     wt('('); fold_inline(sp - 1); wt_op(JS_OP_EQ); wt_int(0); wt(')');
                     wt('?'); wt_int(1); wt(':'); wt_int(0);
                 } else {
@@ -8847,6 +8918,17 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         case OP_not:
             if (!whale_type_is_num(cur[var_count + sp - 1]))
                 { WHALE_STEP_INSTEAD_OF_BAILING(); }
+            /* Bare-int `~x` when the operand is int-clean (IBIT needs no
+               conversion at all). Otherwise the wrapped form as before. */
+            if (whale_type_is_intclean(cur[var_count + sp - 1])) {
+                int fmn = fold_mark();
+                int invn = whale_vexpr[sp - 1].inv;
+
+                wt('~'); fold_toint32(sp - 1, cur[var_count + sp - 1]);
+                fold_set(sp - 1, fmn, invn);
+                cur[var_count + sp - 1] = WHALE_T_IBIT;
+                break;
+            }
             {
                 int fm = fold_mark();
                 int inv = whale_vexpr[sp - 1].inv;
