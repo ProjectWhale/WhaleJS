@@ -3435,8 +3435,47 @@ SOLVED（分相计时）/ 试错回退 ×1 / 评估结论 ×2（不做，诚实�
   线性 IR）+ peeling（稳态零分支）。frontend 能动的已基本收净。
 
 ## 状态
-绿，待提交。下一步：循环 peeling（objshape 穳态零分支）或 deopt 想法
-落地（用户那套：轻决策可能比硬压单条路更接近 node）。
+绿，已提交 c562cb5。下一步见 <109>。
+
+# <109>: escaped 槽位复用（objshape 166→74ms，-55%，反超 node）
+SOLVED（单管线：loop 表 + ru 标记，无新管线）/ 弯路 ×3（全记录）
+
+## 打法（peeling 让路：只值 ~20ms，复用值 ~80ms）
+- 分相定死 escaped 占 66%（121ms，4 calls + 3 malloc/trip）。
+- peeling ROI 重估后放弃（fv 检查 5×2 cycles + park 跨块，满打满算 -15%，
+  还要动 loop buffer）。复用才是 50ms 的必经之路。
+
+## 落地：循环内建对象槽位复用
+- 识别 `whale_loop_reuse_of`（仿 memset 骨架）：体内单 OP_object +
+  数值 define/put/get_field + 单 put_array_el + 无 call + 无内 head +
+  单 exit。write-only/escape 证明 `reuse_writeonly`：数组 local 由
+  array_from-put 配对定（put 前回扫分不清数组/下标/值）；
+  无 get_array_el/length 读数组、无 call、无全局/闭包存、无 with；
+  return 只收常量/数值 local（loc_obj 查）/数值 binop/未作对象用的 arg/
+  return_undef。
+- 发射三处：OP_object `if (!ru) 建` + define 首 trip Define/稳态
+  StoreNum（现成 helper，缓存指针零 transition）+ put_array_el 的
+  STRUCT 物化点 `if (!ru) 物化`（**真落点**：t 走 frame 列，ObjNew 在
+  物化点不在 OP_object——查了三轮才定）。稳态每 trip 1 call（ArrSetVal）。
+- `_wsc.ru[4]` + head→idx 映射（4 封顶，超了走老路）。
+
+## 弯路 ×3（教训）
+1. 复用门一开始装在 OP_object/define（通用对象路），但 t 走 frame 列，
+   真正分配在 put 的 STRUCT 物化点。`[reuse-case]` 打印证明 case 跑了
+   但 fallback 没跑——定位工具，不是瞎猜。
+2. opcode 号段重叠：194 既是 push_i8 又是 scope_put_var_init（短/临时
+   共用设计），escape 名单误杀小整数 push。修：删名单 + with 块另拒。
+3. return 证明三洞：`return acc+seed` 前是 add（数值 binop 结果恒数值，
+   放行）；get_arg 要查 args_obj/arr；get_loc 要查 loc_obj。逐个补。
+
+## 测量（repeat=3）
+- escaped 相 121→**19ms**（单相，反超 node 22ms）；objshape 166→**74ms**
+  （-55%），node 47 只差 1.6x。全量 25/25 check 全一致；API 双路径绿。
+- 到 50ms 还差：writeOrder spill（线性 IR）+ escaped 剩余 ArrSetVal
+  （1 call/trip，数组语义必需）+ 通用 margin。
+
+## 状态
+绿，待提交。下一步：deopt 想法落地，或 writeOrder/线性 IR（spill 主体）。
 
 
 

@@ -1060,6 +1060,24 @@ static int whale_loop_shape_dirty;
    this, not has_call: every object loop lowers field access to helpers, so
    gating on has_call would close stability for exactly the loops it helps. */
 static int whale_loop_has_bcall;
+/* Reuse-loop head -> _wsc.ru[] index (4 cap). Assigned on first use per
+   compilation; a fifth reuse loop keeps per-trip allocation. Zeroed per
+   compilation next to the loop scans (a stale head would reuse the wrong
+   slot's mark). */
+static int whale_reuse_map[4];
+static int whale_reuse_n;
+static int whale_reuse_ridx(int head)
+{
+    int i;
+
+    for (i = 0; i < whale_reuse_n && i < 4; i++)
+        if (whale_reuse_map[i] == head)
+            return i;
+    if (whale_reuse_n >= 4)
+        return -1;
+    whale_reuse_map[whale_reuse_n] = head;
+    return whale_reuse_n++;
+}
 /* Per-local heat inside loop bodies (reads + 2*writes, accumulated over all
    loops): the ELS decision pins the hottest ones. Indexed by local number,
    zeroed before each compilation's scan. */
@@ -1176,6 +1194,24 @@ typedef struct {
 
 static WhaleMemsetLoop *whale_loop_memset;
 static WhaleCountLoop *whale_loop_countrec;
+
+/* In-loop object-reuse descriptor: a loop body that builds exactly one fresh
+   object (`OP_object` + numeric define/put_field only) and parks it into a
+   write-only array (no element/length reads of that array anywhere, no call,
+   no return/global store of either). The object slot is then reused across
+   trips: first trip builds (ObjNew + Define = transition + store), steady
+   trips only store values (StoreValue, shape unchanged, no transition, no
+   prop-array growth). The parked array keeps length semantics (ArrSetVal
+   stays); only the per-trip allocation dies. Like memset/count, the array
+   slot is confirmed from the body tokens at emit time, never here. */
+typedef struct {
+    int ok;       /* recognised (calloc zeroes impersonate head 0) */
+    int objpos;   /* OP_object position (the reused slot's creation site) */
+    int arrpos;   /* put_array_el position (the parking store) */
+    int ridx;     /* _wsc.ru[] index (assigned at fill time, per head) */
+} WhaleReuseLoop;
+
+static WhaleReuseLoop *whale_loop_reuse;
 static int *whale_loop_trip;
 static int *whale_loop_trip_g;
 static int *whale_loop_trip_exit;
@@ -2003,6 +2039,309 @@ static int whale_loop_count_of(const uint8_t *pc, int len, int head, int back,
     out->le = le;
     out->exitp = exitp;
     out->ok = 1;
+    return 1;
+}
+
+/* Recognise a reusable in-loop build at [head, back]: exactly one OP_object,
+   then only numeric define_field/put_field/get_field (values, never new
+   identities), exactly one put_array_el parking the object, the induction
+   increment, and the back edge. No call in the body, no inner head. The
+   parked array's local is recorded for the caller-side write-only proof
+   (no get_array_el/get_length on it anywhere in the function, no return or
+   global/closure store of it or the object - checked by the caller, which
+   sees the whole body; here only the local number is reported).
+   Every rejection is conservative. */
+static int whale_loop_reuse_of(const uint8_t *pc, int len, int head, int back,
+                               int var_count, const int *loop_back,
+                               const int *call_pos, int call_n,
+                               int *objpos_out, int *arrpos_out)
+{
+    int q, qsz;
+    int objpos = -1, arrpos = -1;
+    int exitp = -1;
+    int nop = -1, ntgt = -1;
+
+    if (head < 0 || back <= head || back >= len)
+        return 0;
+    nop = pc[back];
+    if (nop == OP_goto8 && back + 1 < len)
+        ntgt = back + 1 + (int8_t)pc[back + 1];
+    else if (nop == OP_goto && back + 4 < len)
+        ntgt = back + 1 + (int32_t)whale_get_u32(pc + back + 1);
+    else
+        return 0;
+    if (ntgt != head)
+        return 0;
+    for (q = head; q <= back; ) {
+        int qo = (int)pc[q];
+
+        qsz = whale_op_size_of(qo);
+        if (qsz <= 0 || q + qsz > len)
+            return 0;
+        if (qo == OP_goto8 || qo == OP_goto || qo == OP_if_false8 ||
+            qo == OP_if_false || qo == OP_if_true8 || qo == OP_if_true) {
+            int t2 = -1;
+
+            if ((qo == OP_goto8 || qo == OP_if_false8 || qo == OP_if_true8) &&
+                q + 1 < len)
+                t2 = q + 1 + (int8_t)pc[q + 1];
+            else if (q + 4 < len)
+                t2 = q + 1 + (int32_t)whale_get_u32(pc + q + 1);
+            /* leaving the body: the back edge home, plus one exit (the head
+               test's) - anything else refuses. */
+            if (t2 < head || t2 > back) {
+                if (t2 == head && q == back) {
+                    q += qsz;
+                    continue;
+                }
+                if (exitp < 0) {
+                    exitp = t2;
+                    q += qsz;
+                    continue;
+                }
+                return 0;
+            }
+            q += qsz;
+            continue;
+        }
+        if (qo == OP_object) {
+            if (objpos >= 0)
+                return 0;
+            objpos = q;
+            q += qsz;
+            continue;
+        }
+        if (qo == OP_put_array_el) {
+            if (arrpos >= 0)
+                return 0;
+            arrpos = q;
+            q += qsz;
+            continue;
+        }
+        /* numeric field init/update/read: values only, no new identity. */
+        if (qo == OP_define_field || qo == OP_put_field ||
+            qo == OP_get_field || qo == OP_get_field2) {
+            q += qsz;
+            continue;
+        }
+        /* the parked array's local read (its reference for the store) and
+           any other local traffic: induction, accumulators and pure numerics
+           all pass the generic gate below (they are pure-num ops), so no
+           special record is needed here. */
+        switch (qo) {
+        case OP_swap: case OP_dup: case OP_nip: case OP_nip1:
+        case OP_drop: case OP_to_propkey: case OP_to_propkey2:
+        case OP_is_undefined_or_null:
+            break;
+        default:
+            if (!whale_is_pure_num_op(qo))
+                return 0;
+            break;
+        }
+        q += qsz;
+    }
+    if (objpos < 0 || arrpos < 0)
+        return 0;
+    {
+        int k;
+
+        for (k = 0; k < call_n; k++)
+            if (call_pos[k] >= head && call_pos[k] <= back)
+                return 0;
+    }
+    {
+        int qq;
+
+        for (qq = head + 1; qq <= back; qq++)
+            if (loop_back[qq] >= 0)
+                return 0;
+    }
+    *objpos_out = objpos;
+    *arrpos_out = arrpos;
+    return 1;
+}
+
+/* Write-only/escape proof for a reuse candidate: the parked array (found via
+   the put_array_el at arrpos: `get_loc arr` just before its index sequence)
+   must never be read in this function (no get_array_el/get_length on it),
+   never returned, never stored global/closure, and the function must contain
+   no call at all (a call could stash either object anywhere) and no return
+   of a non-trivial value (only a constant/local-number return proves the
+   objects stay local). Conservative on every doubt: an unprovable function
+   simply keeps per-trip allocation. */
+static int whale_loop_reuse_writeonly(const uint8_t *pc, int len, int head,
+                                      int back, int var_count,
+                                      int objpos, int arrpos,
+                                      int arg_count,
+                                      const uint8_t *args_obj,
+                                      const uint8_t *args_arr,
+                                      const uint8_t *loc_obj)
+{
+    int q, qsz;
+    int arrloc = -1;
+
+    (void)head;
+    (void)back;
+    /* the parked array's local: the `array_from` + `put_loc arr` pair that
+       built it (function-wide; the put closest after the array_from). The
+       put_array_el back-scan cannot tell the array operand from the index
+       and value operands (all three are get_loc-shaped), so the creation
+       pair - not proximity - names the array. */
+    {
+        int s, found = 0;
+
+        for (s = 0; s < len; s++) {
+            int op = (int)pc[s];
+
+            if (op == OP_array_from) {
+                int t = s + (int)whale_op_size_of(op);
+
+                if (t < len) {
+                    int nop = (int)pc[t];
+
+                    if (nop >= OP_put_loc0 && nop <= OP_put_loc3) {
+                        arrloc = nop - OP_put_loc0;
+                        found = 1;
+                        break;
+                    } else if (nop == OP_put_loc8 && t + 1 < len) {
+                        arrloc = (int)pc[t + 1];
+                        found = 1;
+                        break;
+                    } else if (nop == OP_put_loc && t + 2 < len) {
+                        arrloc = (int)whale_get_u16(pc + t + 1);
+                        found = 1;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!found)
+            return 0;
+        if (arrloc < 0 || arrloc >= var_count)
+            return 0;
+    }
+    for (q = 0; q < len; ) {
+        int qo = (int)pc[q];
+
+        qsz = whale_op_size_of(qo);
+        if (qsz <= 0 || q + qsz > len)
+            return 0;
+        /* any call anywhere refuses (could stash either object). */
+        if (qo == OP_call || (qo >= OP_call0 && qo <= OP_call3))
+            return 0;
+        /* array reads of our array refuse (write-only proof). A get_array_el
+           or get_length whose receiver is `get_loc arrloc` refuses; other
+           receivers are other arrays and fine. */
+        if (qo == OP_get_array_el || qo == OP_get_length) {
+            int s, hit = 0;
+
+            for (s = q - 1; s >= 0 && s >= q - 6; s--) {
+                int op = (int)pc[s];
+                int li = -1;
+
+                if (op >= OP_get_loc0 && op <= OP_get_loc3)
+                    li = op - OP_get_loc0;
+                else if (op == OP_get_loc8 && s + 1 < len)
+                    li = (int)pc[s + 1];
+                else if (op == OP_get_loc && s + 2 < len)
+                    li = (int)whale_get_u16(pc + s + 1);
+                else
+                    continue;
+                if (li == arrloc) {
+                    hit = 1;
+                    break;
+                }
+                break;
+            }
+            if (hit)
+                return 0;
+        }
+        /* global/closure stores refuse (escape). NB: OP_scope_put_var_init
+           shares its number (194) with OP_push_i8 by the short/temp overlap
+           design, so it is NOT listed (it would veto every small-int push).
+           Scoped stores are still covered: any with-block opcode in the
+           function refuses below (with can observe any scope). */
+        if (qo == OP_put_var || qo == OP_put_var_init ||
+            qo == OP_put_var_ref ||
+            (qo >= OP_put_var_ref0 && qo <= OP_put_var_ref3) ||
+            qo == OP_put_var_ref_check || qo == OP_put_var_ref_check_init ||
+            qo == OP_scope_put_var ||
+            qo == OP_with_put_var)
+            return 0;
+        if (qo == OP_with_get_var || qo == OP_with_delete_var ||
+            qo == OP_with_make_ref || qo == OP_with_get_ref ||
+            qo == OP_with_get_ref_undef)
+            return 0;
+        /* return of anything but a constant, a plain numeric local or an
+           argument never used as an object/array refuses (the parked objects
+           must not leave). A bare `return;` (return_undef) is empty. */
+        if (qo == OP_return_undef) {
+            q += qsz;
+            continue;
+        }
+        if (qo == OP_return) {
+            int pp = q - 1;
+
+            if (pp < 0)
+                return 0;
+            {
+                int pop = (int)pc[pp];
+                int ai = -1;
+
+                if ((pop >= OP_get_arg0 && pop < OP_get_arg0 + 4))
+                    ai = pop - OP_get_arg0;
+                else if (pop == OP_get_arg && pp + 2 < len)
+                    ai = (int)whale_get_u16(pc + pp + 1);
+                if (ai >= 0) {
+                    /* an argument: safe unless it ever served as an object
+                       or array (then it could smuggle either out). */
+                    if (ai >= arg_count || !args_obj || !args_arr)
+                        return 0;
+                    if (args_obj[ai] || args_arr[ai])
+                        return 0;
+                } else if ((pop >= OP_get_loc0 && pop <= OP_get_loc3) ||
+                           pop == OP_get_loc8 || pop == OP_get_loc) {
+                    /* a local: safe unless it holds an object (locals unify
+                       objects to slots; a plain numeric local cannot smuggle
+                       the parked identities out). */
+                    int li = (pop >= OP_get_loc0 && pop <= OP_get_loc3)
+                        ? pop - OP_get_loc0
+                        : (pop == OP_get_loc8 && pp + 1 < len)
+                        ? (int)pc[pp + 1]
+                        : (pop == OP_get_loc && pp + 2 < len)
+                        ? (int)whale_get_u16(pc + pp + 1) : -1;
+
+                    if (li < 0 || li >= WHALE_JIT_MAX_SLOTS)
+                        return 0;
+                    if (loc_obj && loc_obj[li])
+                        return 0;
+                } else if (!((pop >= OP_push_0 && pop <= OP_push_7) ||
+                      pop == OP_push_i8 || pop == OP_push_i16 ||
+                      pop == OP_push_i32 || pop == OP_push_const ||
+                      pop == OP_push_const8 ||
+                      pop == OP_add || pop == OP_sub || pop == OP_mul ||
+                      pop == OP_div || pop == OP_mod ||
+                      pop == OP_and || pop == OP_or || pop == OP_xor ||
+                      pop == OP_shl || pop == OP_shr || pop == OP_sar ||
+                      pop == OP_neg || pop == OP_plus ||
+                      pop == OP_inc || pop == OP_dec ||
+                      pop == OP_not || pop == OP_lnot ||
+                      pop == OP_lt || pop == OP_lte || pop == OP_gt ||
+                      pop == OP_gte || pop == OP_eq || pop == OP_neq ||
+                      pop == OP_strict_eq || pop == OP_strict_neq ||
+                      pop == OP_is_undefined_or_null))
+                    return 0;
+            }
+        }
+        q += qsz;
+    }
+    /* the built object itself never leaves through a local: it has none (it
+       stays on the stack from OP_object to put_array_el - any put_loc of an
+       object in between would be a second identity, and the recogniser only
+       allows the shape above where the stack object flows straight through).
+       Silence unused warnings for the anchor positions. */
+    (void)objpos;
+    (void)arrpos;
     return 1;
 }
 
@@ -4943,12 +5282,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     whale_loop_memset = calloc(len + 1, sizeof(*whale_loop_memset));
     whale_loop_countrec = calloc(len + 1, sizeof(*whale_loop_countrec));
     whale_loop_intreg = calloc(len + 1, sizeof(*whale_loop_intreg));
+    whale_loop_reuse = calloc(len + 1, sizeof(*whale_loop_reuse));
     if (!targets || !seen || !snap || !cur || !args_used || !assign_cnt ||
         !args_obj || !args_arr ||
         !whale_vexpr || !whale_vmat ||
         !whale_lmem || !loop_back || !whale_loop_trip ||
         !whale_loop_trip_g || !whale_loop_trip_exit || !whale_loop_memset ||
-        !whale_loop_countrec || !whale_loop_intreg)
+        !whale_loop_countrec || !whale_loop_intreg || !whale_loop_reuse)
         { whale_out_line = __LINE__; goto out; }
     for (i = 0; i <= len; i++)
         loop_back[i] = -1;
@@ -5201,6 +5541,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     whale_loop_has_call = 0;
     whale_loop_shape_dirty = 0;
     whale_loop_has_bcall = 0;
+    whale_reuse_n = 0;
+    memset(whale_reuse_map, 0xff, sizeof(whale_reuse_map));
     {
         int k;
 
@@ -5382,6 +5724,26 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                                             &ir) &&
                         h <= len)
                         whale_loop_intreg[h] = ir;
+                }
+                {
+                    WhaleReuseLoop ru;
+                    int objpos = -1, arrpos = -1;
+
+                    memset(&ru, 0, sizeof(ru));
+                    if (whale_loop_reuse_of(pc, len, h, loop_back[h],
+                                            var_count, loop_back,
+                                            whale_call_pos, whale_call_n,
+                                            &objpos, &arrpos) &&
+                        h <= len &&
+                        whale_loop_reuse_writeonly(pc, len, h, loop_back[h],
+                                                   var_count, objpos, arrpos,
+                                                   arg_count, args_obj,
+                                                   args_arr, whale_loc_obj)) {
+                        ru.ok = 1;
+                        ru.objpos = objpos;
+                        ru.arrpos = arrpos;
+                        whale_loop_reuse[h] = ru;
+                    }
                 }
             }
         }
@@ -5831,6 +6193,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        a pure numeric function like fib keeps nothing but _wsv[]. */
     {
         int need_field = 0, d;
+        int need_reuse = 0, hh;
 
         need_field = (whale_field_sites_n > 0);
         if (!need_field) {
@@ -5840,7 +6203,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     break;
                 }
         }
-        if (need_field || whale_has_array) {
+        for (hh = 0; hh <= len; hh++)
+            if (whale_loop_reuse[hh].ok) {
+                need_reuse = 1;
+                break;
+            }
+        if (need_field || whale_has_array || need_reuse) {
             wk(JS_WK_STRUCT); wt('{');
             if (need_field) {
                 /* the atoms of the layout being built, handed to JS_WhaleStructNew */
@@ -5862,6 +6230,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 wk(JS_WK_INT); wt_id("ai"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
                 wk(JS_WK_UNSIGNED); wt_id("char"); wt('*'); wt_id("op"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
                 wk(JS_WK_DOUBLE); wt_id("on"); wt('['); wt_int(WHALE_OBJ_SLOTS); wt(']'); wt(';');
+            }
+            /* in-loop object-reuse marks, one per reused build (4 cap): 0 means
+               "not built yet this call", so the first trip builds and later
+               trips only store values. Inside the zeroed _wsc like the rest. */
+            if (need_reuse) {
+                wk(JS_WK_INT); wt_id("ru"); wt('['); wt_int(4); wt(']'); wt(';');
             }
             wt('}'); wt_id("_wsc"); wt('='); wt('{'); wt_int(0); wt('}'); wt(';');
             /* 1, because a cached fv[] of 0 (from that zero initialiser) must not look
@@ -6965,11 +7339,35 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 }
                 {
                     int fm = fold_mark();
+                    int ridx = -1;
+                    int hd = (whale_loop_depth > 0)
+                        ? whale_loops[whale_loop_depth - 1].head_pos : -1;
 
-                    wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjNew"); wt('(');
-                    wt_id("ctx"); wt(','); wt_int(os); wt(')'); wt(')');
-                    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
-                    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    /* In-loop object reuse: when this OP_object is the
+                       recognised build of a reuse loop, the slot is reused
+                       across trips - first trip builds, later trips skip
+                       (the object is still there from the last trip). The
+                       ridx maps the loop head to a _wsc.ru[] mark (4 cap;
+                       more reuse loops keep per-trip allocation). */
+                    if (whale_loop_depth > 0) {
+                        if (hd >= 0 && hd <= len && whale_loop_reuse[hd].ok &&
+                            whale_loop_reuse[hd].objpos == pos)
+                            ridx = whale_reuse_ridx(hd);
+                    }
+                    if (ridx >= 0) {
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_arr("ru", ridx); wt(')'); wt('{');
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjNew"); wt('(');
+                        wt_id("ctx"); wt(','); wt_int(os); wt(')'); wt(')');
+                        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        wt_arr("ru", ridx); wt('='); wt_int(1); wt(';');
+                        wt('}');
+                    } else {
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjNew"); wt('(');
+                        wt_id("ctx"); wt(','); wt_int(os); wt(')'); wt(')');
+                        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    }
                     fold_commit(fm);
                 }
                 whale_plain_slots |= 1u << os;
@@ -7046,16 +7444,56 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 if (whale_ret_obj_g && WHALE_IS_OBJ(ta) && whale_type_is_num(tb)) {
                     /* A plain object from the OP_object fallback arm: the
                        ordinary define - JS_WhaleStructSetNum would refuse it
-                       and every call would deopt. */
+                       and every call would deopt. In a reuse loop the first
+                       trip defines (transition) and later trips only store
+                       the value (shape unchanged, no transition, no prop-array
+                       growth): the ru mark tells them apart. */
                     if (whale_plain_slots & (1u << WHALE_OBJ_SLOT(ta))) {
                         int fm = fold_mark();
+                        int ridx = -1;
+                        int rfc = -1;
 
+                        if (whale_loop_depth > 0) {
+                            int hd = whale_loops[whale_loop_depth - 1].head_pos;
+
+                            if (hd >= 0 && hd <= len && whale_loop_reuse[hd].ok)
+                                ridx = whale_reuse_ridx(hd);
+                        }
+                        /* steady-state cache pair for StoreNum (only when
+                           reusing: pays one pair off the budget). */
+                        if (ridx >= 0) {
+                            if (whale_fields >= WHALE_FIELD_CACHE)
+                                ridx = -1;
+                            else
+                                rfc = whale_fields++;
+                        }
                         fold_materialize(sp - 1);
-                        wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjDefineNum");
-                        wt('('); wt_id("ctx"); wt(','); wt_int(WHALE_OBJ_SLOT(ta)); wt(',');
-                        wt_int(atom); wt(','); fold_inline(sp - 1); wt(')'); wt(')');
-                        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
-                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        if (ridx >= 0) {
+                            wk(JS_WK_IF); wt('('); wt('!'); wt_arr("ru", ridx); wt(')'); wt('{');
+                            wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjDefineNum");
+                            wt('('); wt_id("ctx"); wt(','); wt_int(WHALE_OBJ_SLOT(ta)); wt(',');
+                            wt_int(atom); wt(','); fold_inline(sp - 1); wt(')'); wt(')');
+                            wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                            wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                            wt('}'); wk(JS_WK_ELSE); wt('{');
+                            /* steady state: shape unchanged, so the cached
+                               pointer stores with no transition (frees nothing:
+                               old value is numeric, GC-owned). */
+                            wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjStoreNum");
+                            wt('('); wt_id("ctx"); wt(','); wt_int(WHALE_OBJ_SLOT(ta)); wt(',');
+                            wt_int(atom); wt(','); fold_inline(sp - 1); wt(',');
+                            wt('&'); wt_arr("fs", rfc); wt(','); wt('&'); wt_arr("fp", rfc);
+                            wt(')'); wt(')');
+                            wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                            wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                            wt('}');
+                        } else {
+                            wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjDefineNum");
+                            wt('('); wt_id("ctx"); wt(','); wt_int(WHALE_OBJ_SLOT(ta)); wt(',');
+                            wt_int(atom); wt(','); fold_inline(sp - 1); wt(')'); wt(')');
+                            wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                            wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        }
                         fold_commit(fm);
                         sp--;   /* the object stays on the stack */
                         break;
@@ -7339,13 +7777,48 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                        reshape user objects, while gating on has_call would
                        close stability for exactly the object loops it helps -
                        every one of them lowers field access to helpers. */
-                    fold_obj_field_resolve(WHALE_SLOT(ta), atom, fc, fc2,
-                                           whale_field_stable(ta, whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1))));
+                    /* In a reuse loop the object's shape is fixed after the
+                       first trip (same slot reused, fields only overwritten):
+                       resolve once, then store straight through the cached
+                       pointer. The ru mark (set by the loop's OP_object when
+                       it built) tells them apart. Outside reuse the resolve
+                       runs every trip as before. */
+                    {
+                        int ridx = -1;
+
+                        if (whale_loop_depth > 0) {
+                            int hd = whale_loops[whale_loop_depth - 1].head_pos;
+
+                            if (hd >= 0 && hd <= len && whale_loop_reuse[hd].ok)
+                                ridx = whale_reuse_ridx(hd);
+                        }
+                        if (ridx >= 0)
+                            fold_obj_field_resolve(WHALE_SLOT(ta), atom, fc, fc2, 1);
+                        else
+                            fold_obj_field_resolve(WHALE_SLOT(ta), atom, fc, fc2,
+                                                   whale_field_stable(ta, whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1))));
+                    }
                     fm = fold_mark();
                     if (whale_type_is_num(tb)) {
                         /* the value is a double here, and the old one was a number
-                           too (anything else deopted above) */
-                        wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt('='); wt_int(8); wt(';');
+                           too (anything else deopted above). In a reuse loop
+                           the tag is already 8 from the first trip, so only
+                           the value store runs on later trips - the ru mark
+                           guards the tag write the same way. */
+                        {
+                            int hd2 = (whale_loop_depth > 0)
+                                ? whale_loops[whale_loop_depth - 1].head_pos : -1;
+                            int ridx2 = (hd2 >= 0 && hd2 <= len && whale_loop_reuse[hd2].ok)
+                                ? whale_reuse_ridx(hd2) : -1;
+
+                            if (ridx2 >= 0) {
+                                wk(JS_WK_IF); wt('('); wt('!'); wt_arr("ru", ridx2); wt(')'); wt('{');
+                                wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt('='); wt_int(8); wt(';');
+                                wt('}');
+                            } else {
+                                wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt('='); wt_int(8); wt(';');
+                            }
+                        }
                         wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64"); wt('=');
                         fold_inline(sp - 1); wt(';');
                     } else {
@@ -7713,7 +8186,25 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                             {
                                 int mfm = fold_mark();
                                 int mms = whale_str_obj_slot, mm;
+                                /* In-loop materialisation reuse: when this store
+                                   is the recognised park of a reuse loop, the
+                                   heap object is built once (first trip) and
+                                   reused - later trips only refresh the columns
+                                   (plain L stores, already emitted) and repark
+                                   the same reference. The ru mark tells them
+                                   apart; the array store below stays (length
+                                   semantics + rotating index). */
+                                int ridx = -1;
 
+                                if (whale_loop_depth > 0) {
+                                    int hd = whale_loops[whale_loop_depth - 1].head_pos;
+
+                                    if (hd >= 0 && hd <= len && whale_loop_reuse[hd].ok &&
+                                        whale_loop_reuse[hd].arrpos == pos)
+                                        ridx = whale_reuse_ridx(hd);
+                                }
+                                if (ridx >= 0)
+                                    { wk(JS_WK_IF); wt('('); wt('!'); wt_arr("ru", ridx); wt(')'); wt('{'); }
                                 wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjNew"); wt('(');
                                 wt_id("ctx"); wt(','); wt_int(mms); wt(')'); wt(')');
                                 wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
@@ -7725,6 +8216,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                                     wt_slot("L", whale_str_L[mm]); wt(')'); wt(')');
                                     wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
                                     wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                                }
+                                if (ridx >= 0) {
+                                    wt_arr("ru", ridx); wt('='); wt_int(1); wt(';');
+                                    wt('}');
                                 }
                                 fold_commit(mfm);
                             }
@@ -9655,6 +10150,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     if (whale_loop_intreg)
         free(whale_loop_intreg);
     whale_loop_intreg = NULL;
+    if (whale_loop_reuse)
+        free(whale_loop_reuse);
+    whale_loop_reuse = NULL;
     if (assign_cnt)
         free(assign_cnt);
     if (whale_vexpr)
