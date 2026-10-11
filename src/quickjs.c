@@ -3902,6 +3902,9 @@ static void whale_memo_insert(JSContext *ctx, WhaleMemo *m, int argc,
 /* Version-table dispatch (defined below, used by both call paths). */
 static void *whale_ver_pick(JSContext *ctx, JSFunctionBytecode *b,
                             JSValue *arg_buf, int argc, int *is_gen);
+struct JSShape;
+static uintptr_t whale_ver_key_of(JSValue *arg_buf, int argc, int *nobj_out,
+                                  struct JSShape **single_out);
 /* Shape prefix test (defined near JSShape helpers, used by the pick above). */
 struct JSShape;
 static int whale_shape_is_descendant(const struct JSShape *d,
@@ -4952,32 +4955,21 @@ static void *whale_ver_pick(JSContext *ctx, JSFunctionBytecode *b,
         !b->whale_ver_entry[0] && !b->whale_ver_entry[1] &&
         !b->whale_ver_entry[2])
         return NULL;
-    for (i = 0; i < argc; i++) {
-        JSValue v = arg_buf[i];
-
-        if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
-            JSObject *p = JS_VALUE_GET_OBJ(v);
-
-            if (!p || !p->shape)
-                continue;
-            nobj++;
-            single = p->shape;
-            key ^= (uintptr_t)(void *)p->shape;
-            key = (key << 13) | (key >> (8 * sizeof(key) - 13));
-        }
-    }
+    key = whale_ver_key_of(arg_buf, argc, &nobj, &single);
     if (nobj == 0)
         return NULL;
     if (nobj == 1) {
-        /* single object arg: the key IS the shape pointer (malloc-aligned,
-           low bit clear). Slots match by prefix-compatibility: a version
-           built for S also serves every append-extension of S, so one slot
-           covers a shape family, not a single shape. */
-        key = (uintptr_t)(void *)single;
+        /* single object arg: match by prefix-compatibility on the shape part
+           plus exact argc/position (both packed into the key by the helper):
+           a version built for S also serves every append-extension of S, so
+           one slot covers a shape family, not a single shape. */
         for (i = 0; i < WHALE_VER_SLOTS; i++) {
-            if (b->whale_ver_entry[i] && !(b->whale_ver_key[i] & 1) &&
+            uintptr_t sk = b->whale_ver_key[i];
+
+            if (b->whale_ver_entry[i] && !(sk & 1) &&
+                (sk >> 48) == (key >> 48) && single &&
                 whale_shape_is_descendant(single,
-                    (const JSShape *)(void *)(b->whale_ver_key[i] & ~(uintptr_t)7))) {
+                    (const JSShape *)(void *)(sk & (uintptr_t)0xffffffffffffULL))) {
                 b->whale_ver_use[i] = ++b->whale_ver_clock;
                 return b->whale_ver_entry[i];
             }
@@ -5003,23 +4995,46 @@ static void *whale_ver_pick(JSContext *ctx, JSFunctionBytecode *b,
     return NULL;
 }
 
-/* First shape key for the main entry's version slot: the first recorded
-   shape of the first profiled site (the shape the first compile specialised
-   on). 1 when unobserved (occupied-but-keyless: matches nothing until a
-   keyed version lands). */
-static uintptr_t whale_ver_first_shape_key(JSFunctionBytecode *b)
+/* Key of an arg vector: single object arg -> shape pointer with argc +
+   position up high (low bit clear); multi-object -> xor with low bit set;
+   no object -> 0. Shared by pick and first-compile registration so both
+   speak the same key language. Returns the single shape too when asked. */
+static uintptr_t whale_ver_key_of(JSValue *arg_buf, int argc, int *nobj_out,
+                                  JSShape **single_out)
 {
-    if (b->whale_prof) {
-        int i;
+    uintptr_t key = 0;
+    int i, nobj = 0, single_pos = -1;
+    JSShape *single = NULL;
 
-        for (i = 0; i < WHALE_PROFILE_SITES; i++) {
-            WhaleProfSite *s = &b->whale_prof[i];
+    for (i = 0; i < argc; i++) {
+        JSValue v = arg_buf[i];
 
-            if (s->n >= 1 && s->n <= WHALE_PROFILE_SHAPES && s->shape[0])
-                return (uintptr_t)(void *)s->shape[0];
+        if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
+            JSObject *p = JS_VALUE_GET_OBJ(v);
+
+            if (!p || !p->shape)
+                continue;
+            nobj++;
+            single = p->shape;
+            if (nobj == 1)
+                single_pos = i;
+            key ^= (uintptr_t)(void *)p->shape;
+            key = (key << 13) | (key >> (8 * sizeof(key) - 13));
         }
     }
-    return (uintptr_t)1;
+    if (nobj_out)
+        *nobj_out = nobj;
+    if (single_out)
+        *single_out = (nobj == 1) ? single : NULL;
+    if (nobj == 0)
+        return 0;
+    if (nobj == 1) {
+        return ((uintptr_t)(unsigned)argc << 56) |
+               ((uintptr_t)(single_pos & 0xff) << 48) |
+               ((uintptr_t)(void *)single & (uintptr_t)0xffffffffffffULL);
+    }
+    key |= (uintptr_t)1;
+    return key ? key : (uintptr_t)1 | ((uintptr_t)(unsigned)argc << 56);
 }
 
 /* Version-table re-JIT: compile one more specialised version against the
@@ -5081,15 +5096,22 @@ static void whale_ver_rejit(JSContext *ctx, JSFunctionBytecode *b)
         fprintf(stderr, "whale jit: version table parked slot %d (miss key)\n", victim);
 }
 
-static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
+static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b,
+                           JSValue *arg_buf, int argc)
 {
     JSWhaleContext *w = &ctx->whale;
+    uintptr_t call_key = 0;
 
     if (w->jit_mode == JS_JIT_OFF)
         return 0;
 
     w->stat_requests++;
     b->whale_call_count++;
+    /* The triggering call's arg-shape key (for the main entry's version slot
+       below). Backedge triggers pass NULL/0 (key unknown there) and take the
+       placeholder path. Computed only on the threshold-crossing call. */
+    if (b->whale_call_count >= whale_hot_threshold(b) && arg_buf && argc > 0)
+        call_key = whale_ver_key_of(arg_buf, argc, NULL, NULL);
     /* WhaleJS: the last few interpreted calls observe what the accesses really do.
        This has to arm BEFORE the test below, because the compilation happens on the
        very call that reaches the threshold - there is no window after it. Recording
@@ -5231,13 +5253,14 @@ static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
             /* Register the main entry as version-table slot 0 (notes <112>):
                later shapes consult the table first, and a descendant of the
                first-compile shape hits this slot by prefix-compatibility
-               without ever touching generic. The key is the profile top
-               shape if the table knows one, else 1 (occupied-but-keyless:
-               matches nothing until a keyed version lands). */
+               without ever touching generic. The key is the triggering call's
+               arg-shape key (exact, computed above); a backedge trigger has
+               none (call_key 0) and takes the keyless placeholder, which
+               matches nothing until a keyed version lands. */
             if (objs1 > 0 && !b->whale_ver_entry[0]) {
                 b->whale_ver_entry[0] = b->whale_jit_entry;
                 b->whale_ver_tcc[0] = b->whale_jit_tcc;
-                b->whale_ver_key[0] = whale_ver_first_shape_key(b);
+                b->whale_ver_key[0] = call_key ? call_key : (uintptr_t)1;
                 b->whale_ver_use[0] = ++b->whale_ver_clock;
             }
             JS_WhaleNoteJitResult(ctx, 1, 0);
@@ -5280,7 +5303,7 @@ static void whale_note_backedge(JSContext *ctx, JSFunctionBytecode *b)
        observation window has to open here as well as in whale_on_call */
     whale_prof_maybe_arm(ctx, b);
     if (++b->whale_call_count >= whale_hot_threshold(b))
-        (void)whale_on_call(ctx, b);   /* a compile here only takes effect next call */
+        (void)whale_on_call(ctx, b, NULL, 0);   /* a compile here only takes effect next call */
 }
 
 /* set the new value and free the old value after (freeing the value
@@ -21471,7 +21494,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     ctx = b->realm; /* set the current realm */
 
     /* WhaleJS: �??��统�??（JIT 代码生成接入前先�????数，�?src/whalejs.h�?*/
-    whale_jit_ready = !whale_on_call(ctx, b);
+    whale_jit_ready = !whale_on_call(ctx, b, arg_buf, argc);
 
     /* WhaleJS: native entry ready -> run it. The frame stays current while
        the JIT code runs (it may re-enter the engine for self-recursion). On

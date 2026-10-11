@@ -411,3 +411,5 @@ Reverted to 38579bc; both findings are recorded rather than half-fixed.- `<56>` 
 <111>(SOLVED): **deopt 双版本第二步（版本表 + 分发 + 入槽，全闭环）**。版本表（3 特化 + 1 通用永留 + 时钟/miss/misskey）；key=对象参数 shape 异或（零新增 load），无对象走原路；分发两调用点（命中直调/miss 通用版+计数）；首编即编通用版（objs>0 才编）；入槽（miss>=8 编新，空槽优先满则 LRU，通用永留，释放=指针拿掉）。验证：verswitch 切 shape 后入槽（parked slot 0 日志）+ check 全对。全量绿，objshape 75/bitops 128。下一步：前缀兼容 + 冷淘汰验证 + 多签名 L1 表。见 current.md <111>
 
 <112>(SOLVED): **前缀兼容（一槽罩一族）**。JSShape 无 parent 指针，照单步扩展模板写多步前缀判定（同 proto + 字段数>= + 前缀 atom/flags 全等，compact 误判走通用版安全方向）。key 重定（单对象=shape 指针本身，多对象=xor|1，低位区分）。主版本进槽 0（否则后代无槽可命）。验证：后代 shape 零重编（三次编译→两次），check 全对。全量绿。下一步：冷淘汰长跑 + 多签名 L1 表。见 current.md <112>
+
+<113>(SOLVED): **key 补全 + 冷淘汰长跑**。key 洞：旧 key 无 arity/位置，`f(o)`/`f(o,x)`、`f(o,1)`/`f(1,o)` 同 shape 会撞槽。修：高 16 位编 argc + 位置，匹配改精确 + 前缀；`key_of` 抽 helper，pick 与首编登记同语言；on_call 传实时 key（backedge 传 0 占位）。长跑：5 shape 轮转 17 次入槽（3 槽罩不住，通用版兜底值全对，抖动期 40% 通用版速度——设计内行为，V8 mega 同理）。跨 arity 用例无碰撞。全量绿。下一步：多签名 L1 表。见 current.md <113>

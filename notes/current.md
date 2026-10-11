@@ -3572,7 +3572,35 @@ SOLVED（单指针 key + 前缀判定，无新表）
 - 全量 25/25 check 全一致；objshape 76、sieve 64（repeat=3）。
 
 ## 状态
-绿，待提交。下一步：冷淘汰长跑验证 + 多签名 L1 表（per-签名独立表）。
+绿，已提交 47c3e6c。下一步见 <113>。
+
+# <113>: key 补全（argc + 位置）+ 冷淘汰长跑验证
+SOLVED（key 共享 helper + on_call 传参）/ 长跑行为记录
+
+## key 洞（实证排出，非猜想）
+- 旧 key（纯 shape 异或）：`f(o)` 与 `f(o,x)` 同 shape 会撞槽；
+  `f(o,1)` 与 `f(1,o)` 同样撞。撞槽不翻车（版本按首编 shape 编，
+  错 key 进错版本读错偏移），但必须堵。
+- 修法：64 位 key 高 16 位编 argc（8）+ 对象位置（8），低 48 放 shape
+  指针（malloc 只用低 48）。匹配改 argc/位置精确 + shape 前缀。
+  `key_of` 抽 helper，pick 与 on_call 首编登记同语言。
+- 主版本进槽曾用 prof 首 shape（裸指针，无 argc/位置）→ 永不命中。
+  改 on_call 传实时 key（阈值到达那次调用；backedge 传 0 占位）。
+
+## 长跑（5 shape 轮转，LRU 抖动）
+- check 全对；17 次入槽（3 槽罩不住 5 活跃 shape，轮转 miss→通用版→
+  重编→淘汰，循环）。通用版兜底生效（值全对），抖动期 40% 通用版速度。
+- 结论：设计内行为（V8 mega 态同理退化）。治抖动的"轮转检测钉通用版"
+  记 tech-debt，本轮不做（正确性无损）。
+- 跨 arity/跨位用例（f/g 同 shape 不同签名）check 全对，无碰撞。
+
+## 测量
+- verprefix（后代 shape）：零重编（三次编译→两次），check 全对。
+- 全量 25/25 check 全一致；objshape 73、nested 21（repeat=3）。
+
+## 状态
+绿，待提交。下一步：多签名 L1 表（per-签名独立版本表——一个函数多组
+参数形状各走各的表，本轮是同表内 key 区分）。
 
 
 
