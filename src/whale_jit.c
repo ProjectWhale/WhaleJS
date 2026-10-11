@@ -2799,6 +2799,17 @@ static void fold_toint32(int k, int t)
    which is where the first version of this sat. */
 static int whale_prof_two_shapes(unsigned off);
 static unsigned whale_prof_two_off;
+/* Emit a deopt-census call: JS_WhaleDeoptWhy(ctx, code) with 0=guard,
+   1=shape-miss, 2=tag-miss. Call only inside deopt branches (never steady),
+   right next to `*deopt = 1`, so the steady path pays nothing. Guard-class
+   exits (entry guards, arg unbox) deliberately emit NO call: they sit right
+   before int-region loops, and even one extra call in that branch moves the
+   loop alignment enough to cost 30-50% on pure-numeric loops (measured,
+   <110>). Guard deopts are derived instead: total - shape - tag. */
+static void whale_emit_deopt_why(int code)
+{
+    wt_id("JS_WhaleDeoptWhy"); wt('('); wt_id("ctx"); wt(','); wt_int(code); wt(')'); wt(';');
+}
 static void fold_obj_field_load(int os, int atom, int fc, int fc2, int nm,
                                   int stable)
 {
@@ -2829,7 +2840,7 @@ static void fold_obj_field_load(int os, int atom, int fc, int fc2, int nm,
         wt_arr("fp", fc); wt('='); wt_id("JS_WhaleObjFieldPtr"); wt('(');
         wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_int(atom); wt(','); wt('&'); wt_arr("fs", fc); wt(')'); wt(';');
         wk(JS_WK_IF); wt('('); wt('!'); wt_arr("fp", fc); wt(')'); wt('{');
-        wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+        wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); whale_emit_deopt_why(1); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
         wt_arr("v", nm); wt('=');
         wt('('); wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(8); wt(')');
         wt('?'); wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64");
@@ -2882,7 +2893,7 @@ static void fold_obj_field_load(int os, int atom, int fc, int fc2, int nm,
         wt_arr("fp", fc2); wt('='); wt_id("JS_WhaleObjFieldPtr"); wt('(');
         wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_int(atom); wt(','); wt('&'); wt_arr("fs", fc2); wt(')'); wt(';');
         wk(JS_WK_IF); wt('('); wt('!'); wt_arr("fp", fc2); wt(')'); wt('{');
-        wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+        wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); whale_emit_deopt_why(1); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
         /* first fill parks in pair A too (it is still empty): afterwards A
            holds the first-seen shape and B the runner-up. */
         wk(JS_WK_IF); wt('('); wt_arr("fs", fc); wt_op(JS_OP_EQ); wt_int(0); wt(')'); wt('{');
@@ -2967,7 +2978,7 @@ static void fold_obj_field_resolve(int os, int atom, int fc, int fc2,
         wt_arr("fp", fc); wt('='); wt_id("JS_WhaleObjFieldPtr"); wt('(');
         wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_int(atom); wt(','); wt('&'); wt_arr("fs", fc); wt(')'); wt(';');
         wk(JS_WK_IF); wt('('); wt('!'); wt_arr("fp", fc); wt(')'); wt('{');
-        wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+        wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); whale_emit_deopt_why(1); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
         wk(JS_WK_IF); wt('('); wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_NE); wt_int(8); wt(')');
         wt('{'); wk(JS_WK_IF); wt('('); wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_NE); wt_int(0); wt(')');
         wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}'); wt('}');
@@ -2992,10 +3003,10 @@ static void fold_obj_field_resolve(int os, int atom, int fc, int fc2,
         wt_arr("fp", fc2); wt('='); wt_id("JS_WhaleObjFieldPtr"); wt('(');
         wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_int(atom); wt(','); wt('&'); wt_arr("fs", fc2); wt(')'); wt(';');
         wk(JS_WK_IF); wt('('); wt('!'); wt_arr("fp", fc2); wt(')'); wt('{');
-        wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+        wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); whale_emit_deopt_why(1); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
         wk(JS_WK_IF); wt('('); wt_arr("fp", fc2); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_NE); wt_int(8); wt(')');
         wt('{'); wk(JS_WK_IF); wt('('); wt_arr("fp", fc2); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_NE); wt_int(0); wt(')');
-        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}'); wt('}');
+        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); whale_emit_deopt_why(2); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}'); wt('}');
         /* first fill parks in pair A too (it is still empty): afterwards A
            holds the first-seen shape and B the runner-up. */
         wk(JS_WK_IF); wt('('); wt_arr("fs", fc); wt_op(JS_OP_EQ); wt_int(0); wt(')'); wt('{');
@@ -3020,7 +3031,7 @@ static void fold_obj_field_resolve(int os, int atom, int fc, int fc2,
     wt('}');
     wk(JS_WK_IF); wt('('); wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_NE); wt_int(8); wt(')');
     wt('{'); wk(JS_WK_IF); wt('('); wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_NE); wt_int(0); wt(')');
-    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}'); wt('}');
+    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); whale_emit_deopt_why(2); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}'); wt('}');
     fold_commit(fm);
 }
 
@@ -4420,6 +4431,10 @@ static void whale_inline_out_append(void)
 /* The observations for the function being generated: the generator compiles one
    function at a time, so this does not need to travel through every call. */
 static const void *whale_prof_now;
+/* Generic (unspecialized) compile mode: 1 forces every speculation summary
+   down (shape_stable, prof-mono, int-region) so the function compiles to the
+   fallback shape instead of bailing. Set per compilation at gen entry. */
+static int whale_generic_mode;
 
 /* Did this site hold exactly one shape the whole way through the warm-up?
 
@@ -4852,6 +4867,10 @@ static int whale_prof_one_shape(unsigned off)
                 fprintf(stderr, "%s%d", q ? "," : "", fa[q]);
             fprintf(stderr, "]\n");
         }
+        /* generic mode never claims a single shape (forces the full-resolve
+           fallback instead of the two-state fast path). */
+        if (whale_generic_mode)
+            return 0;
         return n == 1;
     }
 }
@@ -5101,6 +5120,11 @@ static int whale_sites_freq(const int *sites, int nsites)
 static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 {
     whale_prof_now = info->prof;
+    /* Generic (unspecialized) mode: force every speculation summary down so
+       the function compiles to the fallback shape (full-resolve IC, generic
+       objects, double loop) instead of bailing to the interpreter. Set via
+       WHALE_GENERIC for measurement; the re-JIT selector will drive it. */
+    whale_generic_mode = (whale_dbg_env("WHALE_GENERIC") != 0);
     /* A linear disassembly, as opcode numbers and offsets. The generator's own view
        of the bytecode is the only one that matters when a case is refused, and
        reading it back out of the switch is guesswork. */
@@ -5531,7 +5555,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        is only acceptable outside every loop: the common front-end shape is a
        factory called once before the loop (`var o = make(); for (...) ...`), and
        refusing that sent objfields to the interpreter at 26x. */
-    whale_shape_stable = 1;
+    whale_shape_stable = whale_generic_mode ? 0 : 1;
     /* ELS: a pinned local whose live range crosses a call pays spill+reload
        per call and risks stale reloads (its slot is only written by the
        call writeback). If any loop body contains a call - a bytecode call or
@@ -5767,7 +5791,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     nh++;
                     fh = hh;
                 }
-            if (nh == 1 && fh >= 0) {
+            if (nh == 1 && fh >= 0 && !whale_generic_mode) {
                 int d;
 
                 for (d = 0; d < var_count && d < WHALE_JIT_MAX_SLOTS; d++)
@@ -5803,6 +5827,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     wt('}'); wt_id("JSValue"); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_VOID); wt_id("JS_WhaleDeoptNote"); wt('(');
     wt_id("void"); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("flag"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_VOID); wt_id("JS_WhaleDeoptWhy"); wt('(');
+    wt_id("void"); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("code"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleVarRefGetNum"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_VOID); wt('*'); wt_id("var_refs"); wt(',');
         wk(JS_WK_INT); wt_id("idx"); wt(','); wk(JS_WK_DOUBLE); wt('*'); wt_id("out"); wt(')'); wt(';');
@@ -7218,7 +7244,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                    The reservation rule applies inside: the layout is the union of the
                    observed shapes, so a field only some of them carry still gets a
                    slot, because reserving eight bytes beats falling back. */
-                mono = whale_sites_freq(whale_field_sites, whale_field_sites_n);
+                /* generic mode never lays out (forces generic objects, whose
+                   field access is all resolve). */
+                mono = whale_generic_mode ? 0
+                    : whale_sites_freq(whale_field_sites, whale_field_sites_n);
                 if (whale_dbg_env("WHALE_PROF_DBG"))
                     fprintf(stderr, "[obj] pos=%d sites=%d mono=%d\n",
                             pos, whale_field_sites_n, mono);
@@ -8405,7 +8434,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                             whale_sites_freq(whale_field_sites, whale_field_sites_n));
                 if (!whale_dbg_env("WHALE_NO_UNBOX") && whale_str_n == 0 &&
                     (whale_call_n == 0 || pos > whale_call_pos[whale_call_n - 1]) &&
-                    (WHALE_IS_OBJ(t) || WHALE_IS_VAL(t)) &&
+                    (WHALE_IS_OBJ(t) || WHALE_IS_VAL(t)) && !whale_generic_mode &&
                     whale_sites_freq(whale_field_sites, whale_field_sites_n)) {
                     int fn = whale_layout_from_sites(whale_field_sites,
                                                      whale_field_sites_n,
@@ -10233,6 +10262,7 @@ WHALE_HOST_SYM(JS_WhaleVarRefIsFn),
     WHALE_HOST_SYM(JS_WhaleNewBool),
     WHALE_HOST_SYM(JS_WhaleToInt32),
     WHALE_HOST_SYM(JS_WhaleDeoptNote),
+    WHALE_HOST_SYM(JS_WhaleDeoptWhy),
     WHALE_HOST_SYM(JS_WhaleGetGlobalNum),
     WHALE_HOST_SYM(JS_WhaleObjSlot),
     WHALE_HOST_SYM(JS_WhaleObjGet),

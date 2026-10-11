@@ -24,6 +24,9 @@ typedef struct JSWhaleJitStats {
     uint32_t compiled;   /* 编译成功数 */
     uint32_t failed;     /* 编译失败数（已回退解释器） */
     uint64_t code_bytes; /* 生成的机器码字节数 */
+    uint32_t deopt_shape; /* deopt census：字段 resolve 失败（shape 对不上） */
+    uint32_t deopt_tag;   /* deopt census：字段 tag 非数值 */
+    uint32_t deopt_guard; /* deopt census：其余一切（入口/类型/比较守卫） */
 } JSWhaleJitStats;
 
 /* 引擎内部状态：内嵌在 JSContext 里，无单独分配、无需释放 */
@@ -33,6 +36,9 @@ typedef struct JSWhaleContext {
     uint32_t stat_compiled;
     uint32_t stat_failed;
     uint64_t stat_code_bytes;
+    uint32_t stat_deopt_shape;
+    uint32_t stat_deopt_tag;
+    uint32_t stat_deopt_guard;
 } JSWhaleContext;
 
 /* 热点阈值：函数累计调用达到该次数即进入 JIT 候选 */

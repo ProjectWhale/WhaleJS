@@ -3473,6 +3473,9 @@ void JS_WhaleGetJitStats(JSContext *ctx, JSWhaleJitStats *out)
     out->compiled = ctx->whale.stat_compiled;
     out->failed = ctx->whale.stat_failed;
     out->code_bytes = ctx->whale.stat_code_bytes;
+    out->deopt_shape = ctx->whale.stat_deopt_shape;
+    out->deopt_tag = ctx->whale.stat_deopt_tag;
+    out->deopt_guard = ctx->whale.stat_deopt_guard;
 }
 
 void JS_WhaleNoteJitRequest(JSContext *ctx)
@@ -3642,6 +3645,31 @@ void JS_WhaleDeoptNote(JSContext *ctx, int flag)
         dbg = whale_dbg_env("WHALE_DEOPT_DBG") != NULL;
     if (dbg)
         fprintf(stderr, "[deopt] call=%ld flag=%d\n", whale_entry_total, flag);
+}
+
+/* deopt census: why did a compiled function bail? Called only inside deopt
+   branches (never on the steady path), so the call itself is free. Codes:
+   0 = guard (entry/type/compare guards), 1 = shape miss (field resolve
+   failed), 2 = tag miss (field value is not a number). This is the input
+   the re-JIT selector needs ("which functions deopt, and why") - the flag
+   protocol (1/2/3) cannot carry it: 1/2/3 drive re-arm/retire, and every
+   body-internal deopt already shares flag 1. */
+void JS_WhaleDeoptWhy(JSContext *ctx, int code)
+{
+    static int dbg = -1;
+
+    if (!ctx)
+        return;
+    if (code == 1)
+        ctx->whale.stat_deopt_shape++;
+    else if (code == 2)
+        ctx->whale.stat_deopt_tag++;
+    else
+        ctx->whale.stat_deopt_guard++;
+    if (dbg < 0)
+        dbg = whale_dbg_env("WHALE_DEOPT_DBG") != NULL;
+    if (dbg)
+        fprintf(stderr, "[deopt-why] code=%d (0=guard 1=shape 2=tag)\n", code);
 }
 
 /* ---- JIT object slots -----------------------------------------------------
@@ -9145,8 +9173,9 @@ int JS_WhaleObjDefineValue(JSContext *ctx, int slot, int atom, int val_slot)
    the interpreter rather than be guessed at. */
 double JS_WhaleObjValueNum(JSContext *ctx, JSValue *v, int *deopt)
 {
-    (void)ctx;
     (void)v;
+    if (ctx)
+        ctx->whale.stat_deopt_tag++;
     *deopt = 1;
     return 0;
 }

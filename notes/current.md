@@ -3475,7 +3475,49 @@ SOLVED（单管线：loop 表 + ru 标记，无新管线）/ 弯路 ×3（全记
   （1 call/trip，数组语义必需）+ 通用 margin。
 
 ## 状态
-绿，待提交。下一步：deopt 想法落地，或 writeOrder/线性 IR（spill 主体）。
+绿，已提交 50f8a96。下一步见 <110>。
+
+# <110>: deopt 双版本第一步（census + 通用版 + 选择器，re-JIT 执行下轮）
+SOLVED（单管线：计数 + 开关，无新发射逻辑）/ 大坑 ×1（对齐）
+
+## 用户策略的拍板（两级 key + hook 只管新鲜装箱）
+- L1（函数级）：argc + 参数类型/shape 类，L1 不同 = 不同函数，独立版本表。
+- L2（同 L1 内 shape 演进）：3 特化槽 + 1 通用槽（key 去 shape，不存指针）。
+  前缀兼容（只追加）让每槽覆盖"一 shape 及其全部后代"。
+- hook 只管新鲜装箱（返回/字面量新建，硬编码序列不变），参数原地改
+  永远写回（aliasing 洞，发射 review 红线）。二进制 hook 先不做，用参数提示。
+- 释放：槽上限 4（结构性封顶）+ 单版本一窗口零调用即释；通用版永不淘汰；
+  冷对象醒来走通用版（最多慢一次，不会错）。
+
+## 落地的（本轮：census + 通用版 + 选择器读数，不自动切换）
+1. **census**：stats 加 deopt_shape/tag/guard 三计数 + `JS_WhaleDeoptWhy`
+  （纯计数 + DBG，只跑 deopt 分支）。埋入：shape 6 处（fp-NULL）、tag
+   3 处（tag 检查）+ ObjValueNum 内记 1 处。guard 类派生（总数-shape-tag）。
+2. **通用版**：首编形态命名化——5 处 summary 降级开关（shape_stable、
+   prof_one_shape、int_ok、mono×2），WHALE_GENERIC 驱动。objshape：
+   specialized 77 / generic 465 / interp 1200——通用版甩开解释器 2.5x
+   （"次高性能"成立），代价是 specialized 的 6x。
+3. 选择器读数：census 验证（交替 shape 站每次记 shape-miss ✓）。
+
+## 大坑 ×1：deopt 分支加调用，纯数值循环 -30~50%
+- bisect 定案：guard 分支（int-region 入口 guard + arg unbox）的 DeoptWhy
+  调用改变循环对齐。退化全中 int-region 循环（arith 64→107 等），对象类
+  不动。dump 对比排除行为变化。
+- 修法：guard 类零发射（总数派生），census 只留 shape/tag（对象循环分支
+  本来就多，不敏感）。数字全回来。全量 25/25 绿。
+- 教训：TCC 生成码对"循环前分支体大小"敏感到 50% 量级——以后任何循环前
+  新增发射（guard/计数/ slow 路）都要过一遍纯数值计时。记为门控新条目。
+
+## 测量（repeat=3）
+- census：交替站每次 shape-miss ✓；全量 25/25 check 全一致。
+- 三配置（objshape）：77 / 465 / 1200。bitops generic 持平（无对象，
+  int-region 关了也一样——和 <104> 结论一致）。
+- 通用版 entries 44 vs 48（4 函数 fc 预算超限 bail 转解释器，安全方向，
+  记 tech-debt：fc 预算可放宽）。
+
+## 状态
+绿，待提交。下一步：re-JIT 执行（旧版释放 + 新版入槽 + 冷淘汰，碰版本表
+生命周期，单开一轮验证）。
 
 
 
