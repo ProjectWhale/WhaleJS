@@ -3902,6 +3902,10 @@ static void whale_memo_insert(JSContext *ctx, WhaleMemo *m, int argc,
 /* Version-table dispatch (defined below, used by both call paths). */
 static void *whale_ver_pick(JSContext *ctx, JSFunctionBytecode *b,
                             JSValue *arg_buf, int argc, int *is_gen);
+/* Shape prefix test (defined near JSShape helpers, used by the pick above). */
+struct JSShape;
+static int whale_shape_is_descendant(const struct JSShape *d,
+                                     const struct JSShape *s);
 static int whale_fast_call(JSContext *ctx, JSValue func, int argc,
                            JSValue *args, JSValue *ret)
 {
@@ -4938,8 +4942,9 @@ static int whale_rejit_tier2(JSContext *ctx, JSFunctionBytecode *b)
 static void *whale_ver_pick(JSContext *ctx, JSFunctionBytecode *b,
                             JSValue *arg_buf, int argc, int *is_gen)
 {
-    uintptr_t key = (uintptr_t)(unsigned)argc;
-    int i, any = 0;
+    uintptr_t key = 0;
+    int i, nobj = 0;
+    JSShape *single = NULL;
 
     (void)ctx;
     *is_gen = 0;
@@ -4953,19 +4958,40 @@ static void *whale_ver_pick(JSContext *ctx, JSFunctionBytecode *b,
         if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
             JSObject *p = JS_VALUE_GET_OBJ(v);
 
-            if (!p)
+            if (!p || !p->shape)
                 continue;
-            any = 1;
+            nobj++;
+            single = p->shape;
             key ^= (uintptr_t)(void *)p->shape;
             key = (key << 13) | (key >> (8 * sizeof(key) - 13));
         }
     }
-    if (!any)
+    if (nobj == 0)
         return NULL;
-    for (i = 0; i < WHALE_VER_SLOTS; i++) {
-        if (b->whale_ver_entry[i] && b->whale_ver_key[i] == key) {
-            b->whale_ver_use[i] = ++b->whale_ver_clock;
-            return b->whale_ver_entry[i];
+    if (nobj == 1) {
+        /* single object arg: the key IS the shape pointer (malloc-aligned,
+           low bit clear). Slots match by prefix-compatibility: a version
+           built for S also serves every append-extension of S, so one slot
+           covers a shape family, not a single shape. */
+        key = (uintptr_t)(void *)single;
+        for (i = 0; i < WHALE_VER_SLOTS; i++) {
+            if (b->whale_ver_entry[i] && !(b->whale_ver_key[i] & 1) &&
+                whale_shape_is_descendant(single,
+                    (const JSShape *)(void *)(b->whale_ver_key[i] & ~(uintptr_t)7))) {
+                b->whale_ver_use[i] = ++b->whale_ver_clock;
+                return b->whale_ver_entry[i];
+            }
+        }
+    } else {
+        /* multi-object: xor key with low bit set (pointers never have it).
+           Exact match only - a family match across several shapes is not
+           worth the combinatorics; those calls take generic. */
+        key |= (uintptr_t)1;
+        for (i = 0; i < WHALE_VER_SLOTS; i++) {
+            if (b->whale_ver_entry[i] && b->whale_ver_key[i] == key) {
+                b->whale_ver_use[i] = ++b->whale_ver_clock;
+                return b->whale_ver_entry[i];
+            }
         }
     }
     b->whale_ver_miss++;
@@ -4975,6 +5001,25 @@ static void *whale_ver_pick(JSContext *ctx, JSFunctionBytecode *b,
         return b->whale_ver_gen_entry;
     }
     return NULL;
+}
+
+/* First shape key for the main entry's version slot: the first recorded
+   shape of the first profiled site (the shape the first compile specialised
+   on). 1 when unobserved (occupied-but-keyless: matches nothing until a
+   keyed version lands). */
+static uintptr_t whale_ver_first_shape_key(JSFunctionBytecode *b)
+{
+    if (b->whale_prof) {
+        int i;
+
+        for (i = 0; i < WHALE_PROFILE_SITES; i++) {
+            WhaleProfSite *s = &b->whale_prof[i];
+
+            if (s->n >= 1 && s->n <= WHALE_PROFILE_SHAPES && s->shape[0])
+                return (uintptr_t)(void *)s->shape[0];
+        }
+    }
+    return (uintptr_t)1;
 }
 
 /* Version-table re-JIT: compile one more specialised version against the
@@ -5183,6 +5228,18 @@ static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
             }
             b->whale_tier = 1;   /* tier-2 counting starts from here */
             b->whale_needs_obj = objs1 > 0;
+            /* Register the main entry as version-table slot 0 (notes <112>):
+               later shapes consult the table first, and a descendant of the
+               first-compile shape hits this slot by prefix-compatibility
+               without ever touching generic. The key is the profile top
+               shape if the table knows one, else 1 (occupied-but-keyless:
+               matches nothing until a keyed version lands). */
+            if (objs1 > 0 && !b->whale_ver_entry[0]) {
+                b->whale_ver_entry[0] = b->whale_jit_entry;
+                b->whale_ver_tcc[0] = b->whale_jit_tcc;
+                b->whale_ver_key[0] = whale_ver_first_shape_key(b);
+                b->whale_ver_use[0] = ++b->whale_ver_clock;
+            }
             JS_WhaleNoteJitResult(ctx, 1, 0);
             /* Memoise on the self reading only - that is the one the generator
                proved to depend on nothing but its arguments. If it turns out not
@@ -7878,6 +7935,34 @@ static inline uint32_t *prop_hash_end(JSShape *sh)
 static inline JSShapeProperty *get_shape_prop(JSShape *sh)
 {
     return (JSShapeProperty *)(void *)(sh->hash_table + sh->prop_hash_mask + 1);
+}
+
+/* Is D equal to S or a pure append-extension of it (notes <112>): same
+   proto, D carries every S property at the same index with the same flags,
+   possibly plus appended ones. Deleted holes (ATOM_NULL) compare like any
+   other entry: a compacted shape may fail the prefix test, and that only
+   costs a generic run (safe direction). Used by the version table so one
+   slot covers a shape family, not a single shape. */
+static int whale_shape_is_descendant(const JSShape *d, const JSShape *s)
+{
+    int i;
+
+    if (!d || !s)
+        return 0;
+    if (d == s)
+        return 1;
+    if (d->proto != s->proto)
+        return 0;
+    if (d->prop_count < s->prop_count)
+        return 0;
+    for (i = 0; i < s->prop_count; i++) {
+        const JSShapeProperty *pd = &get_shape_prop((JSShape *)d)[i];
+        const JSShapeProperty *ps = &get_shape_prop((JSShape *)s)[i];
+
+        if (pd->atom != ps->atom || pd->flags != ps->flags)
+            return 0;
+    }
+    return 1;
 }
 
 /* The property atoms of a shape, in layout order.

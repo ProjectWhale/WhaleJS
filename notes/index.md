@@ -409,3 +409,5 @@ Reverted to 38579bc; both findings are recorded rather than half-fixed.- `<56>` 
 <110>(SOLVED + 大坑×1): **deopt 双版本第一步（census + 通用版）**。拍板：L1 签名=不同函数独立表；L2 同签名内 3 特化+1 通用（key 去 shape）；hook 只管新鲜装箱（硬编码不变），参数原地改永远写回；释放靠槽上限 4 + 冷淘汰（通用版永留）。census：stats 三计数 + DeoptWhy（shape/tag 埋入，guard 派生）。通用版：5 处 summary 降级（WHALE_GENERIC），objshape 77/465/1200（次高性能成立）。大坑：guard 分支加调用致纯数值 -30~50%（循环对齐），已修（guard 零发射）。全量绿。下一步 re-JIT 执行单开一轮。见 current.md <110>
 
 <111>(SOLVED): **deopt 双版本第二步（版本表 + 分发 + 入槽，全闭环）**。版本表（3 特化 + 1 通用永留 + 时钟/miss/misskey）；key=对象参数 shape 异或（零新增 load），无对象走原路；分发两调用点（命中直调/miss 通用版+计数）；首编即编通用版（objs>0 才编）；入槽（miss>=8 编新，空槽优先满则 LRU，通用永留，释放=指针拿掉）。验证：verswitch 切 shape 后入槽（parked slot 0 日志）+ check 全对。全量绿，objshape 75/bitops 128。下一步：前缀兼容 + 冷淘汰验证 + 多签名 L1 表。见 current.md <111>
+
+<112>(SOLVED): **前缀兼容（一槽罩一族）**。JSShape 无 parent 指针，照单步扩展模板写多步前缀判定（同 proto + 字段数>= + 前缀 atom/flags 全等，compact 误判走通用版安全方向）。key 重定（单对象=shape 指针本身，多对象=xor|1，低位区分）。主版本进槽 0（否则后代无槽可命）。验证：后代 shape 零重编（三次编译→两次），check 全对。全量绿。下一步：冷淘汰长跑 + 多签名 L1 表。见 current.md <112>
