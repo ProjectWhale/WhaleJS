@@ -536,10 +536,12 @@ static int whale_is_pure_num_op(int op)
     case OP_put_loc8: case OP_put_loc:
     case OP_set_loc0: case OP_set_loc1: case OP_set_loc2: case OP_set_loc3:
     case OP_set_loc8: case OP_set_loc:
-    case OP_add: case OP_sub: case OP_mul: case OP_div:
+    case OP_add: case OP_sub: case OP_mul: case OP_div: case OP_mod:
     case OP_lt: case OP_lte: case OP_gt: case OP_gte:
     case OP_eq: case OP_neq: case OP_strict_eq: case OP_strict_neq:
-    case OP_neg: case OP_plus:
+    case OP_neg: case OP_plus: case OP_not: case OP_lnot:
+    case OP_and: case OP_or: case OP_xor:
+    case OP_shl: case OP_shr: case OP_sar:
     case OP_inc: case OP_dec: case OP_inc_loc: case OP_dec_loc: case OP_add_loc:
     case OP_is_undefined_or_null:
     case OP_to_propkey: case OP_to_propkey2:
@@ -2909,10 +2911,16 @@ static void local_set(int d, int mark, int inv)
        (reads + 2*writes inside loop bodies) names those locals, and storing
        at the write point - a statement boundary, where materialising is safe -
        turns the later reads into variable loads. 3 means at least three reads,
-       or a read plus a write: below that the deferred form is shorter. */
+       or a read plus a write: below that the deferred form is shorter.
+       Short expressions are exempt: a pending `_wsv[n]` copy is 4 tokens, and
+       materialising it only adds a pure-copy store (`L0 = (_wsv[0])`) per
+       statement - the reads that follow load the same value either way. The
+       bitops accumulator chain was three such stores per trip. 8 keeps the
+       per-read copy at most one short statement; anything longer still
+       materialises, and the length ceiling above remains the backstop. */
     if (m->expr.len > whale_expr_max ||
-        (whale_loop_depth > 0 && d >= 0 && d < WHALE_JIT_MAX_SLOTS &&
-         whale_loop_heat[d] >= 3))
+        (m->expr.len > 8 && whale_loop_depth > 0 && d >= 0 &&
+         d < WHALE_JIT_MAX_SLOTS && whale_loop_heat[d] >= 3))
         local_materialize(d);
 }
 

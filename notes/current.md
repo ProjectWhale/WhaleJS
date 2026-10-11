@@ -3126,8 +3126,55 @@ SOLVED（零回归，AST 中间替代第一实例）/ TIPS（无条件赢 vs 开
 ## 验证
 `whale api test: ok`；25/25 全对 0 mismatch（repeat=1 全量）。
 ## 状态
-绿，待提交。下一步：tier2 内容（L pin 全函数版 / SIMD gated）；
+绿，已提交 7759556。下一步：bitops 主链（`_wv` 已 pin，但类型合并把 acc 降成 NUM，见 <102>）；
 `_ws` 剩余（`wa` 布局数组？已够小，不动）。
+
+# <102>: bitops 两处生成器修复（heat 短式豁免 + 位运算进 purity 表）
+SOLVED（两处都是"读 trace/dump 定案"，无猜测）
+
+## 根因（WHALE_MEM_TRACE + dump 定量）
+- 猜测是"acc 自引用链膨胀"（deferred local 反复 inline），trace 证伪：
+  L0 每次 `put_loc` 后都因 `heat>=3` **即时物化**（`[set]→[mat]` 紧邻，
+  pending 从未存活）。真正的浪费是 heat 分支**不问长短**：pending 只是
+  4 token 的 `(_wsv[n])` 纯拷贝，物化凭空多出 `L0 = (_wsv[n])` 存储，
+  每 trip 3 个（dump cur_bitops6.c 94/95/97 行）。
+- 第二处：dump 里**一个 `_wv` 都没有**。`fold_materialize` 的 pin 门
+  （`!has_call && depth==1 && loop_count==1`）全满足，但 `has_call` 被
+  误置：`whale_is_pure_num_op` 没收 `and/or/xor/not/shl/shr/sar/mod`，
+  位运算循环整循环标 has_call → ELS 的 `_wv` pin + L-pin 全灭。
+  注释写"conversions that need ToInt32/fmod"，但现在这些 op 走的是
+  inline cast + guarded `%`，循环体内**无 helper call**（`v%7` 是 I32
+  短路 bare `%`），pin 穿过无正确性问题。
+
+## 改动（全 src/whale_jit.c 生成器侧，不动 TCC）
+1. `local_set` heat 分支加 `m->expr.len > 8` 豁免：短 pending 保持
+   deferred（后续读 inline 同值，无额外访存），长链仍物化，上限 24
+   不动。8 = 纯拷贝 `(_wsv[n])` 4 token 的 2 倍余量。
+2. purity 表加 `OP_mod/OP_not/OP_lnot/OP_and/OP_or/OP_xor/
+   OP_shl/OP_shr/OP_sar`：位运算循环不再误标 has_call，`_wv` pin
+   与 L-pin 按原门控恢复。门控策略（<101>）不变：这是"无调用"事实
+   修正，不是新开分支。
+
+## dump 对比（cur_bitops6.c → cur_bitops8.c）
+- 3 个 `L0 = (_wsv[n])` 纯拷贝存储消失（剩 1 个分支必需的）；
+- 主链 `_wsv[0..2]` → `_wv0..2`（pin 回来了），`_wsv` 只剩声明；
+- 剩余：acc 在循环头被 I32→NUM 合并降级（<94> 为拒编修的），后续
+  位运算全走 `(int)(long long)` 长链（I32 短式 `(int)` 用不上）。
+  下一步即此：合并改"升级 giữ I32"（NUM∩I32→I32），`!` 的 NaN 已在
+  lnot 发射处处理，守卫语义不变。
+
+## 测量
+- bitops repeat=3：whalejs 142ms vs node 16ms（改前 148-154，同噪声带；
+  本轮是**正确性修复**——pin 门误关，访存回到应有位置，计时持平符合预期）。
+- 全量 repeat=1：25/25 全对 0 mismatch；纯数值 repeat=3：
+  arith 63 vs 68、floatlit 62 vs 64、minmax 52 vs 48（持平/反超），
+  locals 85 vs 27、loop_sum 44 vs 18（2-3x，TCC spill，待线性 IR）。
+- bench_102.json 落盘（6 纯数值用例 repeat=3）。
+
+## 验证
+`whale api test: ok`；全量 + repeat3 check 全一致。
+## 状态
+绿，待提交。下一步：I32 合并升级（bitops 长链→短式）；线性 IR（locals/loop_sum 的 TCC spill）。
 
 
 
