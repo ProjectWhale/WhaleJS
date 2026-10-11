@@ -961,6 +961,24 @@ int whale_deopt_count;     /* refusals seen before the entry was retired */
     uint32_t whale_tier2_count; /* calls since tier 1 went live */
     void *whale_jit_entry_tier1;
     void *whale_jit_tcc_tier1;
+    /* Version table (see notes <111>): per-signature specialised versions.
+       L1 (arity + arg classes) already selects the function; entries here
+       differ by object-arg shapes (L2). ver_key is an xor of the object-arg
+       JSShape pointers (taken on the unbox path, no extra load); ver_use is
+       a recency stamp for LRU eviction. ver_gen is the generic fallback
+       (shape-blind full-resolve IC): never evicted, so any shape runs hot
+       and cold objects can always wake safely. Zero-initialised; a function
+       with no object args never fills the table (single-version path). */
+#define WHALE_VER_SLOTS 3
+    void *whale_ver_entry[WHALE_VER_SLOTS];
+    void *whale_ver_tcc[WHALE_VER_SLOTS];
+    uintptr_t whale_ver_key[WHALE_VER_SLOTS];
+    uint32_t whale_ver_use[WHALE_VER_SLOTS];
+    void *whale_ver_gen_entry;
+    void *whale_ver_gen_tcc;
+    uint32_t whale_ver_clock;
+    uint32_t whale_ver_miss;    /* recent generic-fallback runs (re-JIT trigger) */
+    uintptr_t whale_ver_miss_key;   /* arg-shape key of the last miss */
     /* Memoisation: this function was JIT-compiled and never reads a global, so
        its result depends only on its numeric arguments - repeated calls with
        the same ones can reuse it. `whale_memo` is a small bounded table (see
@@ -3881,6 +3899,9 @@ typedef struct WhaleMemo WhaleMemo;
 static int whale_memo_lookup(WhaleMemo *m, int argc, const JSValue *argv, JSValue *out);
 static void whale_memo_insert(JSContext *ctx, WhaleMemo *m, int argc,
                               const JSValue *argv, JSValue ret);
+/* Version-table dispatch (defined below, used by both call paths). */
+static void *whale_ver_pick(JSContext *ctx, JSFunctionBytecode *b,
+                            JSValue *arg_buf, int argc, int *is_gen);
 static int whale_fast_call(JSContext *ctx, JSValue func, int argc,
                            JSValue *args, JSValue *ret)
 {
@@ -3954,10 +3975,17 @@ static int whale_fast_call(JSContext *ctx, JSValue func, int argc,
     }
 
     whale_deopt = 0;
-    whale_ret = ((JSValue (*)(JSContext *, JSValue *, JSValue *, int *, JSValue,
-                              void *, void *))b->whale_jit_entry)
-                    (callee_ctx, args, var_buf, &whale_deopt, func,
-                     b->whale_jit_entry, (void *)p->u.func.var_refs);
+    {
+        /* Same version-table dispatch as JS_CallInternal above. */
+        int ver_gen = 0;
+        void *ver_entry = whale_ver_pick(ctx, b, args, argc, &ver_gen);
+        void *run_entry = ver_entry ? ver_entry : b->whale_jit_entry;
+
+        whale_ret = ((JSValue (*)(JSContext *, JSValue *, JSValue *, int *, JSValue,
+                                  void *, void *))run_entry)
+                        (callee_ctx, args, var_buf, &whale_deopt, func,
+                         b->whale_jit_entry, (void *)p->u.func.var_refs);
+    }
     if (b->whale_needs_obj) {
         sf->cur_sp = NULL;
         /* drop whatever the JIT parked: the slots were only borrowed for the
@@ -4899,6 +4927,115 @@ static int whale_rejit_tier2(JSContext *ctx, JSFunctionBytecode *b)
     return 0;
 }
 
+/* Version-table dispatch (notes <111>): pick which compiled version runs
+   this call. Returns NULL when the table is empty (single-version path,
+   zero behaviour change) or when no object arg is present (pure numerics
+   never diversify). Otherwise xors the object-arg JSShape pointers (taken
+   here, no extra load - the unbox path takes them anyway) into a key:
+   hit returns that version's entry (recency stamped for LRU), miss counts
+   toward re-JIT and returns the pinned generic fallback when present (any
+   shape runs hot there), else NULL (run the main entry, census records). */
+static void *whale_ver_pick(JSContext *ctx, JSFunctionBytecode *b,
+                            JSValue *arg_buf, int argc, int *is_gen)
+{
+    uintptr_t key = (uintptr_t)(unsigned)argc;
+    int i, any = 0;
+
+    (void)ctx;
+    *is_gen = 0;
+    if (!b->whale_ver_gen_entry &&
+        !b->whale_ver_entry[0] && !b->whale_ver_entry[1] &&
+        !b->whale_ver_entry[2])
+        return NULL;
+    for (i = 0; i < argc; i++) {
+        JSValue v = arg_buf[i];
+
+        if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
+            JSObject *p = JS_VALUE_GET_OBJ(v);
+
+            if (!p)
+                continue;
+            any = 1;
+            key ^= (uintptr_t)(void *)p->shape;
+            key = (key << 13) | (key >> (8 * sizeof(key) - 13));
+        }
+    }
+    if (!any)
+        return NULL;
+    for (i = 0; i < WHALE_VER_SLOTS; i++) {
+        if (b->whale_ver_entry[i] && b->whale_ver_key[i] == key) {
+            b->whale_ver_use[i] = ++b->whale_ver_clock;
+            return b->whale_ver_entry[i];
+        }
+    }
+    b->whale_ver_miss++;
+    b->whale_ver_miss_key = key;
+    if (b->whale_ver_gen_entry) {
+        *is_gen = 1;
+        return b->whale_ver_gen_entry;
+    }
+    return NULL;
+}
+
+/* Version-table re-JIT: compile one more specialised version against the
+   current profile top and park it. LRU evicts the coldest specialised slot
+   (use-stamp comparison; an empty slot wins outright). The generic fallback
+   is never evicted. TCC handles are process-shared (release is a no-op), so
+   eviction only drops the table pointers - memory is structurally capped at
+   3 specialised + 1 generic versions per function. The new version serves
+   the shapes on record now; prefix-compatibility (append-only shapes) lets
+   it also serve their descendants, so one slot covers a shape family. */
+static void whale_ver_rejit(JSContext *ctx, JSFunctionBytecode *b)
+{
+    JSWhaleFuncInfo info;
+    void *entry = NULL, *handle = NULL;
+    int i, victim = -1;
+
+    for (i = 0; i < WHALE_VER_SLOTS; i++) {
+        if (!b->whale_ver_entry[i]) {
+            victim = i;
+            break;
+        }
+    }
+    if (victim < 0) {
+        victim = 0;
+        for (i = 1; i < WHALE_VER_SLOTS; i++) {
+            if (b->whale_ver_use[i] < b->whale_ver_use[victim])
+                victim = i;
+        }
+    }
+    memset(&info, 0, sizeof(info));
+    info.byte_code = b->byte_code_buf;
+    info.byte_code_len = b->byte_code_len;
+    info.prof = b->whale_prof;
+    info.is_normal = (b->func_kind == JS_FUNC_NORMAL);
+    info.arg_count = b->arg_count;
+    info.var_count = b->var_count;
+    info.stack_size = b->stack_size;
+    info.var_ref_count = b->var_ref_count;
+    info.cpool_count = b->cpool_count;
+    info.cpool = b->cpool;
+    info.loops = b->whale_loops;
+    info.loop_count = b->whale_loop_count;
+    info.prefer_gcc = b->whale_jit_gcc;
+    info.generic = 0;
+    if (!JS_WhaleJitCompileFunction(ctx, &info, &entry, &handle))
+        return;
+    /* Key the new version on the miss key recorded at pick time (the exact
+       arg-shape combination that fell through to generic). Zero means no
+       keyed miss on record - nothing to specialise for; drop the build
+       (its entry/handle die with the single TCC state, structurally fine). */
+    if (b->whale_ver_miss_key == 0)
+        return;
+    b->whale_ver_entry[victim] = entry;
+    b->whale_ver_tcc[victim] = handle;
+    b->whale_ver_key[victim] = b->whale_ver_miss_key;
+    b->whale_ver_use[victim] = ++b->whale_ver_clock;
+    b->whale_ver_miss_key = 0;
+    if (whale_dbg_env("WHALE_JIT_DUMP"))
+        fprintf(stderr, "whale jit: version table parked slot %d (miss key)\n", victim);
+}
+
 static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
 {
     JSWhaleContext *w = &ctx->whale;
@@ -4925,6 +5062,18 @@ static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
             if (whale_tier2_enable &&
                 b->whale_tier2_count >= (uint32_t)whale_tier2_threshold(b))
                 return whale_rejit_tier2(ctx, b);
+        }
+        /* Version-table re-JIT (notes <111>): the generic fallback has been
+           serving new shapes (ver_miss counts those runs). Past the same
+           forgive window as deopt retire (8), compile a fresh specialised
+           version against the current top shapes and park it (LRU evicts the
+           coldest specialised slot; the generic slot is never touched). The
+           profiler kept recording after the first compile, so the new shapes
+           are already in the table - no extra warm-up needed. */
+        if (b->whale_jit_entry && b->whale_ver_gen_entry &&
+            b->whale_ver_miss >= 8) {
+            b->whale_ver_miss = 0;
+            whale_ver_rejit(ctx, b);
         }
         return 0;
     }
@@ -4994,6 +5143,22 @@ static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
                 selfref = whale_gen_self_ref;
                 b->whale_jit_entry = entry;
                 b->whale_jit_tcc = handle;
+                /* Version table seed (notes <111>): when the function uses
+                   object slots, also compile the generic fallback now (same
+                   reading) - it is the pinned slot new shapes fall into, so
+                   a shape change costs a slow call, never a cliff to the
+                   interpreter. Pure-numeric functions skip it (no shapes to
+                   diversify, one version suffices). */
+                if (objs1 > 0 && !b->whale_ver_gen_entry) {
+                    void *gentry = NULL, *ghandle = NULL;
+
+                    info.generic = 1;
+                    if (JS_WhaleJitCompileFunction(ctx, &info, &gentry, &ghandle)) {
+                        b->whale_ver_gen_entry = gentry;
+                        b->whale_ver_gen_tcc = ghandle;
+                    }
+                    info.generic = 0;
+                }
             }
             if (!b->whale_jit_entry || selfref) {
                 whale_assume_self = 0;
@@ -21253,8 +21418,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
            that is true (any other one may have run a host call already). */
         for (;;) {
             whale_deopt = 0;
-            whale_ret = ((JSValue (*)(JSContext *, JSValue *, JSValue *, int *, JSValue, void *, void *))b->whale_jit_entry)
-                            (ctx, arg_buf, var_buf, &whale_deopt, func_obj, (void *)b->whale_jit_entry, (void *)var_refs);
+            {
+                /* Version-table dispatch (notes <111>): a specialised version
+                   for this call's shapes when one exists, else the pinned
+                   generic fallback (or the main entry when neither). The
+                   self-check argument stays the main entry: entry2 swapping
+                   below is orthogonal (closure readings, not shapes). */
+                int ver_gen = 0;
+                void *ver_entry = whale_ver_pick(ctx, b, arg_buf, argc, &ver_gen);
+                void *run_entry = ver_entry ? ver_entry : b->whale_jit_entry;
+
+                whale_ret = ((JSValue (*)(JSContext *, JSValue *, JSValue *, int *, JSValue, void *, void *))run_entry)
+                                (ctx, arg_buf, var_buf, &whale_deopt, func_obj, (void *)b->whale_jit_entry, (void *)var_refs);
+            }
             if (b->whale_needs_obj) {
                 sf->cur_sp = NULL;
                 /* drop whatever the JIT parked, on both the deopt and the normal

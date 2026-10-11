@@ -73,6 +73,11 @@ typedef struct JSWhaleFuncInfo {
        runs when a driver was named with JS_WhaleSetJitCc; otherwise, and for
        every function not so marked, the TinyCC backend stays. */
     int prefer_gcc;
+    /* Compile the generic (unspecialized) fallback version: every speculation
+       summary forced down (full-resolve IC, generic objects, double loop).
+       Set by the version-table logic for the pinned fallback slot; the
+       WHALE_GENERIC env forces it for measurement. */
+    int generic;
 } JSWhaleFuncInfo;
 
 /* Number of JSValue slots the engine lends to a JIT-compiled function so it has

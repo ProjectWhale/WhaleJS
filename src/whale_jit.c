@@ -5122,9 +5122,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     whale_prof_now = info->prof;
     /* Generic (unspecialized) mode: force every speculation summary down so
        the function compiles to the fallback shape (full-resolve IC, generic
-       objects, double loop) instead of bailing to the interpreter. Set via
-       WHALE_GENERIC for measurement; the re-JIT selector will drive it. */
-    whale_generic_mode = (whale_dbg_env("WHALE_GENERIC") != 0);
+       objects, double loop) instead of bailing to the interpreter. Driven by
+       the version table (info->generic) or forced via WHALE_GENERIC. */
+    whale_generic_mode = (info->generic != 0) ||
+        (whale_dbg_env("WHALE_GENERIC") != 0);
     /* A linear disassembly, as opcode numbers and offsets. The generator's own view
        of the bytecode is the only one that matters when a case is refused, and
        reading it back out of the switch is guesswork. */
