@@ -4984,16 +4984,48 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        no call, no jump target in between - which is exactly the run of
        initialiser stores a factory body is. */
     wt_id("JSValue"); wt('*'); wt_id("_sdp"); wt(';');
-    /* The locals, as plain doubles. ELS local pinning stays OFF: with a
-       2-pin budget (pool capped at 2, everything else verified sound) fibi
-       no longer hangs but computes wrong values - the vstore shortcut keeps
-       the new value in the pin register while some gv read path reloads the
-       stale slot, so `a=b; b=t` loses updates. The asymmetry is between
-       vstore (write-through to register only) and gv reads that bypass the
-       shortcut after vstack reshuffling; see notes <84>. The _wv pins below
-       (fold temporaries, single-writer) stay on and are verified. */
-    for (i = 0; i < var_count; i++) {
-        wk(JS_WK_DOUBLE); wt_slot("L", i); wt('='); wt_int(0); wt(';');
+    /* The locals. The two hottest numeric locals in a single call-free loop
+       are pinned (write-through, so the home slot stays authoritative - see
+       the ELS note in tccgen.c): loop-carried values then ride in xmm across
+       the whole loop instead of crossing the memory bus twice per trip.
+       The pool holds 2 (TCC's expression evaluation needs the rest); the pin
+       decision is heat order, object and single-assignment locals excluded.
+       _wv pins below compete for the same pool and lose (plain doubles when
+       the pool is full) - loop-carried values outrank fold temporaries. */
+    {
+        int pin0 = -1, pin1 = -1;
+
+        if (info->loop_count == 1 && !whale_loop_has_call) {
+            int d, h0 = 0, h1 = 0;
+
+            for (d = 0; d < var_count && d < WHALE_JIT_MAX_SLOTS; d++) {
+                int h;
+
+                if (d < WHALE_JIT_MAX_SLOTS && whale_loc_obj[d])
+                    continue;
+                if (d < WHALE_JIT_MAX_SLOTS && whale_lo_c[d])
+                    continue;
+                h = whale_loop_heat[d];
+                if (h > h0) {
+                    h1 = h0;
+                    pin1 = pin0;
+                    h0 = h;
+                    pin0 = d;
+                } else if (h > h1) {
+                    h1 = h;
+                    pin1 = d;
+                }
+            }
+            if (h0 < 3)
+                pin0 = -1;
+            if (h1 < 3)
+                pin1 = -1;
+        }
+        for (i = 0; i < var_count; i++) {
+            if (i == pin0 || i == pin1)
+                wk(JS_WK_REGISTER);
+            wk(JS_WK_DOUBLE); wt_slot("L", i); wt('='); wt_int(0); wt(';');
+        }
     }
     /* ELS spill slots: `register double` locals for the hottest materialised
        values inside loops. Declared ONLY when they can be used - a function

@@ -1058,12 +1058,11 @@ static int whale_pin_find(int loc)
     return -1;
 }
 
-/* A real call destroys every xmm (all caller-saved), so every pinned value
-   is stale afterwards. Write each live pin back to its frame slot first -
-   save_reg_upstack() spills to TCC's temporary area, not to the home slot,
-   so without this the slot holds a stale value and the next read reloads
-   garbage. Called from gfunc_call(); the next read of a pin reloads it from
-   its slot (see gv()) and sets the bit again. */
+/* A real call destroys every xmm (all caller-saved). Drop every pin's
+   validity bit: the registers are dead, and the home slots are authoritative
+   (write-through stores them on every write, so no writeback is needed -
+   the old writeback loop is gone). The next read of a pin reloads it from
+   its slot (see gv()) and sets the bit again. Called from gfunc_call(). */
 void JS_WhalePinInvalidate(void);
 void JS_WhalePinInvalidate(void)
 {
@@ -1074,18 +1073,7 @@ void JS_WhalePinInvalidate(void)
         for (i = 0; i < whale_pin_n; i++)
             fprintf(stderr, "  loc=%d reg=%d\n", whale_pin_loc[i], whale_pin_reg[i]);
     }
-    for (i = 0; i < whale_pin_n; i++) {
-        int pr = whale_pin_reg[i];
-
-        if (whale_pinned_regs & (1u << pr)) {
-            SValue sv;
-
-            sv.type.t = VT_DOUBLE;
-            sv.r = VT_LOCAL | VT_LVAL;
-            sv.c.i = whale_pin_loc[i];
-            store(pr, &sv);
-        }
-    }
+    (void)i;
     whale_pinned_regs = 0;
 }
 
@@ -1115,12 +1103,16 @@ ST_FUNC void save_reg_upstack(int r, int n)
         return;
     if (nocode_wanted)
         return;
-    /* WhaleJS (ELS): spill the register, but do NOT clear the pin validity
-       bit here. This function also runs for non-call saves (?:, &&, argument
-       shuffling) that do not destroy registers - clearing there disabled
-       pinning for any loop containing a ternary. Real calls invalidate via
-       JS_WhalePinInvalidate() in gfunc_call(); a stale pin reloads from its
-       slot on the next read (see gv()). */
+    /* WhaleJS (ELS, write-through pins): a pin's home slot always holds the
+       same value as its register (vstore writes both), so spilling the
+       register only frees it - the slot stays authoritative. Clear the pin's
+       validity bit here: the register is about to be reused, and any later
+       read must reload from the slot rather than claim a register that no
+       longer holds the value. (Not clearing was the stale-pin half of the
+       vstore/gv asymmetry: save_reg_upstack rewrites the vstack entry to a
+       temp slot while the pin table still names the home, so a later home
+       read claimed a reused register.) Non-pin registers are untouched, and
+       with no pins live this loop changes nothing. */
 
     /* modify all stack values */
     saved = 0;
@@ -1130,6 +1122,19 @@ ST_FUNC void save_reg_upstack(int r, int n)
             ((p->type.t & VT_BTYPE) == VT_LLONG && (p->r2 & VT_VALMASK) == r)) {
             /* must save value on stack if not already done */
             if (!saved) {
+                /* NOTE: must reload 'r' because r might be equal to r2 */
+                r = p->r & VT_VALMASK;
+                /* A pinned register spilled here changes owners: drop its
+                   validity bit now, before the entry below is rewritten to
+                   the temp slot. (The home slot already holds the same value
+                   - write-through - so the next home read simply reloads.) */
+                {
+                    int pi;
+
+                    for (pi = 0; pi < whale_pin_n; pi++)
+                        if (whale_pin_reg[pi] == r)
+                            whale_pinned_regs &= ~(1u << r);
+                }
                 /* NOTE: must reload 'r' because r might be equal to r2 */
                 r = p->r & VT_VALMASK;
                 /* store register in the stack */
@@ -3440,24 +3445,32 @@ ST_FUNC void vstore(void)
 #endif
             }
             r = gv(rc);  /* generate value */
-            /* WhaleJS (ELS): a pinned destination keeps the value in its
-               register instead of writing it back to the stack frame. The
-               value moves into pr; the assignment EXPRESSION still yields the
-               variable as an lvalue (VT_LOCAL|VT_LVAL) exactly like the normal
-               store path leaves it - rewriting the result to the register
-               destroyed the lvalue shape and every later use of the assignment
-               (`i = i + 1`, chained assignment) misbehaved, which is how a
-               pinned loop counter stopped advancing. A pin whose validity bit
-               is clear (a call killed it) goes through the normal path: the
-               store lands in the slot, and the next read reloads. */
+            /* WhaleJS (ELS, write-through pins): a pinned destination takes
+               the value in its register AND writes it to its home slot. The
+               register is then a cache, not the only copy: any later spill
+               (save_reg_upstack clears the bit) or call (Invalidate clears
+               all bits) leaves the slot authoritative, and the next read
+               reloads from it. Without the write-through, a spilled pin's
+               slot stayed stale while the table still named the home - the
+               read/write asymmetry that hung loops and misread chain
+               assignments. The assignment EXPRESSION still yields the
+               variable as an lvalue (VT_LOCAL|VT_LVAL) exactly like the
+               normal store path leaves it. A pin whose validity bit is clear
+               goes through the normal path entirely. */
             if ((vtop[-1].r & VT_VALMASK) == VT_LOCAL) {
                 int pr = whale_pin_find((int)vtop[-1].c.i);
 
                 if (pr >= 0 && (whale_pinned_regs & (1u << pr)) == 0)
                     pr = -1;
                 if (pr >= 0) {
+                    SValue home;
+
                     if (r != pr)
                         move_reg(pr, r, vtop->type.t);
+                    home.type.t = VT_DOUBLE;
+                    home.r = VT_LOCAL | VT_LVAL;
+                    home.c.i = vtop[-1].c.i;
+                    store(pr, &home);
                     vswap();
                     vtop--;
                     vtop->r |= delayed_cast;

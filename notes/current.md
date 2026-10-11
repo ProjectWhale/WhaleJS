@@ -3055,6 +3055,45 @@ SOLVED（骨架零变化验证）/ TIPS（IR 证伪 + V8 三级映射 + 侵入�
 绿，待提交。下一步：tier2 内容第一条（L pin 复活 = ELS 最小侵入落地，
 修 <85> vstore/gv 不对称洞）或 `lea` 熔合进 `gen_opi`（单遍零缓存）。
 
+# <100>: L pin 复活进 tier1（write-through 修好 <85> 不对称洞）
+SOLVED（arith -35%、locals -19%、floatlit 反超 node，零 hang 零错答案）
+
+## 用户方向确认（一套发码 + 通用低开销全放 tier1）
+- 独立 x64 后端路线作废（同样优化写两遍，双份维护）。`whale_emit_x64.c`
+  留探针 + 字节缓冲/commit 作发码小件库，VEX/REX 编码以后在这里孵化、
+  成熟一条搬一条进 `gen_op*`（熔合，不是重写）。
+- tier2 只收"单遍做不了、要整函数缓冲/多遍"的（以后按"开销大又不通用"
+  一条条加）；开销小 + 通用的（pin/融合/展开）全在 tier1 做完。
+
+## <85> 不对称洞的精确形态（读代码定案，不是猜测）
+- vstore 捷径只写 pin 寄存器（home slot 不同步）；`save_reg_upstack`
+  把 pin 寄存器 spill 到 TCC **临时槽**并改写 vstack 条目（home→temp），
+  但 pin 表还按 home 登记、位也不清 → 后续 home 读认领已被重用的寄存器，
+  读到垃圾（hang.asm 的 `i++` 消失 + 比较错乱即此）。
+- 修法 = **write-through**：vstore 同时写寄存器 + home slot（寄存器变读
+  缓存）；spill 则清位（home 新鲜，下次读重载）；真调用清全位
+  （Invalidate 的 writeback 循环删除，home 本来就新鲜；有调用的函数
+  本来就不 pin，删了零风险）。
+- 性能账：写 +1 store（与无 pin 持平），读 -1 load；循环内读>>写，净赢。
+  三处全 tccgen.c（vstore/store 回写 + spill 清位 + Invalidate 简化），
+  gen_op 归一化与 gv 捷径原样保留（write-through 下更安全）。
+
+## 生成器侧 L pin 恢复（heat top-2，单循环无调用门现成）
+- prologue 的 L 声明循环加 top-2 `register`（对象/lo_c 单赋值排除，
+  heat<3 不 pin）。L 先声明先拿 pool（预算 2），`_wv` 拿不到则普通变量
+  （安全降级，实测无 measurable 损失）。
+- 效果（repeat=3）：arith 105→68（-35%）、locals 100→81（-19%）、
+  floatlit 106→63（反超 node 66）、minmax 保持追平 48、nested/bitops/
+  fib 持平；25/25 全对，零 hang。`_wv` 降级被 L 收益覆盖（nested 持平为证）。
+
+## 验证
+`whale api test: ok`（含探针）；25/25 全对 0 mismatch；repeat=1 全量 +
+repeat=3 关键 case。
+## 状态
+绿，待提交。下一步：tier2 内容（寄存器分配全函数版 / SIMD， gated）；
+`lea` 熔合进 `gen_opi`（AST 中间替代第一实例）。
+
+
 
 
 
