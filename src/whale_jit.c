@@ -5265,7 +5265,13 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         break;
                     /* any opcode that may lower to a helper call disqualifies
                        local pinning for the whole function (see
-                       whale_loop_has_call above) */
+                       whale_loop_has_call above). TRIED: exempting field
+                       access under a proven-stable shape (helpers run once,
+                       never touch pin homes) - writeOrder gained 3ms but
+                       objshape lost 17ms (pin pool pressure against long
+                       conversion chains). Reverted: pinning stays numeric-only.
+                       Object loops keep their field caches (two-state/poly),
+                       which is where their wins come from. */
                     if (!whale_is_pure_num_op(qo))
                         whale_loop_has_call = 1;
                     w = whale_writes_local(qo, pc, q);

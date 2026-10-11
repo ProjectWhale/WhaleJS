@@ -3398,9 +3398,45 @@ SOLVED（单管线：helper + 两态/poly 分支，无新管线）/ 真 bug ×1�
   真实业务（可选字段交替）吃到即赚。
 
 ## 状态
-绿，待提交。下一步：循环 peeling（objshape 稳态零分支）/ fill×poly 同
-local 交替（merge 拒编转成功——要统一表示，不只是类型）；tag=3  value
-tombstone 进 CStruct 列（del 快路，与 8/2/3 设计一体）。
+绿，已提交 5944eb9。下一步见 <108>。
+
+# <108>: objshape 分相 + shape 归一评估 + pin 豁免试错回退
+SOLVED（分相计时）/ 试错回退 ×1 / 评估结论 ×2（不做，诚实记录）
+
+## 分相计时（whalejs vs node，repeat=1）
+- twoShapes 16 vs 49（已超 3x）、growsShape 23 vs 29（已超）、
+  writeOrder 23 vs 5（4.6x）、escaped 121 vs 22（5.5x，占总量 66%）。
+- 总量 183 vs 105。node 47ms 线（全量口径）的主攻点是 escaped。
+
+## 试错回退：field-stable 不杀 pin（writeOrder 21→18，但 objshape +10%）
+- 根因定位：writeOrder 7 语句 0 调用全 local，21ms 全是 spill；
+  `put_field` 不在 purity 表 → has_call 恒 1 → L-pin/`_wv` 全灭。
+- 试了 heat 扫 field 豁免（shape_stable 即免）：writeOrder 21→18，
+  但 objshape 165→182（repeat=3 确认，+10%）：pin 占 pool 挤压转换链
+  （pin 是访存型优化，对象循环一律不开——门控策略 <101> 的实例）。
+- 保大放小：已回退（注释留结论），objshape 回 166，全量绿。
+
+## 评估结论 ×2（不做）
+1. **escaped 小修全玉米粒**：死值/死分支（`is_undefined` 数值恒假 +
+   `if((0)!=0)` 空跳，零执行成本）、搬运、sp 重写，共 ~3ms。不做。
+2. **Define transition 缓存不做**：只能省查找（~5ms），分配铁板
+   （prop 数组 + Float64×2，每 trip 3 malloc ≈ 100ms）要复用/nursery
+   才消（风险高/GC 大活）。escaped 真解是槽位对象复用或 nursery，
+   本轮不动（121ms 认）。
+3. **引擎级 shape 归一不用做**：order-insensitive + slack（小共用大+2），
+   JIT union 层已隐含（<63> 分相 + 集合语义布局，与序无关；缺席列
+   presence=0/tombstone）。引擎动 transition 是解释器热路径，起飞风险
+   实锤。twoShapes 16ms 超 node 3x 就是 union 的活证据。
+
+## 测量
+- 全量 25/25 check 全一致；objshape 166、bitops 128、objfields 27，
+  余无变化（repeat=3 确认关键三项）。
+- 到 50ms 线还差：escaped（复用/nursery，大活）+ writeOrder（spill，
+  线性 IR）+ peeling（稳态零分支）。frontend 能动的已基本收净。
+
+## 状态
+绿，待提交。下一步：循环 peeling（objshape 穳态零分支）或 deopt 想法
+落地（用户那套：轻决策可能比硬压单条路更接近 node）。
 
 
 
