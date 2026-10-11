@@ -1910,6 +1910,36 @@ void gen_opi(int op)
         opc = 1;
         goto gen_op8;
     case '*':
+        /* WhaleJS: `r * (2^k + 1)` (3/5/9) is one lea instead of an imul:
+           `lea r, [r + r*k]` is 1 cycle against 3, smaller, and never sets
+           flags the code reads afterwards (arithmetic results in TCC carry
+           no flag dependency). Single-pass: the constant is right here in
+           vtop (cc), no buffering, no IR. Anything else falls through to
+           imul below. Unconditional win, so no gate - unlike unrolling this
+           adds no branch, no code growth, no memory traffic. */
+        if (cc && !ll) {
+            int mul = (int)vtop->c.i;
+            int scale = -1;
+
+            if (mul == 3)
+                scale = 1;
+            else if (mul == 5)
+                scale = 2;
+            else if (mul == 9)
+                scale = 3;
+            if (scale >= 0) {
+                vswap();
+                r = gv(RC_INT);
+                vswap();
+                /* lea r32, [r32 + r32*scale]: mod=00, rm=100 (SIB follows),
+                   SIB = scale | index | base, all the same register */
+                orex(0, r, r, 0x8d);
+                o(0x04 | REG_VALUE(r) * 8);
+                o((scale << 6) | (REG_VALUE(r) << 3) | REG_VALUE(r));
+                vtop--;
+                break;
+            }
+        }
         gv2(RC_INT, RC_INT);
         r = vtop[-1].r;
         fr = vtop[0].r;
