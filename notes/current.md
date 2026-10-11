@@ -3628,7 +3628,36 @@ SOLVED（单循环函数，predef 集，6 处 call site 收敛）/ 诚实记录�
 - 全量 25/25 check 全一致；objshape 75、sieve 64（repeat=3）。
 
 ## 状态
-绿，待提交。下一步：多签名 L1 表，或 writeOrder/线性 IR（spill 主体）。
+绿，已提交 049f1b2。下一步见 <115>。
+
+# <115>: writeOrder 评估（AST+缓存约束下无利可图，认账）
+零代码改动轮（只读 + 计时，全量确认）
+
+## 评估（用户约束：不要 IR，最多 AST+缓存）
+- writeOrder 7 语句 0 调用全 local：数据流 4 级依赖链（%→+1→+→acc+），
+  `%` 只求一次是铁律（idiv 26 cycles，求两次净负）→ 最少 6 条语句。
+  最优变换（L5 命名 + 全嵌套复读）省 1 store + 1 load ≈ 2ms。玉米粒，不做。
+- 换变量名（_wd 镜像）零收益：TCC 对一切 C 局部一视同仁 spill。
+  出口活性分析（L3/L4/L5 出口死）省的是装箱（本就没有，deferred），
+  不是 spill。不做。
+- 结论：spill 主体只能寄存器分配（后端，动 TCC 分配器，800 行级）或接受。
+  writeOrder 21ms（node 7 的 3x，TCC 天花板）认账。
+
+## 到 50ms 的诚实算账（总量 78）
+- writeOrder 13ms 差值：要线性 IR，无 AST 解。
+- escaped 22ms：稳态 1 ArrSetVal（数组语义必需）+ 列 spill，无 AST 解。
+- 通用 margin：分支预测/icache，调不动。
+- 结论：50ms 在"不要 IR"约束下到不了。当前 78（已超 node 86）是
+  AST+缓存的天花板。再往下只有两条路：后端寄存器分配，或 deopt 那套
+  （轻决策把工作推给版本选择——已落地，见 <110>~<113>）。
+
+## 测量
+- 全量 25/25 check 全一致（repeat=1）；objshape 79、locals 81、ident 54
+  （repeat=3 确认关键项，repeat=1 偏差全是噪声）。
+
+## 状态
+绿（零改动，无提交）。下一步：后端寄存器分配（用户放行才做），或多签名
+L1 表，或 deopt 那套的冷淘汰长跑（已验证）/前缀兼容（已落地）。
 
 
 
