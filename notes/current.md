@@ -3303,9 +3303,53 @@ SOLVED（单管线：新类型 + 生产/消费两分支，无新管线无切换�
   800-1500 行，见 <87>；本轮证明前端转换税已基本收净）。
 
 ## 状态
-绿，待提交。下一步：线性 IR（<87> 三刀：调用链融合/循环 live-range/字段
-提升）或混合场景；IBIT 自然扩散（sieve/loop_sum 的位运算自动吃到，
-无额外工作）。
+绿，已提交 452b95e。下一步见 <106>。
+
+# <106>: objshape 极致优化第一刀（VAL-stable + 字段两态 + sp 消，194→165ms）
+SOLVED（单管线：helper 收敛，无新管线）/ 诚实记录未达预期部分
+
+## 用户方向与容器结论
+- Map/Set 调查结论（quickjs.c 56565-57900）：分离链接哈希，load 2.0，
+  hash 不缓存、删除不缩。能动的（hash 缓存/mixer/预扩容）全是几十 %
+  级别，2x 只在对抗性用例。**且 objshape 一个 Map 不用**（四相全是
+  普通对象字面量 + 属性读写，走 shape/字段缓存路径）——容器线与
+  objshape 线不相交，容器优化放下，对象路径往极致做。
+- objshape 基线：whalejs 194 vs qjs 1203（6.2x 已赢）vs node 47（差 4.1x）。
+
+## dump 定量（twoShapes 相，每 trip）
+- 5 次 `JS_WhaleObjShape` helper 调用（每字段每迭代一次）；
+- 5 组 sp/fv 检查 + tag 三目 + park + 字段写回。约 40 条语句/trip。
+
+## 三刀（全 src/whale_jit.c 生成器侧）
+1. **VAL-stable**：根因是对象局部一律统一成 VAL_T（put_loc 7727/set_loc
+   7836 行实证；WHALE_OBJ_T 只活在栈临时，`cur[idx]` 永不到 OBJ），而
+   stable 三处写死 `&& IS_OBJ(ta)` → 对局部恒假、stable 恒关。
+   修法：VAL + 无循环内身份交换（新 `has_bcall` 字节码-call 门——has_call
+   对对象循环恒真，门自相矛盾；+ 新 `shape_dirty`：循环内 OP_object 或
+   写对象局部）同样 stable。soundness：威胁只有三条（加字段/删字段有
+   put/def 检查；call 传出 reshape 有 bcall；slot 换对象有 dirty），
+   put_field 只写值不碰身份。三处收敛进 `whale_field_stable()` helper。
+2. **字段两态**（首 trip 全套 / 稳态直读写）：`fv == fver+1` 表已归一。
+   首 trip：resolve + 值读（三目）+ 回写归一（tag=8）+ 置标记；稳态：
+   读 1 条直取、写 0 检查直存。soundness：非数值读/写全 deopt（ObjValueNum
+   无条件 deopt 实证；resolve 只收 8/0），shape 不变（stable），_wsc 每
+   调用重置。5 calls → 首 trip 5 calls + 稳态 0。
+3. **sp 消**：stable 访问点的 struct 列 guard 与 `sp=1` 重写全跳过
+   （shape 证 presence 恒成立；note 保留，后读免查）。VAL-stable 189→
+   169（5 calls 省了只值 ~5ms：helper 只是普通 C 调用，本来就不贵——
+   之前 25ns/trip 估算错，认错）；两态 189→169（-11%）；sp 消持平
+   （分支全中 + L1，玉米粒，诚实记录）。
+
+## 测量（repeat=3）
+- objshape 194→**165**（-15%）；全量 25/25 check 全一致；API 双路径绿。
+- 到 node 47ms 还差 3.5x：剩余是 park 跨块（resolve 分支隔开读写，
+  落地必需）+ fv 检查（每字段 1 读 1 分支）+ TCC spill。
+  下一步是循环 peeling（首 trip 剥出，稳态循环零分支，park 可合）——
+  单独一轮（动 loop buffer，风险中高）。
+
+## 状态
+绿，待提交。下一步：循环 peeling（objshape 稳态零分支）或 growsShape 的
+函数级→循环级 stable（循环外加字段杀整函数 stable，保守过头）。
 
 
 

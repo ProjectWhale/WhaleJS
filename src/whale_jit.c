@@ -1048,6 +1048,18 @@ static int whale_loop_wn;   /* locals per head entry (var_count) */
 /* Set when any loop body contains a call: local pinning is then off (a pin
    spanning a call pays spill+reload per call for zero net gain). */
 static int whale_loop_has_call;
+/* Set when any loop body creates an object (OP_object) or stores into an
+   object-holding local (a second object identity landing in the same slot
+   would reshape it): VAL-slot field caches are then not stable. Zeroed per
+   compilation next to the loop scans. */
+static int whale_loop_shape_dirty;
+/* Set when a real bytecode call sits inside a loop body. Unlike has_call
+   (which also fires for opcodes that merely lower to numeric helpers like
+   fmod/ObjShape - harmless to object shapes), only a bytecode call can hand
+   an object out to user code that reshapes it. VAL-slot stability consults
+   this, not has_call: every object loop lowers field access to helpers, so
+   gating on has_call would close stability for exactly the loops it helps. */
+static int whale_loop_has_bcall;
 /* Per-local heat inside loop bodies (reads + 2*writes, accumulated over all
    loops): the ELS decision pins the hottest ones. Indexed by local number,
    zeroed before each compilation's scan. */
@@ -2454,16 +2466,48 @@ static void fold_obj_field_load(int os, int atom, int fc, int nm, int stable)
        object cannot escape (no calls) and every store targets a field the
        literal already defined. The resolution then happens once and the shape
        check disappears entirely, which is the difference between beating the
-       interpreter and merely matching it. */
+       interpreter and merely matching it.
+       Two states, one check: `fv == fver + 1` means this call already ran the
+       full path below (resolve + tag normalisation), so the steady state is a
+       direct `fp->u.float64` load with no check, no call, no tag dispatch.
+       The first trip runs the full path: resolve, null check, value load with
+       tag dispatch, and - when the tag was not already 8 - a write-back that
+       normalises the field to float64. Past that the tag is provably 8: only
+       numbers ever reach the steady state (anything else deopts - the value
+       helper above unconditionally does, the store resolve below admits only
+       8/0 and every numeric store writes 8), and the shape cannot change
+       (that is what `stable` promises). `_wsc` is zeroed per call, so a fresh
+       call re-runs the full path; a re-JIT gets a fresh `_wsc` too. */
     if (stable) {
-        wk(JS_WK_IF); wt('('); wt('!'); wt_arr("fs", fc); wt_op(JS_OP_OR);
-        wt_arr("fv", fc); wt_op(JS_OP_NE); wt_id("_wsc"); wt('.'); wt_id("fver"); wt(')'); wt('{');
-    } else {
-        wk(JS_WK_IF); wt('('); wt_arr("fv", fc); wt_op(JS_OP_NE); wt_id("_wsc"); wt('.'); wt_id("fver");
-        wt_op(JS_OP_OR); wt_arr("fs", fc); wt_op(JS_OP_NE);
-        wt_id("JS_WhaleObjShape"); wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(')'); wt(')');
-        wt('{');
+        wk(JS_WK_IF); wt('('); wt_arr("fv", fc); wt_op(JS_OP_NE);
+        wt_id("_wsc"); wt('.'); wt_id("fver"); wt('+'); wt_int(1); wt(')'); wt('{');
+        wt_arr("fp", fc); wt('='); wt_id("JS_WhaleObjFieldPtr"); wt('(');
+        wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_int(atom); wt(','); wt('&'); wt_arr("fs", fc); wt(')'); wt(';');
+        wk(JS_WK_IF); wt('('); wt('!'); wt_arr("fp", fc); wt(')'); wt('{');
+        wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+        wt_arr("v", nm); wt('=');
+        wt('('); wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(8); wt(')');
+        wt('?'); wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64");
+        wt(':'); wt('('); wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(0); wt(')');
+        wt('?'); wt('('); wk(JS_WK_DOUBLE); wt(')'); wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("int32");
+        wt(':'); wt_id("JS_WhaleObjValueNum"); wt('('); wt_id("ctx"); wt(','); wt_arr("fp", fc); wt(','); wt_id("deopt"); wt(')');
+        wt(';');
+        /* normalise: the value just loaded is a number (anything else deopted
+           inside the dispatch above), so writing it back as float64 makes the
+           tag 8 for every later trip. One extra store on the first trip only. */
+        wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64"); wt('=');
+        wt_arr("v", nm); wt(';');
+        wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt('='); wt_int(8); wt(';');
+        wt_arr("fv", fc); wt('='); wt_id("_wsc"); wt('.'); wt_id("fver"); wt('+'); wt_int(1); wt(';');
+        wt('}');
+        wt_arr("v", nm); wt('='); wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64"); wt(';');
+        fold_commit(fm);
+        return;
     }
+    wk(JS_WK_IF); wt('('); wt_arr("fv", fc); wt_op(JS_OP_NE); wt_id("_wsc"); wt('.'); wt_id("fver");
+    wt_op(JS_OP_OR); wt_arr("fs", fc); wt_op(JS_OP_NE);
+    wt_id("JS_WhaleObjShape"); wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(')'); wt(')');
+    wt('{');
     wt_arr("fp", fc); wt('='); wt_id("JS_WhaleObjFieldPtr"); wt('(');
     wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_int(atom); wt(','); wt('&'); wt_arr("fs", fc); wt(')'); wt(';');
     wt_arr("fv", fc); wt('='); wt_id("_wsc"); wt('.'); wt_id("fver"); wt(';');
@@ -2482,6 +2526,30 @@ static void fold_obj_field_load(int os, int atom, int fc, int nm, int stable)
     fold_commit(fm);
 }
 
+/* Field-access stability for one access site: the object's shape cannot
+   change for the rest of this call, so cached field pointers (VAL/OBJ
+   slots) and layout columns (STRUCT) stay valid. Takes the function-level
+   proof as a parameter (it lives in whale_jit_gen locals, out of reach
+   here): call sites pass `whale_shape_stable || prof(pos)`.
+   OBJ slots: the function-level proof suffices. VAL slots - where every
+   object local unifies, so a plain IS_OBJ test is dead for locals - need
+   additionally that no loop body can swap the slot's identity: no bytecode
+   call (which could hand the object out for reshaping; helper calls from
+   lowering cannot) and no fresh object or store into an object local in a
+   loop. STRUCT columns ride the same proof (columns derive from the shape).
+   Field-value stores (put_field) never touch the identity. */
+static int whale_field_stable(int ta, int shape_proved)
+{
+    if (!shape_proved)
+        return 0;
+    if (WHALE_IS_OBJ(ta))
+        return 1;
+    if ((WHALE_IS_VAL(ta) || WHALE_IS_STRUCT(ta)) &&
+        !whale_loop_has_bcall && !whale_loop_shape_dirty)
+        return 1;
+    return 0;
+}
+
 /* Resolve `atom` of the object in slot `os` through cache pair `fc` without
    loading anything, so a store can follow. Emits a deopt when the value it
    would overwrite is not a number: overwriting a reference without freeing it
@@ -2490,15 +2558,31 @@ static void fold_obj_field_resolve(int os, int atom, int fc, int stable)
 {
     int fm = fold_mark();
 
+    /* Steady-state twin of the load above: `fv == fver + 1` means resolved
+       and tag-normalised, so a store needs no check at all - the call site's
+       `fp->u.float64 = <value>` runs unconditionally (the tag is already 8
+       and stays 8: only numbers are stored on this path). The first trip runs
+       the full resolve plus the numeric-tag admission (8 or 0, else deopt -
+       overwriting a reference without freeing it would leak). */
     if (stable) {
-        wk(JS_WK_IF); wt('('); wt('!'); wt_arr("fs", fc); wt_op(JS_OP_OR);
-        wt_arr("fv", fc); wt_op(JS_OP_NE); wt_id("_wsc"); wt('.'); wt_id("fver"); wt(')'); wt('{');
-    } else {
-        wk(JS_WK_IF); wt('('); wt_arr("fv", fc); wt_op(JS_OP_NE); wt_id("_wsc"); wt('.'); wt_id("fver");
-        wt_op(JS_OP_OR); wt_arr("fs", fc); wt_op(JS_OP_NE);
-        wt_id("JS_WhaleObjShape"); wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(')'); wt(')');
-        wt('{');
+        wk(JS_WK_IF); wt('('); wt_arr("fv", fc); wt_op(JS_OP_NE);
+        wt_id("_wsc"); wt('.'); wt_id("fver"); wt('+'); wt_int(1); wt(')'); wt('{');
+        wt_arr("fp", fc); wt('='); wt_id("JS_WhaleObjFieldPtr"); wt('(');
+        wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_int(atom); wt(','); wt('&'); wt_arr("fs", fc); wt(')'); wt(';');
+        wk(JS_WK_IF); wt('('); wt('!'); wt_arr("fp", fc); wt(')'); wt('{');
+        wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+        wk(JS_WK_IF); wt('('); wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_NE); wt_int(8); wt(')');
+        wt('{'); wk(JS_WK_IF); wt('('); wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_NE); wt_int(0); wt(')');
+        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}'); wt('}');
+        wt_arr("fv", fc); wt('='); wt_id("_wsc"); wt('.'); wt_id("fver"); wt('+'); wt_int(1); wt(';');
+        wt('}');
+        fold_commit(fm);
+        return;
     }
+    wk(JS_WK_IF); wt('('); wt_arr("fv", fc); wt_op(JS_OP_NE); wt_id("_wsc"); wt('.'); wt_id("fver");
+    wt_op(JS_OP_OR); wt_arr("fs", fc); wt_op(JS_OP_NE);
+    wt_id("JS_WhaleObjShape"); wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(')'); wt(')');
+    wt('{');
     wt_arr("fp", fc); wt('='); wt_id("JS_WhaleObjFieldPtr"); wt('(');
     wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_int(atom); wt(','); wt('&'); wt_arr("fs", fc); wt(')'); wt(';');
     wt_arr("fv", fc); wt('='); wt_id("_wsc"); wt('.'); wt_id("fver"); wt(';');
@@ -5009,6 +5093,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        off for the whole function: the net is zero or negative. _wv pins are
        unaffected (fold temporaries never span a call). */
     whale_loop_has_call = 0;
+    whale_loop_shape_dirty = 0;
+    whale_loop_has_bcall = 0;
     {
         int k;
 
@@ -5020,6 +5106,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     whale_call_pos[k] <= loop_back[tgt]) {
                     whale_shape_stable = 0;
                     whale_loop_has_call = 1;
+                    whale_loop_has_bcall = 1;
                     break;
                 }
             }
@@ -5080,7 +5167,21 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         whale_loop_written[(size_t)h * var_count + w] = 1;
                         if (w < WHALE_JIT_MAX_SLOTS)
                             whale_loop_heat[w] += 2;
+                        /* A store into an object-holding local inside a loop
+                           may land a second identity in the same slot (e.g.
+                           `a = other`), reshaping it: VAL-slot field caches
+                           are not stable then. put_field (field-value stores)
+                           does not come through here as a local write of the
+                           object itself - writes_local names the value local
+                           for put_loc/set_loc/add/inc/dec, and -1 for field
+                           stores - so plain value traffic is unaffected. */
+                        if (w < WHALE_JIT_MAX_SLOTS && whale_loc_obj[w])
+                            whale_loop_shape_dirty = 1;
                     }
+                    /* A fresh object created inside a loop may be stored over
+                       a cached slot on some trip: same verdict. */
+                    if (qo == OP_object)
+                        whale_loop_shape_dirty = 1;
                     /* reads: get_loc family (get_loc0_loc1 reads two) */
                     if (qo >= OP_get_loc0 && qo <= OP_get_loc3)
                         r = qo - OP_get_loc0;
@@ -7024,8 +7125,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 /* A struct field is a frame variable: the store is one
                    assignment - no shape check, no pointer chase, no tag branch.
                    That is the whole point of laying the object out. The flag
-                   write stays: it is what later reads in this segment rely on
-                   (whale_sp_note below), and a store is what proves presence. */
+                   write stays - unless the access is field-stable (the shape
+                   proves presence on every trip, so the runtime flag never
+                   changes): then the emission is just the column store, and
+                   the note stays so later reads in this segment keep their
+                   no-branch form. */
                 if (WHALE_IS_STRUCT(ta)) {
                     int col = whale_str_col(whale_str_atoms, whale_str_n, atom);
 
@@ -7033,9 +7137,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         { WHALE_STEP_INSTEAD_OF_BAILING(); }
                     {
                         int fm = fold_mark();
+                        int colstable = whale_field_stable(ta, whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1)));
 
                         wt_slot("L", whale_str_L[col]); wt('='); fold_inline(sp - 1); wt(';');
-                        wt_arr("sp", col); wt('='); wt_int(1); wt(';');
+                        if (!colstable) {
+                            wt_arr("sp", col); wt('='); wt_int(1); wt(';');
+                        }
                         fold_commit(fm);
                         whale_sp_note(col);
                     }
@@ -7076,9 +7183,22 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     /* `stable` means "the shape cannot change for the rest of
                        this function", which was proved about a local literal.
                        An object that came from a call is not one, so it always
-                       keeps its shape check. */
+                       keeps its shape check.
+                       Object locals always travel as VAL slots (put_loc unifies
+                       to VAL_T, never OBJ), so WHALE_IS_OBJ alone is dead - it
+                       never fires for a local. A VAL slot is equally stable
+                       when no loop body can swap its identity: no calls (escape
+                       + reshape from outside) and no fresh object or store
+                       into an object local inside a loop (whale_loop_shape_
+                       dirty). Field-value stores (put_field) never touch the
+                       identity, so plain `o.x += v` traffic stays stable.
+                       The call gate is bytecode calls only (has_bcall): helper
+                       calls from lowering (fmod/ObjShape/fieldPtr) cannot
+                       reshape user objects, while gating on has_call would
+                       close stability for exactly the object loops it helps -
+                       every one of them lowers field access to helpers. */
                     fold_obj_field_resolve(WHALE_SLOT(ta), atom, fc,
-                                           (whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1))) && WHALE_IS_OBJ(ta));
+                                           whale_field_stable(ta, whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1))));
                     fm = fold_mark();
                     if (whale_type_is_num(tb)) {
                         /* the value is a double here, and the old one was a number
@@ -7151,11 +7271,18 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         /* Skip the check when this segment already proved the
                            column present (whale_sp_known/note) - objfields'
                            read-after-write of one column then compiles to just
-                           the copy, with no branch at all. */
-                        if (!whale_sp_known(col)) {
+                           the copy, with no branch at all. A field-stable
+                           access skips it too: the shape proves the column
+                           present on every trip (the loop pre-fill ran once
+                           outside), so neither the check nor the flag write
+                           is needed - but the note stays, so later reads in
+                           this segment keep their no-branch form. */
+                        if (!whale_sp_known(col) && !whale_field_stable(ta, (unsigned)(pos + 1))) {
                             wk(JS_WK_IF); wt('('); wt('!'); wt_arr("sp", col); wt(')'); wt('{');
                             wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
                             wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                            whale_sp_note(col);
+                        } else {
                             whale_sp_note(col);
                         }
                         wt_arr("v", nm); wt('='); wt_slot("L", whale_str_L[col]); wt(';');
@@ -7174,8 +7301,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 fc = whale_fields++;
                 nm = whale_vserial++;
+                /* VAL slots ride the same stability as OBJ (see the resolve
+                   site above: locals unify to VAL, so IS_OBJ alone is dead). */
                 fold_obj_field_load(WHALE_SLOT(ta), atom, fc, nm,
-                                    (whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1))) && WHALE_IS_OBJ(ta));
+                                    whale_field_stable(ta, whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1))));
                 whale_vname[sp] = nm;
                 whale_vmat[sp] = 1;
                 cur[var_count + sp] = WHALE_T_NUM;
@@ -7261,13 +7390,17 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                        closed off with a commit. It also has to come first: it reads
                        sp[col], which nothing in the expression below touches.
                        Skip it when this segment already proved the column (same
-                       rule as the get_field2 arm above). */
-                    if (!whale_sp_known(col)) {
+                       rule as the get_field2 arm above), or when the access is
+                       field-stable (shape-proved presence on every trip; the
+                       note stays so later reads keep their form). */
+                    if (!whale_sp_known(col) && !whale_field_stable(ta, (unsigned)(pos + 1))) {
                         fm = fold_mark();
                         wk(JS_WK_IF); wt('('); wt('!'); wt_arr("sp", col); wt(')'); wt('{');
                         wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
                         wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
                         fold_commit(fm);
+                        whale_sp_note(col);
+                    } else {
                         whale_sp_note(col);
                     }
                     /* The column is the value. It is a register scalar already, so
@@ -7301,8 +7434,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     { whale_out_line = __LINE__; goto out; }
                 fc = whale_fields++;
                 nm = whale_vserial++;
+                /* VAL slots ride the same stability as OBJ (see the resolve
+                   site above: locals unify to VAL, so IS_OBJ alone is dead). */
                 fold_obj_field_load(WHALE_SLOT(ta), atom, fc, nm,
-                                    (whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1))) && WHALE_IS_OBJ(ta));
+                                    whale_field_stable(ta, whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1))));
                 whale_vname[sp - 1] = nm;
                 whale_vmat[sp - 1] = 1;
                 whale_vexpr[sp - 1].inv = 0;   /* a memory read */
