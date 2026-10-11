@@ -2458,7 +2458,10 @@ static void fold_toint32(int k, int t)
    resolution only runs again if a property is added or removed. Reading the
    value itself is inlined: a helper call per access lands at interpreter speed,
    which is where the first version of this sat. */
-static void fold_obj_field_load(int os, int atom, int fc, int nm, int stable)
+static int whale_prof_two_shapes(unsigned off);
+static unsigned whale_prof_two_off;
+static void fold_obj_field_load(int os, int atom, int fc, int fc2, int nm,
+                                  int stable)
 {
     int fm = fold_mark();
 
@@ -2477,8 +2480,11 @@ static void fold_obj_field_load(int os, int atom, int fc, int nm, int stable)
        helper above unconditionally does, the store resolve below admits only
        8/0 and every numeric store writes 8), and the shape cannot change
        (that is what `stable` promises). `_wsc` is zeroed per call, so a fresh
-       call re-runs the full path; a re-JIT gets a fresh `_wsc` too. */
-    if (stable) {
+       call re-runs the full path; a re-JIT gets a fresh `_wsc` too.
+       Single-shape only: when the site saw two shapes (poly-2 below, fc2
+       allocated) the same slot alternates identities and the fv mark cannot
+       tell them apart - that case falls through to the poly branch. */
+    if (stable && fc2 < 0) {
         wk(JS_WK_IF); wt('('); wt_arr("fv", fc); wt_op(JS_OP_NE);
         wt_id("_wsc"); wt('.'); wt_id("fver"); wt('+'); wt_int(1); wt(')'); wt('{');
         wt_arr("fp", fc); wt('='); wt_id("JS_WhaleObjFieldPtr"); wt('(');
@@ -2501,6 +2507,56 @@ static void fold_obj_field_load(int os, int atom, int fc, int nm, int stable)
         wt_arr("fv", fc); wt('='); wt_id("_wsc"); wt('.'); wt_id("fver"); wt('+'); wt_int(1); wt(';');
         wt('}');
         wt_arr("v", nm); wt('='); wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64"); wt(';');
+        fold_commit(fm);
+        return;
+    }
+    /* Polymorphic-2 (small polymorphic IC): the warm-up saw exactly two shapes
+       at this site, alternating. One cache pair would re-resolve on every trip;
+       two pairs (fc/fc2) hold one resolved pointer each. One ObjShape call per
+       compare (two at most, short-circuited); only a third shape runs the full
+       resolve (parked in the second pair, keeping the first-seen - hottest -
+       entry pinned). No shape universe is fenced off: anything unresolvable
+       still deopts exactly like the single-pair path below. */
+    if (fc2 >= 0 && whale_prof_two_shapes(whale_prof_two_off)) {
+        /* if (S==fsA) v=disp(fpA); else if (S==fsB) v=disp(fpB);
+           else { fpB=FieldPtr; if (!fpB) deopt; v=disp(fpB); } */
+        wk(JS_WK_IF); wt('(');
+        wt_id("JS_WhaleObjShape"); wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(')');
+        wt_op(JS_OP_EQ); wt_arr("fs", fc); wt(')'); wt('{');
+        wt_arr("v", nm); wt('=');
+        wt('('); wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(8); wt(')');
+        wt('?'); wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64");
+        wt(':'); wt('('); wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(0); wt(')');
+        wt('?'); wt('('); wk(JS_WK_DOUBLE); wt(')'); wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("int32");
+        wt(':'); wt_id("JS_WhaleObjValueNum"); wt('('); wt_id("ctx"); wt(','); wt_arr("fp", fc); wt(','); wt_id("deopt"); wt(')');
+        wt(';'); wt('}'); wk(JS_WK_ELSE); wt('{');
+        wk(JS_WK_IF); wt('(');
+        wt_id("JS_WhaleObjShape"); wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(')');
+        wt_op(JS_OP_EQ); wt_arr("fs", fc2); wt(')'); wt('{');
+        wt_arr("v", nm); wt('=');
+        wt('('); wt_arr("fp", fc2); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(8); wt(')');
+        wt('?'); wt_arr("fp", fc2); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64");
+        wt(':'); wt('('); wt_arr("fp", fc2); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(0); wt(')');
+        wt('?'); wt('('); wk(JS_WK_DOUBLE); wt(')'); wt_arr("fp", fc2); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("int32");
+        wt(':'); wt_id("JS_WhaleObjValueNum"); wt('('); wt_id("ctx"); wt(','); wt_arr("fp", fc2); wt(','); wt_id("deopt"); wt(')');
+        wt(';'); wt('}'); wk(JS_WK_ELSE); wt('{');
+        wt_arr("fp", fc2); wt('='); wt_id("JS_WhaleObjFieldPtr"); wt('(');
+        wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_int(atom); wt(','); wt('&'); wt_arr("fs", fc2); wt(')'); wt(';');
+        wk(JS_WK_IF); wt('('); wt('!'); wt_arr("fp", fc2); wt(')'); wt('{');
+        wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+        /* first fill parks in pair A too (it is still empty): afterwards A
+           holds the first-seen shape and B the runner-up. */
+        wk(JS_WK_IF); wt('('); wt_arr("fs", fc); wt_op(JS_OP_EQ); wt_int(0); wt(')'); wt('{');
+        wt_arr("fp", fc); wt('='); wt_arr("fp", fc2); wt(';');
+        wt_arr("fs", fc); wt('='); wt_arr("fs", fc2); wt(';');
+        wt('}');
+        wt_arr("v", nm); wt('=');
+        wt('('); wt_arr("fp", fc2); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(8); wt(')');
+        wt('?'); wt_arr("fp", fc2); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("float64");
+        wt(':'); wt('('); wt_arr("fp", fc2); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_EQ); wt_int(0); wt(')');
+        wt('?'); wt('('); wk(JS_WK_DOUBLE); wt(')'); wt_arr("fp", fc2); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("int32");
+        wt(':'); wt_id("JS_WhaleObjValueNum"); wt('('); wt_id("ctx"); wt(','); wt_arr("fp", fc2); wt(','); wt_id("deopt"); wt(')');
+        wt(';'); wt('}'); wt('}');
         fold_commit(fm);
         return;
     }
@@ -2554,7 +2610,8 @@ static int whale_field_stable(int ta, int shape_proved)
    loading anything, so a store can follow. Emits a deopt when the value it
    would overwrite is not a number: overwriting a reference without freeing it
    would leak. */
-static void fold_obj_field_resolve(int os, int atom, int fc, int stable)
+static void fold_obj_field_resolve(int os, int atom, int fc, int fc2,
+                                     int stable)
 {
     int fm = fold_mark();
 
@@ -2563,8 +2620,9 @@ static void fold_obj_field_resolve(int os, int atom, int fc, int stable)
        `fp->u.float64 = <value>` runs unconditionally (the tag is already 8
        and stays 8: only numbers are stored on this path). The first trip runs
        the full resolve plus the numeric-tag admission (8 or 0, else deopt -
-       overwriting a reference without freeing it would leak). */
-    if (stable) {
+       overwriting a reference without freeing it would leak). Single-shape
+       only (see the load above): a poly-2 site falls through to its branch. */
+    if (stable && fc2 < 0) {
         wk(JS_WK_IF); wt('('); wt_arr("fv", fc); wt_op(JS_OP_NE);
         wt_id("_wsc"); wt('.'); wt_id("fver"); wt('+'); wt_int(1); wt(')'); wt('{');
         wt_arr("fp", fc); wt('='); wt_id("JS_WhaleObjFieldPtr"); wt('(');
@@ -2576,6 +2634,38 @@ static void fold_obj_field_resolve(int os, int atom, int fc, int stable)
         wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}'); wt('}');
         wt_arr("fv", fc); wt('='); wt_id("_wsc"); wt('.'); wt_id("fver"); wt('+'); wt_int(1); wt(';');
         wt('}');
+        fold_commit(fm);
+        return;
+    }
+    /* Poly-2 store-side twin of the load above: pick the resolved pointer by
+       shape, resolving into the second pair on a double miss. The call site's
+       value store follows unconditionally in all three arms (it names fp[fc]
+       after we normalise the choice into it). */
+    if (fc2 >= 0 && whale_prof_two_shapes(whale_prof_two_off)) {
+        wk(JS_WK_IF); wt('(');
+        wt_id("JS_WhaleObjShape"); wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(')');
+        wt_op(JS_OP_NE); wt_arr("fs", fc); wt(')'); wt('{');
+        wk(JS_WK_IF); wt('(');
+        wt_id("JS_WhaleObjShape"); wt('('); wt_id("ctx"); wt(','); wt_int(os); wt(')');
+        wt_op(JS_OP_EQ); wt_arr("fs", fc2); wt(')'); wt('{');
+        wt_arr("fp", fc); wt('='); wt_arr("fp", fc2); wt(';');
+        wt('}'); wk(JS_WK_ELSE); wt('{');
+        wt_arr("fp", fc2); wt('='); wt_id("JS_WhaleObjFieldPtr"); wt('(');
+        wt_id("ctx"); wt(','); wt_int(os); wt(','); wt_int(atom); wt(','); wt('&'); wt_arr("fs", fc2); wt(')'); wt(';');
+        wk(JS_WK_IF); wt('('); wt('!'); wt_arr("fp", fc2); wt(')'); wt('{');
+        wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+        wk(JS_WK_IF); wt('('); wt_arr("fp", fc2); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_NE); wt_int(8); wt(')');
+        wt('{'); wk(JS_WK_IF); wt('('); wt_arr("fp", fc2); wt_op(JS_OP_ARROW); wt_id("tag"); wt_op(JS_OP_NE); wt_int(0); wt(')');
+        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}'); wt('}');
+        /* first fill parks in pair A too (it is still empty): afterwards A
+           holds the first-seen shape and B the runner-up. */
+        wk(JS_WK_IF); wt('('); wt_arr("fs", fc); wt_op(JS_OP_EQ); wt_int(0); wt(')'); wt('{');
+        wt_arr("fp", fc); wt('='); wt_arr("fp", fc2); wt(';');
+        wt_arr("fs", fc); wt('='); wt_arr("fs", fc2); wt(';');
+        wt('}'); wk(JS_WK_ELSE); wt('{');
+        wt_arr("fp", fc); wt('='); wt_arr("fp", fc2); wt(';');
+        wt('}');
+        wt('}'); wt('}');
         fold_commit(fm);
         return;
     }
@@ -3782,7 +3872,7 @@ static int whale_inline_body(const JSWhaleFuncInfo *callee, uint8_t *cur,
                 fc = whale_fields++;
                 nm = whale_vserial++;
                 /* not a literal we can prove stable: keep the shape check */
-                fold_obj_field_load(WHALE_SLOT(ta), atom, fc, nm, 0);
+                fold_obj_field_load(WHALE_SLOT(ta), atom, fc, -1, nm, 0);
                 whale_vname[sp - 1] = nm;
                 whale_vmat[sp - 1] = 1;
                 whale_vexpr[sp - 1].inv = 0;   /* a memory read */
@@ -4276,7 +4366,7 @@ static void whale_fuse_emit(int *sp, uint8_t *cur, int var_count,
        commits itself (fold_obj_field_resolve marks and commits internally),
        so no outer mark/commit here - wrapping one around it emitted the
        resolve twice per iteration. */
-    fold_obj_field_resolve(srcslot, updat, fc, 0);
+      fold_obj_field_resolve(srcslot, updat, fc, -1, 0);
     /* the update value must survive as a C variable: it is read inside the
        store statement, past the argument tokens' truncation point */
     fold_materialize(stk);
@@ -4426,6 +4516,22 @@ static int whale_prof_one_shape(unsigned off)
         return n == 1;
     }
 }
+
+/* Did the warm-up see exactly two shapes at this site (small polymorphic IC)?
+   Two - not three or four (those go mega: the single-pair full resolve) and
+   not zero/one (single-pair paths already cover those). Negative (given up)
+   is not two. */
+static int whale_prof_two_shapes(unsigned off)
+{
+    const void *sh[8];
+    int n;
+
+    if (off == 0 || whale_prof_now == NULL)
+        return 0;
+    n = JS_WhaleProfShapes(whale_prof_now, off, sh, 8);
+    return n == 2;
+}
+static unsigned whale_prof_two_off;
 
 /* Is this field access site safe to build a fixed layout on?
 
@@ -5990,10 +6096,29 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                        were unified and after. */
                     if (WHALE_IS_OBJLIKE(sv) && WHALE_IS_OBJLIKE(cv) &&
                         WHALE_SLOT(sv) == WHALE_SLOT(cv)) {
-                        if (WHALE_IS_STRUCT(sv) && !WHALE_IS_STRUCT(cv))
-                            snap[base + k] = cv;
-                        else if (!WHALE_IS_STRUCT(sv) && WHALE_IS_STRUCT(cv))
-                            snap[base + k] = sv;
+                        /* At a loop head the snapshot holds the entry edge and
+                           cur the back edge: the back edge's store is newer, so
+                           keep it (this is the setField shape above). Anywhere
+                           else (a branch join inside the body) both edges are
+                           new values in different representations - columns on
+                           one side, slot identity on the other - and neither
+                           reading is correct for the other edge: refuse. That
+                           shape (e.g. `o = o1` filling columns on one branch,
+                           `o = o2` copying the slot on the other) silently read
+                           the stale slot before. */
+                        if (loop_back[pos] >= 0) {
+                            if (WHALE_IS_STRUCT(sv) && !WHALE_IS_STRUCT(cv))
+                                snap[base + k] = cv;
+                            else if (!WHALE_IS_STRUCT(sv) && WHALE_IS_STRUCT(cv))
+                                snap[base + k] = sv;
+                        } else if ((WHALE_IS_STRUCT(sv) || WHALE_IS_STRUCT(cv)) &&
+                                   sv != cv) {
+                            if (whale_dbg_env("WHALE_MERGE_DBG"))
+                                fprintf(stderr, "[merge-obj-refuse] pos=%d slot=%d prev=%d now=%d\n",
+                                        pos, k, sv, cv);
+                            differ = 1;
+                            break;
+                        }
                         if (whale_dbg_env("WHALE_MERGE_DBG"))
                             fprintf(stderr, "[merge-obj] pos=%d slot=%d prev=%d now=%d -> %d\n",
                                     pos, k, sv, cv, snap[base + k]);
@@ -7179,6 +7304,17 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 {
                     int fc = whale_fields++;
                     int fm;
+                    /* Poly-2 second pair: only when the warm-up saw exactly two
+                       shapes here (each pair holds one resolved pointer). Costs
+                       one more pair off the 24-pair budget; -1 keeps the
+                       single-pair path. */
+                    int fc2 = -1;
+
+                    if (whale_prof_two_shapes((unsigned)(pos + 1)) &&
+                        whale_fields < WHALE_FIELD_CACHE) {
+                        fc2 = whale_fields++;
+                        whale_prof_two_off = (unsigned)(pos + 1);
+                    }
 
                     /* `stable` means "the shape cannot change for the rest of
                        this function", which was proved about a local literal.
@@ -7197,7 +7333,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                        reshape user objects, while gating on has_call would
                        close stability for exactly the object loops it helps -
                        every one of them lowers field access to helpers. */
-                    fold_obj_field_resolve(WHALE_SLOT(ta), atom, fc,
+                    fold_obj_field_resolve(WHALE_SLOT(ta), atom, fc, fc2,
                                            whale_field_stable(ta, whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1))));
                     fm = fold_mark();
                     if (whale_type_is_num(tb)) {
@@ -7277,7 +7413,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                            outside), so neither the check nor the flag write
                            is needed - but the note stays, so later reads in
                            this segment keep their no-branch form. */
-                        if (!whale_sp_known(col) && !whale_field_stable(ta, (unsigned)(pos + 1))) {
+                        if (!whale_sp_known(col) && !whale_field_stable(ta, whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1)))) {
                             wk(JS_WK_IF); wt('('); wt('!'); wt_arr("sp", col); wt(')'); wt('{');
                             wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
                             wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
@@ -7302,9 +7438,20 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 fc = whale_fields++;
                 nm = whale_vserial++;
                 /* VAL slots ride the same stability as OBJ (see the resolve
-                   site above: locals unify to VAL, so IS_OBJ alone is dead). */
-                fold_obj_field_load(WHALE_SLOT(ta), atom, fc, nm,
-                                    whale_field_stable(ta, whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1))));
+                   site above: locals unify to VAL, so IS_OBJ alone is dead).
+                   Poly-2 second pair when the site saw two shapes (each pair
+                   holds one resolved pointer); -1 keeps the single pair. */
+                {
+                    int fc2 = -1;
+
+                    if (whale_prof_two_shapes((unsigned)(pos + 1)) &&
+                        whale_fields < WHALE_FIELD_CACHE) {
+                        fc2 = whale_fields++;
+                        whale_prof_two_off = (unsigned)(pos + 1);
+                    }
+                    fold_obj_field_load(WHALE_SLOT(ta), atom, fc, fc2, nm,
+                                        whale_field_stable(ta, whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1))));
+                }
                 whale_vname[sp] = nm;
                 whale_vmat[sp] = 1;
                 cur[var_count + sp] = WHALE_T_NUM;
@@ -7393,7 +7540,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                        rule as the get_field2 arm above), or when the access is
                        field-stable (shape-proved presence on every trip; the
                        note stays so later reads keep their form). */
-                    if (!whale_sp_known(col) && !whale_field_stable(ta, (unsigned)(pos + 1))) {
+                    if (!whale_sp_known(col) && !whale_field_stable(ta, whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1)))) {
                         fm = fold_mark();
                         wk(JS_WK_IF); wt('('); wt('!'); wt_arr("sp", col); wt(')'); wt('{');
                         wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
@@ -7435,9 +7582,20 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 fc = whale_fields++;
                 nm = whale_vserial++;
                 /* VAL slots ride the same stability as OBJ (see the resolve
-                   site above: locals unify to VAL, so IS_OBJ alone is dead). */
-                fold_obj_field_load(WHALE_SLOT(ta), atom, fc, nm,
-                                    whale_field_stable(ta, whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1))));
+                   site above: locals unify to VAL, so IS_OBJ alone is dead).
+                   Poly-2 second pair when the site saw two shapes (each pair
+                   holds one resolved pointer); -1 keeps the single pair. */
+                {
+                    int fc2 = -1;
+
+                    if (whale_prof_two_shapes((unsigned)(pos + 1)) &&
+                        whale_fields < WHALE_FIELD_CACHE) {
+                        fc2 = whale_fields++;
+                        whale_prof_two_off = (unsigned)(pos + 1);
+                    }
+                    fold_obj_field_load(WHALE_SLOT(ta), atom, fc, fc2, nm,
+                                        whale_field_stable(ta, whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1))));
+                }
                 whale_vname[sp - 1] = nm;
                 whale_vmat[sp - 1] = 1;
                 whale_vexpr[sp - 1].inv = 0;   /* a memory read */

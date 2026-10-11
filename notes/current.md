@@ -3348,8 +3348,59 @@ SOLVED（单管线：helper 收敛，无新管线）/ 诚实记录未达预期�
   单独一轮（动 loop buffer，风险中高）。
 
 ## 状态
-绿，待提交。下一步：循环 peeling（objshape 稳态零分支）或 growsShape 的
-函数级→循环级 stable（循环外加字段杀整函数 stable，保守过头）。
+绿，已提交 50e77df。下一步见 <107>。
+
+# <107>: 分类 shape（8/2/3 一体）+ 小多态双槽 + merge 正确性修复
+SOLVED（单管线：helper + 两态/poly 分支，无新管线）/ 真 bug ×1（merge 错读）
+
+## 用户方向的取舍结论（8/2/3 一体，不冲突）
+- 查地基：JSShape 只有 transition 链（1205-1226），无 dictionary/fast-slow
+  之分；删除不建新 shape（原地 tombstone + 满 8 死一半才 compact）。
+  tombstone（tag=3 + 非零 payload）在三套 ABI 下全 GC/free 不可见、
+  `===undefined` 恒真——编码安全。
+- 取舍：**transition 链不动**（解释器+全用户，风险大收益小）；
+  **做 V8 式分类使用**：单态→两态/poly 双槽（JIT 消费 prof 的 top-4，
+  不动引擎）；乱加字段→ transition 自然发散（不同加序不同 shape，
+  本来就不共用——"自动不共用"零成本得到）；del 慢→我们的 tombstone
+  已解（delete 原地标记，shape 不动，JIT 的列/tombstone 双读各走各）。
+  和 3（transitioning store）不冲突：transition 边是引擎建的，
+  JIT 只消费不断言——过渡存储是"发射查旧切新"，多态是"发射比对多旧"，
+  同一套 fs/fp 槽。
+- 和 CStruct 不冲突：CStruct 是存储变换（对象消失），分类 shape 是
+  查找加速（对象还在）。函数内部分：能完全拆箱的走 CStruct（对象不
+  逃逸），不能的（逃逸/多态）走分类 shape——判据是现成的逃逸门，
+  不是新切换。
+
+## 落地的：小多态双槽 poly-2（load/resolve）
+- prof 已有 top-4（无计数，首见顺序≈热度）。恰 2 shape 的站发双槽：
+  `S==fsA ? fpA : S==fsB ? fpB : 全套（填B + 首填回填A）`。
+  第三 shape 全套 resolve（不 fence 宇宙，不可解才 deopt——和 deopt
+  想法同构：轻决策，不是重编译）。
+- 5 处调用点：fc2 分配（24 对预算内）+ `two_off` 全局传站（签名已长，
+  不再加参）+ 两态加 `fc2<0` 前提（**关键正确性**：两态的 fv 标记分不
+  清同 slot 两身份，站位多态必须走 poly——不加则静默错读）。
+
+## 真 bug ×1：merge-obj 臂错读（静默错答案，已修）
+- `o=o1`（fill 列，STRUCT）与 `o=o2`（copy 槽，VAL）在 join 相遇，
+  merge 选 VAL 丢列 → 奇 trip 全读旧对象（97.75M vs 55M 实证）。
+  根因：臂假设"STRUCT 列恒 stale"，两边都新时不成立。
+- 修法：loop head（entry 旧/backedge 新）才选新；体内 join 的 STRUCT/VAL
+  同 slot 分歧一律 differ 拒编（安全方向，setField 形在 head 不受影响）。
+- 附带修：三元 `?:` 存对象的 L18 缺分支是既有 bug（if/else 版正常），
+  与 poly 无关，不碰。
+
+## 测量
+- poly-2 验证：字面量交替形（fill 关）dump 确认双槽 + A 回填 + check 对；
+  开 fill 形因 merge 新规则拒编转解释器（对但慢——fill×poly 同 local 交替
+  仍是 open 问题，记下一步）。
+- 全量 25/25 check 全一致；objshape 167（repeat=3），bitops 128，无退化。
+- 本轮是机制落地（混合场景的对象版），benchmark 无 poly-2 形状故无大数；
+  真实业务（可选字段交替）吃到即赚。
+
+## 状态
+绿，待提交。下一步：循环 peeling（objshape 稳态零分支）/ fill×poly 同
+local 交替（merge 拒编转成功——要统一表示，不只是类型）；tag=3  value
+tombstone 进 CStruct 列（del 快路，与 8/2/3 设计一体）。
 
 
 
