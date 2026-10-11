@@ -413,3 +413,5 @@ Reverted to 38579bc; both findings are recorded rather than half-fixed.- `<56>` 
 <112>(SOLVED): **前缀兼容（一槽罩一族）**。JSShape 无 parent 指针，照单步扩展模板写多步前缀判定（同 proto + 字段数>= + 前缀 atom/flags 全等，compact 误判走通用版安全方向）。key 重定（单对象=shape 指针本身，多对象=xor|1，低位区分）。主版本进槽 0（否则后代无槽可命）。验证：后代 shape 零重编（三次编译→两次），check 全对。全量绿。下一步：冷淘汰长跑 + 多签名 L1 表。见 current.md <112>
 
 <113>(SOLVED): **key 补全 + 冷淘汰长跑**。key 洞：旧 key 无 arity/位置，`f(o)`/`f(o,x)`、`f(o,1)`/`f(1,o)` 同 shape 会撞槽。修：高 16 位编 argc + 位置，匹配改精确 + 前缀；`key_of` 抽 helper，pick 与首编登记同语言；on_call 传实时 key（backedge 传 0 占位）。长跑：5 shape 轮转 17 次入槽（3 槽罩不住，通用版兜底值全对，抖动期 40% 通用版速度——设计内行为，V8 mega 同理）。跨 arity 用例无碰撞。全量绿。下一步：多签名 L1 表。见 current.md <113>
+
+<114>(SOLVED + 诚实零收益): **loop 级 stable**。动因：growsShape 的 `o.r=0` 循环外加字段杀整函数 stable。per-head 表（单循环）：体内 put 全命中 define + 循环前 put 集 + 体内无 call → 该循环 stable；6 处 call site 全加。结果 growsShape 只拿 2ms（本来就被 prof 单态救了，同形态零收益），全量零收益但机制正确（首编无 prof 时生效）。保留。到 50ms 靠 writeOrder spill（线性 IR）。见 current.md <114>

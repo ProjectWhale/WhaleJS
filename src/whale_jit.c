@@ -1035,6 +1035,23 @@ typedef struct WhaleLoop {
 } WhaleLoop;
 
 static WhaleLoop whale_loops[WHALE_LOOP_MAX];
+/* Loop-level stability table (definition; a forward declaration also sits
+   next to whale_field_stable below - both are tentative, they merge). */
+static uint8_t *whale_loop_stable_tab;
+/* 1 when the current emit position sits inside a shape-stable loop body
+   (notes <114>). The table is filled once per compilation next to the
+   shape_stable computation; the pointer below publishes it to emit time
+   (NULL outside gen, cleared with the table at out:). */
+static int whale_loop_stable_here(void)
+{
+    if (whale_loop_stable_tab && whale_loop_depth > 0) {
+        int hd = whale_loops[whale_loop_depth - 1].head_pos;
+
+        if (hd >= 0)
+            return whale_loop_stable_tab[hd] ? 1 : 0;
+    }
+    return 0;
+}
 /* (whale_loop_depth lives above, next to whale_lmem: the load analyser
    needs it before this point in the file.) */
 /* Per loop head: which locals its body writes. Indexed [head * n + d], built
@@ -2944,6 +2961,14 @@ static void fold_obj_field_load(int os, int atom, int fc, int fc2, int nm,
    lowering cannot) and no fresh object or store into an object local in a
    loop. STRUCT columns ride the same proof (columns derive from the shape).
    Field-value stores (put_field) never touch the identity. */
+/* Loop-level stability table, filled once per compilation next to the
+   shape_stable computation and read at emit time (helper above). NULL
+   outside gen; cleared with the table at out:. */
+static uint8_t *whale_loop_stable_tab;
+/* 1 when the current emit position sits inside a shape-stable loop body.
+   Lets a loop go stable even when a pre-loop store kills the function
+   level (e.g. `o.r = 0` before the loop: the shape grows once, early). */
+static int whale_loop_stable_here(void);
 static int whale_field_stable(int ta, int shape_proved)
 {
     if (!shape_proved)
@@ -5239,6 +5264,14 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     int whale_put_atoms[WHALE_ATOM_MAX];
     int whale_def_atoms_n = 0;
     int whale_put_atoms_n = 0;
+    /* Loop-level stability (notes <114>): per-head flag, 1 when the loop body
+       itself adds no property (every in-body put hits the define set plus
+       pre-loop puts) and holds no call. Lets a loop go stable even when a
+       pre-loop store (e.g. `o.r = 0` before the loop) kills the function
+       level. Indexed by head like loop_back[]; allocated/freed with it. */
+    uint8_t *whale_loop_stable = NULL;
+    int whale_loop_predef[WHALE_ATOM_MAX];
+    int whale_loop_predef_n = 0;
     int whale_call_pos[WHALE_CALL_MAX];
     int whale_call_n = 0;
     /* The innermost enclosing `catch` targets, innermost last. The bytecode already
@@ -5598,6 +5631,73 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 whale_shape_stable = 0;
         }
     }
+    /* Loop-level stability table: for each head, 1 when the body is stable
+       even if the function is not. The body must hold no call and add no
+       property: every put inside hits the define set plus puts that ran
+       before the head (a pre-loop store grows the shape once, early - the
+       loop itself then sees a fixed shape). Only single-loop functions take
+       it (multi-loop sharing of the predef set is not worth the bookkeeping;
+       they keep the function level). */
+    whale_loop_stable = calloc(len + 1, 1);
+    if (whale_loop_stable && info->loop_count == 1) {
+        int h;
+
+        for (h = 0; h <= len; h++) {
+            int back, q, qsz, ok;
+
+            if (loop_back[h] < 0)
+                continue;
+            back = loop_back[h];
+            /* pre-loop puts: put_field atoms before the head. */
+            whale_loop_predef_n = 0;
+            for (q = 0; q < h; ) {
+                int qo = (int)pc[q];
+
+                qsz = whale_op_size_of(qo);
+                if (qsz <= 0 || q + qsz > h)
+                    break;
+                if (qo == OP_put_field && qsz >= 5) {
+                    int atom = (int)whale_get_u32(pc + q + 1);
+
+                    if (whale_loop_predef_n < WHALE_ATOM_MAX)
+                        whale_loop_predef[whale_loop_predef_n++] = atom;
+                }
+                q += qsz;
+            }
+            ok = 1;
+            for (q = h; q <= back && ok; ) {
+                int qo = (int)pc[q];
+
+                qsz = whale_op_size_of(qo);
+                if (qsz <= 0 || q + qsz > len)
+                    break;
+                if (qo == OP_put_field && qsz >= 5) {
+                    int atom = (int)whale_get_u32(pc + q + 1);
+                    int j, found = 0;
+
+                    for (j = 0; j < whale_def_atoms_n && !found; j++)
+                        if (whale_def_atoms[j] == atom)
+                            found = 1;
+                    for (j = 0; j < whale_loop_predef_n && !found; j++)
+                        if (whale_loop_predef[j] == atom)
+                            found = 1;
+                    if (!found)
+                        ok = 0;
+                }
+                q += qsz;
+            }
+            if (ok) {
+                int k, incall = 0;
+
+                for (k = 0; k < whale_call_n; k++)
+                    if (whale_call_pos[k] >= h && whale_call_pos[k] <= back)
+                        incall = 1;
+                if (!incall)
+                    whale_loop_stable[h] = 1;
+            }
+        }
+    }
+    whale_loop_stable_tab = whale_loop_stable;
 
     /* pass 2: emit tokens. Nothing here builds text - the generator pushes
        tokens into TinyCC's parser directly, so there is no lexer and no
@@ -7826,7 +7926,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                             fold_obj_field_resolve(WHALE_SLOT(ta), atom, fc, fc2, 1);
                         else
                             fold_obj_field_resolve(WHALE_SLOT(ta), atom, fc, fc2,
-                                                   whale_field_stable(ta, whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1))));
+                                                   whale_field_stable(ta, whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1)) || whale_loop_stable_here()));
                     }
                     fm = fold_mark();
                     if (whale_type_is_num(tb)) {
@@ -7959,7 +8059,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         whale_prof_two_off = (unsigned)(pos + 1);
                     }
                     fold_obj_field_load(WHALE_SLOT(ta), atom, fc, fc2, nm,
-                                        whale_field_stable(ta, whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1))));
+                                        whale_field_stable(ta, whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1)) || whale_loop_stable_here()));
                 }
                 whale_vname[sp] = nm;
                 whale_vmat[sp] = 1;
@@ -8103,7 +8203,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         whale_prof_two_off = (unsigned)(pos + 1);
                     }
                     fold_obj_field_load(WHALE_SLOT(ta), atom, fc, fc2, nm,
-                                        whale_field_stable(ta, whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1))));
+                                        whale_field_stable(ta, whale_shape_stable || whale_prof_one_shape((unsigned)(pos + 1)) || whale_loop_stable_here()));
                 }
                 whale_vname[sp - 1] = nm;
                 whale_vmat[sp - 1] = 1;
@@ -10183,6 +10283,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     if (whale_loop_reuse)
         free(whale_loop_reuse);
     whale_loop_reuse = NULL;
+    if (whale_loop_stable)
+        free(whale_loop_stable);
+    whale_loop_stable = NULL;
+    whale_loop_stable_tab = NULL;
     if (assign_cnt)
         free(assign_cnt);
     if (whale_vexpr)

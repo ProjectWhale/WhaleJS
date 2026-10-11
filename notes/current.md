@@ -3599,8 +3599,36 @@ SOLVED（key 共享 helper + on_call 传参）/ 长跑行为记录
 - 全量 25/25 check 全一致；objshape 73、nested 21（repeat=3）。
 
 ## 状态
-绿，待提交。下一步：多签名 L1 表（per-签名独立版本表——一个函数多组
-参数形状各走各的表，本轮是同表内 key 区分）。
+绿，已提交 f7ae72d。下一步见 <114>。
+
+# <114>: loop 级 stable（循环外加字段不再杀整函数）
+SOLVED（单循环函数，predef 集，6 处 call site 收敛）/ 诚实记录零全量收益
+
+## 动因（分相现状）
+- objshape 全量已超 node（总量 78 vs 86）：twoShapes 超 2x、escaped 超、
+  growsShape 持平、writeOrder 2.9x（纯 spill，线性 IR 的活）。
+- 50ms 差 28ms：writeOrder 13ms + 通用 margin。loop-stable 瞄准 growsShape
+  （`o.r=0` 循环外加字段杀整函数 stable）。
+
+## 落地
+- per-head 表（单循环函数才算，多循环免 bookkeeping）：体内 put 全命中
+  define 集 + 循环前 put 集（pre-loop store 早长一次，循环内 shape 固定）
+  + 体内无 call → 该循环 stable。
+- 6 处 `field_stable` call site 全换 `|| loop_stable_here()`（depth/head 查表）。
+- 表挂接：calloc/fill/publish/free+NULL 全套（free 漏了会野指针，review 点）。
+
+## 诚实记录
+- growsShape 22→20ms（只拿 2ms）：它本来就被 prof 单态救了（两态早就在），
+  loop 表只是把"prof 路"换成"表路"，同形态零收益。
+- 全量零收益（repeat=3 确认关键项），但机制正确（首编无 prof 时生效，
+  冷启动形状）。保留。
+- 括号事故一次（replace_all 多个括号，构建即抓，无后果）。
+
+## 测量
+- 全量 25/25 check 全一致；objshape 75、sieve 64（repeat=3）。
+
+## 状态
+绿，待提交。下一步：多签名 L1 表，或 writeOrder/线性 IR（spill 主体）。
 
 
 
