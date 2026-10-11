@@ -3174,7 +3174,49 @@ SOLVED（两处都是"读 trace/dump 定案"，无猜测）
 ## 验证
 `whale api test: ok`；全量 + repeat3 check 全一致。
 ## 状态
-绿，待提交。下一步：I32 合并升级（bitops 长链→短式）；线性 IR（locals/loop_sum 的 TCC spill）。
+绿，已提交 fac7e9b。下一步见 <103>。
+
+# <103>: heat 豁免的 ident 退化 + 自引用门（还解锁了恒等折叠）
+SOLVED（分支型优化必须有门，<101> 策略的实例）/ 证伪×1（I32 合并升级）
+
+## 证伪：I32 合并升级做不了
+- 想法：循环头 NUM∩I32 合并时 giữ I32，让后续位运算走 `(int)` 短式。
+- 不 sound：子分支（如 `if` 内 `acc = acc - x`）可产任意 double，
+  升级后后续 `(int)` 短 cast 静默截断小数/越界 = **错答案**，不是慢。
+  降级（→NUM）是唯一安全方向。bitops 的 `(int)(long long)` 链是
+  double 域统一表示的固定税，消它要 int/double 双轨栈值 = tier2 活。
+- 变体实验定量（node 先行，排除负载噪声后 repeat=3）：
+  去 idiv（`%7`→`&7`）node 15→12ms，去分支 15→14ms；
+  whalejs 三变体 144~164ms 纹丝不动。
+  结论：idiv/分支共 ~4ms，剩余 ~130ms 全是转换链 + TCC 语句级 spill。
+  bitops 到 tier1 天花板（qjs 530 的 3.7x；node 15 的 9.5x 差距是表示税）。
+
+## 退化：<102> 的 heat 豁免把 ident 从 86 干到 120ms+
+- 全量 repeat=1 抓到：ident 118ms（bench_90 基线 86ms）。
+- 因果对照：豁免阈值临时改 1000000（=关掉）→ ident 53ms。确认是豁免引入。
+- 机制：`L0 = L0` 自存（parser 已把 `s*1` 折成 plain copy）deferred 后，
+  后续读 inline `(L0)` 而非变量。TCC 黑盒行为，不深究（语句数一样，
+  慢 40%，pin/分配层面的差异）。
+
+## 修法：自引用门（local_self_ref）
+- 豁免只给**不含 `L<d>` 的短 pending**（`_wv[n]` 拷贝）；
+  pending 含自身变量的一律即时物化（= <102> 前行为）。
+- 实现：`gw_tok` 同 TU 直接扫 `[off, off+len)` 找 `"L<d>"` ident id
+ （`JS_WhaleTokIdent` 有 2251 行先例；`gw_tok` 直读，无新 accessor）。
+- 意外收获：`L0=L0` 即时物化后 `live=0`，peephole-1 的 `load_analyze`
+  不再因 live 拒绝（844 行），`/1` 与 `-0` 的代数恒等折叠生效：
+  ident 循环体 6 语句→4 语句（`L0=L0` + `_wv0` + `L0=(_wv0)` + 计数），
+  ident 86→**54ms**（node 8ms；之前从未进过 60ms 内）。
+- bitops 保持 144ms，dump 确认 `_wv` 主链与单存储不变。
+
+## 验证
+`whale api test: ok`；全量 25/25（qjs vs whalejs，check 全一致，无 mismatch）；
+ident 54×3、bitops 144。node 列缺（`node1.exe` 改名，perftest 认 `node`；
+qjs 列即解释器基线，结论不受影响）。
+## 状态
+绿，待提交。下一步：tier1 纯数值已见顶（arith/floatlit/minmax 持平或超，
+bitops/ident 到表示税墙）；tier2（双轨栈值/线性 IR）或混合场景（mixed/
+nested/objshape 的对象段）。
 
 
 

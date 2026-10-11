@@ -2887,6 +2887,25 @@ static void local_forget(int d)
     whale_lmem[d].used = 0;
 }
 
+/* Whether the pending expression of local d names the variable L<d> itself.
+   A self-copy (`L0 = (L0)`, a parser-folded `s * 1`) must not stay deferred:
+   every later read then inlines `(L0)` instead of loading the variable, and
+   measured on ident that is pure loss (86 -> 120ms+). A `_wv[n]` copy names
+   no local, so the short-expression exemption below still applies to it. */
+static int local_self_ref(int d)
+{
+    char lb[32];
+    int lid, i;
+    WhaleLocal *m = &whale_lmem[d];
+
+    snprintf(lb, sizeof(lb), "L%d", d);
+    lid = JS_WhaleTokIdent(lb);
+    for (i = 0; i < m->expr.len; i++)
+        if (gw_tok[m->expr.off + i] == lid)
+            return 1;
+    return 0;
+}
+
 /* Record the expression just built in the workspace as the pending value of
    local d. Falls back to storing it when it grew too long to duplicate.
 
@@ -2912,15 +2931,19 @@ static void local_set(int d, int mark, int inv)
        at the write point - a statement boundary, where materialising is safe -
        turns the later reads into variable loads. 3 means at least three reads,
        or a read plus a write: below that the deferred form is shorter.
-       Short expressions are exempt: a pending `_wsv[n]` copy is 4 tokens, and
-       materialising it only adds a pure-copy store (`L0 = (_wsv[0])`) per
+       Short expressions are exempt: a pending `_wv[n]` copy is 4 tokens, and
+       materialising it only adds a pure-copy store (`L0 = (_wv[0])`) per
        statement - the reads that follow load the same value either way. The
        bitops accumulator chain was three such stores per trip. 8 keeps the
        per-read copy at most one short statement; anything longer still
-       materialises, and the length ceiling above remains the backstop. */
+       materialises, and the length ceiling above remains the backstop.
+       Self-copies are NOT exempt: `L0 = (L0)` deferred makes every later
+       read inline `(L0)` instead of loading the variable, and measured on
+       ident that loses 86 -> 120ms+. local_self_ref() above tells the two
+       apart (a `_wv[n]` copy names no local). */
     if (m->expr.len > whale_expr_max ||
-        (m->expr.len > 8 && whale_loop_depth > 0 && d >= 0 &&
-         d < WHALE_JIT_MAX_SLOTS && whale_loop_heat[d] >= 3))
+        (m->expr.len > 8 && !local_self_ref(d) && whale_loop_depth > 0 &&
+         d >= 0 && d < WHALE_JIT_MAX_SLOTS && whale_loop_heat[d] >= 3))
         local_materialize(d);
 }
 
