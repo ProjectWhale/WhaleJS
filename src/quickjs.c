@@ -949,6 +949,18 @@ typedef struct JSFunctionBytecode {
     void *whale_jit_tcc;       /* owning TCCState (keeps the code alive) */
 void *whale_jit_entry2;    /* the other reading of a closure-slot call target */
 int whale_deopt_count;     /* refusals seen before the entry was retired */
+    /* Re-JIT tiers (see notes <99>): tier 1 is the ~1ms single-pass compile
+       that runs by default; tier 2 is the expensive recompile (whole-function
+       buffering, register allocation, vectorisation) gated off until a
+       function proves itself hot twice. tier==0 uncompiled, 1/2 = which
+       entry is live. tier1's entry/handle are parked aside while tier 2 is
+       live so a tier-2 failure steps back down instead of falling off a
+       cliff. Zero-initialised with the rest. */
+    uint8_t whale_tier;
+    uint8_t whale_jit_tried2;   /* tier-2 compile already attempted */
+    uint32_t whale_tier2_count; /* calls since tier 1 went live */
+    void *whale_jit_entry_tier1;
+    void *whale_jit_tcc_tier1;
     /* Memoisation: this function was JIT-compiled and never reads a global, so
        its result depends only on its numeric arguments - repeated calls with
        the same ones can reuse it. `whale_memo` is a small bounded table (see
@@ -3956,6 +3968,12 @@ static int whale_fast_call(JSContext *ctx, JSValue func, int argc,
            the frame from the top in the interpreter. */
         if ((whale_deopt == 1 || whale_deopt == 3) && ++b->whale_deopt_count < 8) {
             b->whale_jit_entry2 = NULL;
+        } else if (b->whale_tier == 2 && b->whale_jit_entry_tier1) {
+            b->whale_jit_entry = b->whale_jit_entry_tier1;
+            b->whale_jit_tcc = b->whale_jit_tcc_tier1;
+            b->whale_jit_entry_tier1 = NULL;
+            b->whale_jit_tcc_tier1 = NULL;
+            b->whale_tier = 1;
         } else {
             b->whale_jit_entry = NULL;
             b->whale_jit_tried = 1;
@@ -4726,6 +4744,18 @@ static int whale_hot_threshold(JSFunctionBytecode *b)
     return WHALE_JIT_HOT_THRESHOLD;
 }
 
+/* Tier-2 (re-JIT) gate. Tier 2 is the expensive recompile - whole-function
+   buffering, register allocation, vectorisation - so it must not fire on the
+   same evidence as tier 1. The multiplier is deliberately conservative and in
+   one place: enabling policy (executed/compile-cost ratio, per-function
+   opt-in) plugs in here later without touching the call sites. Zero disables
+   the tier entirely (the default until tier-2 content lands). */
+static int whale_tier2_enable = 0;
+static int whale_tier2_threshold(JSFunctionBytecode *b)
+{
+    return 10 * whale_hot_threshold(b);
+}
+
 static void whale_prof_maybe_arm(JSContext *ctx, JSFunctionBytecode *b)
 {
     if (b->whale_prof_on || b->whale_jit_tried)
@@ -4827,6 +4857,20 @@ extern int whale_gen_objs;
 extern int whale_gen_self_ref;
 extern int whale_assume_self;
 
+/* Tier-2 recompile attempt. Same compile function as tier 1 (hotter content
+   plugs in later behind its own flag); only the bookkeeping differs: tier 1
+   is parked, never dropped, so any failure steps back down to it. Returns 1
+   when fresh tier-2 code is live (the caller falls through to the
+   interpreter once, for the same frame-size reason as tier 1), 0 when tier 1
+   stays. Until tier-2 content lands this always bails - the chain (trigger,
+   swap, step-back) is what this commit verifies. */
+static int whale_rejit_tier2(JSContext *ctx, JSFunctionBytecode *b)
+{
+    (void)ctx;
+    (void)b;
+    return 0;
+}
+
 static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
 {
     JSWhaleContext *w = &ctx->whale;
@@ -4844,8 +4888,18 @@ static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
     whale_prof_maybe_arm(ctx, b);
     if (b->whale_call_count < whale_hot_threshold(b))
         return 0;
-    if (b->whale_jit_entry || b->whale_jit_tried)
+    if (b->whale_jit_entry || b->whale_jit_tried) {
+        /* Tier 1 is live (or failed): count toward the tier-2 recompile.
+           The tier-2 attempt reuses the whole path below with a hotter flag;
+           until its content lands the compile bails and this is a counter. */
+        if (b->whale_tier == 1 && !b->whale_jit_tried2) {
+            b->whale_tier2_count++;
+            if (whale_tier2_enable &&
+                b->whale_tier2_count >= (uint32_t)whale_tier2_threshold(b))
+                return whale_rejit_tier2(ctx, b);
+        }
         return 0;
+    }
     b->whale_jit_tried = 1;
     b->whale_prof_on = 0;
     if (whale_dbg_env("WHALE_PROF_DBG"))
@@ -4934,6 +4988,7 @@ static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b)
                 JS_WhaleNoteJitResult(ctx, 0, 0);
                 return 0;   /* neither reading compiled: stay interpreted */
             }
+            b->whale_tier = 1;   /* tier-2 counting starts from here */
             b->whale_needs_obj = objs1 > 0;
             JS_WhaleNoteJitResult(ctx, 1, 0);
             /* Memoise on the self reading only - that is the one the generator
@@ -21208,6 +21263,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                the give-up behaviour. */
             if ((whale_deopt == 1 || whale_deopt == 3) && ++b->whale_deopt_count < 8) {
                 b->whale_jit_entry2 = NULL;
+            } else if (b->whale_tier == 2 && b->whale_jit_entry_tier1) {
+                /* Tier 2 stepped out: back down to the tier-1 floor instead of
+                   off the cliff. The tier-1 entry/handle were parked, never
+                   dropped, so this is a pointer swap - no recompile, no new
+                   failure mode. Tier-2 stays tried so it is not attempted
+                   again; tier 1 keeps its own deopt count from here. */
+                b->whale_jit_entry = b->whale_jit_entry_tier1;
+                b->whale_jit_tcc = b->whale_jit_tcc_tier1;
+                b->whale_jit_entry_tier1 = NULL;
+                b->whale_jit_tcc_tier1 = NULL;
+                b->whale_tier = 1;
+                if (whale_dbg_env("WHALE_JIT_DUMP"))
+                    fprintf(stderr, "whale jit: tier 2 stepped back to tier 1\n");
             } else {
                 b->whale_jit_entry = NULL;   /* give up and interpret this one */
                 b->whale_jit_tried = 1;

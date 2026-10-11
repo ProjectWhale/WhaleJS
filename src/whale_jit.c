@@ -2281,6 +2281,11 @@ static int whale_loop_unroll(WhaleLoop *l, int trip, int g, int exitp)
     if (back_start < 0)
         return 0;
     body_end = back_start;
+    /* Compile-time guard: trip is capped at 8, but a huge body times 8 is a
+       huge function (compile time + icache). Cap the single body; anything
+       bigger stays a loop. 2048 tokens is ~10x minmax's inner body. */
+    if (body_end - body_start > 2048)
+        return 0;
     {
         int k, j;
 
@@ -2434,6 +2439,11 @@ static int whale_loop_memset_emit(WhaleLoop *l, const WhaleMemsetLoop *ms)
         if (trips < 1 || trips > 2147483647.0)
             return 0;
     }
+    /* Compile-time guard: memset length is bounded by the array, but refuse
+       absurd trips outright (a hostile literal bound must not hang the
+       compiler in the length arithmetic). */
+    if (!ms->k_is_arg && ms->k > 1073741824.0)
+        return 0;
     head = l->head_pos;
     if (head < 0)
         return 0;

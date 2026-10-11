@@ -57,6 +57,11 @@ local engine_sources = {
     SRC .. "/quickjs.c", SRC .. "/whale_jit.c", SRC .. "/dtoa.c", SRC .. "/libregexp.c",
     SRC .. "/libunicode.c", SRC .. "/quickjs-libc.c",
 }
+-- x86-64 直发机器码后端（route B）：只在 x86_64 编译，与 TCC 后端共存
+-- （wrapper 仍走 TCC，只有 numeric core 走这里）。
+if is_arch("x86_64") then
+    table.insert(engine_sources, SRC .. "/whale_emit_x64.c")
+end
 
 -- Windows/MinGW 链接参数对齐 quickjs-ng 的 cmake MINGW 分支
 local function link_whale()

@@ -65,6 +65,17 @@ typedef struct JSWhaleContext {
 #define WHALE_PROFILE_SHAPES 4
 #endif
 
+/* WhaleJS 自己的版本（MAJOR.MINOR.PATCH），与 QuickJS-ng 的版本解耦：
+   上游升级时只合并它的代码和它的 QJS_VERSION_*，绝不跟着它改这里。
+   MAJOR = 对外接口 / JIT ABI 不兼容；MINOR = 新优化 / 新 opcode 覆盖；
+   PATCH = 纯修 bug。见 CHANGELOG.md。 */
+#define WHALE_VERSION_MAJOR 0
+#define WHALE_VERSION_MINOR 1
+#define WHALE_VERSION_PATCH 0
+
+/* WhaleJS 版本字符串（"0.1.0" 形），由上面的三元组合成。 */
+JS_EXTERN const char *JS_WhaleGetVersion(void);
+
 /* 公开 API */
 JS_EXTERN void      JS_WhaleSetJitMode(JSContext *ctx, JSJitMode mode);
 JS_EXTERN JSJitMode JS_WhaleGetJitMode(JSContext *ctx);

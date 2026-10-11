@@ -117,11 +117,27 @@ static void check_ir_direct(void)
     }
 }
 
+/* ---- x86-64 direct emitter probe (route B skeleton): raw addsd bytes. */
+extern void *JS_WhaleX64ProbeAdd2(void);
+
+static void check_x64_probe(void)
+{
+    double (*add2)(double, double) = (double (*)(double, double))JS_WhaleX64ProbeAdd2();
+
+    printf("  [x64] direct emit: %s\n", add2 ? "committed" : "NULL");
+    if (add2) {
+        double r = add2(2.5, 4.0);
+        printf("        result = %.2f (expected 6.50)\n", r);
+        CHECK(r == 6.5);
+    }
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
     check_ir_direct();
+    check_x64_probe();
 
     JSRuntime *rt = JS_NewRuntime();
     JSContext *ctx = rt ? JS_NewContext(rt) : NULL;

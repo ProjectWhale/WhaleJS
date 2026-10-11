@@ -3010,7 +3010,51 @@ SOLVED（sieve 111→77ms，累计 144→77ms，node 42ms 到 1.8x）
 ## 验证
 `whale api test: ok`；25/25 全对 0 mismatch；sieve repeat=3 77ms。
 ## 状态
-绿，待提交。下一步：`_ws` 拆分（fib per-call 税）/ 线性 IR（bitops 等）。
+绿，已提交 bc4fb15。下一步见 <99>。
+
+# <99>: IR 不要了 + re-JIT 两级骨架（tier1 常驻底线，tier2 空壳待填）
+SOLVED（骨架零变化验证）/ TIPS（IR 证伪 + V8 三级映射 + 侵入红线）
+
+## IR 证伪（用户方向，记录结论）
+- 已落地的优化没有一个需要完整 IR（融合=单步前瞻、折叠=2-3 条窗口、
+  LICM=输出指针切换、unroll/memset=字节码表+已有 buffer、heat=计数器）。
+  需要前瞻的两处（跳转合并 snap、循环改写 loop buffer）早就是按需缓存。
+- 结论：**永远不建全函数 IR**；要前瞻用字节码级摘要表 + 已有 buffer；
+  TCC 侧保持单遍流式。token→IR 翻译器已删（`whale_emit_x64.c` 降格为
+  发码小件库，只留探针 + 字节缓冲/commit；测试回退只验探针）。
+- 映射 V8：解释器=Sparkplug 位，TCC 单趟 + 生成器优化=Maglev 位
+  （Maglev 开销，TurboFan 效果：minmax 追平、fib 反超 11 倍），直发/x64
+  = TurboFan 位（只给热点，复用 token 流）。
+- 编译开销红线：unroll 体上限（2048）+ token 总量上限（已有 32768）+
+  memset 字面量界上限（1G）；超预算一律原样发射（bail 回正常路径）。
+  广告性编译（为编而编）永不进 tier1。
+
+## re-JIT 骨架（用户方向：TCC 可大改，分级有效，tier1 绝不白编）
+- 语义：tier1（~1ms 单遍）常驻底线（deopt<8 重武装，8 次退役，**不动**）；
+  tier2（整函数缓冲/分配/向量化，以后按"开销大又不通用"一条一条加）
+  只给跑得久的函数。tier2 失败 → 回 tier1（不断崖）；tier2 deopt →
+  换回 parked 的 tier1（不记 tier1 的账）。
+- 落点（全 quickjs.c，生成器零改，解释器 opcode switch 一行不碰）：
+  Bytecode 加 5 字段（tier/tried2/tier2_count/entry_tier1/tcc_tier1，
+  零初始化现成）；`whale_on_call` 加 tier2 触发分支（tier==1 +
+  tier2_count 过 `10×` 阈值 + 未试 → `whale_rejit_tier2`，现恒 bail）；
+  tier1 成功处置 `tier=1`；deopt 两处（CallInternal + fast_call）加
+  tier2 退级分支（换回 parked entry/tcc，tier=1）。
+- 门：`whale_tier2_enable = 0`（默认关，启用方式后面研究）+
+  `whale_tier2_threshold()` 单点（现 `10×` tier1 阈值）+ tier2 handle
+  生命周期（成功 park tier1 / 失败当场 release，零新增泄漏；单例 state
+  累积老账不恶化）。
+- 附带发现：`whale_jit_tcc` 从无释放（无 `tcc_delete`，<8> 老账至今），
+  记 <71> 技术债第 1 条，不在本轮还。
+- 验证：tier2 默认关 + 空壳恒 bail → fib 5/sieve 64/minmax 49/bitops 153
+  全基线零变化，API 绿（含 `[x64] direct emit` 探针），25/25 全绿。
+
+## 验证
+`whale api test: ok`；25/25 全对 0 mismatch（repeat=3 关键 case）。
+## 状态
+绿，待提交。下一步：tier2 内容第一条（L pin 复活 = ELS 最小侵入落地，
+修 <85> vstore/gv 不对称洞）或 `lea` 熔合进 `gen_opi`（单遍零缓存）。
+
 
 
 
