@@ -3702,6 +3702,47 @@ comma_end`）则续接 `,`，否则 close（补 `;` + 提交）。三天症状
   的"语句合并 ROI 放弃"结论一致：TCC 的 spill 是按求值深度不是按语句数，
   逗号融合的上限就是零。机制保留（正确且零成本），收益指望转后端。
 
+# <117>: 后端浮点堆扩容（xmm6/7 进池 + pin 2→4）
+SOLVED + 真 bug×2（return 落点 + reload 判据）+ 弯路×1（pin-only 旁路）
+
+## 方案
+- `reg_classes[22/23]` 加 `RC_FLOAT`（池 6→8 深）；`get_reg` 显式跳过
+  22/23（pin-only：只有 `whale_pin_alloc` 能拿，`JS_WhaleXmmSpill` 在声明
+  处即时存 `movq %xmmN, off(%rbp)`，两版 `gfunc_epilog` 在 `leave` 前取回；
+  无 claim 的函数零字节变化）。
+- pin 池 2→4（callee-saved 优先）；generator 侧 local pin 选 4（heat top-4，
+  插入排序）、`_wv` 带 `register` 4 个；注释同步。
+- callee-saved pin 跨调用存活：`JS_WhalePinInvalidate`、`save_reg_upstack`
+  驱逐、`get_reg` 回收三处全跳过 22/23（write-through 保证 slot 永远最新，
+  存活 sound）。
+
+## 真 bug×2
+1. return 落点：`gv()` 的 pin 快捷曾对一切请求直返 pin 寄存器，
+   `return (L0)` 经 `gv(RC_FRET=RC_XMM0)` 把值留在 xmm7 → 函数返回垃圾
+   （fibi 单元测试挂）。修：具体请求（return/显式 xmmN）一律走 move-out，
+   只有泛型 `RC_FLOAT` 才直认领。
+2. reload 判据：中间曾走"22/23 不打 tag、gv 认编号"路线，结果 `gv()` 尾部
+   通用检查 `!(reg_classes[r] & rc)` 对已认领的 pin 恒真 → 每 trip 一次
+   `xmm7→xmm0→xmm7` 空转（arith 62→95ms，反汇编定案）。修：打上 tag +
+   `get_reg` 跳过（分配保护），旁路删除。
+
+## 弯路
+- 曾以为"不进通用池更稳"，实测证明 tag 是 reload 判据的一部分，去掉 tag
+  就得多处打补丁还漏判据。教训：class 表是分配器与重载检查的共同语言，
+  动一处必须两处一起看（反汇编，不是注释）。
+- 调试工具坑：cmd 下 `set VAR=value && exe` 把行尾空格吃进值里
+  （`temp/obj_on /whale_1.bin`），`set "VAR=value"` 才对；WHALE_JIT_OBJ
+  的 release 门（`#ifdef WHALE_DEBUG`）曾让 dump 零输出，临时打开、验证
+  完即关（树上最终仍是 debug-only）。
+
+## 测量（repeat=3）
+- arith 62、locals 66（原 87）、floatlit 61（原 93）、mixed 130（原 166）、
+  loop_sum 44、nested 20、objshape 76、bitops 126、sieve 64。全量 25/25 绿，
+  单元测试绿。
+- 诚实记录：当前收益全来自"池深 4"（pin 住第 3/4 热局部）；xmm6/7 的
+  跨调用存活机制已就位但尚未被测量（pin 门要求循环内无调用，有调用的
+  循环根本不 pin）——那是下一步"放宽 pin 门"的地基，不是今天的数字。
+
 
 
 

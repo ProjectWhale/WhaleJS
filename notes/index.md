@@ -419,3 +419,5 @@ Reverted to 38579bc; both findings are recorded rather than half-fixed.- `<56>` 
 <115>(评估轮，零改动): **writeOrder 在 AST+缓存约束下无解，认账**。7 语句 0 调用全 local，4 级依赖链 + `%` 单求铁律 → 最少 6 条，变换最多省 2ms；换变量名零收益（TCC 一视同仁 spill）；出口活性省的是本就没有的装箱。到 50ms（总量 78→50）在"不要 IR"约束下到不了：缺口 28ms，可见总和 <10ms。当前 78（已超 node 86）即 AST+缓存天花板。再往下只有后端寄存器分配或 deopt 那套。全量绿。见 current.md <115>
 
 <116>(SOLVED + 诚实零收益): **逗号融合落地（sink-mark 证伪 → output-tail 重写）**。第一版（sink 相邻=续接）双提交：eager-commit 与 close-recommit 重叠，writeOrder 出 `_wsv[0]=(E) [0]=(E);`，整套作废。第二版语句永远完整提交，续接=弹尾 `;` 推 `,`（一次 commit 无重叠）；close 只清状态；fold_begin 复位；hoist 改搬运 + 仅 founded 可搬。bitops 5 存储融成一条，writeOrder 损坏消失。全量绿（repeat=3：bitops 128/objshape 75）。诚实：性能零变化——TCC 在大逗号表达式内部照样 spill，省的只是语句边界。机制保留，收益指望转后端。见 current.md <116>
+
+<117>(SOLVED): **后端浮点堆扩容（xmm6/7 进池 + pin 2→4）**。reg_classes 加 RC_FLOAT + get_reg 跳过（pin-only）+ 声明处即时存/epilog 取回 + 三处驱逐跳过（跨调用存活）。真 bug×2：return 经 pin 快捷留错寄存器（fibi 挂，改具体请求走 move-out）；pin-only 旁路线漏 reload 判据致每 trip 空转（arith 62→95，反汇编定案，改打 tag）。repeat=3：arith 62、locals 87→66、floatlit 93→61、mixed 166→130。全量绿。见 current.md <117>

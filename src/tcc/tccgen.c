@@ -978,15 +978,24 @@ static int whale_pin_n;
  * throw away. This is the TCC-side mechanism; the decision (which variables,
  * from liveness analysis) lives in the generator.
  *
- * Only the float pool is used. RC_FLOAT covers xmm0-xmm5, so pinning one of
- * them needs no change to reg_classes[]; the integer pool would (r8-r11 carry
- * no RC_INT, and gv() reloads anything whose class does not match).
+ * Only the float pool is used. RC_FLOAT covers xmm0-xmm7: xmm6/7 carry the
+ * tag so gv()'s reload check treats a value already sitting in one as
+ * satisfied (no pointless move-out/move-back per trip). They stay pin-only
+ * in practice - get_reg() skips them explicitly, so only whale_pin_alloc
+ * hands them out (with JS_WhaleXmmSpill recording the claim and the epilog
+ * restoring them); the integer pool would need reg_classes changes (r8-r11
+ * carry no RC_INT, and gv() reloads anything whose class does not match).
  *
- * Soundness across calls: every xmm is caller-saved, so a pinned value cannot
- * survive one. save_reg_upstack() (which runs before every call) spills the
- * register to its frame slot and CLEARS its bit in whale_pinned_regs - the bit
- * is the validity flag. gv()/vstore()/gen_op() only take the shortcut while it
- * is set; after a call the slot is authoritative until the next read reloads.
+ * Soundness across calls: caller-saved pins (xmm0-xmm5) cannot survive one.
+ * save_reg_upstack() (which runs before every call) spills the register to
+ * its frame slot and CLEARS its bit in whale_pinned_regs - the bit is the
+ * validity flag. gv()/vstore()/gen_op() only take the shortcut while it is
+ * set; after a call the slot is authoritative until the next read reloads.
+ * Callee-saved pins (xmm6/7) DO survive calls: JS_WhalePinInvalidate still
+ * clears their bits (uniform handling), so the next read reloads - one
+ * redundant load per call, not per trip. (Skipping the clear for them would
+ * save that load, but the spill path in save_reg_upstack also clears, so
+ * the two would disagree - measured, not worth the special case.)
  * ------------------------------------------------------------------------ */
 static int whale_pin_next;          /* set by the TOK_REGISTER case below */
 /* Non-zero while the JIT generator owns the pin map. gen_function then leaves
@@ -996,25 +1005,44 @@ static int whale_pin_scope;
 
 static unsigned whale_pinned_regs;  /* one bit per pinned register */
 
+/* x86_64-gen.c: record that this function must preserve a callee-saved xmm
+   (Windows ABI). Called when a pin claims xmm6/7. */
+void JS_WhaleXmmSave(int reg);
+/* x86_64-gen.c: emit the callee-saved spill for reg now (claim time). */
+void JS_WhaleXmmSpill(int reg);
+
 static int whale_pin_alloc(int t)
 {
     int r;
 
     if (!is_float(t))
         return -1;
-    /* At most 2 float registers, leaving 2 of the 6 free: TinyCC's expression
-       evaluation needs spare registers, and pinning more exhausted the pool -
-       get_reg returned -1 for a plain constant load and the generated loop
-       hung. (xmm0/xmm1 stay desirable for TCC too; 2 pins of the 4-deep
-       RC_FLOAT pool keep 2 free.) */
+    /* At most 4 float registers: the two callee-saved ones first (xmm6/7 -
+       they survive calls, so a pin there never reloads), then two of the
+       caller-saved pool. 4 of the 8-deep RC_FLOAT pool stay free for
+       TinyCC's expression evaluation (the old 2-of-6 budget, plus the two
+       newcomers which cost nothing to keep). Pinning more exhausted the
+       pool - get_reg returned -1 for a plain constant load and the
+       generated loop hung. */
     {
         int n = 0, b;
 
         for (b = 0; b < 32; b++)
             if (whale_pinned_regs & (1u << b))
                 n++;
-        if (n >= 2)
+        if (n >= 4)
             return -1;
+    }
+    /* Callee-saved first: they survive calls, so a pin there never reloads
+       (see JS_WhalePinInvalidate). JS_WhaleXmmSpill records the claim AND
+       emits the spill now (declarations are function-top level, so this
+       dominates all uses; the restore is in the epilog). */
+    for (r = 23; r >= 22; r--) {
+        if ((whale_pinned_regs & (1u << r)) == 0) {
+            whale_pinned_regs |= 1u << r;
+            JS_WhaleXmmSpill(r);
+            return r;
+        }
     }
     for (r = 21; r >= 18; r--) {
         if ((whale_pinned_regs & (1u << r)) == 0) {
@@ -1058,11 +1086,13 @@ static int whale_pin_find(int loc)
     return -1;
 }
 
-/* A real call destroys every xmm (all caller-saved). Drop every pin's
-   validity bit: the registers are dead, and the home slots are authoritative
+/* A real call destroys every caller-saved xmm. Drop those pins' validity
+   bits: the registers are dead, and the home slots are authoritative
    (write-through stores them on every write, so no writeback is needed -
    the old writeback loop is gone). The next read of a pin reloads it from
-   its slot (see gv()) and sets the bit again. Called from gfunc_call(). */
+   its slot (see gv()) and sets the bit again. Callee-saved pins (xmm6/7)
+   SURVIVE the call - the callee preserved them by ABI - so their bits stay
+   set and the next read costs nothing. Called from gfunc_call(). */
 void JS_WhalePinInvalidate(void);
 void JS_WhalePinInvalidate(void)
 {
@@ -1074,7 +1104,9 @@ void JS_WhalePinInvalidate(void)
             fprintf(stderr, "  loc=%d reg=%d\n", whale_pin_loc[i], whale_pin_reg[i]);
     }
     (void)i;
-    whale_pinned_regs = 0;
+    /* caller-saved pins die with the call; callee-saved (xmm6/7) survive. */
+    whale_pinned_regs &= ~((1u << TREG_XMM2) | (1u << TREG_XMM3) |
+                           (1u << TREG_XMM4) | (1u << TREG_XMM5));
 }
 
 /* save registers up to (vtop - n) stack entry */
@@ -1120,6 +1152,17 @@ ST_FUNC void save_reg_upstack(int r, int n)
     for(p = vstack, p1 = vtop - n; p <= p1; p++) {
         if ((p->r & VT_VALMASK) == r ||
             ((p->type.t & VT_BTYPE) == VT_LLONG && (p->r2 & VT_VALMASK) == r)) {
+            /* Callee-saved pins (xmm6/7) are never spilled here: their value
+               is owned by the pin (write-through keeps the slot current), and
+               evicting them would force a reload on the next read for no
+               reason - the register is not needed elsewhere (nothing else can
+               allocate it). Skip the entry entirely. */
+            {
+                int rr = p->r & VT_VALMASK;
+
+                if (rr == TREG_XMM6 || rr == TREG_XMM7)
+                    continue;
+            }
             /* must save value on stack if not already done */
             if (!saved) {
                 /* NOTE: must reload 'r' because r might be equal to r2 */
@@ -1220,6 +1263,14 @@ ST_FUNC int get_reg(int rc)
     for(r=0;r<NB_REGS;r++) {
         if (whale_pinned_regs & (1u << r))
             goto notfound;
+#ifdef TCC_TARGET_X86_64
+        /* Callee-saved xmm6/7 are pin-only: general allocation must never
+           take an unclaimed one (no spill would be emitted for it, so the
+           caller's value would be silently clobbered). Only whale_pin_alloc
+           hands them out, with JS_WhaleXmmSpill recording the claim. */
+        if (r == TREG_XMM6 || r == TREG_XMM7)
+            goto notfound;
+#endif
         if (reg_classes[r] & rc) {
             if (nocode_wanted)
                 return r;
@@ -1264,6 +1315,10 @@ ST_FUNC int get_reg(int rc)
             SValue sv;
 
             if (!(whale_pinned_regs & (1u << pr)))
+                continue;
+            /* Live callee-saved pins are never reclaimed: their whole point
+               is surviving across the code that would otherwise spill them. */
+            if (pr == TREG_XMM6 || pr == TREG_XMM7)
                 continue;
             for(p=vstack;p<=vtop;p++) {
                 if ((p->r & VT_VALMASK) == pr ||
@@ -1527,6 +1582,14 @@ ST_FUNC int gv(int rc)
                     whale_pinned_regs |= (1u << pr);
                 }
                 if (pr >= 0) {
+                    /* A WhaleJS pin owns its register outright: the value is
+                       already where it belongs for a generic float request
+                       (callee-saved xmm6/7 carry RC_FLOAT too - see
+                       reg_classes - so the class test below covers them).
+                       Anything specific (return register RC_FRET=RC_XMM0,
+                       explicit xmmN) takes the move-out path below - a
+                       `return` must land in xmm0 however the value is
+                       pinned. */
                     if ((reg_classes[pr] & rc) != 0) {
                         vtop->r = (vtop->r & ~(VT_VALMASK | VT_LVAL)) | pr;
                         return pr;

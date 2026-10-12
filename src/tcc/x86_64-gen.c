@@ -135,16 +135,46 @@ ST_DATA const int reg_classes[NB_REGS] = {
     /* xmm3 */ RC_FLOAT | RC_XMM3,
     /* xmm4 */ RC_FLOAT | RC_XMM4,
     /* xmm5 */ RC_FLOAT | RC_XMM5,
-    /* xmm6 an xmm7 are included so gv() can be used on them,
-       but they are not tagged with RC_FLOAT because they are
-       callee saved on Windows */
-    RC_XMM6,
-    RC_XMM7,
+    /* WhaleJS: xmm6/xmm7 join the float pool so ordinary gv(RC_FLOAT)
+       treats a value already sitting in one as satisfied (no pointless
+       move-out/move-back per trip). They are callee-saved on Windows:
+       the only allocator that hands them out is whale_pin_alloc, which
+       records the claim AND emits the spill at claim time
+       (JS_WhaleXmmSpill); gfunc_epilog restores them. Nothing else can
+       allocate them because get_reg() skips pinned registers and pins
+       are only created by the JIT generator's `register` declarations. */
+    /* xmm6 */ RC_FLOAT | RC_XMM6,
+    /* xmm7 */ RC_FLOAT | RC_XMM7,
     /* st0 */ RC_ST0
 };
 
 static unsigned long func_sub_sp_offset;
 static int func_ret_sub;
+
+/* WhaleJS: which callee-saved xmm registers this function must preserve.
+   Bit 0 = xmm6, bit 1 = xmm7. Set when a pin (or any allocation) claims one
+   (see whale_pin_alloc in tccgen.c via JS_WhaleXmmSave), read by both
+   gfunc_prolog/gfunc_epilog pairs. Only functions that actually use them pay
+   the save/restore - a pure-xmm0-5 function emits exactly what it did before.
+   Reset per function in gfunc_prolog. */
+static int whale_xmm_saved;
+void JS_WhaleXmmSave(int reg);
+void JS_WhaleXmmSpill(int reg);
+static void gen_modrm(int op_reg, int r, Sym *sym, int c);
+void JS_WhaleXmmSave(int reg)
+{
+    if (reg == TREG_XMM6)
+        whale_xmm_saved |= 1;
+    else if (reg == TREG_XMM7)
+        whale_xmm_saved |= 2;
+}
+/* (JS_WhaleXmmSpill's body lives after gen_modrm below: it emits code, so it
+   needs o()/gen_modrm()/loc, none of which exist this early.) */
+/* Frame offsets of the two save slots (valid only when the matching
+   whale_xmm_saved bit is set). Written at claim time, read by
+   gfunc_epilog. Reset per function alongside the mask. */
+static int whale_xmm_off6;
+static int whale_xmm_off7;
 
 /* ---- ISA capability probe -------------------------------------------------
  *
@@ -449,6 +479,28 @@ static void gen_modrm64(int opcode, int op_reg, int r, Sym *sym, int c)
     gen_modrm_impl(op_reg, r, sym, c, is_got);
 }
 
+
+/* Emit the callee-saved spill for reg NOW (claim time, during declaration
+   parsing). The generator declares every pinned local at function top level,
+   so this executes once on entry and dominates all uses; the restore in
+   gfunc_epilog post-dominates. Allocates an 8-byte frame slot below the
+   locals (loc only grows more negative from here - parameters are already
+   placed) and records it for the epilog. movq %xmmN, off(%rbp), same
+   encoding as the float-arg spill in gfunc_prolog. */
+void JS_WhaleXmmSpill(int reg)
+{
+    int off;
+
+    JS_WhaleXmmSave(reg);
+    loc -= 8;
+    off = loc;
+    if (reg == TREG_XMM6)
+        whale_xmm_off6 = off;
+    else
+        whale_xmm_off7 = off;
+    o(0xd60f66); /* movq */
+    gen_modrm(reg, VT_LOCAL, NULL, off);
+}
 
 /* load 'r' from value 'sv' */
 void load(int r, SValue *sv)
@@ -1074,6 +1126,10 @@ void gfunc_prolog(CType *func_type)
     func_scratch = 0;
     func_alloca = 0;
     loc = 0;
+    /* no callee-saved xmm claimed yet (pins claim them below). */
+    whale_xmm_saved = 0;
+    whale_xmm_off6 = 0;
+    whale_xmm_off7 = 0;
 
     addr = PTR_SIZE * 2;
     ind += FUNC_PROLOG_SIZE;
@@ -1129,6 +1185,11 @@ void gfunc_prolog(CType *func_type)
         }
         reg_param_index++;
     }
+    /* No xmm save here: gfunc_prolog runs before the body is parsed, so no
+       pin has claimed anything yet (the mask is always 0 at this point).
+       Saves are emitted at claim time by JS_WhaleXmmSpill (below), which runs
+       during declaration parsing - after the frame exists, before any use.
+       Restores are in gfunc_epilog, where the mask is final. */
 }
 
 /* generate function epilog */
@@ -1136,6 +1197,17 @@ void gfunc_epilog(void)
 {
     int v, saved_ind;
 
+    /* WhaleJS: restore callee-saved xmm registers claimed by pins (mask is
+       final here). movq off(%rbp), %xmmN - before `leave`, while the frame
+       is still live. Only functions that claimed one pay for this. */
+    if (whale_xmm_saved & 1) {
+        o(0x7e0ff3); /* movq */
+        gen_modrm(TREG_XMM6, VT_LOCAL, NULL, whale_xmm_off6);
+    }
+    if (whale_xmm_saved & 2) {
+        o(0x7e0ff3); /* movq */
+        gen_modrm(TREG_XMM7, VT_LOCAL, NULL, whale_xmm_off7);
+    }
     o(0xc9); /* leave */
     if (func_ret_sub == 0) {
         o(0xc3); /* ret */
@@ -1560,6 +1632,10 @@ void gfunc_prolog(CType *func_type)
     ind += FUNC_PROLOG_SIZE;
     func_sub_sp_offset = ind;
     func_ret_sub = 0;
+    /* no callee-saved xmm claimed yet (pins claim them below). */
+    whale_xmm_saved = 0;
+    whale_xmm_off6 = 0;
+    whale_xmm_off7 = 0;
 
     if (sym->f.func_type == FUNC_ELLIPSIS) {
         int seen_reg_num, seen_sse_num, seen_stack_size;
@@ -1733,6 +1809,16 @@ void gfunc_epilog(void)
         o(0x585a); /* restore returned value, if any */
     }
 #endif
+    /* WhaleJS: restore callee-saved xmm registers claimed by pins (mask is
+       final here). Before `leave`, while the frame is still live. */
+    if (whale_xmm_saved & 1) {
+        o(0x7e0ff3); /* movq */
+        gen_modrm(TREG_XMM6, VT_LOCAL, NULL, whale_xmm_off6);
+    }
+    if (whale_xmm_saved & 2) {
+        o(0x7e0ff3); /* movq */
+        gen_modrm(TREG_XMM7, VT_LOCAL, NULL, whale_xmm_off7);
+    }
     o(0xc9); /* leave */
     if (func_ret_sub == 0) {
         o(0xc3); /* ret */
