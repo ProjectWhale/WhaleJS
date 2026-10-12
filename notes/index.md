@@ -417,3 +417,5 @@ Reverted to 38579bc; both findings are recorded rather than half-fixed.- `<56>` 
 <114>(SOLVED + 诚实零收益): **loop 级 stable**。动因：growsShape 的 `o.r=0` 循环外加字段杀整函数 stable。per-head 表（单循环）：体内 put 全命中 define + 循环前 put 集 + 体内无 call → 该循环 stable；6 处 call site 全加。结果 growsShape 只拿 2ms（本来就被 prof 单态救了，同形态零收益），全量零收益但机制正确（首编无 prof 时生效）。保留。到 50ms 靠 writeOrder spill（线性 IR）。见 current.md <114>
 
 <115>(评估轮，零改动): **writeOrder 在 AST+缓存约束下无解，认账**。7 语句 0 调用全 local，4 级依赖链 + `%` 单求铁律 → 最少 6 条，变换最多省 2ms；换变量名零收益（TCC 一视同仁 spill）；出口活性省的是本就没有的装箱。到 50ms（总量 78→50）在"不要 IR"约束下到不了：缺口 28ms，可见总和 <10ms。当前 78（已超 node 86）即 AST+缓存天花板。再往下只有后端寄存器分配或 deopt 那套。全量绿。见 current.md <115>
+
+<116>(SOLVED + 诚实零收益): **逗号融合落地（sink-mark 证伪 → output-tail 重写）**。第一版（sink 相邻=续接）双提交：eager-commit 与 close-recommit 重叠，writeOrder 出 `_wsv[0]=(E) [0]=(E);`，整套作废。第二版语句永远完整提交，续接=弹尾 `;` 推 `,`（一次 commit 无重叠）；close 只清状态；fold_begin 复位；hoist 改搬运 + 仅 founded 可搬。bitops 5 存储融成一条，writeOrder 损坏消失。全量绿（repeat=3：bitops 128/objshape 75）。诚实：性能零变化——TCC 在大逗号表达式内部照样 spill，省的只是语句边界。机制保留，收益指望转后端。见 current.md <116>

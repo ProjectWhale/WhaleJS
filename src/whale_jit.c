@@ -242,6 +242,11 @@ enum {
  * ---------------------------------------------------------------------- */
 /* wk = keyword (JS_WK_*), wt = punctuation / single-char operator */
 static void wsrc(const char *s);   /* the generated-source mirror, defined below */
+static void whale_comma_close(void);   /* comma-fused stores, defined below */
+static int whale_comma_open;   /* comma sequence state, defined below */
+static int *whale_comma_out;   /* output buffer the open statement lives in */
+static int whale_comma_base;   /* output length the open statement started at */
+static int whale_comma_len;    /* token length of the open statement so far */
 
 static void wk(int w)
 {
@@ -258,6 +263,13 @@ static void wk(int w)
         "union", "enum", "short",
     };
 
+    /* `if` and `goto` always start a statement in our output (no expression-
+       level ifs): an open comma sequence ends here. This covers every branch
+       emission (compare-into-branch, head test, back edge) without touching
+       each site - and expression keywords (types, return is handled at its
+       own site) never trip it. */
+    if (w == JS_WK_IF || w == JS_WK_GOTO)
+        whale_comma_close();
     if (w >= 0 && w < (int)(sizeof(kwname) / sizeof(kwname[0]))) {
         wsrc(kwname[w]);
         wsrc(" ");
@@ -2671,6 +2683,12 @@ static void fold_begin(void)
     whale_vserial = 0;
     whale_vpin_next = 0;
     whale_empty_ranges = 0;
+    /* no comma sequence carries across compilations (stale base/len would
+       alias the fresh output). */
+    whale_comma_open = 0;
+    whale_comma_out = NULL;
+    whale_comma_base = 0;
+    whale_comma_len = 0;
 
     memset(whale_vname, 0, sizeof(whale_vname));
 }
@@ -2695,6 +2713,7 @@ static int whale_expr_max = 24;
 
 static void fold_materialize(int k);
 static void fold_commit(int mark);
+/* (whale_comma_close fwd-declared at the top, next to wsrc). */
 
 /* Record [mark, now) as the value of stack slot k, with loop-invariance inv.
    inv is a parameter rather than a post-hoc write-back for one reason: a
@@ -2714,8 +2733,21 @@ static void fold_set(int k, int mark, int inv)
     whale_vexpr[k].len = JS_WhaleTokSinkLen() - mark;
     whale_vmat[k] = 0;
     whale_vexpr[k].inv = (uint8_t)(inv ? 1 : 0);
-    if (whale_vexpr[k].len > whale_expr_max)
+    /* overlong expressions take their own statement (a long chain inside a
+       comma sequence risks spilling inside TCC's expression evaluator -
+       the fused statement would be worse than two plain ones). NB: this
+       fires for sub-expressions too (a guard arm's fold_set inside a `%`
+       guard) - those must NOT close the sequence (the `;` would land
+       mid-expression and unbalance parens). Only statement-level
+       materialisations (fold_materialize/local_materialize called directly,
+       not from here) join or break sequences; here just materialise. */
+    if (whale_vexpr[k].len > whale_expr_max) {
+        /* Statements commit eagerly and completely (see fold_materialize),
+           so a sub-expression's store cannot disturb any outer sequence:
+           the output-tail adjacency test simply fails afterwards and the
+           outer store starts a fresh statement. No save/restore needed. */
         fold_materialize(k);
+    }
 }
 
 /* Loop-invariance of a peephole load operand: literals and parameters are
@@ -3096,6 +3128,53 @@ static void fold_commit(int mark)
     }
 }
 
+/* Comma-fused stores (notes <116>): consecutive pure stores
+   (`L5=..; L4=..; L3=..`, no control flow / call / aliasing between them)
+   fuse into one comma expression (`L5=.., L4=.., L3=..;`) - AST level, no
+   new IR, tokens only. TCC treats it as one statement (one spill boundary
+   instead of three).
+
+   Buffering, not sink marks: a pending segment is committed to the output
+   eagerly with its `;`, and continuation rewrites that tail. An open sequence
+   is exactly one committed statement in the current output buffer whose tail
+   is `... <expr> ;` - continuing pops the `;`, pushes `, <next-store> ;`.
+   Helper-call statements between stores break the chain automatically (the
+   output tail is no longer ours to rewrite).
+
+   This replaced a sink-mark scheme (adjacent-in-sink meant continuation) that
+   double-emitted: the eager commit that founded the sequence and the close
+   that recommitted it overlapped (writeorder: `_wsv[0]=(E) [0]=(E);`). */
+/* (state fwd-declared at the top, next to wsrc.) */
+/* Close the open sequence, if any: it is already committed (with its `;`),
+   so closing only clears the state. Called at every basic-block boundary
+   (flush/jump/return/loop-buffer switch), before truncates, and at
+   function end. */
+static void whale_comma_close(void)
+{
+    whale_comma_open = 0;
+}
+
+/* Try to continue the open comma sequence: the current output must still end
+   with our statement (`;` tail, same buffer, nothing appended since). Pops
+   the `;`, pushes `,` - the caller then emits `<store> ;` into the sink and
+   commits, so the fused statement is one commit, never two overlapping ones.
+   Returns 1 on continuation, 0 for a fresh statement (caller closes first). */
+static int whale_comma_continue(void)
+{
+    int *lenp = whale_out_len;
+
+    if (!whale_comma_open || whale_comma_out != whale_out_tok)
+        return 0;
+    if (*lenp != whale_comma_base + whale_comma_len)
+        return 0;
+    if (whale_comma_len < 1 || whale_out_tok[*lenp - 1] != ';')
+        return 0;
+    /* pop the `;` (numbers travel alongside, keep them aligned) */
+    (*lenp)--;
+    wt(',');
+    return 1;
+}
+
 /* WhaleJS: the loop buffer is ON.
  *
  * It hands a complete loop body to a loop-level pass, and that pass now exists -
@@ -3112,6 +3191,8 @@ static int loop_begin(int head_pos, int back_pos)
 {
     WhaleLoop *l;
 
+    /* a comma sequence never crosses a buffer switch. */
+    whale_comma_close();
     if (whale_loop_depth >= WHALE_LOOP_MAX)
         return 0;                       /* too deep: emit straight through */
     l = &whale_loops[whale_loop_depth];
@@ -3136,6 +3217,8 @@ static void loop_end(void)
     WhaleLoop *l, *p;
     int i, n;
 
+    /* same reason as loop_begin: no sequence crosses the switch. */
+    whale_comma_close();
     if (whale_loop_depth <= 0)
         return;
     whale_loop_depth--;
@@ -3755,9 +3838,36 @@ static void fold_materialize(int k)
     else
         whale_vname[k] = whale_vserial++;
     mark = fold_mark();
+    /* comma-fused via output-tail rewrite (see above): continuing pops the
+       open statement's `;` and joins with `,`; otherwise close first and
+       start a fresh statement. WHALE_NO_COMMA restores the old
+       immediate-`;` behaviour exactly (each store its own statement). */
+    if (getenv("WHALE_NO_COMMA")) {
+        whale_comma_close();
+        wt_vname(whale_vname[k]); wt('=');
+        fold_inline(k);
+        wt(';');
+        fold_commit(mark);
+        whale_vmat[k] = 1;
+        return;
+    }
+    int founded;
+
+    if (!whale_comma_continue()) {
+        whale_comma_close();
+        whale_comma_out = whale_out_tok;
+        whale_comma_base = *whale_out_len;
+        founded = 1;
+    } else {
+        founded = 0;
+    }
     wt_vname(whale_vname[k]); wt('=');
     fold_inline(k);
     wt(';');
+    fold_commit(mark);
+    /* the open statement now spans [base, out_len): continuation rewrites it. */
+    whale_comma_open = 1;
+    whale_comma_len = *whale_out_len - whale_comma_base;
     /* Loop-invariant hoisting: the value is the same on every iteration, so
        compute it once before the loop instead of on every trip. The statement
        goes to the enclosing output (which sits right before the loop-head
@@ -3766,27 +3876,45 @@ static void fold_materialize(int k)
        are loop-carried by definition here, and the AND in the binop emitters
        already refused anything with a variable leaf. */
     if (whale_loop_depth > 0 && whale_vexpr[k].inv) {
-        WhaleLoop *outer;
         int *save_tok = whale_out_tok;
         double *save_num = whale_out_num;
         int *save_len = whale_out_len;
+        int hlen = *whale_out_len - whale_comma_base;
+        int i;
+
+        /* hoisted statements leave the comma sequence: the store is already
+           committed above, so move its output tokens to the enclosing output
+           (which sits right before the loop-head label) instead of
+           re-committing from the sink (that re-emitted the open segment).
+           Only a statement this store founded travels: a continued store may
+           join an older chain whose earlier segments are variant, and moving
+           those out of the loop would repeat the first trip's values. */
+        if (!founded) {
+            /* joined an older statement: leave the chain in place. */
+            whale_vmat[k] = 1;
+            return;
+        }
+        whale_comma_close();
 
         if (whale_loop_depth - 1 == 0) {
             whale_out_tok = go_tok;
             whale_out_num = go_num;
             whale_out_len = &go_len;
         } else {
-            outer = &whale_loops[whale_loop_depth - 2];
+            WhaleLoop *outer = &whale_loops[whale_loop_depth - 2];
+
             whale_out_tok = outer->tok;
             whale_out_num = outer->num;
             whale_out_len = &outer->len;
         }
-        fold_commit(mark);
+        for (i = 0; i < hlen && *whale_out_len < WHALE_TOK_MAX; i++) {
+            whale_out_num[*whale_out_len] = save_num[whale_comma_base + i];
+            whale_out_tok[(*whale_out_len)++] = save_tok[whale_comma_base + i];
+        }
+        *save_len = whale_comma_base;
         whale_out_tok = save_tok;
         whale_out_num = save_num;
         whale_out_len = save_len;
-    } else {
-        fold_commit(mark);
     }
     whale_vmat[k] = 1;
 }
@@ -3810,6 +3938,14 @@ static void local_materialize(int d)
     if (whale_dbg_env("WHALE_MEM_TRACE"))
         fprintf(stderr, "[mat] L%d off=%d len=%d\n", d, m->expr.off, m->expr.len);
     mark = fold_mark();
+    /* comma-fused like fold_materialize above (same tail-rewrite rule). */
+    if (!getenv("WHALE_NO_COMMA") && whale_comma_continue()) {
+        /* joined: `;` popped, `,` pushed - emit `<store> ;` below */
+    } else {
+        whale_comma_close();
+        whale_comma_out = whale_out_tok;
+        whale_comma_base = *whale_out_len;
+    }
     /* Int-region mirror: inside the loop the pending expression is an int
        expression (mirror stores wrap `(int)`), so it goes to I<d>, not L<d>.
        Storing it to L<d> would leave later in-loop reads loading a stale
@@ -3823,6 +3959,8 @@ static void local_materialize(int d)
     fold_inline_expr(&m->expr);
     wt(';');
     fold_commit(mark);
+    whale_comma_open = 1;
+    whale_comma_len = *whale_out_len - whale_comma_base;
     m->live = 0;
     m->used = 0;
 }
@@ -3932,6 +4070,10 @@ static void local_flush_all(int n)
 {
     int d;
 
+    /* flush closes any open comma sequence first (a block boundary ends it),
+       then materialises (which may open a new one - harmless, the next
+       boundary closes it again). */
+    whale_comma_close();
     for (d = 0; d < n; d++)
         local_materialize(d);
 }
@@ -4757,7 +4899,7 @@ static void whale_fuse_emit(int *sp, uint8_t *cur, int var_count,
         fold_inline(stk); wt(';');
         fold_commit(sfm);
     }
-    JS_WhaleTokSinkTruncate(fm);
+    JS_WhaleTokSinkTruncate(fm); whale_comma_open = 0;
     cur[var_count + func_slot] = cur[var_count + *sp - whale_fuse_argc + whale_fuse_srcarg];
     *sp = func_slot + 1;
 }
@@ -9231,7 +9373,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                                drops the stray argument tokens. Re-type the
                                callee as the plain parked value and take the
                                general path. */
-                            JS_WhaleTokSinkTruncate(fm);
+                            JS_WhaleTokSinkTruncate(fm); whale_comma_open = 0;
                             cur[var_count + func_slot] =
                                 WHALE_VAL_T(whale_vr_slot[vidx]);
                         } else {
@@ -9288,7 +9430,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                                handle. Throw away whatever it managed to emit and
                                take the general call path instead of abandoning the
                                whole function. */
-                            JS_WhaleTokSinkTruncate(fm);
+                            JS_WhaleTokSinkTruncate(fm); whale_comma_open = 0;
                             goto whale_call_fallback;
                         }
                         /* the body committed into its own buffer; appending it
@@ -10112,6 +10254,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 else if (ret_is_bool != (t == WHALE_T_BOOL))
                     { WHALE_STEP_INSTEAD_OF_BAILING(); } /* mixed number/boolean returns: not our shape */
                 fm = fold_mark();
+                /* the return closes any open store sequence first. */
+                whale_comma_close();
                 wk(JS_WK_RETURN); fold_inline(sp - 1); wt(';');
                 fold_commit(fm);
                 unreachable = 1;
@@ -10144,6 +10288,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        leave its buffer open - flush whatever is left before committing */
     while (whale_loop_depth > 0)
         loop_end();
+    /* function end closes any open store sequence. */
+    whale_comma_close();
 
     /* The epilogue and the whole engine entry are structural, so they are
        committed as one block rather than folded. */

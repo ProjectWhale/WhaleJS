@@ -3659,6 +3659,49 @@ SOLVED（单循环函数，predef 集，6 处 call site 收敛）/ 诚实记录�
 绿（零改动，无提交）。下一步：后端寄存器分配（用户放行才做），或多签名
 L1 表，或 deopt 那套的冷淘汰长跑（已验证）/前缀兼容（已落地）。
 
+# <116>: 逗号融合落地（sink-mark 方案证伪 → output-tail 重写）
+SOLVED + 真 bug×2（双提交 + 陈旧状态）
+
+## 起点
+<115> 认账之后用户说"继续"：逗号融合（连续纯存储 `L5=..; L4=..; L3=..`
+合成一条 `L5=.., L4=.., L3=..;`，TCC 每语句边界 spill 一次，语句少即
+spill 少）是 AST+缓存约束下唯一还没动的前端语句级优化。
+
+## 第一版方案（sink-mark）与证伪
+状态 = open + 序列起点 sink mark + 上段尾 sink mark；相邻（`mark ==
+comma_end`）则续接 `,`，否则 close（补 `;` + 提交）。三天症状
+（`';' expected` / `_wsv` 名丢失 / `duplicate label` 跨 phase 跳动）全是
+同一个根因的不同侧面：
+- `[commit L3891] mark=1680 n=1776`（fold_materialize 的 eager commit）
+  紧跟 `[commit L3164] mark=1681 n=1777`（close 的 recommit）——同一
+  sink 区被提交两次，第二次缺首 token。
+- 完整 mirror 定案：`_wsv[0]=(EXPR) [0]=(EXPR) ;` —— 重复存储，第二份无名。
+- 结论：eager-commit（found 时提交）+ close-recommit（close 时再提交）
+  在设计上重叠，sink 相邻性判据救不了。第一版整套作废。
+
+## 第二版（output-tail 重写，落地）
+- 语句永远完整提交（含 `;`）；open 序列 = 当前输出 buffer 里一条已提交
+  语句（记 base + len）。续接 = `whale_comma_continue()` 校验尾（同
+  buffer + 长度吻合 + 尾是 `;`）→ 弹 `;`、推 `,` → 新存储提交（一次
+  commit，无重叠可能）。helper 语句插中间则尾校验失败，自动断链。
+- close 只清状态（不再提交）；`fold_begin` 补状态复位（旧版陈旧 mark
+  跨编译泄漏，第二编译一起点就是脏的）；`fold_set` 超长门删 save/restore
+ （提交即完整，无外层序列可扰）；hoist 改搬运输出 token（旧版从 sink
+  recommit 会重发整条 open 链）+ 仅 founded 语句可 hoist（续接进来的旧链
+  前段可能 variant，搬出去等于重复首 trip 的值）。
+- 调试脚手架（commit 行号打点、vname 打点、mirror 断尾补全）全拆，只留
+  whale_jit.c 改动（+155/-9）；iface.c 零改动。
+
+## 验证
+- bitops 循环体 5 存储融成一条（dump 第 108 行
+  `I2=.., _wv0=.., L0=.., _wv1=.., L0=..;`），writeOrder 双版本损坏消失。
+- 全量 25/25 check 全一致；repeat=3：bitops 128、locals 87、objshape 75、
+  nested 19、loop_sum 44、arith 62。
+- 诚实记录：融合点火但性能零变化——TCC 在大逗号表达式内部同样 spill
+  临时值，省掉的只是语句边界，表达式内部的求值栈 spill 还在。这与 <105>
+  的"语句合并 ROI 放弃"结论一致：TCC 的 spill 是按求值深度不是按语句数，
+  逗号融合的上限就是零。机制保留（正确且零成本），收益指望转后端。
+
 
 
 
