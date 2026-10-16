@@ -3959,6 +3959,38 @@ string 19/fib 4/sieve 66/objshape 75，entries>0）；包解压到项目外、�
 - **改 TCC 之前先想清楚是不是必须改**：这次最终**没动 TCC 源码**（只加了一个 iface
   里的 `nostdlib` setter），前两条路线的 TCC 改动全回退了。
 
+# <122>: 复核 WhaleNode 遗留分歧 —— 普通对象 free list 的崩溃已不复现（已修）
+
+## 背景
+`temp/WHALENODE-DIVERGENCE.md`（WhaleNode 侧的 vendored 补丁清单）第 1 条记录了
+一个旧的 WhaleJS 缺陷：普通对象 free list（`whale_obj_free` park/reuse）会破坏
+被 park 的 shell 的 shape 指针，表现为 `JS_FreeRuntime` 里段错误、以及运行中偶发
+崩溃。WhaleNode 当时的规避手段是把 `WHALE_OBJ_FREE_DEPTH` 从 64 改成 0（关掉
+free list）。该文档的"复核规则"要求：每次同步时恢复 64、跑复现 + 全量测试，
+在上游修好前保持 0。
+
+## 复核结论：**已解决，规避补丁可以撤掉**
+- 本树 `WHALE_OBJ_FREE_DEPTH` 就是 **64**（free list 开着），没有 0 的补丁。
+- 根因其实在 <88> 那轮就修了：drain 读链指针读的是 `p->prop`，而链实际存在
+  `u.opaque`；同时漏释 prop 块。现在 `free_object` park 与 `js_free_runtime`
+  的 drain 都用 `u.opaque`（quickjs.c:2815 一带），一致。
+- 复现（`temp/repro/repro.c`，release 构建）：文档给的形状（`JS_NewObject` +
+  `JS_SetPropertyFunctionList` + eval `{a:1,b:2}` + `FreeContext`/`FreeRuntime`），
+  再加"同 shape 一半 park 一半存活 + `JS_RunGC`"和 perftest objshape 的
+  escaped 形状（让 JIT 的 `ObjNew` 真的走 checkout）——**1000 轮无崩溃**。
+- `temp/repro/drain.c`：每轮造 5000 个普通对象再拆 runtime，逼 drain 走一遍链
+  ——**200 轮无崩溃**。
+- free list 确实在被用：`WHALE_STR_STAT=1` 下 objshape 全程 `ObjNew free-list
+  hit=N miss=0`。
+- 全量：`whale api test: ok`、25/25 perftest 0 mismatch。
+
+## 教训
+- **"偶发崩溃"要按类别归因**：这类"链指针读错字段"的 bug 会让崩溃点到处飘
+  （shape free / iowatcher / DeleteProperty），单看崩溃现场会误判成"预存问题"；
+  <88> 靠 gdb + 六组二分 repro 才钉死是 drain 读错字段。
+- **规避补丁要能被复核**：文档里"恢复 64 再跑 repro"这条规则正是为此。本次按它
+  执行，结论是可撤掉补丁。
+
 
 
 
