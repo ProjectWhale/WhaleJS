@@ -12,6 +12,10 @@
 #include "whalejs.h"
 #include "libtcc.h"
 
+/* iface helper: skip the CRT libraries for a state (every external the JIT
+   needs is a host symbol, so no libtcc1-64.a has to exist) */
+extern void JS_WhaleTccNoStdLibs(TCCState *s);
+
 static int failures;
 
 #define CHECK(cond)                                                           \
@@ -69,10 +73,15 @@ static void check_tcc_backend(void)
     if (!s)
         return;
 
-    /* 必须先设路径再定 output type：TCC 的 include/lib 搜索路径在初始化时就定了 */
+    /* Every external the JIT's generated code needs is a host symbol and the
+       CRT libraries are skipped, so this check needs no on-disk tcc-runtime at
+       all; WHALE_TCC_DIR is just a search path. */
     tcc_set_lib_path(s, WHALE_TCC_DIR);
     tcc_add_include_path(s, WHALE_TCC_DIR "/include");
     tcc_add_library_path(s, WHALE_TCC_DIR "/lib");
+    /* the generated C here references no external at all (pure int code), so
+       skipping the CRT is enough to make it compile with no tcc-runtime */
+    JS_WhaleTccNoStdLibs(s);
     tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
 
     rc = tcc_compile_string(s,
@@ -107,7 +116,12 @@ extern void *JS_WhaleTokCompileAdd2(const char *tcc_dir);
 
 static void check_ir_direct(void)
 {
-    double (*add2)(double, double) = (double (*)(double, double))JS_WhaleTokCompileAdd2(WHALE_TCC_DIR);
+    double (*add2)(double, double);
+
+    /* the runtime is all host symbols + embedded helpers now, so the probe's
+       tcc_dir is just a search path; WHALE_TCC_DIR works with or without a
+       directory behind it */
+    add2 = (double (*)(double, double))JS_WhaleTokCompileAdd2(WHALE_TCC_DIR);
 
     printf("  [tok] token-stream compile: %s\n", add2 ? "compiled" : "NULL");
     if (add2) {

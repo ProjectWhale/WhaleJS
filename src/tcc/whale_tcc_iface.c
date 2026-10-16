@@ -1,6 +1,9 @@
 /* Diagnostics live behind WHALE_DEBUG (see the file): include it before libtcc.c
    so every upstream file pulled in below sees the same definition. */
 #include "../whale_dbg.h"
+#include <stdio.h>
+#include <stddef.h>
+#include <string.h>
 #include "libtcc.c"
 
 /* ========================================================================
@@ -36,6 +39,16 @@ void JS_WhaleTccClearRuntimeMain(TCCState *s)
         s->runtime_main = NULL;
 }
 
+/* The JIT registers every external the generated code references as a host
+   symbol and does not want the CRT libraries linked (no libtcc1-64.a, no
+   msvcrt/kernel32 .def files anywhere): pe_add_runtime() consults s->nostdlib,
+   which only this file can set (TCCState is opaque to whale_jit.c). */
+void JS_WhaleTccNoStdLibs(TCCState *s)
+{
+    if (s)
+        s->nostdlib = 1;
+}
+
 /* ------------------------------------------------------------------------
  * One translation unit, opened and closed the way tcc_compile() does
  * (libtcc.c:623): tcc_open_bf, tccelf_begin_file, preprocess_start, [emit],
@@ -62,6 +75,8 @@ static Sym *whale_define_start;
             return NULL;                                                    \
         tcc_set_lib_path((s), (tcc_dir));                                   \
         tcc_add_library_path((s), whale_lib);                               \
+        /* no CRT libraries: this path only emits self-contained code */     \
+        (s)->nostdlib = 1;                                                  \
         tcc_set_output_type((s), TCC_OUTPUT_MEMORY);                        \
         if (setjmp((s)->error_jmp_buf) != 0) {                              \
             (s)->error_set_jmp_enabled = 0;                                 \
@@ -683,6 +698,8 @@ void *JS_WhaleTokCompileAdd2(const char *tcc_dir)
         return NULL;
     tcc_set_lib_path(s, tcc_dir);
     tcc_add_library_path(s, lib_dir);
+    /* self-contained probe code: no CRT libraries needed */
+    s->nostdlib = 1;
     tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
 
     /* Guard exactly like JS_WhaleCompileTokens: the lexer must be off before

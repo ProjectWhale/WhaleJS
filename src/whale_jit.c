@@ -12,6 +12,8 @@
 #include <string.h>
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <dlfcn.h>
 #endif
 #include <stdarg.h>
 
@@ -120,6 +122,26 @@ int JS_WhaleTccProbe(void);
 void JS_WhaleTokPush(int t, double val);
 extern int whale_tok_active;   /* owned by the TinyCC-side file */
 int JS_WhaleCompileTokens(struct TCCState *s, void (*emit)(void *), void *emit_ctx);
+/* skip the CRT libraries for this state (iface); the JIT registers every
+   external it needs as a host symbol instead */
+void JS_WhaleTccNoStdLibs(struct TCCState *s);
+
+/* libgcc-style 64-bit helpers, compiled into this library from
+   src/tcc/lib/libtcc1.c and registered as host symbols so generated code that
+   does 64-bit division / float conversion links with no libtcc1-64.a. */
+long long __divdi3(long long, long long);
+long long __moddi3(long long, long long);
+unsigned long long __udivdi3(unsigned long long, unsigned long long);
+unsigned long long __umoddi3(unsigned long long, unsigned long long);
+long long __ashldi3(long long, int);
+long long __ashrdi3(long long, int);
+unsigned long long __lshrdi3(unsigned long long, int);
+double __floatundidf(unsigned long long);
+unsigned long long __fixunsdfdi(double);
+long long __fixdfdi(double);
+float __floatundisf(unsigned long long);
+unsigned long long __fixunssfdi(float);
+long long __fixsfdi(float);
 
 #ifndef WHALE_JIT_TCC_DIR
 #define WHALE_JIT_TCC_DIR "thirdparty/tcc-runtime"
@@ -127,6 +149,164 @@ int JS_WhaleCompileTokens(struct TCCState *s, void (*emit)(void *), void *emit_c
 #ifndef WHALE_JIT_SRC_DIR
 #define WHALE_JIT_SRC_DIR "src"
 #endif
+
+/* Where the JIT looks for the TCC runtime data. In a release the runtime files
+   (libtcc1-64.a + PE .def) are embedded in the library and served to TCC from
+   memory by basename (whale_serve_embedded), so no runtime directory needs to
+   exist on disk at all. The probes below are only for the case where the user
+   DOES keep a tcc-runtime beside the library (or sets one explicitly).
+
+   Build-time absolute paths are a development default. The search order is:
+
+     1. JS_WhaleSetJitRuntimeDir() - what the embedder said, if anything;
+     2. WHALE_JIT_RUNTIME_DIR in the environment (development convenience);
+     3. next to the running module: <module dir>/tcc-runtime, then
+        <module dir>/lib/tcc-runtime and <module dir>/../lib/tcc-runtime -
+        the layouts a package can reasonably have;
+     4. the build-time path, which is what makes an uninstalled build work.
+
+   The first candidate whose <dir>/lib/libtcc1-*.a exists wins; the others are
+   not probed. Resolved once, on first use. */
+static char whale_rt_dir[1024];
+static int  whale_rt_resolved;
+/* Set by JS_WhaleSetJitRuntimeDir before the first JIT compile. */
+static char whale_user_rt_dir[1024];
+
+static int whale_file_exists(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+
+    if (!f)
+        return 0;
+    fclose(f);
+    return 1;
+}
+
+/* Directory the running module (DLL or executable) lives in, no trailing
+   separator, or 0 when it cannot be determined. */
+static int whale_module_dir(char *out, size_t cap)
+{
+#ifdef _WIN32
+    HMODULE mod = NULL;
+    char path[1024];
+    DWORD n;
+    char *slash;
+
+    /* The library's own module, not the host executable: GetModuleHandleEx with
+       FROM_ADDRESS on a function in this file gives the DLL when the engine is
+       shared and the exe when it is static, which is exactly the right answer
+       for both. */
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCSTR)(const void *)&whale_module_dir, &mod))
+        return 0;
+    n = GetModuleFileNameA(mod, path, (DWORD)sizeof(path));
+    if (n == 0 || n >= sizeof(path))
+        return 0;
+    slash = strrchr(path, '\\');
+    if (!slash)
+        slash = strrchr(path, '/');
+    if (!slash)
+        return 0;
+    *slash = '\0';
+    snprintf(out, cap, "%s", path);
+    return 1;
+#else
+    /* ELF: the address of a function in this module, asked of the dynamic
+       loader. Needs -ldl (already linked) and _GNU_SOURCE (already defined). */
+    Dl_info info;
+
+    if (!dladdr((const void *)&whale_module_dir, &info) || !info.dli_fname)
+        return 0;
+    {
+        char path[1024];
+        char *slash;
+
+        snprintf(path, sizeof(path), "%s", info.dli_fname);
+        slash = strrchr(path, '/');
+        if (!slash)
+            return 0;
+        *slash = '\0';
+        snprintf(out, cap, "%s", path);
+        return 1;
+    }
+#endif
+}
+
+static int whale_rt_candidate(const char *dir)
+{
+    char probe[1400];
+
+    if (!dir || !*dir)
+        return 0;
+    /* TCC names the runtime archive by pointer size (see config.h) */
+    snprintf(probe, sizeof(probe), "%s/lib/libtcc1-64.a", dir);
+    if (whale_file_exists(probe))
+        return 1;
+    snprintf(probe, sizeof(probe), "%s/lib/libtcc1-32.a", dir);
+    return whale_file_exists(probe);
+}
+
+static const char *whale_jit_rt_dir(void)
+{
+    const char *env;
+    char mod[1024];
+    char cand[1200];
+
+    if (whale_rt_resolved)
+        return whale_rt_dir;
+    whale_rt_resolved = 1;
+    whale_rt_dir[0] = '\0';
+
+    if (whale_user_rt_dir[0]) {
+        snprintf(whale_rt_dir, sizeof(whale_rt_dir), "%s", whale_user_rt_dir);
+        return whale_rt_dir;
+    }
+    env = getenv("WHALE_JIT_RUNTIME_DIR");
+    if (env && *env && whale_rt_candidate(env)) {
+        snprintf(whale_rt_dir, sizeof(whale_rt_dir), "%s", env);
+        return whale_rt_dir;
+    }
+    /* No runtime files are needed in a release: every external the generated
+       code references is a host symbol and the CRT libraries are skipped
+       (JS_WhaleTccNoStdLibs), so the runtime directory is only a search path.
+       The probes below are for a user who keeps a tcc-runtime beside the
+       library (or for the uninstalled build). */
+    if (whale_module_dir(mod, sizeof(mod))) {
+        /* <module>/tcc-runtime and <module>/lib/tcc-runtime: a package that
+           keeps the runtime beside the library, or under lib/. */
+        snprintf(cand, sizeof(cand), "%s/tcc-runtime", mod);
+        if (whale_rt_candidate(cand)) {
+            snprintf(whale_rt_dir, sizeof(whale_rt_dir), "%s", cand);
+            return whale_rt_dir;
+        }
+        snprintf(cand, sizeof(cand), "%s/lib/tcc-runtime", mod);
+        if (whale_rt_candidate(cand)) {
+            snprintf(whale_rt_dir, sizeof(whale_rt_dir), "%s", cand);
+            return whale_rt_dir;
+        }
+        /* <module>/../lib/tcc-runtime: the classic prefix layout, library in
+           bin/ or lib/ and the runtime under lib/. */
+        snprintf(cand, sizeof(cand), "%s/../lib/tcc-runtime", mod);
+        if (whale_rt_candidate(cand)) {
+            snprintf(whale_rt_dir, sizeof(whale_rt_dir), "%s", cand);
+            return whale_rt_dir;
+        }
+    }
+    snprintf(whale_rt_dir, sizeof(whale_rt_dir), "%s", WHALE_JIT_TCC_DIR);
+    return whale_rt_dir;
+}
+
+void JS_WhaleSetJitRuntimeDir(const char *dir)
+{
+    if (dir && *dir)
+        snprintf(whale_user_rt_dir, sizeof(whale_user_rt_dir), "%s", dir);
+    else
+        whale_user_rt_dir[0] = '\0';
+    /* Re-resolve on the next compile: the embedder may set this after a first
+       compile has already picked a default. */
+    whale_rt_resolved = 0;
+}
 
 #define WHALE_JIT_MAX_SLOTS 64
 
@@ -10581,10 +10761,39 @@ WHALE_HOST_SYM(JS_WhaleCallMethodValue),
     WHALE_HOST_SYM(JS_WhaleStepOutNum),
     WHALE_HOST_SYM(JS_WhaleStepOutSlot),
     WHALE_HOST_SYM(JS_WhaleStepClear),
-    /* libc memset, for Uint8Array fill loops the generator lowers wholesale.
-       Registered like every other host symbol; the generated code declares
-       its own prototype. */
-    { "memset", (void *)memset },
+    /* libc/libm the generated code may call. Registered as host symbols so the
+       JIT needs no TCC runtime archive and no CRT .def files at all: the only
+       externals the generated C references are these few, and everything else
+       it calls is a JS_Whale or whale_jit_ wrapper (also host symbols). */
+    { "memset",  (void *)memset },
+    { "memmove", (void *)memmove },
+    { "memcpy",  (void *)memcpy },
+    { "memcmp",  (void *)memcmp },
+    { "strlen",  (void *)strlen },
+    { "fmod",    (void *)fmod },
+    { "floor",   (void *)floor },
+    { "fabs",    (void *)fabs },
+    { "sqrt",    (void *)sqrt },
+    /* libgcc-style 64-bit helpers, compiled into this library from
+       src/tcc/lib/libtcc1.c (TinyCC's runtime library). On x86_64 only the
+       float<->int conversions are in that file (the div/mod/shift helpers are
+       under #if !__x86_64__, since the hardware does them), so those are the
+       ones that can be missing from the generated code's point of view. */
+    { "__floatundidf",  (void *)__floatundidf },
+    { "__fixunsdfdi",   (void *)__fixunsdfdi },
+    { "__fixdfdi",      (void *)__fixdfdi },
+    { "__floatundisf",  (void *)__floatundisf },
+    { "__fixunssfdi",   (void *)__fixunssfdi },
+    { "__fixsfdi",      (void *)__fixsfdi },
+#if !defined(__x86_64__) && !defined(__aarch64__)
+    { "__divdi3",       (void *)__divdi3 },
+    { "__moddi3",       (void *)__moddi3 },
+    { "__udivdi3",      (void *)__udivdi3 },
+    { "__umoddi3",      (void *)__umoddi3 },
+    { "__ashldi3",      (void *)__ashldi3 },
+    { "__ashrdi3",      (void *)__ashrdi3 },
+    { "__lshrdi3",      (void *)__lshrdi3 },
+#endif
     WHALE_HOST_SYM(JS_WhaleTAU8CountNZ),
 };
 #define WHALE_HOST_SYM_COUNT \
@@ -10598,17 +10807,31 @@ WHALE_HOST_SYM(JS_WhaleCallMethodValue),
 static int whale_jit_state_ensure(void)
 {
     TCCState *s;
+    const char *rt;
+    char inc[1200], lib[1200];
 
     if (whale_jit_state)
         return 1;
     s = tcc_new();
     if (!s)
         return 0;
-    tcc_set_lib_path(s, WHALE_JIT_TCC_DIR);
-    tcc_add_include_path(s, WHALE_JIT_TCC_DIR "/include");
+    /* The runtime directory is resolved at run time (see whale_jit_rt_dir):
+       package consumer -> embedded archive materialised to a temp dir;
+       installed package -> beside the library; otherwise the build-time path. */
+    rt = whale_jit_rt_dir();
+    snprintf(inc, sizeof(inc), "%s/include", rt);
+    snprintf(lib, sizeof(lib), "%s/lib", rt);
+    tcc_set_lib_path(s, rt);
+    tcc_add_include_path(s, inc);
     tcc_add_include_path(s, WHALE_JIT_SRC_DIR);
-    tcc_add_library_path(s, WHALE_JIT_TCC_DIR "/lib");
+    tcc_add_library_path(s, lib);
     tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
+    /* Every external the generated code references is registered below as a
+       host symbol: the JS_Whale/whale_jit wrappers, the few libc/libm calls,
+       and the libgcc-style 64-bit helpers (compiled into this library from
+       src/tcc/lib/libtcc1.c). Tell TCC to skip the CRT libraries, so no
+       libtcc1 / msvcrt / kernel32 file has to exist anywhere. */
+    JS_WhaleTccNoStdLibs(s);
     for (int i = 0; i < WHALE_HOST_SYM_COUNT; i++)
         tcc_add_symbol(s, whale_host_syms[i].name, whale_host_syms[i].addr);
     whale_jit_state = s;
@@ -10620,7 +10843,7 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
     void *fn;
 
     if (whale_dbg_env("WHALE_JIT_DUMP"))
-        fprintf(stderr, "whale jit paths: src=%s rt=%s\n", WHALE_JIT_SRC_DIR, WHALE_JIT_TCC_DIR);
+        fprintf(stderr, "whale jit paths: src=%s rt=%s\n", WHALE_JIT_SRC_DIR, whale_jit_rt_dir());
 
     /* the lexer must be OFF before anything in TinyCC defines a builtin macro,
        otherwise tcc_define_symbol() would read our (finished) token stream */

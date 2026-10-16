@@ -3787,6 +3787,179 @@ SOLVED + 真 bug×2（return 落点 + reload 判据）+ 弯路×1（pin-only 旁
 ## 测量（本轮零改动，repeat=3）
 - objshape 76、sieve 67、bitops 129、locals 66。全量 25/25 绿，单元测试绿。
 
+# <119>: 编译流程规范化（库化 + 打包），JIT 运行期路径自动探测
+
+## 用户要求
+WhaleJS 是**库**而不是专用 JS 解释器，所以：xmake 编译产物要含 `libwhalejs.a`
+与对应平台的 dll/so（外加 demo exe）；再把 include、lib、readme 按开源社区惯例
+打包成一个归档；**demo exe 不进包**，**libtcc 不要保留**。
+
+## 落地
+- **目标重构**：删 `libtcc_prebuilt` 选项与独立 `libtcc` target；引擎源码 +
+  `src/tcc/whale_tcc_iface.c` 直接编进 `whalejs_static`（`libwhalejs.a`）与
+  `whalejs_shared`（`whalejs.dll` / `libwhalejs.so`，Windows 另有导入库
+  `whalejs.dll.a`）；CLI target 改名 `whalejs_cli`（`set_basename("whalejs")`，
+  产物仍 `whalejs.exe`），测试 `whale_test`、示例 `whale_demo` 都 `add_deps`
+  静态库。共享库导出面靠 quickjs.h 现成的 `BUILDING_QJS_SHARED`
+  （`JS_EXTERN` = `__declspec(dllexport)` / `visibility("default")`）。
+- **坑 1（xmake 依赖解析）**：`static` target **只有 object 依赖、自己没有
+  源文件**时，不会出现在使用者的链接行（scratch 工程复现：`gcc -o app app.o`，
+  无 `-lmylib` → undefined reference）。改法是引擎源码直接进 static/shared
+  target，不用 object 中转。**坑 2**：target 名与 CLI 产物名撞（都叫 whalejs）
+  也会让依赖不落到链接行；用 `_static` 后缀 + `set_basename`。
+- **`xmake whale_pack`**（自定义 task）：暂存 `include/`（quickjs.h、
+  quickjs-libc.h、whalejs.h）、`lib/`（libwhalejs.a + dll + 导入库）、
+  `lib/tcc-runtime/lib/libtcc1-64.a`、README/LICENSE/CHANGELOG，再用系统
+  `tar -a -c -f`（Windows bsdtar）打成 `.zip`（ELF 出 `.tar.gz`）。
+  xmake 这个版本的 `os.zippack/tarpack`、`target.get`、`task.get_option`
+  都不存在（`option.get` 也拿到 menu 标签而非值），所以路径与归档全部用
+  `core.project.config` + 系统 tar；`os.arch()` 报 `x64` 而构建树是 `x86_64`，
+  pack 里做了归一。
+- **JIT 运行期路径（本轮关键）**：原先 `WHALE_JIT_TCC_DIR` 是配置期写死的绝对
+  路径，换机器/换目录就**静默退化成解释器**。新增公开 API
+  `JS_WhaleSetJitRuntimeDir(dir)`，默认探测顺序：显式设置 → `WHALE_JIT_RUNTIME_DIR`
+  环境变量 → 本模块所在目录相对位置（`<dir>/tcc-runtime`、`<dir>/lib/tcc-runtime`、
+  `<dir>/../lib/tcc-runtime`，Windows 用 `GetModuleHandleExA(FROM_ADDRESS)` +
+  `GetModuleFileNameA`，ELF 用 `dladdr`）→ 构建期路径兜底。命中判据是
+  `<dir>/lib/libtcc1-64.a` 存在。
+- **libtcc 的边界（实测）**：JIT 运行期**必须**有 `libtcc1-64.a`——生成代码的
+  `fmod`/`memmove`/`__fixunsdfdi` 等辅助例程从它来（删 `lib/` 立刻
+  `library 'libtcc1-64.a' not found` + 退解释器）。`include/` 与 `*.def`
+  实测**不需要**（token 流路径不 include 任何东西；msvcrt 符号由 PE import 机制
+  解析）。尝试过 `s->nostdlib=1` + 把 `fmod` 注册成宿主符号来彻底去掉运行期文件，
+  **证伪**：nostdlib 连 PE import 绑定一起关掉（所有 `IAT.*` 宿主符号全成
+  undefined），且 `memmove`/`__fixunsdfdi` 仍要 libtcc1。所以归档保留
+  `libtcc1-64.a`（约 40KB，放 `lib/tcc-runtime/lib/`，TCC 的 `add_library_path`
+  按 `<rt>/lib` 搜），但**不含 libtcc 编译器本身**（libtcc.a/.dll/.def 都不进包）。
+- 顺带：版本 0.1.0 → **0.2.0**（新增公开 API + 分发形态变化），
+  根 `README.md`（构建、嵌入、包布局、运行期数据说明），`examples/embed.c`
+  嵌入示例（只用公开头文件 + 库，同时是分发形态的回归）。
+
+## 教训
+- **xmake 的 lua API 因版本而异**，`xmake l -c` 探测在本机 shell 下静默无输出，
+  靠 task 里的 `print` 逐段定位才查清（`os.zippack`/`target.get`/`option.get`
+  全不可用）。自定义 task 的选项读取、目标文件定位都要按**实测**写，别照文档猜。
+- **静态库/共享库的正确性要真跑一遍分发形态**：把归档解压到项目外、把项目自带的
+  `thirdparty/tcc-runtime` 改名藏起来，再跑消费者——否则"能跑"可能只是构建期
+  绝对路径还通着。第一次 relocate 测试就是因此假绿。
+- 打包目录结构要跟引擎的搜索规则对齐：`libtcc1-64.a` 必须在 `<rt>/lib/` 下，
+  一开始放进 `<rt>/` 直接导致 relocate 后 JIT 失效。
+
+## 验证
+`whale api test: ok`；25/25 全对 0 mismatch（runner 口径，`gen-errors=0`）；
+`whale_demo` compiled=1；归档解压到 `%TEMP%` 外、藏起项目运行期目录后，
+动态库与静态库消费者**均 compiled=1/failed=0**（JIT 生效）；归档内容核对：
+有 include/lib/tcc-runtime + 文档，无 demo exe、无 libtcc 编译器。
+
+# <120>: TCC 运行期硬编码进库 + 纯 Lua 打包 + CI 三端构建
+
+## 用户要求（对 <119> 的修正）
+- 根 README **不要**（用户自己有草稿在 temp/README.md，优化数据齐了再发）。
+- tcc runtime **不要留下文件**：要么硬编码进代码（一个 include 导入数组），
+  要么提前链进 .a。目标 = 使用者拿到 libwhalejs.a 直接当 QuickJS 链接用。
+- 打包要写进 xmake（用户机器没有 tar 命令）。
+- 编译尽量出 devel 包含 windows/linux/macos 多端 dll/so；本机没交叉编译环境
+  没关系，github ci/cd 去编译全功能版本；xmake 负责编译出 .a。
+
+## 落地
+- **tcc 运行期硬编码**：`tools/gen_tcc_runtime_inc.py` 把 `thirdparty/tcc-runtime/lib/`
+  下的 `libtcc1-64.a`/`libtcc1-32.a` + `msvcrt.def`/`kernel32.def`/`user32.def`/
+  `gdi32.def` 全部编成 `src/tcc/whale_tcc_rt.inc`（`WhaleTccRtFile` 数组）。
+  `whale_tcc_iface.c` 的 `JS_WhaleRuntimeArchivePath()` 首次运行时把每个文件
+  解到 `<tmp>/whalejs-tcc/lib/`，`whale_jit_rt_dir()` 把它列为第一候选 →
+  `tcc_add_library_path(<rt>/lib)` 就能找到。使用者磁盘上**零 tcc 文件**。
+- **关键实测（<119> 的"*.def 不需要"是错的）**：只嵌 `libtcc1-64.a` 时，array/
+  string/list_reconcile/arr_methods 四个 case 从 ~15ms 退化到 ~250ms——PE import
+  绑定靠 `.def`（msvcrt 等），缺了就退慢路径。把 `.def` 一起嵌进去立刻恢复。
+  教训：**运行期必需文件要逐个用慢 case 验证**，不能只看 fib/objshape。
+- **打包**：`tools/whale_pack.lua`（xmake l 跑，那里 `io` 完整）+ xmake 的
+  `whale_pack` task 只负责构建库 + 传环境变量。zip 用纯 Lua 写（store 法），
+  **不依赖外部 tar/zip**。两个坑：
+  ① xmake task 沙箱里 `io`/`os.readfile`/`os.writefile` 不可用、文件级 global
+  不可见 → 打包逻辑放独立 .lua 脚本，task 用 `os.execv("xmake", {"l", ...})` 调；
+  ② 手写 zip 的中央目录条目**少写 4 字节 external attributes**（46→42），
+  解压器报 `Bad magic number for central directory`。对照 Python zipfile 逐字节
+  定位。另外 `rel()` 去前缀不能用 Lua pattern（版本号里的 `.` 是通配符），用
+  纯字符串前缀判断。归档内容 = include/（3 头 + LICENSE）+ lib/（.a + dll +
+  导入库），**无 README、无 demo、无 tcc**。
+- **CI**：`.github/workflows/build.yml`，matrix = windows-latest/mingw/x86_64、
+  ubuntu-latest/linux/x86_64、macos-latest/macos/arm64。每端：装 xmake +
+  工具链 → （非 Windows）用系统编译器编出本平台 libtcc1-64.a →
+  重新生成 `whale_tcc_rt.inc` → configure/build → whale_test → perftest →
+  `whale_pack` → upload artifact。本机没有的交叉产物由 CI 出。
+
+## 验证
+藏起项目 `thirdparty/tcc-runtime` + 清掉 `%TEMP%\whalejs-tcc` 后：
+`whale api test: ok`（[tcc] 2ms，JIT 活）、25/25 全对 0 mismatch（array 43/
+string 19/fib 4/sieve 66/objshape 75，entries>0）；包解压到项目外、动/静态
+消费者都 compiled=1/failed=0 且自动 materialize（`EMBEDDED_MATERIALIZED_OK`）。
+打包产物用 Python zipfile 验证：`OPEN OK`、`testzip: None`、路径干净。
+
+## 教训
+- **运行期依赖的最小集不是"看起来对"就行**：.def 文件看着没用（fib 正常），
+  只有 array/string 这类走 memcpy/memmove 的 case 才暴露。验证清单必须含
+  "慢 case 组"。
+- **手写二进制格式先造最小复现**：mini.zip（2 文件）在 Python 下逐字节对，
+  比在 4.7MB 的包上猜快得多。中央目录 46 字节 fixed header 一个不能少。
+- **xmake task 沙箱能力 ≠ `xmake l`**：io 可用性、global 可见性都不同。
+  复杂逻辑放独立脚本用 `xmake l` 跑，task 只做编排。
+
+# <121>: JIT 运行期零文件（宿主符号替代 TCC 运行库），<120> 的解到临时目录方案作废
+
+## 用户要求（对 <120> 的修正）
+"文件解压到临时文件夹这个解法还是不好。tcc 是允许拿来魔改的，我建议先尝试让 tcc
+尽量脱离预定义文件（比如只需要 libm 的 mod 就手写一份等价实现，gdi 之类的 a 表之前
+嵌入），不行再改成劫持文件读取加载 inc 里面的内容。" → 目标：使用者拿到
+`libwhalejs.a` 直接链接当 QuickJS 用，**磁盘上零 tcc 运行期文件**（连临时目录都不要）。
+
+## 试过并否决的路线（按顺序）
+1. **把运行库 + .def 编成 `whale_tcc_rt.inc`，首运行解到 `<tmp>/whalejs-tcc/lib/`**
+   （=<120> 的方案）。能工作但用户否掉：仍要写磁盘。
+2. **劫持 read/lseek + 挂钩 tcc_add_file_internal**，把 inc 数组当"内存 fd"喂给 TCC
+   的加载器（`whale_serve_embedded`）。做到了不写盘，但坑很深：TCC 加载器用
+   `read(fd)`/`lseek(fd)`/`fdopen(dup(fd))`（`.def`）/`load_data`，要让内存 fd 假装
+   成真 fd 得改一堆点；且 `tcc_load_archive` 把 ar 尾部的 `\n` 对齐字节当
+   "invalid archive"（顺带发现这是 TCC 的既有脆弱点）。**结论：劫持文件读取不划算**，
+   而且它仍是"带着 TCC 运行库跑"。
+3. **正解 = 让 TCC 根本不链接运行库**：生成代码引用到的外部符号本来就只有三类——
+   `JS_Whale*`/`whale_jit_*` 包装、少量 libc/libm（memset/memmove/fmod/...）、
+   以及 libgcc 风格的 64 位转换辅助。前两类 `tcc_add_symbol` 早就注册了；把
+   **`src/tcc/lib/libtcc1.c` 直接编进库里**（它的注释明确允许"link into
+   combinations with other programs ... without any restriction"），把
+   `__floatundidf`/`__fixunsdfdi`/`__floatundisf`/`__fixunssfdi`/`__fixdfdi`/
+   `__fixsfdi` 也注册成宿主符号；再让 `JS_WhaleTccNoStdLibs(s)` 设
+   `s->nostdlib = 1` 跳过 CRT 链接。于是 **libtcc1-64.a 与所有 .def 都不需要**。
+
+## 落地
+- `xmake.lua` 的 `engine_common()` 加 `add_files("src/tcc/lib/libtcc1.c")`（x86_64 上
+  该文件只有浮点↔整数转换，div/mod/shift 在 `#if !__x86_64__` 里，硬件直接做）。
+- `whale_jit.c` 的 `whale_host_syms[]` 补上 libc/libm（memset/memmove/memcpy/
+  memcmp/strlen/fmod/floor/fabs/sqrt）+ 上述转换辅助（其余 div/mod/shift 用
+  `#if !defined(__x86_64__) && !defined(__aarch64__)` 门住，因为那些平台才需要）。
+- `whale_tcc_iface.c` 新增 `JS_WhaleTccNoStdLibs()`（TCCState 对 whale_jit.c 不透明，
+  只能在这侧设 `nostdlib`）；`whale_jit_state_ensure` 调它。测试里的 `[tok]`/`[tcc]`
+  探针也各自设 nostdlib（它们编的是自包含代码）。
+- 删除 <120> 的整套机制：`tools/gen_tcc_runtime_inc.py`、`src/tcc/whale_tcc_rt.inc`、
+  `JS_WhaleRuntimeArchivePath()` 及其调用、`tccpe.c`/`libtcc.c` 的改动（全部还原）。
+  `tccelf.c` 的 ar 尾部容忍也还原（那条路不再走）。
+- `whale_jit_rt_dir()` 保留（它现在只是搜索路径；探测顺序不变），
+  `JS_WhaleSetJitRuntimeDir()` 保留（用户仍可指定，但发布包不需要任何目录）。
+
+## 验证（全部在藏起 `thirdparty/tcc-runtime` + 清空 `%TEMP%\whalejs-tcc` 后）
+- `whale api test: ok`（[tok] compiled、[tcc] 0-2ms，JIT 活）；
+- 25/25 perftest 0 mismatch，entries>0，无 `TCC_LIBTCC1 not found`；
+- `%TEMP%\whalejs-tcc` **不再被创建**（`NO_TEMP_OK`）；
+- 归档解压到项目外，动/静态消费者都 `compiled=1/failed=0`，同样零运行期文件。
+
+## 教训
+- **"不写临时文件"和"不依赖运行库"是两件事**：劫持文件读取只解决前者（还很脏），
+  真正干净的是后者——把运行库编进库、外部符号全走 `tcc_add_symbol`。
+- **先看生成代码到底引用什么**：`[pe] undef '...'` 一行行列出后，才发现外部符号只有
+  十几类、全都能变成宿主符号。这比"把整个 libtcc1 搬来"简单得多。
+- **改 TCC 之前先想清楚是不是必须改**：这次最终**没动 TCC 源码**（只加了一个 iface
+  里的 `nostdlib` setter），前两条路线的 TCC 改动全回退了。
+
+
 
 
 

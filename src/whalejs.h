@@ -76,7 +76,7 @@ typedef struct JSWhaleContext {
    MAJOR = 对外接口 / JIT ABI 不兼容；MINOR = 新优化 / 新 opcode 覆盖；
    PATCH = 纯修 bug。见 CHANGELOG.md。 */
 #define WHALE_VERSION_MAJOR 0
-#define WHALE_VERSION_MINOR 1
+#define WHALE_VERSION_MINOR 2
 #define WHALE_VERSION_PATCH 0
 
 /* WhaleJS 版本字符串（"0.1.0" 形），由上面的三元组合成。 */
@@ -94,6 +94,14 @@ JS_EXTERN void      JS_WhaleGetJitStats(JSContext *ctx, JSWhaleJitStats *out);
    flags：  传给驱动的额外参数（可为 NULL）；TinyCC 后端忽略。
    两者内部各保留一份拷贝，可随时再次调用覆盖；须在本进程第一次 JIT 编译前设置。 */
 JS_EXTERN void JS_WhaleSetJitCc(const char *driver, const char *flags);
+
+/* JIT 后端查找运行期数据的目录。发布版**不需要任何 tcc 运行期文件**（生成的
+   机器码只引用宿主符号，CRT 不链接），所以这只是一个搜索路径，给"用户自己保留
+   了一份 tcc-runtime"的场景用。默认顺序：本库所在目录的相对位置
+   （<dir>/tcc-runtime、<dir>/lib/tcc-runtime、<dir>/../lib/tcc-runtime）→
+   环境变量 WHALE_JIT_RUNTIME_DIR → 构建期路径。
+   dir：含 lib/libtcc1-64.a 的目录；NULL 或空串恢复自动探测。 */
+JS_EXTERN void JS_WhaleSetJitRuntimeDir(const char *dir);
 
 /* Compile one function with the gcc backend instead of TinyCC. The function
    keeps running interpreted until it goes hot; at that point the gcc backend

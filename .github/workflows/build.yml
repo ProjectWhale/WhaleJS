@@ -1,0 +1,87 @@
+name: build
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+
+jobs:
+  build:
+    name: ${{ matrix.os }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            arch: x86_64
+            plat: mingw
+          - os: ubuntu-latest
+            arch: x86_64
+            plat: linux
+          - os: macos-latest
+            arch: arm64
+            plat: macos
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xmake (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          iwr -useb https://xmake.io/psget.ps1 | iex
+          echo "$env:USERPROFILE\scoop\shims" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Install xmake (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          curl -fsSL https://xmake.io/shget.text | bash
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install xmake (macOS)
+        if: runner.os == 'macOS'
+        run: brew install xmake
+
+      - name: Install MinGW (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install mingw --version=13.2.0 -y
+          echo "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Install build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc g++ make python3
+
+      - name: Install build deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install python
+
+      - name: Configure
+        run: xmake f -y -p ${{ matrix.plat }} -m release -a ${{ matrix.arch }}
+
+      - name: Build
+        run: xmake -y
+
+      - name: Unit tests
+        shell: bash
+        run: |
+          ./build/${{ matrix.plat }}/${{ matrix.arch }}/release/whale_test
+
+      - name: Perftest
+        shell: bash
+        run: |
+          export PATH="$PWD/build/${{ matrix.plat }}/${{ matrix.arch }}/release:$PATH"
+          node perftest/main.js --engines=node,whalejs || true
+
+      - name: Pack
+        run: xmake whale_pack
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whalejs-${{ matrix.plat }}-${{ matrix.arch }}
+          path: |
+            build/package/*.zip
