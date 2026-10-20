@@ -12633,11 +12633,10 @@ void JS_WhaleJitRelease(void *handle)
  * translates something else into C (the WebAssembly extension does this) gets
  * the same parser and the same one TCCState the JIT uses.
  *
- * The state has to be this one. tcc_new() runs tcc_cleanup(), which resets the
- * symbol pools every state shares, and every function already compiled in the
- * engine's state would become unusable - measured as a crash on the next JIT
- * compile. So the extension never creates a state of its own; it hands its
- * tokens here.
+ * The state has to be this one. It is a process-wide singleton (tcc_new()
+ * returns the existing state), because a second state would reset the symbol
+ * pools every state shares and invalidate everything already compiled. So the
+ * extension never creates a state of its own; it hands its tokens here.
  *
  * The caller supplies the body: `emit` is called with the parser ready, and is
  * expected to push a complete C function through JS_WhaleTok*. Returns 1 on

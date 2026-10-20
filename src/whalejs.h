@@ -143,9 +143,9 @@ JS_EXTERN int JS_WhaleInstallWasm(JSContext *ctx);
    把一段 C 函数体编译进引擎**唯一**的那个 TCCState，取回符号地址。WebAssembly
    扩展用它把 wasm 翻译成 C 之后编译。
 
-   为什么必须是引擎这个 state：tcc_new() 会 tcc_cleanup()，把各 state 共享的
-   符号池整个复位，之后引擎已有的 JIT 代码就失效了（实测下一次 JIT 编译直接
-   崩）。所以扩展不要自己 tcc_new()，把 token 交给这里。
+   引擎的 TCCState 是进程级单例：tcc_new() 在 state 已存在时直接返回它，
+   tcc_delete() 对它是空操作。扩展仍应把 token 交给这里，而不是自己驱动
+   parser——这个入口会做编译单元的开合、relocate 的时机和宿主符号的解析。
 
    emit：parser 已经就绪时被调用，负责用 JS_WhaleTok* 推一个完整 C 函数。
    symbol：要取回的符号名（调用方保证唯一）。
