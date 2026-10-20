@@ -152,6 +152,20 @@ int  JS_WhaleJitCompileFunction(JSContext *ctx, const JSWhaleFuncInfo *info,
                                 void **entry_out, void **handle_out);
 void JS_WhaleJitRelease(void *handle);
 
+/* The numeric-leaf entry of the function compiled by the most recent
+   JS_WhaleJitCompileFunction call, or NULL.
+
+   A function whose arguments and result are all numbers, that parks no object,
+   never calls and has no closure state, is also emitted under a frame-free ABI:
+
+       double f(void *ctx, double *args, int *deopt);
+
+   No JSValue, no boxing, no JSStackFrame - so a compiled caller can invoke it
+   the way it invokes its own core, and an interpreted call site only pays one
+   unbox per argument. Anything the ABI cannot express sets *deopt and the
+   caller falls back to the ordinary entry. */
+void *JS_WhaleJitLastNatEntry(void);
+
 /* services the engine provides to the generator */
 int JS_WhaleVarRefIsSelf(JSContext *ctx, void **var_refs, int idx, JSValue self);
 /* Fill `out` with the bytecode of the function literal in cpool[idx], so the
@@ -218,6 +232,45 @@ int  JS_WhaleObjSlotAtom(JSContext *ctx, int atom, int k);
    exception, in which case the generated code must deopt. */
 JS_EXTERN int JS_WhaleBinopVal(JSContext *ctx, int op, int a_slot, int b_slot,
                                int out_slot);
+/* `"literal" + small int` with a bounded result cache, for the render-loop shape
+   `"c" + (i % 3)`. `atom` is the left operand's atom (the generator emitted the
+   push, so it knows it). Returns 0 when the operands are not that shape; the
+   caller then uses JS_WhaleBinopVal. The result is parked in out_slot. */
+JS_EXTERN int JS_WhaleConcatAtomInt(JSContext *ctx, int atom, int b_slot,
+                                    int out_slot);
+JS_EXTERN void JS_WhaleConcatCacheFree(JSRuntime *rt);
+/* `obj[field] = prefix_atom + v` in one call: the render loop's
+   `{ cls: "c" + (i % 3) }`. Returns 0 when v is not a small integer; the caller
+   then emits the general sequence. `str_slot` is scratch. */
+JS_EXTERN int JS_WhaleObjDefineConcat(JSContext *ctx, int obj_slot,
+                                      int field_atom, int prefix_atom,
+                                      int str_slot, double v);
+/* Build a whole object literal in one call. `atoms[k]` names field k;
+   `num_mask` bit k selects `nums[k]` (a double) over `slots[k]` (a JSValue).
+   Returns 0 to deopt. The field set is a compile-time constant, so the caller
+   fills the arrays once per call site rather than per iteration. */
+JS_EXTERN int JS_WhaleObjBuild(JSContext *ctx, int slot, const int *atoms, int n,
+                               const double *nums, const int *slots,
+                               unsigned num_mask, unsigned val_mask);
+/* Build a numeric literal and store it into an array element in one call:
+   `a[i] = { x: <num>, ... }`. Every field must be numeric. */
+JS_EXTERN int JS_WhaleObjBuildStore(JSContext *ctx, int arr_slot, double idx,
+                                    int obj_slot, const int *atoms, int n,
+                                    const double *nums, unsigned num_mask);
+/* `obj[field] = null` / `obj[field] = "literal"`: the value is a compile-time
+   constant, so one call does both the value materialisation and the define.
+   The general path needs two (park the value, then define from the slot). */
+JS_EXTERN int JS_WhaleObjDefineNull(JSContext *ctx, int obj_slot, int field_atom);
+JS_EXTERN int JS_WhaleObjDefineAtom(JSContext *ctx, int obj_slot, int field_atom,
+                                    int val_atom);
+
+/* Read property `atom` of the object in `slot` as a JSValue and park it in
+   `out_slot`, using the caller's (shape, pointer) cache pair. 0 means deopt -
+   not an object, no such property, or an accessor. This is the nested-record
+   arm: `v.props` is an object, so the numeric read above can only refuse it. */
+int JS_WhaleObjFieldVal(JSContext *ctx, int slot, int atom,
+                        void **shape_cache, void **ptr_cache, int out_slot,
+                        int *deopt);
 
 /* Exception handling. The handler targets live in the generator (the bytecode says
    where a `catch` goes); the runtime raises and answers whether something was
@@ -275,6 +328,10 @@ int JS_WhaleObjSlotCopy(JSContext *ctx, int src, int dst);
    receiver of a property access can travel as the JSValue it is. 0 means "not an
    object" and deopts. */
 int JS_WhaleArgGetObj(JSContext *ctx, JSValue v, int slot);
+/* Park argument `v` in slot k whatever its tag. A parameter that is stored into
+   an object field as its value (`{ props: props }`) may be an object, a string
+   or null, so no tag assumption is legal there. */
+int JS_WhaleArgGetVal(JSContext *ctx, JSValue v, int slot);
 /* The pending exception as a value the generated code can return. */
 JSValue JS_WhaleExceptionValue(JSContext *ctx);
 

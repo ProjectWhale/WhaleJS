@@ -55,9 +55,6 @@ static double eval_number(JSContext *ctx, const char *src)
 #define SRC_LOOP "var s=0; for (var i=0;i<1000;i++) s+=i; s"
 #define SRC_STR  "('a'+'b'+[1,2,3].join('-')).length"
 
-/* TCC 运行时支持目录（相对项目根；xmake run 的 cwd 就是项目根） */
-#define WHALE_TCC_DIR "thirdparty/tcc-runtime"
-
 /*
  * TCC 后端自检：证明 libtcc 已经链进来，且能在运行期把 C 源码编成机器码直接调用。
  * 这是 JIT 的地基——真正的字节码→C 翻译还没接。
@@ -73,14 +70,9 @@ static void check_tcc_backend(void)
     if (!s)
         return;
 
-    /* Every external the JIT's generated code needs is a host symbol and the
-       CRT libraries are skipped, so this check needs no on-disk tcc-runtime at
-       all; WHALE_TCC_DIR is just a search path. */
-    tcc_set_lib_path(s, WHALE_TCC_DIR);
-    tcc_add_include_path(s, WHALE_TCC_DIR "/include");
-    tcc_add_library_path(s, WHALE_TCC_DIR "/lib");
-    /* the generated C here references no external at all (pure int code), so
-       skipping the CRT is enough to make it compile with no tcc-runtime */
+    /* 不需要任何 tcc 运行期目录：生成的 C 不引用外部符号，CRT 也不链接。
+       这里刻意不设 include/library path——一旦设了，TinyCC 会去磁盘上找
+       libtcc1-*.a，那正是发布版不该发生的事。 */
     JS_WhaleTccNoStdLibs(s);
     tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
 
@@ -112,16 +104,15 @@ static void check_tcc_backend(void)
 }
 
 /* ---- custom token stream driving TinyCC's own parser, no C source involved. */
-extern void *JS_WhaleTokCompileAdd2(const char *tcc_dir);
+extern void *JS_WhaleTokCompileAdd2(void);
 
 static void check_ir_direct(void)
 {
     double (*add2)(double, double);
 
-    /* the runtime is all host symbols + embedded helpers now, so the probe's
-       tcc_dir is just a search path; WHALE_TCC_DIR works with or without a
-       directory behind it */
-    add2 = (double (*)(double, double))JS_WhaleTokCompileAdd2(WHALE_TCC_DIR);
+    /* no runtime directory at all: the probe's code is self-contained and every
+       external the JIT emits is a host symbol */
+    add2 = (double (*)(double, double))JS_WhaleTokCompileAdd2();
 
     printf("  [tok] token-stream compile: %s\n", add2 ? "compiled" : "NULL");
     if (add2) {
@@ -131,7 +122,9 @@ static void check_ir_direct(void)
     }
 }
 
-/* ---- x86-64 direct emitter probe (route B skeleton): raw addsd bytes. */
+/* ---- x86-64 direct emitter probe (route B skeleton): raw addsd bytes.
+   The emitter itself is Windows/x64-only, so the probe only exists there. */
+#if defined(_WIN32) && (defined(__x86_64__) || defined(_M_X64))
 extern void *JS_WhaleX64ProbeAdd2(void);
 
 static void check_x64_probe(void)
@@ -145,6 +138,12 @@ static void check_x64_probe(void)
         CHECK(r == 6.5);
     }
 }
+#else
+static void check_x64_probe(void)
+{
+    printf("  [x64] direct emit: skipped (x86-64 only)\n");
+}
+#endif
 
 int main(void)
 {

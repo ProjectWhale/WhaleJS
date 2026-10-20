@@ -990,6 +990,12 @@ int whale_deopt_count;     /* refusals seen before the entry was retired */
        function that does not use them must not pay for that - it is per call,
        and fib-style recursion notices. */
     uint8_t whale_needs_obj;
+    /* The frame-free entry, when the compiled function has the numeric-leaf
+       shape: `double f(void *ctx, double *args, int *deopt)`. No JSValue, no
+       boxing, no stack frame - a caller that already holds the arguments as
+       doubles (compiled code does) enters here directly. NULL when the shape
+       does not apply, and then every call goes through whale_jit_entry. */
+    void *whale_nat_entry;
     /* Observation of this function's property accesses, filled during the last
        WHALE_PROFILE_CALLS interpreted calls and read by the generator. Site lookup
        is direct-mapped on the operand offset: a slot holding a different offset is
@@ -1634,6 +1640,7 @@ static void async_func_mark(JSRuntime *rt, JSAsyncFunctionState *s,
 static int JS_AddIntrinsicBasicObjects(JSContext *ctx);
 static void js_free_shape(JSRuntime *rt, JSShape *sh);
 static void js_free_shape_null(JSRuntime *rt, JSShape *sh);
+static JSShape *js_dup_shape(JSShape *sh);
 static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
                                    JSShapeProperty **pprs);
 static int init_shape_hash(JSRuntime *rt);
@@ -2825,6 +2832,10 @@ void JS_FreeRuntime(JSRuntime *rt)
         }
     }
 
+    /* The JIT's small-integer concatenation cache holds string values; they are
+       owned here, not by any object, so the runtime has to release them. */
+    JS_WhaleConcatCacheFree(rt);
+
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
     /* leaking objects */
     if (check_dump_flag(rt, JS_DUMP_LEAKS)) {
@@ -3173,8 +3184,15 @@ int JS_WhaleStructNew(JSContext *ctx, const int *atoms, int nslots, int slot)
     int k;
 
     if (whale_str_stat_on()) {
-        static long n;
-        fprintf(stderr, "[str-stat] StructNew calls=%ld nslots=%d slot=%d\n", ++n, nslots, slot);
+        static long n, hit, miss;
+        n++;
+        if (ctx->rt->whale_struct_free[nslots - 1])
+            hit++;
+        else
+            miss++;
+        if (n == 1 || (n & (n - 1)) == 0)
+            fprintf(stderr, "[str-stat] StructNew calls=%ld nslots=%d slot=%d hit=%ld miss=%ld\n",
+                    n, nslots, slot, hit, miss);
     }
     if (nslots <= 0 || nslots > WHALE_ATOM_MAX || !atoms)
         return 0;
@@ -3572,11 +3590,11 @@ int JS_WhaleVarRefGetNum(JSContext *ctx, void *var_refs, int idx, double *out)
         return 0;
     v = *vr->pvalue;
     if (JS_VALUE_GET_TAG(v) == JS_TAG_FLOAT64) {
-        *out = v.u.float64;
+        *out = JS_VALUE_GET_FLOAT64(v);
         return 1;
     }
     if (JS_VALUE_GET_TAG(v) == JS_TAG_INT) {
-        *out = (double)v.u.int32;
+        *out = (double)JS_VALUE_GET_INT(v);
         return 1;
     }
     return 0;
@@ -3606,6 +3624,27 @@ int JS_WhaleCheckStack(JSContext *ctx)
         return 0;
     }
     return 1;
+}
+
+static void JS_ThrowInterrupted(JSContext *ctx);
+
+/* Run the embedder's interrupt handler once and report whether it asked to
+   stop. Code that runs outside JS_CallInternal - a native interpreter the
+   extension drives, a wasm loop - has no js_poll_interrupts() call to reach,
+   and the handler itself lives in the private JSRuntime. This is that poll:
+   return 1 when execution must stop (the caller then unwinds and throws), 0
+   to carry on. The error is thrown here, so a caller that stops must not throw
+   a second one. */
+int JS_WhalePollInterrupt(JSContext *ctx)
+{
+    if (!ctx)
+        return 0;
+    if (ctx->rt->interrupt_handler &&
+        ctx->rt->interrupt_handler(ctx->rt, ctx->rt->interrupt_opaque)) {
+        JS_ThrowInterrupted(ctx);
+        return 1;
+    }
+    return 0;
 }
 
 /* Diagnostic: how a compiled call actually ended.
@@ -3661,8 +3700,19 @@ void JS_WhaleDeoptNote(JSContext *ctx, int flag)
        was measurable all by itself (the CRT consults the process environment). */
     if (dbg < 0)
         dbg = whale_dbg_env("WHALE_DEOPT_DBG") != NULL;
-    if (dbg)
-        fprintf(stderr, "[deopt] call=%ld flag=%d\n", whale_entry_total, flag);
+    if (dbg) {
+        JSFunctionBytecode *fb = NULL;
+        JSStackFrame *sf = ctx ? ctx->rt->current_stack_frame : NULL;
+
+        if (sf && JS_VALUE_GET_TAG(sf->cur_func) == JS_TAG_OBJECT &&
+            JS_VALUE_GET_OBJ(sf->cur_func)->class_id == JS_CLASS_BYTECODE_FUNCTION)
+            fb = JS_VALUE_GET_OBJ(sf->cur_func)->u.func.function_bytecode;
+        if (fb)
+            fprintf(stderr, "[deopt] call=%ld flag=%d len=%d argc=%d\n",
+                    whale_entry_total, flag, fb->byte_code_len, fb->arg_count);
+        else
+            fprintf(stderr, "[deopt] call=%ld flag=%d\n", whale_entry_total, flag);
+    }
 }
 
 /* deopt census: why did a compiled function bail? Called only inside deopt
@@ -3845,8 +3895,7 @@ int JS_WhaleObjSlotNum(JSContext *ctx, int slot, double v)
 /* Duplicate slot src into slot dst - how a value that is already parked (an
    object literal, a property that is not a number) gets into the contiguous
    scratch area a compiled call needs. */
-int JS_WhaleObjSlotCopy(JSContext *ctx, int src, int dst)
-{
+int JS_WhaleObjSlotCopy(JSContext *ctx, int src, int dst){
     if (src < 0 || src >= WHALE_OBJ_SLOTS)
         return 0;
     if (dst < 0 || dst >= WHALE_OBJ_SLOTS)
@@ -3863,6 +3912,18 @@ int JS_WhaleArgGetObj(JSContext *ctx, JSValue v, int slot)
     if (slot < 0 || slot >= WHALE_OBJ_SLOTS)
         return 0;
     if (!JS_IsObject(v))
+        return 0;
+    JS_WhaleObjSlot(ctx, slot, js_dup(v));
+    return 1;
+}
+
+/* Park an argument that is stored into an object field as its value. Unlike
+   JS_WhaleArgGetObj this accepts ANY value: a vnode's `props` is an object, a
+   `key` may be null, a `cls` a string. The field store then takes the slot's
+   value, so no assumption is made about the tag. */
+int JS_WhaleArgGetVal(JSContext *ctx, JSValue v, int slot)
+{
+    if (slot < 0 || slot >= WHALE_OBJ_SLOTS)
         return 0;
     JS_WhaleObjSlot(ctx, slot, js_dup(v));
     return 1;
@@ -3909,6 +3970,19 @@ static uintptr_t whale_ver_key_of(JSValue *arg_buf, int argc, int *nobj_out,
 struct JSShape;
 static int whale_shape_is_descendant(const struct JSShape *d,
                                      const struct JSShape *s);
+/* Box a double the way the generated entry does: int32 when it is one, float64
+   otherwise. Shared so the frame-free path returns exactly the same value the
+   ordinary entry would have. */
+static JSValue whale_box_number(JSContext *ctx, double d)
+{
+    if (d >= -2147483648.0 && d <= 2147483647.0) {
+        int i = (int)d;
+
+        if ((double)i == d)
+            return JS_MKVAL(JS_TAG_INT, i);
+    }
+    return JS_NewFloat64(ctx, d);
+}
 static int whale_fast_call(JSContext *ctx, JSValue func, int argc,
                            JSValue *args, JSValue *ret)
 {
@@ -3929,6 +4003,36 @@ static int whale_fast_call(JSContext *ctx, JSValue func, int argc,
     b = p->u.func.function_bytecode;
     if (!b->whale_jit_entry)
         return 0;
+    /* The frame-free entry first: a function whose arguments and result are all
+       numbers needs no JSValue frame, no boxing and no stack frame at all. The
+       call is then a double array in and a double out - the same shape a compiled
+       caller already has its arguments in. A deopt falls through to the ordinary
+       path, which re-runs the frame from the top. */
+    if (b->whale_nat_entry && argc == b->arg_count && argc <= 8) {
+        double dargs[8];
+        int ddeopt = 0, k, ok = 1;
+
+        for (k = 0; k < argc; k++) {
+            int t = JS_VALUE_GET_TAG(args[k]);
+
+            if (t == JS_TAG_INT) {
+                dargs[k] = (double)JS_VALUE_GET_INT(args[k]);
+            } else if (JS_TAG_IS_FLOAT64(t)) {
+                dargs[k] = JS_VALUE_GET_FLOAT64(args[k]);
+            } else {
+                ok = 0;
+                break;
+            }
+        }
+        if (ok) {
+            double r = ((double (*)(JSContext *, double *, int *))
+                        b->whale_nat_entry)(ctx, dargs, &ddeopt);
+
+            if (!ddeopt) {
+                *ret = whale_box_number(ctx, r);
+                return 1;
+            }        }
+    }
     /* The entry's wrapper reads args[i] directly; a missing argument would
        have to be filled with undefined first, and a captured variable needs
        the interpreter's var_ref area. Both are rare - leave them to JS_Call. */
@@ -4218,7 +4322,7 @@ int JS_WhaleVarRefIsFn(JSContext *ctx, void *var_refs, int idx, int expect_slot)
         return 0;
     v = *vr->pvalue;
     return JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT &&
-        JS_VALUE_GET_PTR(v) == (uintptr_t)whale_vr_expect[expect_slot] &&
+        JS_VALUE_GET_PTR(v) == whale_vr_expect[expect_slot] &&
         JS_VALUE_GET_OBJ(v)->class_id == JS_CLASS_BYTECODE_FUNCTION;
 }
 
@@ -4275,6 +4379,22 @@ int JS_WhaleCallSelfValue(JSContext *ctx, int argc, int arg_base, int ret_slot)
     self = sf->cur_func;   /* borrowed: the frame running this generated code */
     if (argc < 0 || arg_base < 0 || arg_base + argc > WHALE_OBJ_SLOTS)
         return 0;
+    /* A compiled callee goes straight to its entry, exactly like a plain
+       compiled call (whale_fast_call). Going through JS_Call instead built a
+       full interpreter frame per iteration, and re-ran the callee's own
+       hotness bookkeeping. `real()` in vnprof2 - a render loop calling a
+       two-argument factory - measured 11ms against 0ms for the identical loop
+       with the literal written inline; the call was the whole difference. The
+       callee may still be interpreted (its compile failed, or it deopted and
+       retired); then JS_Call is the correct path, and whale_fast_call answers
+       0 for exactly that case. */
+    if (whale_fast_call(ctx, self, argc, slots + arg_base, &r)) {
+        if (ret_slot >= 0 && ret_slot < WHALE_OBJ_SLOTS)
+            JS_WhaleObjSlot(ctx, ret_slot, r);
+        else
+            JS_FreeValue(ctx, r);
+        return 1;
+    }
     r = JS_Call(ctx, self, JS_UNDEFINED, argc, slots + arg_base);
     if (JS_IsException(r))
         return 0;
@@ -4752,7 +4872,36 @@ static void whale_memo_insert(JSContext *ctx, WhaleMemo *m, int argc,
    disabled once they pass WHALE_PROFILE_SHAPES: memory has to stay bounded because
    a script can reach tens of thousands of objects, and a site that has seen many
    shapes is one the general form should handle anyway. */
-static void whale_prof_record(JSFunctionBytecode *b, uint32_t pc, JSShape *shape)
+/* Drop the references a site holds. A shape stored here is owned by the profile
+   table (see whale_prof_record), so every path that discards a slot has to
+   release it - otherwise the table leaks one shape per recorded site. */
+static void whale_prof_site_release(JSRuntime *rt, WhaleProfSite *s)
+{
+    int i;
+
+    if (s->n > 0 && s->n < 0xff) {
+        for (i = 0; i < s->n; i++)
+            js_free_shape_null(rt, s->shape[i]);
+    }
+    s->n = 0;
+}
+
+static void whale_prof_site_disable(JSRuntime *rt, WhaleProfSite *s)
+{
+    whale_prof_site_release(rt, s);
+    s->n = 0xff;
+}
+
+/* The shapes are PINNED here. An object's shape is reference-counted and freed
+   as soon as its last object dies, which is exactly what happens while a loop's
+   temporaries are collected - and the profile table is read later, during the
+   compile, through JS_WhaleShapeFields(). Storing a raw pointer meant the
+   generator dereferenced freed memory (WhaleNode saw 4/10 crashes on a small
+   test-file reproducer). Taking a reference makes the table an owner: the shape
+   cannot be collected while the table lives, and whale_prof_site_release /
+   whale_memo_discard give the reference back. */
+static void whale_prof_record(JSRuntime *rt, JSFunctionBytecode *b, uint32_t pc,
+                              JSShape *shape)
 {
     WhaleProfSite *s;
     int i;
@@ -4760,14 +4909,14 @@ static void whale_prof_record(JSFunctionBytecode *b, uint32_t pc, JSShape *shape
     s = &b->whale_prof[(pc >> 2) % WHALE_PROFILE_SITES];
     if (s->n == 0) {
         s->pc = pc;
-        s->shape[0] = shape;
+        s->shape[0] = js_dup_shape(shape);
         s->n = 1;
         return;
     }
     if (s->n == 0xff)
         return;                                  /* already disabled */
     if (s->pc != pc) {
-        s->n = 0xff;                             /* two offsets in one slot */
+        whale_prof_site_disable(rt, s);          /* two offsets in one slot */
         return;
     }
     if (s->shape[s->n - 1] == shape)
@@ -4776,10 +4925,10 @@ static void whale_prof_record(JSFunctionBytecode *b, uint32_t pc, JSShape *shape
         if (s->shape[i] == shape)
             return;
     if (s->n < WHALE_PROFILE_SHAPES) {
-        s->shape[s->n] = shape;
+        s->shape[s->n] = js_dup_shape(shape);
         s->n++;
     } else {
-        s->n = 0xff;                             /* too many: leave it to the general form */
+        whale_prof_site_disable(rt, s);          /* too many: the general form */
     }
 }
 
@@ -4896,12 +5045,15 @@ static void whale_prof_dump(JSFunctionBytecode *b)
 static void whale_memo_discard(JSRuntime *rt, JSFunctionBytecode *b)
 {
     WhaleMemo *m = b->whale_memo;
+    int i;
 
     if (b->whale_prof) {
+        /* the table owns a reference to every shape it recorded */
+        for (i = 0; i < WHALE_PROFILE_SITES; i++)
+            whale_prof_site_release(rt, &b->whale_prof[i]);
         js_free_rt(rt, b->whale_prof);
         b->whale_prof = NULL;
     }
-    int i;
 
     if (!m)
         return;
@@ -4967,7 +5119,7 @@ static void *whale_ver_pick(JSContext *ctx, JSFunctionBytecode *b,
             uintptr_t sk = b->whale_ver_key[i];
 
             if (b->whale_ver_entry[i] && !(sk & 1) &&
-                (sk >> 48) == (key >> 48) && single &&
+                ((uint64_t)sk >> 48) == ((uint64_t)key >> 48) && single &&
                 whale_shape_is_descendant(single,
                     (const JSShape *)(void *)(sk & (uintptr_t)0xffffffffffffULL))) {
                 b->whale_ver_use[i] = ++b->whale_ver_clock;
@@ -5029,12 +5181,18 @@ static uintptr_t whale_ver_key_of(JSValue *arg_buf, int argc, int *nobj_out,
     if (nobj == 0)
         return 0;
     if (nobj == 1) {
-        return ((uintptr_t)(unsigned)argc << 56) |
-               ((uintptr_t)(single_pos & 0xff) << 48) |
-               ((uintptr_t)(void *)single & (uintptr_t)0xffffffffffffULL);
+        /* Packed through uint64_t so the expression is defined on every host:
+           a 32-bit uintptr_t cannot hold argc and the position (the shifts
+           would be UB), and it would truncate - which is fine, because the
+           version table is only consulted by the JIT and the JIT needs the
+           16-byte JSValue (64-bit) to exist at all. */
+        uint64_t k64 = ((uint64_t)(unsigned)argc << 56) |
+                       ((uint64_t)(single_pos & 0xff) << 48) |
+                       ((uint64_t)(uintptr_t)(void *)single & 0xffffffffffffULL);
+        return (uintptr_t)k64;
     }
     key |= (uintptr_t)1;
-    return key ? key : (uintptr_t)1 | ((uintptr_t)(unsigned)argc << 56);
+    return key ? key : (uintptr_t)1 | (uintptr_t)((uint64_t)(unsigned)argc << 56);
 }
 
 /* Version-table re-JIT: compile one more specialised version against the
@@ -5210,6 +5368,10 @@ static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b,
                 selfref = whale_gen_self_ref;
                 b->whale_jit_entry = entry;
                 b->whale_jit_tcc = handle;
+                /* The frame-free entry, when the generator emitted one. Only the
+                   self reading gets it: the other reading depends on captured
+                   state, which the numeric-leaf ABI has no room for. */
+                b->whale_nat_entry = JS_WhaleJitLastNatEntry();
                 /* Version table seed (notes <111>): when the function uses
                    object slots, also compile the generic fallback now (same
                    reading) - it is the pinned slot new shapes fall into, so
@@ -5267,8 +5429,16 @@ static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b,
             /* Memoise on the self reading only - that is the one the generator
                proved to depend on nothing but its arguments. If it turns out not
                to be the right reading, the entry check fails on the very first
-               run and JS_CallInternal drops this (see *deopt == 3 there). */
-            if (pure1) {
+               run and JS_CallInternal drops this (see *deopt == 3 there).
+
+               WHALE_NO_MEMO turns it off. Memoisation is a semantic
+               optimisation, not a speed trick: a call with the arguments it has
+               already seen does not run the body at all, so a benchmark that
+               calls f(26) twenty times measures one execution and nineteen
+               table lookups. perftest sets it, because every case there exists
+               to measure throughput. The flag is deliberately read per compile
+               (not cached): it is checked once per function, not per call. */
+            if (pure1 && !getenv("WHALE_NO_MEMO")) {
                 WhaleMemo *m = js_mallocz(ctx, sizeof(*m));
 
                 if (m) {
@@ -9332,6 +9502,154 @@ int JS_WhaleObjNew(JSContext *ctx, int slot)
     return 1;
 }
 
+/* Build a whole object literal in one call: `{ a: <num>, b: <slot>, ... }`.
+
+   The generated code used to make one helper call per field - ObjNew, then
+   DefineNum or DefineValue for each - and each of those is a call plus a slot
+   write plus, for the value form, a dup. Measured on a two-field literal in a
+   loop, the six calls alone cost ~225ns per iteration even though every one of
+   them does almost nothing; the call overhead *is* the cost.
+
+   `atoms[k]` names field k. `num_mask` has bit k set when field k is a double
+   taken from `nums[k]`; otherwise it is the JSValue already parked in
+   `slots[k]` and is duplicated into the object. Returns 0 to deopt (a failed
+   allocation, or a define that threw).
+
+   The field set is a compile-time constant, so the caller passes it as arrays
+   the generated code fills once per call site - not per iteration. */
+int JS_WhaleObjBuild(JSContext *ctx, int slot, const int *atoms, int n,
+                     const double *nums, const int *slots,
+                     unsigned num_mask, unsigned val_mask)
+{
+    JSValue *frame;
+    JSValue o;
+    JSObject *p;
+    int k;
+
+    if (n <= 0 || n > WHALE_ATOM_MAX || !atoms || slot < 0 ||
+        slot >= WHALE_OBJ_SLOTS)
+        return 0;
+    if (!JS_WhaleObjNew(ctx, slot))
+        return 0;
+    frame = whale_frame_obj_slots(ctx);
+    o = frame[slot];
+    /* Fast path for the free-list case: the shell keeps its shape and its
+       property block, so an object of the same literal arrives already carrying
+       every field. Then each field is a store into its slot - no define, no
+       shape lookup, no transition. That is the whole cost difference measured
+       on `a[0] = {a:i, b:i+1}` in a loop (164ms against 29ms with the object
+       built once outside); the free list was already hitting 100%, so the
+       remaining cost was the property machinery per field.
+
+       The shape check is one pointer compare against the last shape this call
+       site saw. A miss falls through to the general define, which is what the
+       first iteration and any shape change take. */
+    p = JS_VALUE_GET_OBJ(o);
+    if (p->class_id == JS_CLASS_OBJECT && p->shape && p->prop &&
+        p->shape->prop_count >= n) {
+        JSShapeProperty *prs = get_shape_prop(p->shape);
+        int ok = 1, all_num = (num_mask & ((1u << n) - 1u)) == ((1u << n) - 1u);
+
+        for (k = 0; k < n && ok; k++) {
+            if (prs[k].atom != (JSAtom)atoms[k] ||
+                (prs[k].flags & JS_PROP_TMASK) != JS_PROP_NORMAL ||
+                !(prs[k].flags & JS_PROP_WRITABLE))
+                ok = 0;
+        }
+        if (ok && all_num) {
+            /* Same shape, same atoms, all numeric: pure slot writes.
+
+               The old value is freed inline rather than through JS_FreeValue:
+               that is an out-of-line call that only checks the tag and returns
+               for a number, and this loop runs twice per iteration in the
+               escape-into-array shape - 4M no-op calls per 2M iterations, which
+               measured as the remaining gap to node. */
+            for (k = 0; k < n; k++) {
+                JSValue old = p->prop[k].u.value;
+
+                if (JS_VALUE_HAS_REF_COUNT(old))
+                    JS_FreeValue(ctx, old);
+                p->prop[k].u.value = JS_NewFloat64(ctx, nums[k]);
+            }
+            if (whale_str_stat_on()) {
+                static long fh, fm;
+
+                fh++;
+                if ((fh & (fh - 1)) == 0)
+                    fprintf(stderr, "[str-stat] ObjBuild fast=%ld\n", fh);
+            }
+            return 1;
+        }
+    }
+    for (k = 0; k < n; k++) {
+        JSValue v;
+
+        /* A field the literal did not assign on this path is skipped, not
+           written as zero: the layout is the union of every field site in the
+           function, so it reserves names this object never has. */
+        if (num_mask & (1u << k)) {
+            v = JS_NewFloat64(ctx, nums[k]);
+        } else if (val_mask & (1u << k)) {
+            int s = slots[k];
+
+            if (s < 0 || s >= WHALE_OBJ_SLOTS)
+                return 0;
+            v = js_dup(frame[s]);
+        } else {
+            continue;
+        }
+        if (JS_DefinePropertyValue(ctx, o, atoms[k], v, JS_PROP_C_W_E) < 0)
+            return 0;
+    }
+    return 1;
+}
+
+/* Build a literal and store it into an array element in one call:
+   `a[i] = { x: <num>, ... }`.
+
+   The two-call form (JS_WhaleObjBuild then JS_WhaleArrSetVal) was the remaining
+   cost of the escape-into-array shape: measured 100ms per 2M iterations against
+   node's 27ms, while the same loop with the object built once outside costs
+   28ms and the arithmetic alone costs 0ms. Every helper call on this path is
+   visible at that scale, so the build and the store become one.
+
+   All fields must be numeric (the caller guarantees it): a literal with an
+   opaque field takes the per-field path, whose values are staged in object
+   slots this signature has no room for. */
+int JS_WhaleObjBuildStore(JSContext *ctx, int arr_slot, double idx,
+                          int obj_slot, const int *atoms, int n,
+                          const double *nums, unsigned num_mask)
+{
+    JSValue *frame;
+    JSValue a, o;
+    JSObject *p;
+    uint32_t i;
+
+    if (!JS_WhaleObjBuild(ctx, obj_slot, atoms, n, nums, NULL, num_mask, 0))
+        return 0;
+    frame = whale_frame_obj_slots(ctx);
+    a = frame[arr_slot];
+    if (JS_VALUE_GET_TAG(a) != JS_TAG_OBJECT)
+        return 0;
+    if (!(idx >= 0 && idx <= 4294967294.0))
+        return 0;
+    i = (uint32_t)idx;
+    p = JS_VALUE_GET_OBJ(a);
+    o = js_dup(frame[obj_slot]);
+    if (p->fast_array && p->class_id == JS_CLASS_ARRAY) {
+        if (i == p->u.array.count)
+            return add_fast_array_element(ctx, p, o, JS_PROP_C_W_E) > 0;
+        if (i < p->u.array.count) {
+            JS_FreeValue(ctx, p->u.array.u.values[i]);
+            p->u.array.u.values[i] = o;
+            return 1;
+        }
+    }
+    if (JS_SetPropertyInt64(ctx, a, (int64_t)i, o) < 0)
+        return 0;
+    return 1;
+}
+
 /* Park closure slot idx in object slot `slot`, as-is. A call target read out of
    a closure is either this very function or an enclosing closure's value, and
    the generated code only needs "a JSValue to call" - so this does not try to
@@ -9353,20 +9671,38 @@ int JS_WhaleVarRefGetObj(JSContext *ctx, void *var_refs, int idx, int slot)
     return 1;
 }
 
-/* The object's shape, as an opaque key for generated code to compare against
-   the one it cached. A struct object answers with the struct itself: its
-   columns are allocated once and never move, and two struct objects must
-   never share a key - struct objects carry no ordinary properties, so p->shape
-   would hand every one of them the same empty shape. */
+/* The cache key a generated field access compares before reusing its resolved
+   pointer.
+
+   It has to be the *object*, not its shape. The cached value is the address of
+   one property inside one object (`p->prop[i]`), so two different objects that
+   happen to share a shape are not interchangeable: a loop that builds a fresh
+   literal per iteration reuses one access site, and a shape-only key made every
+   trip after the first read the previous iteration's object. That is the
+   `v.props.id` bug - `{id: i}` objects all have one shape, so the second
+   iteration answered with the first iteration's `id`.
+
+   A shape change on the *same* object is still covered: adding or removing a
+   property reallocates `p->prop`, and the generator bumps `_wsc.fver` for every
+   store that can do it (a call, put_field, define_field on a heap object), so
+   the `fv[fc] != fver` half of the test misses and the pointer is re-resolved.
+
+   A struct answers with its WhaleStruct, which is unique per object by
+   construction - the same identity rule. */
+static void *whale_obj_key(JSObject *p)
+{
+    if (p->class_id == JS_CLASS_WHALE_STRUCT)
+        return p->u.opaque;
+    return p;
+}
+
 void *JS_WhaleObjShape(JSContext *ctx, int slot)
 {
     JSValue o = whale_frame_obj_slots(ctx)[slot];
 
     if (JS_VALUE_GET_TAG(o) != JS_TAG_OBJECT)
         return NULL;
-    if (JS_VALUE_GET_OBJ(o)->class_id == JS_CLASS_WHALE_STRUCT)
-        return JS_VALUE_GET_OBJ(o)->u.opaque;
-    return JS_VALUE_GET_OBJ(o)->shape;
+    return whale_obj_key(JS_VALUE_GET_OBJ(o));
 }
 
 /* Address of the value of property `atom` on the object in `slot`, or NULL to
@@ -9401,13 +9737,51 @@ JSValue *JS_WhaleObjFieldPtr(JSContext *ctx, int slot, int atom, void **shape_io
     }
     if (p->class_id != JS_CLASS_OBJECT)
         return NULL;                    /* arrays and the rest are other shapes */
-    *shape_io = p->shape;
+    *shape_io = whale_obj_key(p);
     prs = find_own_property(&pr, p, atom);
     if (!prs)
         return NULL;
     if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
         return NULL;                    /* an accessor would have side effects */
     return &pr->u.value;
+}
+
+/* Store `v` into an existing plain data property, without going through
+   JS_DefinePropertyValue.
+
+   The object-literal build in a compiled loop reuses one shell from the free
+   list, so from the second iteration on the shape already carries every
+   property: the define is really an assignment. JS_DefinePropertyValue still
+   runs the full path - hash the atom, walk the shape, check the attribute bits,
+   compare flags - per field per iteration. That showed up as the whole gap
+   between a numeric-only literal (free) and one with a string field (~5ms per
+   20000 nodes).
+
+   Returns 0 when the shape does not already have the property, so the caller
+   falls back to the general define (first iteration, or a shape the site has
+   not seen). */
+static int whale_obj_store_existing(JSContext *ctx, JSValue o, JSAtom atom,
+                                    JSValue v)
+{
+    JSObject *p;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+
+    if (JS_VALUE_GET_TAG(o) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(o);
+    if (p->class_id != JS_CLASS_OBJECT)
+        return 0;
+    prs = find_own_property(&pr, p, atom);
+    if (!prs)
+        return 0;
+    if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+        return 0;                       /* accessor: side effects, take the slow path */
+    if (!(prs->flags & JS_PROP_WRITABLE))
+        return 0;                       /* non-writable: the define would throw */
+    JS_FreeValue(ctx, pr->u.value);
+    pr->u.value = v;
+    return 1;
 }
 
 /* Define (or redefine) numeric property `atom` on the object in `slot`. Only
@@ -9417,11 +9791,12 @@ JSValue *JS_WhaleObjFieldPtr(JSContext *ctx, int slot, int atom, void **shape_io
 int JS_WhaleObjDefineNum(JSContext *ctx, int slot, int atom, double v)
 {
     JSValue o = whale_frame_obj_slots(ctx)[slot];
+    JSValue nv;
 
     if (JS_VALUE_GET_TAG(o) != JS_TAG_OBJECT)
         return 0;
-    return JS_DefinePropertyValue(ctx, o, atom, JS_NewFloat64(ctx, v),
-                                  JS_PROP_C_W_E) >= 0;
+    nv = JS_NewFloat64(ctx, v);
+    return JS_DefinePropertyValue(ctx, o, atom, nv, JS_PROP_C_W_E) >= 0;
 }
 
 /* Define a property whose value is an opaque parked value - a string, a null, an
@@ -9433,13 +9808,34 @@ int JS_WhaleObjDefineValue(JSContext *ctx, int slot, int atom, int val_slot)
 {
     JSValue o = whale_frame_obj_slots(ctx)[slot];
     JSValue v = js_dup(whale_frame_obj_slots(ctx)[val_slot]);
+    WhaleStruct *ws;
 
     if (JS_VALUE_GET_TAG(o) != JS_TAG_OBJECT) {
         JS_FreeValue(ctx, v);
         return 0;
     }
+    /* A column already owns this name. Defining it as an ordinary property
+       would put the value in the struct's shape, where every read misses it
+       (the column wins and reports the reserved value) - `{ a: x, s: "..." }`
+       built by compiled code read `s` back as undefined. Write the column. */
+    ws = whale_struct_of(o);
+    if (ws) {
+        int col = whale_struct_col(ctx, ws, atom);
+
+        if (col >= 0 && (uint32_t)col < ws->nslots) {
+            JS_FreeValue(ctx, ws->data[col]);
+            ws->data[col] = v;
+            return 1;
+        }
+    }
+    if (whale_obj_store_existing(ctx, o, atom, v))
+        return 1;
     return JS_DefinePropertyValue(ctx, o, atom, v, JS_PROP_C_W_E) >= 0;
 }
+/* Diagnostic switch for the literal-store fast path: WHALE_NO_FASTSTORE
+   restores the unconditional JS_DefinePropertyValue, which is what the engine
+   did before it existed. */
+
 
 /* The cold branch of an inlined property read: the generated code handles the
    int32 and float64 tags itself, so anything reaching here has to go back to
@@ -9603,20 +9999,28 @@ double JS_WhaleObjFieldNum(JSContext *ctx, int slot, int atom,
     if (JS_VALUE_GET_TAG(o) != JS_TAG_OBJECT)
         goto bad;
     p = JS_VALUE_GET_OBJ(o);
-    if (p->shape == *shape_cache) {
-        v = *ptr_cache;                 /* resolved before, shape unchanged */
-    } else if (p->class_id == JS_CLASS_WHALE_STRUCT) {
+    if (p->class_id == JS_CLASS_WHALE_STRUCT) {
         WhaleStruct *ws = whale_struct_of(o);
-        int col;
 
         if (!ws)
             goto bad;
-        col = whale_struct_col(ctx, ws, atom);
-        if (col < 0 || (uint32_t)col >= ws->nslots)
-            goto bad;
-        v = &ws->data[col];
-        *shape_cache = ws;              /* the struct is the key; see JS_WhaleObjShape */
-        *ptr_cache = v;
+        /* The struct is its own cache key (see JS_WhaleObjShape): every struct
+           carries the same empty shape, so comparing p->shape here never hits
+           and each read rescanned the column map - the five field reads after
+           every createElement() call in a render loop paid five linear scans. */
+        if (ws == *shape_cache) {
+            v = *ptr_cache;
+        } else {
+            int col = whale_struct_col(ctx, ws, atom);
+
+            if (col < 0 || (uint32_t)col >= ws->nslots)
+                goto bad;
+            v = &ws->data[col];
+            *shape_cache = ws;
+            *ptr_cache = v;
+        }
+    } else if (whale_obj_key(p) == *shape_cache) {
+        v = *ptr_cache;                 /* same object, same layout */
     } else {
         JSProperty *pr;
         JSShapeProperty *prs;
@@ -9629,13 +10033,75 @@ double JS_WhaleObjFieldNum(JSContext *ctx, int slot, int atom,
         if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
             goto bad;                   /* an accessor would have side effects */
         v = &pr->u.value;
-        *shape_cache = p->shape;
+        *shape_cache = whale_obj_key(p);
         *ptr_cache = v;
     }
-    if (v->tag == JS_TAG_FLOAT64)
-        return v->u.float64;
-    if (v->tag == JS_TAG_INT)
-        return (double)v->u.int32;
+    if (JS_VALUE_GET_TAG(*v) == JS_TAG_FLOAT64)
+        return JS_VALUE_GET_FLOAT64(*v);
+    if (JS_VALUE_GET_TAG(*v) == JS_TAG_INT)
+        return (double)JS_VALUE_GET_INT(*v);
+bad:
+    *deopt = 1;
+    return 0;
+}
+
+/* The VALUE of property `atom` on the object in `slot`, parked into `out_slot`.
+
+   This is the arm a nested record needs: `v.props.id` reads `props` first, and
+   that value is an object, not a number - so the numeric helper above can only
+   deopt on it, and the whole `get_field; get_field` chain fell back to the
+   per-instruction step path (four engine calls per node in vnode_build).
+
+   Uses the same (shape, pointer) cache as the numeric one, so the resolve is
+   paid once. Returns 0 to deopt: not an object, no such property, or an
+   accessor (which could have side effects). */
+int JS_WhaleObjFieldVal(JSContext *ctx, int slot, int atom,
+                        void **shape_cache, void **ptr_cache, int out_slot,
+                        int *deopt)
+{
+    JSValue o = whale_frame_obj_slots(ctx)[slot];
+    JSObject *p;
+    JSValue *v;
+
+    if (JS_VALUE_GET_TAG(o) != JS_TAG_OBJECT || out_slot < 0 ||
+        out_slot >= WHALE_OBJ_SLOTS)
+        goto bad;
+    p = JS_VALUE_GET_OBJ(o);
+    if (p->class_id == JS_CLASS_WHALE_STRUCT) {
+        WhaleStruct *ws = whale_struct_of(o);
+
+        if (!ws)
+            goto bad;
+        if (ws == *shape_cache) {
+            v = *ptr_cache;
+        } else {
+            int col = whale_struct_col(ctx, ws, atom);
+
+            if (col < 0 || (uint32_t)col >= ws->nslots)
+                goto bad;
+            v = &ws->data[col];
+            *shape_cache = ws;
+            *ptr_cache = v;
+        }
+    } else if (whale_obj_key(p) == *shape_cache) {
+        v = *ptr_cache;
+    } else {
+        JSProperty *pr;
+        JSShapeProperty *prs;
+
+        if (p->class_id != JS_CLASS_OBJECT)
+            goto bad;
+        prs = find_own_property(&pr, p, atom);
+        if (!prs)
+            goto bad;
+        if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+            goto bad;
+        v = &pr->u.value;
+        *shape_cache = whale_obj_key(p);
+        *ptr_cache = v;
+    }
+    JS_WhaleObjSlot(ctx, out_slot, js_dup(*v));
+    return 1;
 bad:
     *deopt = 1;
     return 0;
@@ -9734,9 +10200,9 @@ WhaleNative *JS_WhaleNativeMake(JSContext *ctx, JSValueConst obj, const int *ato
             return NULL;    /* absent, or an accessor would have side effects */
         v = &pr->u.value;
         if (JS_VALUE_GET_TAG(*v) == JS_TAG_FLOAT64)
-            wn->vals[k] = v->u.float64;
+            wn->vals[k] = JS_VALUE_GET_FLOAT64(*v);
         else if (JS_VALUE_GET_TAG(*v) == JS_TAG_INT)
-            wn->vals[k] = (double)v->u.int32;
+            wn->vals[k] = (double)JS_VALUE_GET_INT(*v);
         else
             return NULL;
     }
@@ -12663,6 +13129,61 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
     *ptab = NULL;
     *plen = 0;
 
+    /* WhaleJS: a struct's columns are its own properties, and they do not live
+       in `shape`. Without this, Object.keys/JSON.stringify/spread/for-in see an
+       object built by compiled code as empty - the same omission as the get
+       path, one level up. Reserved columns (undefined with a nonzero value) were
+       never set and are not properties, exactly like the `in` test above. */
+    if (p->class_id == JS_CLASS_WHALE_STRUCT) {
+        WhaleStruct *ws = whale_struct_of(JS_MKPTR(JS_TAG_OBJECT, p));
+
+        if (ws) {
+            JSPropertyEnum *dyn_tab = NULL;
+            uint32_t dyn_len = 0, n = 0, k;
+
+            if ((flags & JS_GPN_STRING_MASK)) {
+                for (k = 0; k < ws->nslots; k++) {
+                    JSValue v = ws->data[k];
+
+                    if (JS_VALUE_GET_TAG(v) == JS_TAG_UNDEFINED &&
+                        JS_VALUE_GET_PTR(v) != NULL)
+                        continue;       /* reserved, never set */
+                    n++;
+                }
+            }
+            if (!JS_IsUndefined(ws->dynamic)) {
+                if (JS_GetOwnPropertyNamesInternal(ctx, &dyn_tab, &dyn_len,
+                                                   JS_VALUE_GET_OBJ(ws->dynamic),
+                                                   flags) < 0)
+                    return -1;
+            }
+            tab_atom = js_malloc(ctx, sizeof(tab_atom[0]) * max_int(n + dyn_len, 1));
+            if (!tab_atom) {
+                js_free_prop_enum(ctx, dyn_tab, dyn_len);
+                return -1;
+            }
+            i = 0;
+            if ((flags & JS_GPN_STRING_MASK)) {
+                for (k = 0; k < ws->nslots; k++) {
+                    JSValue v = ws->data[k];
+
+                    if (JS_VALUE_GET_TAG(v) == JS_TAG_UNDEFINED &&
+                        JS_VALUE_GET_PTR(v) != NULL)
+                        continue;
+                    tab_atom[i].atom = JS_DupAtom(ctx, ws->atoms[k]);
+                    tab_atom[i].is_enumerable = true;
+                    i++;
+                }
+            }
+            for (k = 0; k < dyn_len; k++)
+                tab_atom[i++] = dyn_tab[k];
+            js_free(ctx, dyn_tab);
+            *ptab = tab_atom;
+            *plen = i;
+            return 0;
+        }
+    }
+
     /* compute the number of returned properties */
     num_keys_count = 0;
     str_keys_count = 0;
@@ -12854,6 +13375,40 @@ static int JS_GetOwnPropertyInternal2(JSContext *ctx, JSPropertyDescriptor *desc
     int flags_only = (desc == NULL && pflags != NULL);
 
 retry:
+    /* WhaleJS: a struct's column is a real own property even though it is not
+       in `shape`. Report it the way any data property is reported, so
+       hasOwnProperty / getOwnPropertyDescriptor / Object.entries see the same
+       object the get and `in` paths already see. A reserved column (undefined
+       with a nonzero value) was never set and is not a property. */
+    if (p->class_id == JS_CLASS_WHALE_STRUCT) {
+        WhaleStruct *ws = whale_struct_of(JS_MKPTR(JS_TAG_OBJECT, p));
+
+        if (ws) {
+            int col = whale_struct_col(ctx, ws, prop);
+
+            if (col >= 0 && (uint32_t)col < ws->nslots) {
+                JSValue v = ws->data[col];
+
+                if (JS_VALUE_GET_TAG(v) == JS_TAG_UNDEFINED &&
+                    JS_VALUE_GET_PTR(v) != NULL)
+                    return false;
+                if (desc) {
+                    desc->flags = JS_PROP_C_W_E;
+                    desc->getter = JS_UNDEFINED;
+                    desc->setter = JS_UNDEFINED;
+                    desc->value = js_dup(v);
+                } else if (pflags) {
+                    *pflags = JS_PROP_C_W_E;
+                }
+                return true;
+            }
+            if (!JS_IsUndefined(ws->dynamic))
+                return JS_GetOwnPropertyInternal2(ctx, desc,
+                                                  JS_VALUE_GET_OBJ(ws->dynamic),
+                                                  prop, pflags);
+            return false;
+        }
+    }
     prs = find_own_property(&pr, p, prop);
     if (prs) {
         if (desc) {
@@ -19630,6 +20185,204 @@ int JS_WhaleBinopVal(JSContext *ctx, int op, int a_slot, int b_slot, int out_slo
     return 1;
 }
 
+/* A small bounded cache of the concatenations a front-end render loop repeats.
+   `"c" + (i % 3)` is the canonical case: the left operand is an interned atom
+   and the right one is a small integer, so there are only a handful of distinct
+   results in a whole render pass. Each miss still goes through the engine
+   (js_add_slow), so the semantics are exactly JS's; only the repeat is cached.
+
+   Nothing here is a general memo: the key is (left atom, right integer) and the
+   value is the interned result string, so a hit costs a compare and a dup. */
+#define WHALE_CAT_CACHE 64
+typedef struct WhaleCatEntry {
+    int32_t left_atom;
+    int32_t right_int;
+    JSValue value;              /* owned: a string, released with the runtime */
+} WhaleCatEntry;
+static WhaleCatEntry whale_cat_cache[WHALE_CAT_CACHE];
+static int whale_cat_n;
+
+/* `atom_string + small_int`, cached by (atom, int).
+
+   This is the render-loop class name: `"c" + (i % 3)`. The generator knows the
+   left operand is a literal atom (it emitted the push), so it passes the atom
+   itself - keying on that is two integer compares, where keying on the JSValue
+   pointer never hit at all (each trip re-materialises the atom into a fresh
+   string) and keying on a re-interned atom cost as much as the concatenation.
+
+   A miss runs the real thing through js_add_slow, so semantics are exactly JS's;
+   only the repeat is cached. Returns 1 with the result parked in out_slot. */
+int JS_WhaleConcatAtomInt(JSContext *ctx, int atom, int b_slot, int out_slot)
+{
+    JSValue *slots = whale_frame_obj_slots(ctx);
+    JSValue b = slots[b_slot];
+    int ri, k;
+
+    if (atom <= 0 || JS_VALUE_GET_TAG(b) != JS_TAG_INT)
+        return 0;
+    ri = JS_VALUE_GET_INT(b);
+    if (ri < 0 || ri > 4096)
+        return 0;                       /* keep the key space tiny */
+    for (k = 0; k < whale_cat_n; k++) {
+        if (whale_cat_cache[k].left_atom == atom &&
+            whale_cat_cache[k].right_int == ri) {
+            JS_WhaleObjSlot(ctx, out_slot, js_dup(whale_cat_cache[k].value));
+            return 1;
+        }
+    }
+    if (whale_cat_n < WHALE_CAT_CACHE) {
+        /* Miss: do the real thing once and remember it. js_add_slow reads its
+           operands at sp[-2]/sp[-1] and leaves the result at sp[-2]. */
+        JSValue v[4];
+        int rc;
+
+        v[2] = JS_AtomToValue(ctx, atom);
+        if (JS_IsException(v[2]))
+            return 0;
+        v[3] = js_dup(b);
+        rc = js_add_slow(ctx, v + 4);
+        if (rc) {
+            JS_FreeValue(ctx, v[2]);
+            return 0;
+        }
+        whale_cat_cache[whale_cat_n].left_atom = atom;
+        whale_cat_cache[whale_cat_n].right_int = ri;
+        whale_cat_cache[whale_cat_n].value = js_dup(v[2]);
+        whale_cat_n++;
+        JS_WhaleObjSlot(ctx, out_slot, v[2]);
+        return 1;
+    }
+    return 0;
+}
+
+/* The whole render-loop idiom in one call: `obj.field = "prefix" + n`.
+
+   The generated code would otherwise do four helper calls per node - park the
+   number, build/look up the string, park it, define the property - and each is
+   a call plus a slot write. This does all of it in C: the cache lookup is two
+   integer compares, and the property define is the same call
+   JS_WhaleObjDefineValue makes.
+
+   `str_slot` holds the literal prefix (the caller only had it for this key, so
+   overwriting it with the result is fine). 0 means "not this shape" and the
+   caller falls back to the general sequence. */
+int JS_WhaleObjDefineConcat(JSContext *ctx, int obj_slot, int field_atom,
+                            int prefix_atom, int str_slot, double v)
+{
+    int ri = (int)v;
+    int k;
+
+    if (v != (double)ri || ri < 0 || ri > 4096)
+        return 0;
+    for (k = 0; k < whale_cat_n; k++) {
+        if (whale_cat_cache[k].left_atom == prefix_atom &&
+            whale_cat_cache[k].right_int == ri) {
+            JS_WhaleObjSlot(ctx, str_slot, js_dup(whale_cat_cache[k].value));
+            return JS_WhaleObjDefineValue(ctx, obj_slot, field_atom, str_slot);
+        }
+    }
+    if (whale_cat_n < WHALE_CAT_CACHE) {
+        JSValue a = JS_AtomToValue(ctx, prefix_atom);
+        JSValue b = JS_NewFloat64(ctx, v);
+        JSValue vv[4];
+        int rc;
+
+        if (JS_IsException(a)) {
+            JS_FreeValue(ctx, b);
+            return 0;
+        }
+        vv[2] = a;
+        vv[3] = b;
+        rc = js_add_slow(ctx, vv + 4);
+        if (rc) {
+            JS_FreeValue(ctx, vv[2]);
+            return 0;
+        }
+        whale_cat_cache[whale_cat_n].left_atom = prefix_atom;
+        whale_cat_cache[whale_cat_n].right_int = ri;
+        whale_cat_cache[whale_cat_n].value = js_dup(vv[2]);
+        whale_cat_n++;
+        JS_WhaleObjSlot(ctx, str_slot, vv[2]);
+        return JS_WhaleObjDefineValue(ctx, obj_slot, field_atom, str_slot);
+    }
+    return 0;
+}
+
+/* `obj[field] = null` and `obj[field] = "literal"` in one call each.
+
+   The general path parks the value in a slot first (JS_WhaleObjSlotNull /
+   JS_WhaleObjSlotAtom) and then defines the field from it - two helper calls
+   and a slot write for a value that is a compile-time constant. In a render
+   loop that is two calls per node for `key: null` alone, and the call itself
+   is the cost (the generated code is unoptimised, so every call is a full
+   save/restore sequence).
+
+   Both take the value from the compiler, so nothing is resolved at run time
+   except the define. */
+/* Define `field_atom` on the object in `obj_slot` as the value `v` (ownership
+   transfers), handling a struct's columns.
+
+   A struct keeps its fields in flat columns and reports them through the
+   offset map, not through `shape` - so JS_DefinePropertyValue would add a
+   second, invisible property and every read would still see the column. This is
+   the same branch JS_WhaleObjDefineValue takes, factored out so the constant
+   folding below goes through it too. */
+static int whale_obj_define_val(JSContext *ctx, int obj_slot, int field_atom,
+                                JSValue v)
+{
+    JSValue o;
+    WhaleStruct *ws;
+
+    if (obj_slot < 0 || obj_slot >= WHALE_OBJ_SLOTS) {
+        JS_FreeValue(ctx, v);
+        return 0;
+    }
+    o = whale_frame_obj_slots(ctx)[obj_slot];
+    if (JS_VALUE_GET_TAG(o) != JS_TAG_OBJECT) {
+        JS_FreeValue(ctx, v);
+        return 0;
+    }
+    ws = whale_struct_of(o);
+    if (ws) {
+        int col = whale_struct_col(ctx, ws, field_atom);
+
+        if (col >= 0 && (uint32_t)col < ws->nslots) {
+            JS_FreeValue(ctx, ws->data[col]);
+            ws->data[col] = v;
+            return 1;
+        }
+    }
+    return JS_DefinePropertyValue(ctx, o, field_atom, v, JS_PROP_C_W_E) >= 0;
+}
+
+int JS_WhaleObjDefineNull(JSContext *ctx, int obj_slot, int field_atom)
+{
+    return whale_obj_define_val(ctx, obj_slot, field_atom, JS_NULL);
+}
+
+int JS_WhaleObjDefineAtom(JSContext *ctx, int obj_slot, int field_atom,
+                          int val_atom)
+{
+    JSValue v;
+
+    if (val_atom <= 0)
+        return 0;
+    v = JS_AtomToValue(ctx, val_atom);
+    if (JS_IsException(v))
+        return 0;
+    return whale_obj_define_val(ctx, obj_slot, field_atom, v);
+}
+
+/* Release the concatenation cache with the runtime. */
+void JS_WhaleConcatCacheFree(JSRuntime *rt)
+{
+    int k;
+
+    for (k = 0; k < whale_cat_n; k++)
+        JS_FreeValueRT(rt, whale_cat_cache[k].value);
+    whale_cat_n = 0;
+}
+
 /* ---- exception handling ---------------------------------------------------
 
    A compiled function follows the same rule as value synchronisation: the normal
@@ -21679,7 +22432,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        past the atom operand, so pc - 4 is the site's offset - the
                        same key the generator uses. */
                     if (unlikely(b->whale_prof_on))
-                        whale_prof_record(b, (uint32_t)(pc - 4 - b->byte_code_buf), p->shape);
+                        whale_prof_record(rt, b, (uint32_t)(pc - 4 - b->byte_code_buf), p->shape);
                     for(;;) {
                         prs = find_own_property(&pr, p, atom);
                         if (prs) {
@@ -23024,7 +23777,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        past the atom operand, so pc - 4 is the site's offset - the
                        same key the generator uses. */
                     if (unlikely(b->whale_prof_on))
-                        whale_prof_record(b, (uint32_t)(pc - 4 - b->byte_code_buf), p->shape);
+                        whale_prof_record(rt, b, (uint32_t)(pc - 4 - b->byte_code_buf), p->shape);
+                    /* WhaleJS: an object built by compiled code keeps its fields in
+                       flat columns, not in `prop`, so find_own_property() below
+                       cannot see them. Hand it to the struct-aware path in
+                       JS_GetPropertyInternal - otherwise a struct that escaped to
+                       interpreted code reads back every field as undefined. */
+                    if (unlikely(p->class_id == JS_CLASS_WHALE_STRUCT))
+                        goto get_field_slow_path;
                     for(;;) {
                         prs = find_own_property(&pr, p, atom);
                         if (prs) {
@@ -23078,7 +23838,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                        past the atom operand, so pc - 4 is the site's offset - the
                        same key the generator uses. */
                     if (unlikely(b->whale_prof_on))
-                        whale_prof_record(b, (uint32_t)(pc - 4 - b->byte_code_buf), p->shape);
+                        whale_prof_record(rt, b, (uint32_t)(pc - 4 - b->byte_code_buf), p->shape);
+                    /* WhaleJS: struct columns are not in `prop` - see OP_get_field. */
+                    if (unlikely(p->class_id == JS_CLASS_WHALE_STRUCT))
+                        goto get_field2_slow_path;
                     for(;;) {
                         prs = find_own_property(&pr, p, atom);
                         if (prs) {

@@ -35,6 +35,13 @@ int code_reloc (int reloc_type)
         case R_AARCH64_MOVW_UABS_G3:
         case R_AARCH64_ADR_PREL_PG_HI21:
         case R_AARCH64_ADD_ABS_LO12_NC:
+        case R_AARCH64_LDST8_ABS_LO12_NC:
+        case R_AARCH64_LDST16_ABS_LO12_NC:
+        case R_AARCH64_LDST32_ABS_LO12_NC:
+        case R_AARCH64_LDST64_ABS_LO12_NC:
+        case R_AARCH64_LDST128_ABS_LO12_NC:
+        case R_AARCH64_TLSLE_ADD_TPREL_HI12:
+        case R_AARCH64_TLSLE_ADD_TPREL_LO12:
         case R_AARCH64_ADR_GOT_PAGE:
         case R_AARCH64_LD64_GOT_LO12_NC:
         case R_AARCH64_GLOB_DAT:
@@ -43,6 +50,8 @@ int code_reloc (int reloc_type)
 
         case R_AARCH64_JUMP26:
         case R_AARCH64_CALL26:
+        case R_AARCH64_CONDBR19:
+        case R_AARCH64_TSTBR14:
         case R_AARCH64_JUMP_SLOT:
             return 1;
     }
@@ -64,6 +73,13 @@ int gotplt_entry_type (int reloc_type)
         case R_AARCH64_MOVW_UABS_G3:
         case R_AARCH64_ADR_PREL_PG_HI21:
         case R_AARCH64_ADD_ABS_LO12_NC:
+        case R_AARCH64_LDST8_ABS_LO12_NC:
+        case R_AARCH64_LDST16_ABS_LO12_NC:
+        case R_AARCH64_LDST32_ABS_LO12_NC:
+        case R_AARCH64_LDST64_ABS_LO12_NC:
+        case R_AARCH64_LDST128_ABS_LO12_NC:
+        case R_AARCH64_TLSLE_ADD_TPREL_HI12:
+        case R_AARCH64_TLSLE_ADD_TPREL_LO12:
         case R_AARCH64_GLOB_DAT:
         case R_AARCH64_JUMP_SLOT:
         case R_AARCH64_COPY:
@@ -73,6 +89,8 @@ int gotplt_entry_type (int reloc_type)
         case R_AARCH64_ABS64:
         case R_AARCH64_JUMP26:
         case R_AARCH64_CALL26:
+        case R_AARCH64_CONDBR19:
+        case R_AARCH64_TSTBR14:
             return AUTO_GOTPLT_ENTRY;
 
         case R_AARCH64_ADR_GOT_PAGE:
@@ -154,6 +172,89 @@ ST_FUNC void relocate_plt(TCCState *s1)
 
 void relocate_init(Section *sr) {}
 
+/* Undo the relocations already applied to a section's data. WhaleJS relocates
+   one TCCState several times (one compile per JIT function), and relocate()
+   writes into the section storage - a second pass would otherwise patch on top
+   of the first result. AArch64 is RELA, so the addend lives in the relocation
+   entry and the code generator leaves the target bytes at their instruction
+   encoding (or zero, for data); restoring those is exactly what this does.
+
+   The instruction relocations (ADRP/ADD/BRANCH/MOVW) rewrite specific bit
+   fields, so they need their *original* instruction back. Rather than
+   reconstructing it, the generic cases are handled by zeroing the field the
+   relocation wrote, which is what the first pass started from: the code
+   generator emits ADRP/ADD/MOVZ/MOVK with zero immediates (see arm64_sym). */
+ST_FUNC void relocate_reset(TCCState *s1, Section *s)
+{
+    Section *sr = s->reloc;
+    ElfW_Rel *rel;
+
+    (void)s1;
+    if (!sr || !s->data)
+        return;
+    for_each_elem(sr, 0, rel, ElfW_Rel) {
+        unsigned char *ptr = s->data + rel->r_offset;
+
+        switch (ELFW(R_TYPE)(rel->r_info)) {
+        case R_AARCH64_ABS64:
+            write64le(ptr, 0);
+            break;
+        case R_AARCH64_ABS32:
+        case R_AARCH64_PREL32:
+            write32le(ptr, 0);
+            break;
+        case R_AARCH64_CALL26:
+        case R_AARCH64_JUMP26:
+            /* bl/b with a zero offset: the instruction word's opcode bits
+               survive, the 26-bit immediate goes back to 0. */
+            write32le(ptr, read32le(ptr) & 0xfc000000);
+            break;
+        case R_AARCH64_ADR_PREL_PG_HI21:
+            write32le(ptr, read32le(ptr) & 0x9f00001f);
+            break;
+        case R_AARCH64_ADD_ABS_LO12_NC:
+        case R_AARCH64_LDST8_ABS_LO12_NC:
+        case R_AARCH64_LDST16_ABS_LO12_NC:
+        case R_AARCH64_LDST32_ABS_LO12_NC:
+        case R_AARCH64_LDST64_ABS_LO12_NC:
+        case R_AARCH64_LDST128_ABS_LO12_NC:
+        case R_AARCH64_TLSLE_ADD_TPREL_HI12:
+        case R_AARCH64_TLSLE_ADD_TPREL_LO12:
+            write32le(ptr, read32le(ptr) & 0xffc003ff);
+            break;
+        case R_AARCH64_MOVW_UABS_G0_NC:
+        case R_AARCH64_MOVW_UABS_G1_NC:
+        case R_AARCH64_MOVW_UABS_G2_NC:
+        case R_AARCH64_MOVW_UABS_G3:
+            write32le(ptr, read32le(ptr) & 0xffe0001f);
+            break;
+        case R_AARCH64_CONDBR19:
+            write32le(ptr, read32le(ptr) & 0xff00001f);
+            break;
+        case R_AARCH64_TSTBR14:
+            write32le(ptr, read32le(ptr) & 0xfff8001f);
+            break;
+        case R_AARCH64_GLOB_DAT:
+        case R_AARCH64_JUMP_SLOT:
+            /* relocate() writes an 8-byte value here too. */
+            write64le(ptr, 0);
+            break;
+        case R_AARCH64_RELATIVE:
+#ifdef TCC_TARGET_PE
+            /* PE adds a 32-bit delta into the field (the .pdata RVA). On ELF
+               this relocation is a no-op - the loader fills it in - so the
+               original value must be left alone. */
+            write32le(ptr, 0);
+#endif
+            break;
+        default:
+            /* GOT/PLT entries and COPY relocations do not write into section
+               data, or are handled by the linker itself. */
+            break;
+        }
+    }
+}
+
 void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr, addr_t addr, addr_t val)
 {
     int sym_index = ELFW(R_SYM)(rel->r_info);
@@ -189,15 +290,61 @@ void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr, addr_t 
             return;
         case R_AARCH64_ADR_PREL_PG_HI21: {
             uint64_t off = (val >> 12) - (addr >> 12);
+#ifdef TCC_TARGET_PE
+            /* A weak undefined symbol resolves to address 0 on PE. ADRP cannot
+               encode that from the default image base, so materialize zero and
+               let the paired ADD handle any low addend. */
+            if ((off + ((uint64_t)1 << 20)) >> 21) {
+                ElfW(Sym) *sym = &((ElfW(Sym) *)symtab_section->data)[sym_index];
+                if (sym->st_shndx == SHN_UNDEF
+                    && ELFW(ST_BIND)(sym->st_info) == STB_WEAK) {
+                    write32le(ptr, 0xd2800000 | (read32le(ptr) & 0x1f));
+                    return;
+                }
+                tcc_error("R_AARCH64_ADR_PREL_PG_HI21 relocation failed");
+            }
+#else
             if ((off + ((uint64_t)1 << 20)) >> 21)
                 tcc_error("R_AARCH64_ADR_PREL_PG_HI21 relocation failed");
+#endif
             write32le(ptr, ((read32le(ptr) & 0x9f00001f) |
                             (off & 0x1ffffc) << 3 | (off & 3) << 29));
             return;
         }
         case R_AARCH64_ADD_ABS_LO12_NC:
+        case R_AARCH64_LDST8_ABS_LO12_NC:
             write32le(ptr, ((read32le(ptr) & 0xffc003ff) |
                             (val & 0xfff) << 10));
+            return;
+        case R_AARCH64_LDST16_ABS_LO12_NC:
+            write32le(ptr, ((read32le(ptr) & 0xffc003ff) |
+                            (val & 0xffe) << 9));
+            return;
+        case R_AARCH64_LDST32_ABS_LO12_NC:
+            write32le(ptr, ((read32le(ptr) & 0xffc003ff) |
+                            (val & 0xffc) << 8));
+            return;
+        case R_AARCH64_LDST64_ABS_LO12_NC:
+            write32le(ptr, ((read32le(ptr) & 0xffc003ff) |
+                            (val & 0xff8) << 7));
+            return;
+        case R_AARCH64_LDST128_ABS_LO12_NC:
+            write32le(ptr, ((read32le(ptr) & 0xffc003ff) |
+                            (val & 0xff0) << 6));
+            return;
+        case R_AARCH64_CONDBR19:
+            if (((val - addr) + ((uint64_t)1 << 20)) & ~(uint64_t)0x1ffffc)
+                tcc_error("R_AARCH64_CONDBR19 relocation failed (val=%lx, addr=%lx)",
+                          (long)val, (long)addr);
+            write32le(ptr, ((read32le(ptr) & 0xff00001f) |
+                            (((val - addr) >> 2 & 0x7ffff) << 5)));
+            return;
+        case R_AARCH64_TSTBR14:
+            if (((val - addr) + ((uint64_t)1 << 15)) & ~(uint64_t)0xfffc)
+                tcc_error("R_AARCH64_TSTBR14 relocation failed (val=%lx, addr=%lx)",
+                          (long)val, (long)addr);
+            write32le(ptr, ((read32le(ptr) & 0xfff8001f) |
+                            (((val - addr) >> 2 & 0x3fff) << 5)));
             return;
         case R_AARCH64_JUMP26:
         case R_AARCH64_CALL26:
@@ -205,9 +352,18 @@ void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr, addr_t 
 	    printf ("reloc %d @ 0x%lx: val=0x%lx name=%s\n", type, addr, val,
 		    (char *) symtab_section->link->data + sym->st_name);
 #endif
-            if (((val - addr) + ((uint64_t)1 << 27)) & ~(uint64_t)0xffffffc)
+            if (((val - addr) + ((uint64_t)1 << 27)) & ~(uint64_t)0xffffffc) {
+#ifdef TCC_TARGET_PE
+                ElfW(Sym) *sym = &((ElfW(Sym) *)symtab_section->data)[sym_index];
+                if (sym->st_shndx == SHN_UNDEF
+                    && ELFW(ST_BIND)(sym->st_info) == STB_WEAK) {
+                    write32le(ptr, 0xd503201f); /* nop */
+                    return;
+                }
+#endif
                 tcc_error("R_AARCH64_(JUMP|CALL)26 relocation failed"
-                          " (val=%lx, addr=%lx)", val, addr);
+                          " (val=%lx, addr=%lx)", (long)val, (long)addr);
+            }
             write32le(ptr, (0x14000000 |
                             (uint32_t)(type == R_AARCH64_CALL26) << 31 |
                             ((val - addr) >> 2 & 0x3ffffff)));
@@ -242,6 +398,7 @@ void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr, addr_t 
             return;
         case R_AARCH64_RELATIVE:
 #ifdef TCC_TARGET_PE
+            /* .pdata entries are 32-bit RVAs, so the delta is 32-bit too. */
             add32le(ptr, val - s1->pe_imagebase);
 #endif
             /* do nothing */

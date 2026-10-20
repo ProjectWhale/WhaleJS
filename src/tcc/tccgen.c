@@ -978,12 +978,15 @@ static int whale_pin_n;
  * throw away. This is the TCC-side mechanism; the decision (which variables,
  * from liveness analysis) lives in the generator.
  *
- * Only the float pool is used. RC_FLOAT covers xmm0-xmm7: xmm6/7 carry the
- * tag so gv()'s reload check treats a value already sitting in one as
- * satisfied (no pointless move-out/move-back per trip). They stay pin-only
- * in practice - get_reg() skips them explicitly, so only whale_pin_alloc
- * hands them out (with JS_WhaleXmmSpill recording the claim and the epilog
- * restoring them); the integer pool would need reg_classes changes (r8-r11
+ * Only the float pool is used, on both backends that have one:
+ *  - x86-64: RC_FLOAT covers xmm0-xmm7. xmm6/7 carry the tag so gv()'s reload
+ *    check treats a value already sitting in one as satisfied (no pointless
+ *    move-out/move-back per trip). They stay pin-only in practice - get_reg()
+ *    skips them explicitly, so only whale_pin_alloc hands them out (with
+ *    JS_WhaleXmmSpill recording the claim and the epilog restoring them).
+ *  - arm64: RC_FLOAT covers v0-v7; all of them are caller-saved, so the pin
+ *    pool is the low four and every call drops them (see below).
+ * The integer pool would need reg_classes changes on either target (r8-r11
  * carry no RC_INT, and gv() reloads anything whose class does not match).
  *
  * Soundness across calls: caller-saved pins (xmm0-xmm5) cannot survive one.
@@ -1005,14 +1008,17 @@ static int whale_pin_scope;
 
 static unsigned whale_pinned_regs;  /* one bit per pinned register */
 
+#ifdef TCC_TARGET_X86_64
 /* x86_64-gen.c: record that this function must preserve a callee-saved xmm
    (Windows ABI). Called when a pin claims xmm6/7. */
 void JS_WhaleXmmSave(int reg);
 /* x86_64-gen.c: emit the callee-saved spill for reg now (claim time). */
 void JS_WhaleXmmSpill(int reg);
+#endif
 
 static int whale_pin_alloc(int t)
 {
+#ifdef TCC_TARGET_X86_64
     int r;
 
     if (!is_float(t))
@@ -1051,6 +1057,20 @@ static int whale_pin_alloc(int t)
         }
     }
     return -1;
+#else
+    /* The pin map's bookkeeping is written against x86-64's XMM layout: a pin
+       claims a register, JS_WhaleXmmSpill allocates its home slot with
+       `loc -= 8` at claim time and stores the incoming value there, and the
+       epilog restores it. `gv()`'s reload path depends on that slot existing -
+       without it a pinned local reads whatever happens to sit at the offset.
+       The arm64 backend has no equivalent of that claim-time spill yet, so
+       `register` stays the no-op the parser used to make it: the generator's
+       `_wv` locals are plain doubles, which is slower but correct. Do not
+       re-enable this by only adding a register range - the spill/restore half
+       has to come with it. */
+    (void)t;
+    return -1;
+#endif
 }
 
 /* Claim the pin map for one JIT compilation. The generator calls this once
@@ -1104,9 +1124,11 @@ void JS_WhalePinInvalidate(void)
             fprintf(stderr, "  loc=%d reg=%d\n", whale_pin_loc[i], whale_pin_reg[i]);
     }
     (void)i;
+#ifdef TCC_TARGET_X86_64
     /* caller-saved pins die with the call; callee-saved (xmm6/7) survive. */
     whale_pinned_regs &= ~((1u << TREG_XMM2) | (1u << TREG_XMM3) |
                            (1u << TREG_XMM4) | (1u << TREG_XMM5));
+#endif
 }
 
 /* save registers up to (vtop - n) stack entry */
@@ -1157,12 +1179,14 @@ ST_FUNC void save_reg_upstack(int r, int n)
                evicting them would force a reload on the next read for no
                reason - the register is not needed elsewhere (nothing else can
                allocate it). Skip the entry entirely. */
+#ifdef TCC_TARGET_X86_64
             {
                 int rr = p->r & VT_VALMASK;
 
                 if (rr == TREG_XMM6 || rr == TREG_XMM7)
                     continue;
             }
+#endif
             /* must save value on stack if not already done */
             if (!saved) {
                 /* NOTE: must reload 'r' because r might be equal to r2 */
@@ -1318,8 +1342,10 @@ ST_FUNC int get_reg(int rc)
                 continue;
             /* Live callee-saved pins are never reclaimed: their whole point
                is surviving across the code that would otherwise spill them. */
+#ifdef TCC_TARGET_X86_64
             if (pr == TREG_XMM6 || pr == TREG_XMM7)
                 continue;
+#endif
             for(p=vstack;p<=vtop;p++) {
                 if ((p->r & VT_VALMASK) == pr ||
                     (p->r2 & VT_VALMASK) == pr)

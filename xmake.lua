@@ -15,7 +15,7 @@ set_project("WhaleJS")
 -- WhaleJS 自己的版本，与 QuickJS-ng 解耦（上游升级不跟它的号）。
 -- MAJOR=接口/ABI 不兼容，MINOR=新优化/新覆盖，PATCH=修 bug。见 CHANGELOG.md。
 set_version("0.2.0")
-set_languages("c11", "c++14")
+set_languages("c11")
 add_rules("mode.debug", "mode.release")
 
 -- 诊断开关（WHALE_JIT_DUMP / WHALE_STR_STAT / ... 这类环境变量）只进调试构建。
@@ -30,8 +30,8 @@ option_end()
 -- 把 include/（公开头文件）与 lib/（库文件）按开源惯例打成一个 zip。
 -- 刻意不放的东西：
 --   * README —— 用户自备（见 temp/README.md 草稿），发布时再补；
---   * tcc-runtime —— 已硬编码进库（whale_libtcc1_a.inc，首次运行解到 %TEMP%），
---     包里没有任何 tcc 相关文件；
+--   * tcc-runtime —— 运行库已被宿主符号取代（生成的代码只引用宿主符号，
+--     CRT 不链接），包里没有任何 tcc 相关文件，运行期也不搜索任何目录；
 --   * demo/CLI exe —— 归档只有库，没有可执行文件。
 -- 打包逻辑在 tools/whale_pack.lua（用 xmake l 跑，那里 io 完整可用，zip 纯 Lua
 -- 写，不依赖外部 tar/zip）；task 只负责保证库已构建并传配置。
@@ -65,17 +65,46 @@ end
 
 local qjs_defines = { "_GNU_SOURCE" }
 
--- The JIT backend runs at runtime and needs to find the TCC runtime next to the
--- sources, whatever the working directory is, so bake the absolute paths in at
--- configure time. These are only the last-resort fallback: a released package
--- locates its own tcc-runtime relative to the library (JS_WhaleSetJitRuntimeDir
--- / module-relative probe in whale_jit.c).
--- NB: backslashes would be eaten as escapes inside the C string literal
-local PROJ = string.gsub(os.projectdir(), "\\", "/")
-table.join2(qjs_defines, {
-    'WHALE_JIT_SRC_DIR="' .. PROJ .. '/src"',
-    'WHALE_JIT_TCC_DIR="' .. PROJ .. '/thirdparty/tcc-runtime"',
-})
+-- TCC 的目标宏必须跟着构建目标走，不能写死。它同时决定两件事：
+--   * TCC 生成哪个架构的代码（x86_64-gen.c / arm64-gen.c / ...）；
+--   * TCC_IS_NATIVE 是否成立，即"宿主能不能直接执行生成的代码"。
+-- 写死 x86_64 + PE 时交叉编译到 arm64 会同时炸两处：
+--   * libtcc1.c 按宿主 aarch64 编译，却走进 32 位 x86 的除法辅助代码
+--     （#error unsupported CPU type / udiv_qrnnd 未声明）；
+--   * TCCState 里没有 runtime_main（TCC_IS_NATIVE 不成立），iface 编译失败。
+-- tcc.h 自己也能从编译器预定义宏推断，但显式给出更可靠（MSVC/clang-cl 的
+-- 预定义宏与 GCC 不同），而且构建系统本来就知道目标是什么。
+--
+-- 返回 nil 表示"这个平台/架构组合 TCC 后端不支持"。调用方据此**关闭 JIT**
+-- （不编译 TCC、不定义 WHALE_JIT_AVAILABLE），引擎照常构建、走解释器：
+-- 兼容性优先，绝不让一个 TCC 不支持的架构把整个库编译失败。
+local function tcc_target_defines()
+    if is_win() then
+        if is_arch("x86_64") then
+            return { "TCC_TARGET_PE", "TCC_TARGET_X86_64" }
+        elseif is_arch("i386", "x86") then
+            return { "TCC_TARGET_PE", "TCC_TARGET_I386" }
+        elseif is_arch("arm64", "arm64-v8a", "aarch64") then
+            -- Windows on ARM64: PE backend ported in tccpe.c/arm64-gen.c
+            return { "TCC_TARGET_PE", "TCC_TARGET_ARM64" }
+        end
+    else
+        if is_arch("x86_64") then
+            return { "TCC_TARGET_X86_64" }
+        elseif is_arch("arm64", "arm64-v8a", "aarch64") then
+            return { "TCC_TARGET_ARM64" }
+        elseif is_arch("arm", "armeabi-v7a") then
+            return { "TCC_TARGET_ARM", "TCC_ARM_EABI", "TCC_ARM_HARDFLOAT" }
+        end
+    end
+    return nil
+end
+
+-- Does the JIT exist on this target? Only the TCC backends above can produce
+-- machine code for the host, so this is exactly "TCC has a target for it".
+local tcc_defs = tcc_target_defines()
+local jit_enabled = tcc_defs ~= nil
+
 if is_win() then
     table.join2(qjs_defines, { "WIN32_LEAN_AND_MEAN", "_WIN32_WINNT=0x0601" })
 end
@@ -117,17 +146,26 @@ end
 -- libtcc API itself uses) and declare them here.
 local function engine_common()
     add_files(engine_sources)
-    add_files(TCC .. "/whale_tcc_iface.c")
-    -- TinyCC's runtime helpers (__divdi3/__fixunsdfdi/...), compiled into the
-    -- library so the JIT needs no libtcc1-64.a at run time: they are registered
-    -- as host symbols in whale_jit.c. Their own TU - they are plain C with no
-    -- TCC-specific macros.
-    add_files(TCC .. "/lib/libtcc1.c")
+    if jit_enabled then
+        add_files(TCC .. "/whale_tcc_iface.c")
+        -- TinyCC's runtime helpers (__divdi3/__fixunsdfdi/...), compiled into
+        -- the library so the JIT needs no libtcc1-64.a at run time: they are
+        -- registered as host symbols in whale_jit.c. Their own TU - they are
+        -- plain C with no TCC-specific macros.
+        add_files(TCC .. "/lib/libtcc1.c")
+        -- TCC_TARGET_* only matters to the TCC sources; on a target TCC has no
+        -- backend for, the whole backend is left out and the engine runs the
+        -- interpreter (the public API stays, it just reports no JIT).
+        add_defines(tcc_defs)
+        add_defines("WHALE_JIT_AVAILABLE")
+    else
+        -- Without TCC the JIT translation unit still has to exist (the engine
+        -- calls its entry points), but everything inside is compiled out; see
+        -- whale_jit.c's WHALE_JIT_AVAILABLE guard.
+        add_defines("WHALE_JIT_OFF")
+    end
     add_includedirs(SRC, TCC, TCC_RT)
     add_defines(qjs_defines)
-    -- TCC_TARGET_* 只对 whale_tcc_iface.c 有意义；放在 target 级是为了让
-    -- 单文件编译参数保持简单（引擎源码不引用这两个宏）。
-    add_defines("TCC_TARGET_PE", "TCC_TARGET_X86_64")
     if has_config("whale_debug") then
         add_defines("WHALE_DEBUG")
     end
@@ -141,6 +179,45 @@ target("whalejs_static")
     set_basename("whalejs")
     engine_common()
     add_includedirs(SRC, { public = true })
+    link_whale(false)
+
+-- WebAssembly 扩展：独立的静态库 libWhaleJS-wasm.a，基于 wasm3。
+-- 它只 include 公开头文件（quickjs.h / whalejs.h / wasm3.h），不碰引擎内部，
+-- 所以不链它时引擎行为完全不变；链上之后调用 JS_WhaleInstallWasm(ctx) 即可
+-- 在 context 上挂出 globalThis.WebAssembly。
+-- 注意：产物名必须与 whalejs_static 区分开（同名 target 会被 xmake 从链接行
+-- 上丢掉，见 notes），所以 target 名是 WhaleJS-wasm、basename 是 WhaleJS-wasm。
+local WASM3 = "thirdparty/wasm3/source"
+local wasm3_sources = {
+    WASM3 .. "/m3_bind.c", WASM3 .. "/m3_code.c", WASM3 .. "/m3_compile.c",
+    WASM3 .. "/m3_core.c", WASM3 .. "/m3_env.c", WASM3 .. "/m3_exec.c",
+    WASM3 .. "/m3_function.c", WASM3 .. "/m3_info.c", WASM3 .. "/m3_module.c",
+    WASM3 .. "/m3_parse.c", WASM3 .. "/m3_validate.c", WASM3 .. "/m3_xxh64.c",
+    WASM3 .. "/m3_deterministic.c",
+}
+
+target("WhaleJS-wasm")
+    set_kind("static")
+    set_basename("WhaleJS-wasm")
+    -- 绑定层 + wasm3 本体。wasm3 不启用 WASI/uvwasi（需要额外依赖），
+    -- 只用核心解释器：WASI 的 host 函数由嵌入方通过 imports 提供。
+    add_files(SRC .. "/whale_wasm.c")
+    add_files(SRC .. "/whale_wasm_c.c")
+    add_files(SRC .. "/whale_wasm_rt.c")
+    add_files(wasm3_sources)
+    add_includedirs(SRC, WASM3, { public = true })
+    add_defines(qjs_defines)
+    -- 中断支持靠 gas 计量：runtime 可挂起 + 计量后，wasm3 在每条控制流转折
+    -- 点（循环回边、函数入口）切出安全点，gas 用尽就在那里暂停，宿主可以
+    -- 恢复。stack switching / snapshots 是挂起机制的前提（见 m3_config.h），
+    -- typed refs 又是 stack switching 的前提。exception handling 和 memory64
+    -- 用不到，关掉。
+    add_defines("d_m3HasTypedRefs=1", "d_m3HasStackSwitching=1",
+                "d_m3HasSnapshots=1", "d_m3HasGasMetering=1",
+                "d_m3HasExceptionHandling=0", "d_m3HasMemory64=0")
+    if is_win() then
+        add_defines("WIN32_LEAN_AND_MEAN", "_WIN32_WINNT=0x0601")
+    end
     link_whale(false)
 
 -- 动态库 whalejs.dll / libwhalejs.so（Windows 另出导入库 whalejs.dll.a）。
@@ -162,6 +239,34 @@ target("whalejs_shared")
     add_includedirs(SRC, { public = true })
     -- 使用者需要 USING_QJS_SHARED 才能把 JS_EXTERN 认成 dllimport（Windows）。
     add_defines("USING_QJS_SHARED", { interface = true })
+    link_whale(false)
+
+-- WebAssembly 扩展的单元测试：xmake run whale_wasm_test
+-- 单独一个 target，因为 tests/whale 下的文件都链进 whale_test，而那个测试
+-- 不链接 wasm 扩展。
+target("whale_wasm_test")
+    set_kind("binary")
+    set_rundir("$(projectdir)")
+    -- Pure C, like the whole project: no C++ runtime and no static
+    -- initialisers in the test binary.
+    set_languages("c11")
+    add_deps("whalejs_static", "WhaleJS-wasm")
+    add_files("tests/wasm/*.c")
+    add_includedirs(SRC, WASM3)
+    add_defines(qjs_defines)
+    -- No --export-all-symbols here: the test does not need to export anything,
+    -- and exporting every symbol makes the loader process a large export table
+    -- for no benefit.
+    link_whale(false)
+
+-- WebAssembly 扩展的嵌入示例：只 include 公开头文件，链接两个库。
+target("whale_wasm_demo")
+    set_kind("binary")
+    set_rundir("$(projectdir)")
+    add_deps("whalejs_static", "WhaleJS-wasm")
+    add_files("examples/wasm.c")
+    add_includedirs(SRC)
+    add_defines(qjs_defines)
     link_whale(false)
 
 -- whalejs CLI（手工验证与 perftest 的引擎命令名；产物名 whalejs.exe）

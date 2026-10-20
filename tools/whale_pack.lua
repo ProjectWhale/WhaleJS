@@ -1,7 +1,8 @@
 -- WhaleJS release packer.
 -- Runs as: xmake l tools/whale_pack.lua
--- Stages include/ + lib/ (no README, no tcc-runtime - the runtime archive is
--- embedded in the library) and writes a .zip with pure Lua (store method),
+-- Stages include/ + lib/ (no README, no tcc-runtime - generated code only
+-- references host symbols, so no TCC runtime file is needed at run time) and
+-- writes a .zip with pure Lua (store method),
 -- no external tar/zip tool.
 --
 -- Reads the configured platform from xmake via an env var set by the task.
@@ -41,6 +42,12 @@ os.cp(inc .. "/LICENSE", stage .. "/include")
 
 -- libraries
 os.cp(tdir .. "/libwhalejs.a", stage .. "/lib")
+-- The WebAssembly extension is a separate, optional static library: link it
+-- only if the program wants wasm. Its public header (whalejs.h) is staged
+-- above already, so no extra include is needed.
+if os.isfile(tdir .. "/libWhaleJS-wasm.a") then
+    os.cp(tdir .. "/libWhaleJS-wasm.a", stage .. "/lib")
+end
 if plat == "windows" or plat == "mingw" then
     os.cp(tdir .. "/whalejs.dll", stage .. "/lib")
     os.cp(tdir .. "/whalejs.dll.a", stage .. "/lib")

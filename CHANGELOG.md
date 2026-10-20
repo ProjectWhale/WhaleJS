@@ -23,9 +23,12 @@ WhaleJS 变成可分发的库：编译产物含静态库、动态库与按惯例
   编进库里）。`JS_WhaleTccNoStdLibs()` 让 TCC 跳过 CRT 链接，于是
   **不需要 libtcc1-64.a，也不需要任何 .def 文件**。使用者拿 `libwhalejs.a`
   （或 DLL）+ 头文件直接链接即可，磁盘上没有任何 tcc 运行期文件
-- 新增 API `JS_WhaleSetJitRuntimeDir()`：JIT 目录探测（本库所在目录相对位置 →
-  环境变量 `WHALE_JIT_RUNTIME_DIR` → 构建期路径）；现在它只是搜索路径，包解压到
-  任意位置都能用
+- **多架构 JIT**：TCC 目标宏跟随构建目标（不再写死 x86_64+PE）。
+  Windows x86-64/ARM64、Linux/macOS x86-64/ARM64、32 位 ARM 都能出 JIT；
+  TCC 没有后端的架构（如 RISC-V）自动关闭 JIT，引擎按解释器构建，
+  **API 表面不变**——同一份嵌入方代码在各平台都能编译运行
+- 移除 `JS_WhaleSetJitRuntimeDir()`：JIT 不再有任何运行期目录搜索
+  （也不读 `WHALE_JIT_RUNTIME_DIR`），发布版连"去磁盘找 libtcc1"这条路径都不存在
 - 移除 `--libtcc_prebuilt` 选项（预编译 libtcc.dll 的开发捷径）；TinyCC 一律从源码编
 - CI：`.github/workflows/build.yml` 在 Windows/Linux/macOS 三端构建库+CLI、
   跑单元测试与 perftest、出归档

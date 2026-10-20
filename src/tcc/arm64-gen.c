@@ -994,6 +994,67 @@ static unsigned long arm64_func_va_list_stack;
 static int arm64_func_va_list_gr_offs;
 static int arm64_func_va_list_vr_offs;
 static int arm64_func_sub_sp_offset;
+/* Address of the first instruction of the function being emitted, for the
+   Windows .pdata entry (see gfunc_epilog). */
+static unsigned arm64_func_start_offset;
+
+/* PE needs the prolog's `sub sp` to be patchable in place; the epilog rewrites
+   a fixed-size slot. Six instructions covers every form arm64_sub_sp can
+   emit: two `sub sp,sp,#imm`, or movimm (up to four) + `sub sp,sp,x16`, or
+   the PE probe path movimm + `bl __chkstk` + `sub`. */
+#define ARM64_FUNC_STACK_SETUP_SLOTS 6
+
+#ifdef TCC_TARGET_PE
+/* Call a runtime helper by its token (__chkstk). A direct `bl` with a
+   R_AARCH64_CALL26 relocation: the helper is an import from the CRT, so the
+   linker resolves it through the import thunk pe_check_symbols builds. */
+static void gen_static_call(int v)
+{
+    Sym *sym = external_global_sym(v, &func_old_type, 0);
+
+    greloca(cur_text_section, sym, ind, R_AARCH64_CALL26, 0);
+    o(0x94000000); // bl .
+}
+
+/* Where a parameter lands in the home area (or on the stack) under the
+   Windows ARM64 calling convention. Same layout the stores in gfunc_prolog
+   use: x0-x7 at [sp+160], v0-v7 at [sp+16], stack args after the 224-byte
+   frame. */
+static unsigned long arm64_pe_param_off(unsigned long a)
+{
+    return a < 16 ? 160 + a / 2 * 8 :
+           a < 32 ? 16 + (a - 16) / 2 * 16 :
+           224 + ((a - 32) >> 1 << 1);
+}
+#endif
+
+/* `sub sp, sp, #diff`, with the stack-probe call Windows requires for frames
+   larger than one page. */
+static void arm64_sub_sp(uint64_t diff)
+{
+    if (!diff)
+        return;
+#ifdef TCC_TARGET_PE
+    if (diff >= 4096) {
+        /* __chkstk(x15 = number of 16-byte units) probes every page, so a
+           guard-page hit reports a stack overflow instead of faulting in the
+           middle of the frame. */
+        arm64_movimm(15, diff >> 4);
+        gen_static_call(TOK___chkstk);
+        o(0xcb2f73ff); // sub sp,sp,x15,lsl #4
+        return;
+    }
+#endif
+    if (!(diff >> 24)) {
+        if (diff & 0xfff)
+            o(0xd10003ff | (diff & 0xfff) << 10); // sub sp,sp,#(diff & 0xfff)
+        if (diff >> 12)
+            o(0xd14003ff | ((diff >> 12) & 0xfff) << 10); // sub sp,sp,#(diff>>12),lsl #12
+    } else {
+        arm64_movimm(16, diff);
+        o(0xcb3063ff); // sub sp,sp,x16
+    }
+}
 
 ST_FUNC void gfunc_prolog(CType *func_type)
 {
@@ -1017,6 +1078,7 @@ ST_FUNC void gfunc_prolog(CType *func_type)
 
     arm64_func_va_list_stack = arm64_pcs(n - 1, t, a);
 
+    arm64_func_start_offset = ind;
     o(0xa9b27bfd); // stp x29,x30,[sp,#-224]!
     o(0xad0087e0); // stp q0,q1,[sp,#16]
     o(0xad018fe2); // stp q2,q3,[sp,#48]
@@ -1068,8 +1130,8 @@ ST_FUNC void gfunc_prolog(CType *func_type)
     o(0x910003fd); // mov x29,sp
     arm64_func_sub_sp_offset = ind;
     // In gfunc_epilog these will be replaced with code to decrement SP:
-    o(0xd503201f); // nop
-    o(0xd503201f); // nop
+    for (i = 0; i < ARM64_FUNC_STACK_SETUP_SLOTS; i++)
+        o(0xd503201f); // nop
     loc = 0;
 }
 
@@ -1243,37 +1305,30 @@ ST_FUNC void gfunc_epilog(void)
 {
     if (loc) {
         // Insert instructions to subtract size of stack frame from SP.
-        unsigned char *ptr = cur_text_section->data + arm64_func_sub_sp_offset;
+        addr_t saved_ind = ind;
+        addr_t patch_end = arm64_func_sub_sp_offset + ARM64_FUNC_STACK_SETUP_SLOTS * 4;
         uint64_t diff = (-loc + 15) & ~15;
-        if (!(diff >> 24)) {
-            if (diff & 0xfff) // sub sp,sp,#(diff & 0xfff)
-                write32le(ptr, 0xd10003ff | (diff & 0xfff) << 10);
-            if (diff >> 12) // sub sp,sp,#(diff >> 12),lsl #12
-                write32le(ptr + 4, 0xd14003ff | (diff >> 12) << 10);
-        }
-        else {
-            // In this case we may subtract more than necessary,
-            // but always less than 17/16 of what we were aiming for.
-            int i = 0;
-            int j = 0;
-            while (diff >> 20) {
-                diff = (diff + 0xffff) >> 16;
-                ++i;
-            }
-            while (diff >> 16) {
-                diff = (diff + 1) >> 1;
-                ++j;
-            }
-            write32le(ptr, 0xd2800010 | diff << 5 | i << 21);
-            // mov x16,#(diff),lsl #(16 * i)
-            write32le(ptr + 4, 0xcb3063ff | j << 10);
-            // sub sp,sp,x16,lsl #(j)
-        }
+        int i;
+
+        ind = arm64_func_sub_sp_offset;
+        /* Nop the whole slot first, then emit the real sequence into it: the
+           slot always occupies exactly ARM64_FUNC_STACK_SETUP_SLOTS
+           instructions, so the code after it does not move. */
+        for (i = ind; i < patch_end; i += 4)
+            write32le(cur_text_section->data + i, 0xd503201f); // nop
+        arm64_sub_sp(diff);
+        ind = saved_ind;
     }
     o(0x910003bf); // mov sp,x29
     o(0xa8ce7bfd); // ldp x29,x30,[sp],#224
 
     o(0xd65f03c0); // ret
+
+#ifdef TCC_TARGET_PE
+    /* Windows unwinds through .pdata when an exception crosses a JIT frame,
+       so every emitted function needs an entry. */
+    pe_add_unwind_data(arm64_func_start_offset, ind, -loc);
+#endif
 }
 
 // Generate forward branch to label:

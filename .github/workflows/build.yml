@@ -22,6 +22,17 @@ jobs:
           - os: macos-latest
             arch: arm64
             plat: macos
+          # Windows on ARM64: the PE backend for it was ported into the bundled
+          # TinyCC (tccpe.c/arm64-gen.c/arm64-link.c), so the JIT runs there too.
+          # windows-11-arm is the GitHub-hosted ARM64 runner.
+          - os: windows-11-arm
+            arch: arm64
+            plat: windows
+          # Native Linux ARM64 (no cross toolchain needed): exercises the
+          # ELF/ARM64 backend on real hardware.
+          - os: ubuntu-24.04-arm
+            arch: arm64
+            plat: linux
     steps:
       - uses: actions/checkout@v4
 
@@ -42,8 +53,8 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install xmake
 
-      - name: Install MinGW (Windows)
-        if: runner.os == 'Windows'
+      - name: Install MinGW (Windows x64)
+        if: matrix.plat == 'mingw'
         shell: pwsh
         run: |
           choco install mingw --version=13.2.0 -y

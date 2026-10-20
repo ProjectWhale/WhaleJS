@@ -3992,9 +3992,1927 @@ free list）。该文档的"复核规则"要求：每次同步时恢复 64、跑
   执行，结论是可撤掉补丁。
 
 
+# <123>: perftest 全面分析（node vs whalejs）+ 前端三形状的 JIT 覆盖修复
+
+UNRESOLVED（性能方向明确，但"反超 V8"仍未达成）
+
+## 本轮任务与口径
+
+用户要求：跑 `node perftest/main.js --engines=node,whalejs`（release 目录进 PATH），
+分析 whalejs 的性能短板并给建议，重点是 vnode / diff / immutable 这类前端框架常用形状，
+目标是这些方面反超 V8。
+
+测量口径：`build/mingw/x86_64/release/whalejs.exe`，`--repeat=3`（个别 A/B 用 repeat=5），
+node 24。全量 25 case，0 mismatch。
+
+## 基线（本轮修复前，repeat=3）
+
+| case | node | whalejs | 倍数 |
+|---|---|---|---|
+| **vnode_build** | 2 | 11 | 5.5× |
+| **props_diff** | 2 | 18 | 9× |
+| **immutable_update** | 13 | 24 | 1.8× |
+| **list_reconcile** | 10 | 27 | 2.7× |
+| **objshape** | 50 | 73 | 1.5× |
+| objfields | 20 | 27 | 1.35× |
+| arr_methods | 3 | 9 | 3× |
+| bitops | 15 | 125 | 8.3× |
+| ident | 8 | 48 | 6× |
+| locals | 26 | 66 | 2.5× |
+| mixed | 55 | 131 | 2.4× |
+| sieve | 45 | 67 | 1.5× |
+| 纯数值（arith/branch/floatlit/minmax/nested/loop_sum） | 15-65 | 19-62 | ≈1× |
+| object / fib | 25 / 32 | 1 / 4 | **反超 20× / 8×** |
+
+结论和 <68> 一致：**能进 JIT 的形状已经接近或反超；短板全在"进不去"**。
+
+## 定位到的四个真 bug（都已修，全量 0 mismatch）
+
+### 1. 纯工厂函数（无字段访问 site）整段编译失败 —— `_wsc.wa` 未声明
+`createElement` / `makeProps` 这种"只建对象、没有一处字段读"的函数：
+`whale_ret_obj_g` 走 unboxed-struct 路径要发 `_wsc.wa[]`，但 prologue 的
+`_wsc` 声明门只认 `whale_field_sites_n > 0 || whale_loc_obj[] || whale_has_array
+|| need_reuse`。于是生成代码引用未声明的 `_wsc`，TinyCC 报
+`'_wsc' undeclared`，**整个函数静默退回解释器**——React/Vue 渲染函数调用的
+那个工厂正好是这个形状。修法：`need_wa = whale_ret_obj_g && whale_def_atoms_n > 0`
+加入声明门，`wa[]` 单独声明（`fs/fp/fver/fv/sp` 仍只在 need_field 时声明）。
+
+### 2. 工厂返回的对象在解释器里读出来全是 undefined（两处）
+- `set_loc` 不登记 `whale_loc_obj[]`：`var o = {...}; return o` 的字节码是
+  `set_loc0; get_loc0; return`，`whale_ret_obj_g` 判定失败 → 选了 frame-column
+  布局 → `return` 从空 object slot 取对象。修法：set_loc 分支补
+  `whale_obj_pending → whale_loc_obj[a]`。
+- frame-column 兜底 arm 未排除 `whale_ret_obj_g`：即使走了 struct 路径失败，
+  还会落回列布局，留下"struct 类型但 slot 里没有对象"。修法：
+  `!whale_ret_obj_g` 加进该 arm 的条件。
+- 顺带补了 `OP_get_field/get_field2` 解释器快路径：`find_own_property` 看不到
+  struct 的列，直接 `goto slow_path`（走 `JS_GetPropertyInternal` 的 struct 分支）。
+
+### 3. struct 的 own keys 全是空 —— `Object.keys/JSON.stringify/spread/for-in`
+`JS_GetOwnPropertyNamesInternal` 只读 `shape`，struct 的列不在 shape 里，于是
+`Object.keys(struct)` = `[]`、`JSON.stringify` = `{}`。对 React 生态是致命的
+（props 展开、浅比较、devtools 都走这条路）。修法：struct 分支把非 reserved 的
+列按声明序返回，再拼上 dynamic map；`JS_GetOwnPropertyInternal2` 同步补 struct
+列（`hasOwnProperty` / `Object.entries` / `getOwnPropertyDescriptor`）。
+验证：`keys=[a,b]`、`json={"a":9,"b":10}`、spread/in/hasOwn 全对。
+
+### 4. `a && b` / 三元表达式的跨边值读写错槽（静默错答案）
+`a && b` 的字节码是 `dup; if_false8 L; drop; <b>; L:`；`c ? a+1 : b+2` 赋值给
+局部变量时是 `if_false8; <true>; goto L; L2: <false>; L:`。两条边的栈值都跨
+基本块，但 pending expression 存在 fold sink 里，分支自己的 commit 会把它冲掉，
+且 `fold_materialize` 每次发新名字（v5 vs v6），join 只认自己这条边写的那个。
+→ props_diff 数出 19998 而不是 19999，`band3(0)` 返回 true 而 node 是 false。
+修法：`fold_materialize_live(n, cur, var_count)` 在每条离开基本块的边
+（if/goto/fused-compare/label）把"仍是 pending expression"的活槽物化到
+**规范槽变量**（`WHALE_CANON_BASE + k`，映射到 `_wsv` 的保留尾部），
+已经物化的槽不动（否则每轮多一次 copy，sieve 65→79ms）。
+
+### 5. struct 字段 IC 永远不命中 —— 每次读都线性扫列名
+`JS_WhaleObjFieldNum` 缓存键是 `ws`（struct 指针），却先拿 `p->shape` 比：
+所有 struct 共享同一个空 shape，所以第一次比较必不相等，然后每次读都
+`whale_struct_col()` 扫一遍 atoms。修法：struct 先按 `ws == *shape_cache` 判，
+命中直接走 `ptr_cache`。`JS_WhaleObjFieldPtr` 本来就是这个语义。
+收益：`fields.js` 里 `write=` 3ms→1ms；`icmiss.js` freshObj 218→?（见下）。
+（这一条本身在本轮未带来 perftest 大数字，因为受 6 影响。）
+
+### 6. `_wsc.oi` 在无 array 的函数里被发射 —— 又一处声明门漏项
+`put_loc/set_loc` 的"slot 里换了值"会发 `_wsc.oi[k] = 0`，但 `oi[]` 只在
+`need_field || whale_has_array || ...` 时声明。于是"局部变量接过 call 结果/字符串"
+的函数（stringField、mkStr 这种）编译失败退解释器。修法：三处 `oi` 写回全部
+加 `if (whale_has_array)`（无 array 时它本来就没有读者）。
+
+## 修复后的数字（repeat=3，同机）
+
+| case | node | whalejs 修前 | whalejs 修后 |
+|---|---|---|---|
+| vnode_build | 2-3 | 11-13 | 11-13（见下） |
+| props_diff | 2 | 18-19 | **14-16** |
+| immutable_update | 12-19 | 24-26 | 25-26 |
+| list_reconcile | 10-15 | 27-30 | 26-30 |
+| sieve | 43-50 | 64-66 | 60-66 |
+| 其余 | — | — | ±5% 噪声内 |
+
+注意：**vnode_build 的 ms 没变**，但这是对的——见"为什么修了还慢"。
+
+## 为什么修完仍然慢：三个结构性瓶颈（重点）
+
+### A. 每次跨函数调用 ≈ 4.5µs，是 V8 的 200 倍
+`breakdown.js`（同一个循环，只换调用形态，均已被 JIT）：
+
+| 形状 | whalejs | node |
+|---|---|---|
+| `s += inc(i)`（编译后的普通调用） | 40ms | 4ms |
+| `s += i + 1 + g`（内联展开） | 3ms | 4ms |
+| 字段读 6 个（参数传入的 struct） | 85ms | 0ms |
+| 局部变量 6 个 | 0ms | 1ms |
+| 每轮建一个对象 | 49ms | 8ms |
+| 每轮拼一个字符串 | 46ms | 3ms |
+
+- 调用本身：`JS_WhaleCallValue` → `whale_fast_call`，每次都要
+  `alloca` 帧 + 清 `stack_buf/obj_slots`（`whale_needs_obj` 时 64+ 个
+  `JS_UNDEFINED` 写）+ 建 `JSStackFrame` + `whale_ver_pick`（读 shape 算 key）
+  + 入口 guard + `JS_WhaleDeoptNote`。**vnode 的 `render` 每轮调一次
+  `createElement`，光这一项就是 200ns+ 量级**，node 内联后是 0。
+- `vnodedeco.js` 分解（20 万次）：`call=118ms` vs `inline=100ms` vs
+  `noalloc=26ms` vs `fields=1ms`。也就是说**对象创建本身只占 ~26ms，
+  调用链占 ~75-90ms**。这直接对上 <68> 的结论"墙 = JS_Call 全帧装配"。
+- `whale_fast_call` 已经存在（跳过 JS_Call 的解释器路径），但它仍然建
+  `JSStackFrame` + 清 obj slots，且 **vnode 的 render 里 `createElement` 是
+  closure-slot 调用（`get_var_ref0`），`whale_fast_call` 要求
+  `var_ref_count == 0`**——所以走的是完整 `JS_Call`。这是 vnode 5× 的主因。
+
+### B. 编译后的对象每轮一次真实堆分配（escape 后无法列化）
+`alloccost.js`：`escape1=81ms`（3 字段，每轮返回/逃逸）vs `local=2ms`
+（同形状不逃逸，走 frame columns，零分配）——**40 倍**。
+vnode 的 `createElement` 返回对象 → 必然 escape → 每轮 `JS_WhaleStructNew`
+（`JS_NewObjectClass` + 一次 malloc + GC 链登记）＋ `ObjDefineValue`。
+`icmiss.js`：`oneObj=119ms`（复用同一个对象）vs `freshObj=218ms`
+（每轮新建），差的就是分配。
+- 已有 free list（`whale_struct_free`），但 vnode 的两个对象宽度不同
+  （3 列 / 2 列），且 GC 每 20 次分配触发一次扫描，仍是大头。
+- node 有 bump-pointer 新生代 + 逃逸分析标量替换；WhaleJS 没有。
+
+### C. 纯数值循环仍输在 TCC 代码质量（bitops 8×、ident 6×、locals 2.5×）
+这些函数**已经编译**，慢在"每条语句都 spill"（TCC 无寄存器分配）。
+`bitops` 的 int 镜像只覆盖一部分 local（`acc` 被 set/add 黑名单挡住），
+转换链还在；`ident` 每轮 4 条恒等运算，TCC 不能折叠成一条。
+<73> 已实测 gcc -O2 同函数快 1.7-6×，但 gcc 编译 250ms/函数，只适合 AOT/热点再编译。
+注意 `bitops` 的 `%` 走的是完整的 `>0 && <=INT_MAX && ==(int)` 守卫链，
+而 node 的 `%` 是 idiv——<118> 已证伪"倒数乘法"在 TCC 下是负优化。
+
+## 建议（按"对前端形状的收益 / 成本"排序）
+
+1. **内联编译后的小函数（最高优先，vnode/diff 的 5-9× 主要在这）**
+   现在 `whale_inline_body` 只对 `WHALE_T_VRFN`（closure-slot 调用目标）
+   生效，而 vnode 的 `createElement` 恰好就是 `get_var_ref0` + `call2`。
+   `[vr-inline] pos=34 argc=2 rtype=-1 clen=20` 说明它被调用了但**拒绝了**。
+   三个已知缺口（<66> 续的清单）：callee 有 `define_field`+`return`（工厂）
+   时 `whale_inline_body` 的 `OP_object` 分支要求 `whale_inline_str_n > 0`，
+   而 `render` 的 cpool 里 `createElement` 是独立函数、`whale_inline_str_n`
+   的预扫描只在 `whale_vr_info` 路径填；以及 `rtype<0` 的拒绝链。
+   建议先 dump 这两条（`WHALE_JIT_DUMP` 已打印 `[vr-inline]`），
+   把"工厂函数 + 纯数值参数"这一种 inline 打通——`breakdown.js` 显示
+   内联后 40ms→3ms，vnode 立刻从 11ms 掉到 ~4ms 量级。
+
+2. **降低 fast-call 的门槛与成本（vnode/diff 的第二刀）**
+   - 允许 `var_ref_count > 0` 的 callee 走 `whale_fast_call`（closure 的
+     var_refs 可以直接从 `p->u.func.var_refs` 取，帧布局一样）。
+   - `whale_needs_obj` 的 64 个 obj slot 清空改成"按编译期实际用到的最大
+     slot 数"（`whale_gen_objs` 已知），vnode 的 createElement 只用 1-2 个。
+   - `whale_ver_pick` 在无 object 参数时已经早退（`nobj==0`），但每次调用
+     仍要遍历 argc 读 tag；对"全数值参数"的函数可以编译期标记跳过。
+   预期：跨函数调用 200ns → 80ns 量级，vnode/props_diff 再降 30-50%。
+
+3. **对象分配走 bump 指针 / 按宽度 free list 扩容（immutable/objshape 的主墙）**
+   `alloccost.js` 的 40× 全在分配。现有 `whale_struct_free[width]` 只有
+   `WHALE_STRUCT_FREE_DEPTH`（64）深度，且每次 `StructNew` 仍要遍历列清零/
+   释放。建议：
+   - free list 深度按宽度分级调大（vnode 3 列 / props 2 列各 256）；
+   - 新生代 bump 区：`JS_NewObjectClass` 对 `JS_CLASS_WHALE_STRUCT` 走
+     一段线性 arena，GC 时整段回收（struct 没有 dynamic map 时天然可搬）。
+   - 这一步是唯一能把 `escape1` 从 81ms 拉到 20ms 级别的办法。
+
+4. **`%` 的 int 快路径收窄守卫（bitops / objshape writeOrder）**
+   <118> 已证伪倒数乘法，但守卫链本身可以缩短：`(int)i % (int)k` 在
+   `i,k` 都是 `WHALE_T_I32`/`ICONST` 时不需要 `>0 && <=INT_MAX` 的 6 个
+   比较，只需要 `i == (int)i`（k 是正字面量时连这个都不用）。
+   预期 bitops 125→90ms 量级。
+
+5. **LICM + 归纳变量强度削弱（纯数值循环 2-3×）**
+   `nested`/`locals`/`loop_sum` 的循环体里大量 `L4 = L3 * L3` 这类跨层
+   不变式（<118> 证伪的是"local 存储外提"，不是"表达式外提"）。
+   `fold_materialize` 已经有 `whale_vexpr[k].inv`，缺的是把 inv 语句
+   真正移到 loop head 之前的输出（`loop_end` 插入点已确认）。
+
+6. **vnode 专属：`props` 子对象的两级分配合并**
+   `createElement(i%5, {id:i, cls:"c"+...})` 每轮建 2 个 struct。若内联
+   （建议 1）成立，`{id,cls}` 可以变成 caller 的 frame columns，只留
+   `v` 一个真实 struct；`key:null` 那列用 reserved 标记即可，不必
+   `ObjDefineValue`。
+
+7. **验收口径**：前端形状的目标应是 `vnode_build ≤ 4ms`、`props_diff ≤ 6ms`、
+   `immutable_update ≤ 12ms`（node 的 2-3×以内），而不是现在的 11/15/25。
+   每一步都跑 `perftest --repeat=3` + `whale_test`，entries 必须 >0。
+
+## 本轮验证
+
+- `xmake run whale_test` → `whale api test: ok`
+- `node perftest/main.js --engines=node,whalejs --repeat=3` → 25/25，0 mismatch
+- 新增探针（`temp/jitprobe/`，不入 git）：`and.js` `tern.js` `eq.js`
+  `ifelse.js` `h.js` `g.js` `structkeys.js` `fields.js` `breakdown.js`
+  `alloccost.js` `icmiss.js` `vnodedeco.js` `memo.js` `prims.js`
+- A/B：`temp/ab_base/whalejs.exe`（修前）vs `temp/ab_new/whalejs.exe`（修后），
+  props_diff 19→16ms，sieve 66→63ms，其余在噪声内；**正确性修复不换性能**。
+
+## 教训
+
+- **"编译成功"不等于"编译对了"**：`gen_ok=1` + TCC 报错也是静默退解释器，
+  perftest 的 entries 列看不出来（entries>0 只说明有函数进了 JIT）。
+  新形状接入时先看 `WHALE_JIT_DUMP` 里有没有 `compile failed (gen_ok=1)`。
+- **声明门和发射点必须同源**：`_wsc` 的每个字段组（wa/fs/fp/fver/fv/sp/oi/
+  ap/an/ai/op/on/ru）都要么有统一的"这个组会不会被发"判定，要么无条件声明。
+  本轮两个 bug（wa、oi）都是"发射点比声明门宽"。
+- **跨基本块的栈值不能是 pending expression**：fold sink 是线性缓冲，
+  分支 commit 即清空。任何跳转前都要物化，且两条边必须写同一个变量名。
+- **perftest 的 ms 会因为修复而"不变"**：vnode 修完仍是 11ms，因为瓶颈从
+  "整段解释"变成了"每轮一次调用+分配"。分析时必须分解到 primitive
+  （`vnodedeco.js` / `breakdown.js`），只看 case 总分会得出错误结论。
+
+# <124>: 装箱快路径 —— 数字叶子 ABI（无帧/无装箱入口），以及内联器两个真 bug
+
+PARTIAL（帧消除已落地并实测 20×，但"统一装箱"本身证明不是瓶颈）
+
+## 用户设想与我的结论（先说结论）
+
+用户提出："对象分配还是和装箱有关吧？有机会应该搞一个装箱的快路径……如果现有实现更快就算了。"
+
+实测结论：**在这个引擎里，"装箱"本身很便宜，贵的是"跨函数调用的帧"**。
+
+- 数字→JSValue（`whale_jit_box_num`）就是一次范围判断 + `JS_MKVAL`，纳秒级；
+  反向 `whale_jit_unbox_num` 是两次 tag 比较。**单独测装箱/拆箱不构成瓶颈。**
+- 贵的是 `whale_fast_call` / `JS_CallInternal` 里的：`alloca` 帧、`var_buf`
+  清零、`stack_buf`/`obj_slots` 清零（`whale_needs_obj` 时 28+ 个槽）、
+  `JSStackFrame` 建立与恢复、`whale_ver_pick` 的 shape key、入口 guard、
+  `JS_WhaleDeoptNote`。
+- 因此正确的"装箱快路径"不是"更快地把 double 变成 JSValue"，而是
+  **让纯数值函数根本不需要 JSValue**：调用方把 double 数组递进去，拿 double 回来。
+  这就是本轮落地的 `numeric-leaf` ABI（下面的实现）。
+
+按用户要求"先按设想修复，再告诉看法"：已实现，见下。
+
+## 实现：数字叶子入口（frame-free ABI）
+
+生成器在函数体降级完成后判定 `whale_gen_nat`：无对象槽、无调用、无闭包状态
+（var_ref_used/val/rw 全 0）、不返回对象、非 bool 返回、无 typed array、
+所有参数都以 double 形式到达。满足时额外发射：
+
+```c
+double whale_jit_nat_<seq>(void *ctx, double *An, int *deopt) {
+    return whale_jit_core_<seq>(ctx, 0, An, deopt, 0, 0);
+}
+```
+
+- `whale_jit.h` 新增 `void *JS_WhaleJitLastNatEntry(void)`；`JSFunctionBytecode`
+  新增 `void *whale_nat_entry`（只有 self 读法会设置它——另一种读法依赖捕获状态，
+  这个 ABI 没有位置放）。
+- `whale_fast_call` 在进入常规路径**之前**先试它：参数逐个 unbox 到 `double[8]`，
+  调用，`*deopt == 0` 就直接 `whale_box_number` 返回；deopt 则原样落回常规路径
+  （重新解释同一帧，语义与原来完全一致）。
+- `whale_box_number` 抽成引擎侧的共用函数，保证返回值与普通入口逐位相同
+  （int32 可表示就用 INT，否则 float64）。
+
+### 实测（30 万次，单进程 best-of-5）
+
+| 形状 | 修前 | 修后 | node |
+|---|---|---|---|
+| 编译后的 caller 调"有局部变量的"callee（`g(x)=f(x)+1`） | **280 ms** | **14 ms** | 1-2 ms |
+| 同上的 `loopNum` 内联形状 | 1-2 ms | 1-2 ms | — |
+
+即 **20×**，且结果与 node/qjs/修前二进制逐位一致（见下"正确性"）。
+注意：`f` 有局部变量，内联器拒绝它，所以这条路径走的是引擎调用——
+正是这个 ABI 的用武之地。
+
+## 顺带修掉的两个真 bug（都是本轮引入的路径暴露出来的）
+
+### 1. 内联体的操作数栈基址是 0，覆盖了调用者的活值（静默错答案）
+`whale_inline_body` 里 `sp = 0` 起步，而内联体应该从**调用者参数之上**开始。
+`s += inc(i)` 内联 `inc` 后，`inc` 的临时值写进了 slot 0/1——正是累加器 `s`
+和 callee 槽——于是加法读成 `_wsv[nm] + 1` 而不是 `s + (i+1)`。
+之所以之前没暴露：第一次编译（self 读法）入口 guard 就 deopt 了，跑到第二次
+读法才执行内联体。表现是 `loop(300000)` 正确、`loop(5)` 返回 6。
+
+修法：`sbase = arg_base + callee->arg_count`；`state_len` 增加
+`WHALE_INLINE_EXTRA`（8）个生成器侧栈槽，`whale_vexpr/whale_vmat` 同步扩容
+（只影响生成器，不影响引擎分配的帧）。
+
+### 2. 内联结果只拷了类型，没拷值（同一个错答案的另一半）
+`cur[var_count + func_slot] = rtype` 只把**类型**写回 callee 槽，表达式/
+名字仍指向调用者原来的 callee 表达式（`(get_var_ref0)`），于是 `s += inc(i)`
+累加的是函数对象。修法：`whale_inline_result` 记录内联体结果所在槽，
+调用点把 `whale_vexpr/vmat/vname` 一并搬过去。
+
+### 3. `whale_objs` / `whale_fields` 是两份变量（跨编译累积）
+文件作用域一份（内联器用）+ `whale_jit_gen` 局部同名一份（主循环用），
+局部遮蔽全局，两个计数器各自前进。内联器那份**从不重置**，几十次编译后
+越过 `WHALE_FIELD_CACHE`，之后所有内联体里的 `get_field` 都退化成
+逐指令 step 路径。修法：改成同一份文件作用域变量，在 `whale_jit_gen` 开头重置。
+
+## 正确性验证
+
+`temp/jitprobe/natrobust2.js`：int / float / 负数 / 3e9 / 字符串 / bool / null /
+缺参 / 多参 / 1e300 / -0，以及两参函数、部分参数。
+whalejs（修后）vs node vs qjs vs whalejs（修前）**逐行完全相同**（Compare-Object 无差异）。
+
+`whale_test`：`whale api test: ok`。
+perftest 25/25，0 mismatch；vnode/props_diff/immutable 等前端形状数字未变
+（这条 ABI 只影响"已编译 caller 调已编译 callee"）。
+
+## 看法（对"统一装箱"路线的评估）
+
+1. **不要做"统一装箱函数"**。数字装箱已经是 3-5 条指令，再包一层只会更慢。
+   真正的开销在帧；本轮把帧去掉后，同一形状从 280ms 降到 14ms，
+   而"更快的 box"最多再省几个百分点。
+2. **优先级仍然是内联**。帧消除把 280→14ms，但 node 是 1-2ms：
+   剩下的 12ms 是"仍然发生了一次函数调用"（哪怕没有帧）。内联后是 0 次。
+   所以路线应是：能内联的（小、无局部、纯数值）内联；内联不了但形状是
+   数字叶子的走 `whale_jit_nat_*`；两者都不满足才走通用帧。
+3. **对象结果需要另一条 ABI，而不是装箱**。`createElement` 返回对象，
+   数字叶子 ABI 覆盖不到；它需要的是"结果放进调用者的 obj_slots"，
+   现有 `ret_obj` 参数已经做到一半。下一步应把这条也做成免帧入口
+   （`double f(void *ctx, double *An, int *ret_slot, int *deopt)`），
+   这样 vnode 的 `createElement` 也能免掉帧——它才是 5× 差距的正主。
+4. **真正的对象成本是分配，不是装箱**：`alloccost.js` 显示逃逸对象
+   81ms vs 列布局 2ms（40×）；free-list 命中率已经是 99.999%
+   （`StructNew hit=262142 miss=2`），所以剩下的 43ms/30 万次是
+   `add_gc_object`/`remove_gc_object` 链表操作 + 每次分配触发的 GC 扫描，
+   不是 malloc。这条要靠"新生代 bump + 延迟入 GC 链"，不是装箱优化。
+
+## 下一步（按值排序）
+
+1. 对象结果的免帧入口（`ret_slot` ABI），打通 `createElement` 这类工厂。
+2. 让 `vr-inline` 对"无局部 + 返回对象"的工厂真正内联（当前 `rtype=-1`，
+   日志 `[vr-inline] pos=12 argc=1 rtype=-1 clen=24`），这是 vnode 的 5×。
+3. `whale_fast_call` 的剩余固定成本：`JS_WhaleCheckStack`、`DeoptNote`、
+   `ver_pick`——数字叶子入口已经绕开了它们，通用入口还没有。
+
+# <125>: 前端三形状的"进不去"根因全部修完 + vnode 首次真正编译（entries 1→20901）
+
+SOLVED（覆盖）+ UNRESOLVED（性能仍有 5×）
+
+## 用户反馈
+
+"没进步啊？继续" —— 上一轮 <124> 只解决了"已编译函数之间的调用帧"，
+perftest 的前端 case 数字没动。本轮把 vnode/diff/immutable 的**入口路径**
+彻底打通，找到 4 个新 bug（其中 2 个会崩溃/错答案）。
+
+## 根因链（vnode_build 为例，逐层剥开）
+
+1. **`createElement` 编译失败**：`_wsc.wa` 未声明（<123> 已修）。
+2. 修完仍 `entries=1`：**`props` 参数被当成 double**。
+   `get_arg1; define_field props` 只是把参数存进字段，从不参与运算，但
+   `args_obj[]` 只认"参数被当作字段访问的 receiver"，于是 `props` 走了
+   `whale_jit_unbox_num`，每次调用 flag=1 deopt。
+   → 新增 `args_val[]`（存进字段、tag 未知）+ `args_num[]`（参与算术），
+   只有 `args_val && !args_num` 才按不透明值传递（`JS_WhaleArgGetVal`）。
+3. 修完 `entries` 涨了但**崩溃**（SIGSEGV in `whale_jit_unbox_num`）：
+   `arg_obj_slot` 的 `malloc` 在某次行编辑里被误删（null 指针写）。
+4. 修完崩溃后**错答案**（`{a:v,b:v+1}` 读回 `b=1`）：两处独立原因
+   - **frame-column 内联**：把 callee 的 literal 当 caller 的列，列号是
+     callee 的、寻址是 caller 的，第二个字段落到错列。**已禁用**（需要
+     per-body 列重映射，不是开关能解决的）。
+   - **`_wsv[]` 越界**：`fold_materialize_live` 的规范名是
+     `WHALE_VSER_MAX + k`，而数组只开了 `stack_size + WHALE_VSER_MAX`；
+     `k` 可以到 `stack_size + WHALE_INLINE_EXTRA`，于是写到数组外。
+     修法：数组开到 `stack_size + WHALE_INLINE_EXTRA + WHALE_VSER_MAX`，
+     并把两处 `whale_vserial` 上界同步。
+
+## 最终状态（repeat=3）
+
+| case | node | whalejs | entries |
+|---|---|---|---|
+| **vnode_build** | 2 | **11** | **20901**（原来是 1） |
+| props_diff | 2 | 15-16 | 39801 |
+| immutable_update | 12-20 | 26-49 | 920 |
+| list_reconcile | 10 | 28 | 6001 |
+| objshape | 45-48 | 74-76 | 48 |
+| objfields | 18 | 27 | 20 |
+| 其余 | — | 噪声内 | — |
+
+**vnode_build 现在整段 render 循环是编译代码**（entries 20901 = 20000 次
+`createElement` + 900 次预热），不再是"解释器跑 20000 次"。
+
+## 为什么 ms 还没降（下一步的靶子）
+
+render 循环的循环体现在是（`WHALE_JIT_SRC` dump 实测）：
+
+```
+JS_WhaleObjNew(0)                    // props 对象：真实堆分配
+JS_WhaleObjDefineNum(0,689,L1)
+JS_WhaleObjSlotAtom(691,1)           // "cls" 原子 → 槽
+JS_WhaleObjSlotNum(2, i%3)
+JS_WhaleBinopVal(156,1,2,3)          // "c" + (i%3)  ← 字符串拼接走引擎
+JS_WhaleObjDefineValue(0,690,3)
+JS_WhaleObjSlotNum(20,i%5)
+JS_WhaleObjSlotCopy(0,21)
+JS_WhaleCallSelfValue(2,20,4)        // createElement 调用（内联被拒）
+JS_WhaleObjFieldNum ×5               // v.type / v.props / v.props.id
+JS_WhaleStepPushNum/Run/OutIsNum     // ← 加减法走了逐指令 step 通路
+```
+
+即：**每轮 1 次真实调用 + 2 次堆分配 + 1 次字符串拼接 + 1 次 step 通路**。
+剩下的 11ms 全在这里，不在解释器。
+
+## 下一步（按值）
+
+1. **字符串拼接快路径**（`"c" + (i%3)` 每轮一次 `JS_WhaleBinopVal` → 引擎）。
+   vnode 的 `cls` 只有 3 个可能值；给 `push_atom_value + add` 加一个
+   "短字符串 + 小整数"的内联 concat（栈上 32 字节缓冲），预期 vnode 11→8ms。
+2. **`args_val` 的调用点直通**：`createElement(type, props)` 里的 `props`
+   已经以 VAL 形式在槽里，`JS_WhaleCallSelfValue` 仍把它当对象复制一次
+   （`ObjSlotCopy`）。可以让自调用直接传槽号。
+3. **让 `vr-inline` 接受"有对象参数 + 返回对象"的工厂**（现在
+   `rtype=136` 成功但只在内层；外层 `render` 的调用点仍走
+   `CallSelfValue`）。这是 5× 的最后一段。
+4. 分配器（<124> 第 3 条）仍是 immutable/objshape 的墙。
+
+## 教训
+
+- **"entries>0" 不足以证明 case 在跑编译代码**：vnode 一直是 entries=1
+  （顶层脚本调 render 一次），但 render 内部 20000 次调用全在解释器。
+  perftest 的 entries 列对"循环内调用"不敏感，必须看 `[hot]/[gen]` 日志
+  里目标函数有没有 `whale_jit_fn_N`。
+- **参数分类要按"用法"而不是"位置"**：同一个参数可以既存字段又参与运算
+  （`type`），也可以只存字段（`props`）。一个布尔数组不够，要两个。
+- **行编辑会静默删行**：`arg_obj_slot = malloc(...)` 就是这样消失的，
+  表现为纯崩溃。改完必须 `git diff` 逐段读，不能只看 build ok。
+
+# <126>: 字段缓存键必须是对象身份（vnode 错答案的真因）+ 内联/字面量的三个坑
+
+SOLVED（严重错答案）+ PARTIAL（性能）
+
+## 用户可见现象
+
+perftest 的 vnode_build 从"11ms 正确"变成"12ms **check=1357786**（正确 200030000）"，
+即每轮读到的 `v.props.id` 是**上一次迭代**的值。`render(10)` 返回 62 而不是 65。
+
+## 真因：IC 的键是 shape，缓存的值是某个对象内部的地址
+
+`JS_WhaleObjFieldPtr` / `JS_WhaleObjFieldNum` / `JS_WhaleObjFieldVal` 把
+`p->shape` 存进 `*shape_cache`，把 `&p->prop[i].u.value` 存进 `*ptr_cache`，
+生成的代码只比较键：
+
+```c
+if (_wsc.fv[0] != _wsc.fver || _wsc.fs[0] != JS_WhaleObjShape(ctx, 5)) {
+    _wsc.fp[0] = JS_WhaleObjFieldPtr(ctx, 5, 682, &_wsc.fs[0]);
+    ...
+}
+_wsv[2] = _wsc.fp[0]->u.float64;      /* ← 上一轮那个对象的属性地址 */
+```
+
+shape 只保证"布局一样"，不保证"地址一样"。`{id: i}` 每轮都是同一个 shape，
+所以第二轮的 `props` 对象命中缓存，`v.props.id` 直接读到第一轮那个对象的
+`id`。这个 bug 在我把 shape 比较改成"struct 用 ws 当键"（<123>）时就埋下了——
+那次改动只让 struct 走对了，普通对象仍然用 `p->shape`，而普通对象才是每轮
+新建的那个。
+
+修法：新增
+
+```c
+static void *whale_obj_key(JSObject *p)
+{
+    if (p->class_id == JS_CLASS_WHALE_STRUCT)
+        return p->u.opaque;      /* WhaleStruct*，每个对象唯一 */
+    return p;                    /* 对象指针本身就是身份 */
+}
+```
+
+三处缓存（FieldPtr 的 `*shape_io`、FieldNum 的 `*shape_cache`、
+FieldVal 的 `*shape_cache`）统一改用它。形状变化仍被覆盖：任何会重分配
+`p->prop` 的 store（call、put_field、对堆对象的 define_field）都由生成器
+bump `_wsc.fver`，`fv != fver` 那一半会 miss 并重新解析。
+
+**代价**：现在每次读一个**新**对象都要重新 `find_own_property`。对"每轮新建
+对象"的循环这是必然的（缓存本来就不能跨对象复用）；对"同一个对象读很多次"
+（objfields、immutable 的 `st`）仍然只解析一次，因为这些循环里对象槽不变。
+实测 `twoobj5` 从 177ms 回到 12ms，说明原来那 177ms 有一部分就是"每轮都
+重新解析"的假象被错误缓存掩盖后的错答案。
+
+## 顺带修掉的三个坑
+
+### 1. `_wsc.wa` 在调用方 prologue 里没声明 → 整个单元被 TCC 拒绝
+
+内联工厂在调用方体内生成 `_wsc.wa[k] = atom; JS_WhaleStructNew(...)`，
+但调用方的 `_wsc` 声明闸门（`need_field || need_wa || whale_has_array || need_reuse`）
+在 prologue 就发射完了，那时 `whale_inline_str_n` 还是 0。结果 TinyCC 报
+`field not found: wa`，**整个函数静默留在解释器**（连日志都不一定有）。
+
+修法：prologue 里把"本单元是否声明了 wa"发布到 `whale_gen_has_wa`；
+`whale_inline_body` 在 `whale_inline_str_n > 0` 且 `!whale_gen_has_wa` 时
+`goto done` 拒绝该体，调用点退回 fast call（正确、只是略慢）。
+不要在 prologue 里猜——猜错不是慢路径，是编译失败。
+
+### 2. 内联的对象结果被当成数值表达式发布 → `_wsv[n] = ( )`
+
+调用点把 `whale_inline_result` 槽的 `vexpr/vmat/vname` 无条件搬到 `func_slot`。
+数值结果需要这样做（值在表达式缓冲里）；对象结果只携带槽号，没有表达式，
+搬过去就发布了一个空缓冲，后面的 `fold_materialize` 发出 `_wsv[2] = ( ) ;`，
+TCC 报 `identifier expected`。修法：只对 `WHALE_T_NUM/BOOL/I32/IBIT` 搬运
+表达式，其余清空记录（`len=0, vmat=0, vname=-1`）。
+
+### 3. 字面量字段写入绕开 `JS_DefinePropertyValue`
+
+`whale_obj_store_existing`：形状里已经有这个属性、且是普通可写数据属性时，
+直接 `JS_FreeValue` 旧值 + 写新值。这省掉每字段一次的原子哈希与属性位检查
+（数值字面量几乎免费，但带字符串字段的字面量原来要 ~5ms/2 万次）。
+`JS_WhaleObjDefineNum` 保持原样（首次构建要长形状），只有
+`JS_WhaleObjDefineValue` 走这条快路径。
+
+## 验证
+
+| 检查 | 结果 |
+|---|---|
+| `vnsplit4.js`（a/b/c/d 四种读法） | 20/45/65/65，全对 |
+| `findmis2.js`（逐轮比对 id） | -1000001 / -1000001 / -1000001（无失配） |
+| `perftest` 25 case | 全通过，**0 mismatch** |
+| `whale_test` | `whale api test: ok` |
+| 探针（and/tern/eq/ifelse/alias/h/g/mp/ce/structkeys/keys/natrobust2/concat…） | 全部正确 |
+
+## 性能现状（repeat=3）
+
+| case | node | whalejs |
+|---|---|---|
+| vnode_build | 2 | 11-12 |
+| props_diff | 2 | 15-16 |
+| immutable_update | 13-21 | 25-26 |
+| objshape | 45-57 | 72-77 |
+| objfields | 19 | 47-50 |
+| list_reconcile | 11 | 27 |
+
+vnode 的循环体现在是（`WHALE_JIT_SRC` 实测）：
+
+```
+JS_WhaleObjNew / ObjDefineNum / ObjSlotAtom / ObjSlotNum
+JS_WhaleConcatAtomInt              ← "c" + (i%3)，已缓存
+JS_WhaleObjDefineValue
+JS_WhaleCallSelfValue              ← createElement，内联被拒
+JS_WhaleObjSlotCopy
+JS_WhaleObjFieldNum ×5             ← 外层 fill（v 有 5 列，只用到 2 个）
+JS_WhaleStepPushNum/Run/OutIsNum   ← `v.type + v.props.id` 走逐指令通路
+```
+
+下一步（按值）：① 让 `vr-inline` 接受"对象参数 + 返回对象"的工厂，
+消掉 `CallSelfValue`（这是 5× 的正主）；② fill 只读真正用到的列
+（`v` 只用 `type`/`props`，不该读 5 列）；③ `v.type + v.props.id` 的加法
+走原生表达式而不是 step 通路（`props` 现在是 VAL 槽，`id` 读出来是 NUM，
+两者都是 double 域）。
+
+## 教训
+
+**缓存的键必须和缓存值的有效期一致。** shape 是"布局"的身份，不是"地址"的身份；
+把 `&obj->prop[i]` 缓存起来却用 shape 做键，等于假设"同形状 ⇒ 同一对象"。
+这类错误不会崩溃、不会 deopt，只会安静地返回上一个对象的值——
+测试里必须有一轮"值逐轮不同且能验算"的用例（`findmis2.js` 就是为此写的）。
+# <127>: 帧列内联修好（objfields 27ms 反超 node、vnode 12→6ms）+ 三条错误结论的撤回
+
+SOLVED（两处回归）+ RETRACTED（三条判断）
+
+## 用户反馈（三条，全部成立）
+
+1. "这回性能比之前弱，可能是引入了固有开销，很多用例都比之前还多几ms"
+2. "objfield 本来都已经和 node 在同一水平线了，我们不能让它现在慢这么多"
+3. "函数内对象不是已经拆箱了吗？我的理解是用到的属性全部变成局部变量，
+   然后装箱时重新写入，难道不是吗？还有就是，你测试如果带 qjs 跑，
+   可以发现纯解释器的 objfield 是 545ms，那之前的 27ms 又是怎么达到的呢？"
+
+第 3 条是决定性的：qjs 纯解释器 545ms 而基线 27ms，说明基线**一定是编译+拆箱**。
+我当时"基线没编译"的结论是错的，方向也找错了。
+
+## 撤回的三条错误结论
+
+### 撤回 1：「基线 `run()` 根本没编译，27ms 是解释器」
+
+错。`WHALE_ENTER_COUNT=1` 显示基线 `objfields` 的 `entries=20`，
+正好是 20 次 `run(200000)`；`WHALE_NO_UNBOX=1`（关掉拆箱）基线变 47ms。
+两条证据都指向：基线在跑编译代码，**而且拆箱生效**。
+
+我当时看的是 debug 构建的 `WHALE_JIT_SRC` dump。debug 与 release 的
+`info->prefer_gcc` 不同，布局策略因此不同，我把 debug dump 的形态当成了
+release 的行为。**dump 必须用与测量同一配置的构建**。
+
+### 撤回 2：「回归是编译版打不过解释器，是固有开销」
+
+错。基线拆箱生效 28ms、关掉拆箱 47ms —— 47ms 正是我那一版的数字。
+也就是说我那一版**完全没走到拆箱路径**，不是"走到了但慢"。
+
+### 撤回 3：「vnode 的 6ms 是帧列内联的收益」
+
+错。那次的 6ms 是"`inline_cols=1` 设了但没真正生效"时偶然测到的
+（它走的还是堆 struct，只是别的地方碰巧快）。修好之后 vnode 是 6ms，
+但成因不同：帧列对 vnode **不适用**（见下），收益来自别的修复。
+
+## 真正的根因：布局只发布了长度，没发布 atom 表
+
+我上一轮把 `whale_inline_cols_ok` 从硬编码 0 改成 1，但 `inline_cols`
+分支只做了：
+
+```c
+whale_str_n = whale_inline_str_n;   /* 长度 */
+```
+
+没有把 `whale_inline_str_atoms[]` 抄进 `whale_str_atoms[]`。而内联体内
+**每一个** `define_field` / `get_field` 都通过
+`whale_str_col(whale_str_atoms, whale_str_n, atom)` 查列 —— 表是空的，
+所以查不到列，`goto done`，**整个 body 被拒绝**。调用点于是退回
+`whale_inline_str_n > 0` 的堆 struct 分支，也就是"每轮 12 次
+`JS_WhaleObjFieldPtr`"。
+
+补上三行：
+
+```c
+whale_str_n = whale_inline_str_n;
+for (k = 0; k < whale_inline_str_n; k++)
+    whale_str_atoms[k] = whale_inline_str_atoms[k];
+```
+
+`objfields` 从 48ms 回到 **27ms**。
+
+## 用户第 3 条的判断完全正确：拆箱就是"属性变局部变量"
+
+基线 `run()` 生成的循环体（release 构建）：
+
+```c
+/* make() 之后，四个字段各读一次进局部变量 */
+L2 = JS_WhaleObjFieldNum(ctx, 1, 682, &fs[23], &fp[23], deopt);   /* tag   */
+L3 = JS_WhaleObjFieldNum(ctx, 1, 683, &fs[23], &fp[23], deopt);   /* key   */
+L4 = JS_WhaleObjFieldNum(ctx, 1, 117, &fs[23], &fp[23], deopt);   /* flags */
+L5 = JS_WhaleObjFieldNum(ctx, 1, 684, &fs[23], &fp[23], deopt);   /* depth */
+
+L5: /* 循环体：一次都不碰对象 */
+L2 = _wsv[0];
+L3 = _wsv[1];
+L4 = _wsv[2] + L2;
+L5 = L4 - L3;
+I1 = I1 + 1;
+goto L5;
+```
+
+20 万次循环里没有一次 `FieldPtr`，全是局部变量。这正是用户描述的
+"用到的属性全部变成局部变量，装箱时重新写入"。
+
+## `inline_cols` 的真实边界：只容纳全数值字段
+
+修好之后 `objfields` 走帧列，`vnode_build` 不走 —— 日志：
+
+```
+[vr-inline] refused at pos=8 op=75 (define_field) sp=5 len=20 argc=2 inline_cols=1
+```
+
+`createElement(type, props)` 的布局是 `{ type, props, key }`：
+`props` 是对象、`key` 是 null，装不进 `double` 列（
+`whale_type_is_num(tb)` 为假 → `goto done`）。这是**正确行为**：
+`whale_str_L[]` 是 `double`，塞一个引用进去就会错。
+
+所以 vnode 仍然是堆 struct。它 12→6ms 的收益来自本轮其他修复
+（内联成功、`_wsc.wa` 声明、常量折叠、presence 守卫）。
+
+**下一步（明确记录）**：给布局加 `JSValue` 列（与 `double` 列并列），
+让 `props`/`key` 这类非数值字段也能走帧列。这样 vnode 的
+`createElement` 才能真正零分配 —— 那是 vnode 剩下的主要成本。
+
+## 本轮实际改动
+
+1. **`whale_str_atoms` 发布**（上面那段）—— 回归修复，`objfields` 48→27ms。
+2. **`whale_inline_cols_ok = 1`**（上一轮已改，本轮确认其正确性）。
+3. **常量值折叠进 define**：`{ key: null }` / `{ cls: "c" }` 从两次调用
+   （park 值 + define）合成一次 `JS_WhaleObjDefineNull` /
+   `JS_WhaleObjDefineAtom`。两个 helper 都经过新的
+   `whale_obj_define_val()`，它统一处理 "struct 查列 / 普通对象 define"
+   两条路 —— 第一版没走 struct 分支，直接对 struct 调
+   `JS_DefinePropertyValue`，`p->prop` 是 NULL，段错误。
+4. **物化的 presence 守卫**：布局是全函数字段的并集，物化时原本把所有列
+   都写进对象（包括这个字面量从未赋值的列），既多出 helper 调用，又给对象
+   加上了不该存在的属性（值是列里的 0）。改成只写 `sp[col]` 为真的列。
+5. **`whale_const_slot` 每指令清理**：标记记录的槽号会在后续指令里被复用，
+   于是垃圾 atom 被折叠进字段（崩溃）。只有 `OP_define_field` 读它，
+   所以在每条其他指令开头清掉。
+
+## 实测（release，同进程/交错对照）
+
+| case | node | 修正前 | 修正后 |
+|---|---|---|---|
+| **objfields** | 34 | 48 | **27**（反超 node） |
+| **vnode_build** | 2 | 12 | **6**（entries 20901） |
+| props_diff | 2 | 16 | 14 |
+| 其余 22 例 | — | — | 噪声内 |
+
+`whale api test: ok`，perftest 25/25 且 0 mismatch，
+`findmis2.js` 三档无失配，`vnsplit4.js` a/b/c/d 全对。
+
+## 试过并回退的：字段缓存按 (对象, atom) 复用
+
+`objfields` 里同一个 atom 在 4 个访问点各占一对缓存（24 对用了 13 对）。
+按直觉实现 `whale_fc_find/whale_fc_note` 复用 → **48ms 反而变 61ms**。
+原因：读写混用同一对缓存污染了 `fv` 标记的两种语义（读路径用
+`fv == fver + 1` 表示"已解析且已归一化为 float64"，写路径用 `fv == fver`
+表示"已解析且可无条件覆盖"）。正确复用需要读写各一组、预算翻倍，
+24 对不够。已完整回退。
+
+## 教训
+
+1. **dump 必须用与测量同配置的构建。** debug 的 `prefer_gcc` 让布局策略
+   不同，我因此把"基线在跑拆箱"误判成"基线没编译"，方向错了整一轮。
+   判断"是否在跑编译代码"用 `WHALE_ENTER_COUNT`（entries）和
+   `WHALE_NO_UNBOX` 的对照，不是读 dump。
+2. **一个形状有两种证据时要交叉验证。** qjs 545ms vs 基线 28ms 这条
+   外部对照，比我自己读生成的代码可靠得多 —— 用户一句话就点破了。
+3. **"设了标志"不等于"路径生效"。** `inline_cols=1` 设了，但内联体第一个
+   `define_field` 就拒绝了，实际走的是另一条分支。必须看内联的
+   `rtype`（`WHALE_STRUCT_T` vs `WHALE_OBJ_T`），不是看标志。
+4. **物化一个布局时只写它真正拥有的字段。** 布局是并集，"列存在"和
+   "这个对象有这个属性"是两件事。
+
+# <128>: 非数值字段也走帧列 —— vnode_build 12ms → 2ms（与 node 持平）
+
+SOLVED
+
+## 起点：<127> 留下的边界
+
+`inline_cols` 只能容纳**全数值字段**的对象。`createElement` 的
+`{ type, props, key }` 里 `props` 是对象、`key` 是 null，`whale_type_is_num`
+为假 → `goto done` → 整个 body 被拒 → 退回堆 struct（每轮一次
+`JS_WhaleStructNew` + 每个字段一次 define）。
+
+先量化这个代价。用四个只差一个字段的循环（参数全是数值，排除参数分类的干扰）：
+
+| 形状 | 改前 |
+|---|---|
+| `{a, b, c}` 全数值 | 3ms |
+| `{a, b, c: true}` | 2ms |
+| `{a, b, c: null}` | **40ms** |
+| `{a, b, c: "x"}` | **43ms** |
+
+同一个循环，只因为一个 `null` 字段，慢 13 倍。这就是靶子。
+
+## 设计：列的第二种模式
+
+`sp[col]`（presence flag）原来只有 0/1。现在：
+
+| 值 | 含义 |
+|---|---|
+| 0 | 该字段从未赋值 |
+| 1 | 值是 `L<col>` 里的 double |
+| 2 | 值是对象槽 `whale_str_vslot[col]` 里的 JSValue |
+
+为什么用对象槽而不是在 C 栈上开 `JSValue vc[]`：**C 栈上的 JSValue 不被
+GC 扫描**。生成代码是普通 C 函数，没有 `JSStackFrame`，GC 唯一能看到引用
+的地方就是引擎预留的那 28 个对象槽（`whale_frame_obj_slots`）。把
+`props` 对象存进 `vc[]` 会让它在下次 GC 时被回收，然后读到悬垂指针。
+`whale_str_vslot[col]` 记录槽号，值本身在 `JS_WhaleObjSlotCopy` 里复制进去，
+和调用参数用的是同一套机制。
+
+## 三处改动
+
+1. **写**（主循环 `OP_define_field` 的 STRUCT 分支，以及内联体的同名分支）：
+   `col >= 0 && WHALE_IS_SLOT(tb)` 时，把值复制进该列的对象槽，`sp[col] = 2`。
+   槽按列惰性分配（`whale_str_vslot[col]`，每编译重置为 -1），所以只有真正
+   有非数值字段的布局才占槽。
+2. **读**（`OP_get_field` 的 STRUCT 分支）：`whale_str_vslot[col] >= 0` 时
+   直接把栈槽类型改成 `WHALE_VAL_T(vslot)` —— 这是**编译期**性质（该列存过
+   非数值），不是运行时分支，所以不需要任何 guard。
+3. **物化**：`sp[col] == 2` 的列不能被 `JS_WhaleObjDefineNum` 写（它要
+   double），要改走 `JS_WhaleObjDefineValue`。这部分本轮**没有改**——
+   `vnode` 不需要物化（`v` 不逃逸），先不动，留作已知缺口。
+
+## 实测
+
+| case | node | <127> | 现在 |
+|---|---|---|---|
+| **vnode_build** | 2 | 6-12 | **2**（entries 20901） |
+| objfields | 19-34 | 27 | 27 |
+| immutable_update | 14-16 | 25 | 25 |
+| props_diff | 2 | 14-17 | 15-16 |
+| 其余 21 例 | — | — | 噪声内 |
+
+`vnode_build` 现在与 node 持平（2ms vs 2ms）。三个变体（全数值 / null 字段 /
+字符串字段）从 3/40/43ms 变成 2/5/4ms。
+
+`whale api test: ok`，perftest 25/25 且 0 mismatch。
+
+## 正确性验证
+
+- `vnsplit4.js`：a/b/c/d 四种读法全对（20/45/65/65）
+- `findmis2.js`：逐轮比对三档全 -1000001（无失配）
+- `vnwrong.js`：`r=65 / r3=20000045 / big=200030000` 与 node 一致
+- `structkeys.js` / `keys.js`：`Object.keys`、`JSON.stringify`、spread、
+  `in`、`hasOwnProperty`、数组元素、优化后重读，全部与 node 一致
+- 探针全扫（and/tern/eq/ifelse/alias/ce/ce2/mp/h/g/b10/samesame/
+  vnprof2/nestcost4/heapcost2/allocparts/strfield2）：无 error、无 mismatch
+
+## 已知缺口
+
+`sp[col] == 2` 的列在**物化**时还写不进去（物化只发
+`JS_WhaleObjDefineNum`）。目前没有用例走到：vnode 的 `v` 不逃逸，
+`objfields` 的布局全数值。一个"含 null 字段且会逃逸"的对象会在这里
+退回 step 通路（正确，但慢）。修法是物化循环按 `sp[col]` 分派到
+`JS_WhaleObjDefineValue`。
+
+## 教训
+
+1. **先量化再动手。** 四个只差一个字段的循环把"非数值字段的代价"钉死在
+   13 倍上，这个数字决定了改动值不值得做。
+2. **C 栈上的 JSValue 不是 GC 根。** 想在内联布局里存引用，唯一安全的
+   落点是引擎预留的对象槽。这条约束决定了整个设计（记槽号而不是存值）。
+3. **编译期已知的性质不要做成运行时分支。** `vslot[col] >= 0` 在编译期
+   就定了，读路径直接换类型，零 guard。
+
+# <129>: 列池扩宽 + 编译失败可见化；按槽布局五次尝试全部失败并回退
+
+SOLVED（两项）+ FAILED/RETRACTED（按槽布局）
+
+## 用户的判断
+
+- "逃逸检测是必要的，如果逃逸过多，那确实不如不拆箱，使用字段地址缓存折中
+  （注意如果有循环可能循环体内拆箱依旧有用）"
+- "字段访问检测我倒觉得不一定，因为有的情况只需要调用相应函数就行，只要不逃逸"
+- "递归装箱其实是因为多次编译多版本我担心装进新的版本会出错，不过考虑到新版本
+  在偏移量上和旧版本其实是兼容的，也许并不用担心这个"
+- "验证吧，不行把池改一改？比如说改改前缀什么的"
+- "如果遇到时序无关的任务，你还可以把函数调用拆出来单独搞，免去大量装箱"
+
+第 3 条（偏移量兼容）和第 4 条（换前缀扩池）都被采纳；第 2 条纠正了我原先
+"必须全是字段访问"的过强假设 —— 数据也支持：`u_call`（传参）58ms 比
+`u_local`（嵌套字段读）143ms **更快**。
+
+## 先拿到的数据
+
+同一循环、同一算术，只改对象结构：
+
+| 形状 | whalejs | node |
+|---|---|---|
+| 一个对象 4 字段 | **3ms** | 51ms |
+| 两个对象各 2 字段 | **38ms** | 11ms |
+| 两个对象各 1 字段 | **23ms** | 7ms |
+| 嵌套 `v = {t, p:{a,b}}` | **176ms** | 10ms |
+
+以及"非数值字段"的代价（参数全数值，排除参数分类干扰）：
+
+| 形状 | 改前 |
+|---|---|
+| `{a,b,c}` 全数值 | 3ms |
+| `{a,b,c:true}` | 2ms |
+| `{a,b,c:null}` | **40ms** |
+| `{a,b,c:"x"}` | **43ms** |
+
+结论：瓶颈确实是"第二个对象退回堆"，不是池大小。
+
+## 做成的两件事
+
+### 1. 列池扩宽到 64（`C`/`D` 前缀）
+
+`wt_col(k)` 输出 `C<k>`（k<32）或 `D<k-32>`。**不能继续用 `L`**：`L<number>`
+是跳转标签（`L<pos>:`），列号与标签撞名会生成 `double L4 = 0;` 紧挨 `L4:`，
+TinyCC 直接拒绝整个单元。原来的编号只是碰巧没撞（池从 `var_count` 起、标签用
+字节码偏移，都很小）。
+
+### 2. 编译失败可见化（重要）
+
+`goto fail` 以前完全静默：返回 0，`whale_jit_entry` 留空，函数继续被解释，
+**不打印任何东西**。本轮多次误判都源于此 —— "这个 case 变慢了"其实是
+"这个单元编译失败了，量到的是解释器"。
+
+现在：失败计数 + 退出时汇总一行（release 构建也有），
+`WHALE_JIT_VERBOSE=1` 逐次打印，`WHALE_JIT_DUMP=1` 连生成器放弃的
+`__LINE__` 一起打印。诊断用 `getenv` 而不是 `whale_dbg_env` —— 后者在
+release 构建里恒为 0，恰恰是最需要它的地方失效。
+
+## 按槽布局：五次尝试，全部失败，已回退
+
+目标是解除"一个函数一个布局"（`whale_str_n == 0` 闸门），让两个对象各有自己的
+列区间。设计是对的（`whale_slot_base[]/whale_slot_n[]` + `whale_slot_col(os,atom)`），
+但每次都在某处漏掉一个引用点，而 TinyCC 失败是静默的：
+
+| 尝试 | 漏掉的地方 | 表现 |
+|---|---|---|
+| 1 | 列池扩到 64 但每个函数声明全部 64 列 | objfields 27→48ms（prologue 开销） |
+| 2 | `wt_col` 输出 `L`，与跳转标签撞名 | 全部用例慢 10×，`redeclaration of 'L0'` |
+| 3 | `inline_cols` 分支发布布局时没抄 atom 表 | 内联体第一个 define_field 就拒绝 |
+| 4 | 内联体里的列引用仍按 `whale_str_L[base+k]` | `'L3' undeclared` |
+| 5 | 内联体注册了 slot_base 但推进了 `whale_pool_next` | 下一个对象区间重叠 |
+
+每次修好一处又冒出下一处，且中间态本身就是坏的（没法分步验证）。最终
+`git checkout` 回退，保留扩池与可见化两项。
+
+**这个方向没有错**，但需要一次性改对：声明循环、`wt_col` 输出、`whale_slot_col`
+查找（主循环 4 处 + 内联体 2 处）、`OP_object` 分配、`inline_cols` 注册，五处
+必须同时正确。下次做之前应该先写一个"生成代码自检"（把每个 `C<n>` 的声明与
+引用位置收集起来比对），而不是靠 TCC 报错反推。
+
+## 当前状态
+
+| case | node | whalejs |
+|---|---|---|
+| vnode_build | 2-5 | **2-3** |
+| objfields | 29-35 | 32-47 |
+| 其余 | — | 与 <128> 持平 |
+
+`whale api test: ok`，perftest 25/25 且 0 mismatch，探针全扫无 error。
+
+`whale_test` 现在会打印 `10 compilation(s) failed`。这些是**既有的设计内
+回退**（不支持的 opcode 走 `whale_step_emit`，失败则整个函数保持解释），
+不是本轮引入的 —— 以前看不出来只是因为诊断在 release 里失效。
+
+## 下一步（按价值）
+
+1. **按槽布局**（上面那五处一起改 + 生成代码自检）。收益：两对象形状 38ms → 约 3ms。
+2. **嵌套扁平化**（`v.p.id` → 列 `p.id`）。收益：嵌套形状 176ms → 约 3ms。
+   这是比按槽布局更大的缺口。
+3. 循环内拆箱：`o` 整体逃逸时，循环体仍可纯列操作，出循环再物化一次。
+4. 时序无关的调用外提（用户提的）：把不依赖循环变量的调用移出循环，
+   免去每轮装箱。
+
+# <130>: 按槽布局做成（两对象 38ms → 2ms）；七处必须同时正确，可见化是前提
+
+SOLVED
+
+## 起点
+
+<129> 里五次尝试按槽布局全部失败，每次都在某处漏掉一个引用点，而 TinyCC 拒绝
+整个单元时是**静默**的（函数继续被解释，不打印任何东西）。当时留下了两条结论：
+先做"编译失败可见化"，再把七处改动一次性做对。
+
+## 先做的可见化（这是这次成功的前提）
+
+`goto fail` 以前只是 `return 0`。现在：
+
+- 失败计数 + `atexit` 汇总一行（**release 构建也打印**）
+- `WHALE_JIT_VERBOSE=1` 逐次打印失败的单元名
+- `WHALE_JIT_DUMP=1` 打印生成器放弃的 `__LINE__`（`gen_ok=0 at line N`）
+
+关键细节：这些开关必须用 `getenv` 而不是 `whale_dbg_env` —— 后者在 release
+构建里恒为 0，恰恰是最需要它的地方失效。前几轮"某个 case 变慢了"的误判，
+全部来自"这个单元编译失败、量到的是解释器"。
+
+有了 `at line N`，每次失败都能立刻定位到具体哪个 arm 在 `goto done`，不用再
+靠猜测。这一条把"改一处漏一处"的循环断掉了。
+
+## 七处改动（缺一不可）
+
+| # | 位置 | 内容 |
+|---|---|---|
+| 1 | `wt_col` | 列变量用 `C`/`D` 前缀。`L<number>` 是跳转标签（`L<pos>:`），撞名会生成 `double L4 = 0;` 紧挨 `L4:`，TCC 拒绝整个单元 |
+| 2 | 布局状态 | `whale_slot_base[]` / `whale_slot_n[]` / `whale_pool_next`：每个对象槽记自己的池区间 |
+| 3 | `whale_slot_col(os, atom)` | 列号 = 槽基址 + 布局内偏移；对象没有布局或没有该列时返回 -1 |
+| 4 | `OP_object` 帧列臂 | 每个对象从 `whale_pool_next` 取自己的区间，成功后 `whale_slot_register` |
+| 5 | 主循环四处字段访问 | `define_field` / `put_field` / `get_field2` / `get_field` 全部改走 `whale_slot_col(WHALE_STRUCT_SLOT(ta), atom)` |
+| 6 | 内联体六处列引用 | 内联体拥有整个池（`inline_cols` 要求调用方尚无布局），列号就是池索引，不能加 `var_count` |
+| 7 | `_wsc.wa` 声明闸门 | 工厂函数（`return {a,b}`）没有字段访问点，prologue 会跳过 `_wsc`；`whale_gen_has_wa` 要覆盖 `whale_ret_obj_g && whale_def_atoms_n > 0` |
+
+另外：内联体在调用方没有 `_wsc.wa` 时**拒绝**该 body（`goto done`），退回
+fast call —— 正确，只是略慢；这比发出一个未声明字段让整个单元失败要好。
+
+## 实测（best-of-5，release）
+
+| 形状 | node | <129> | 现在 |
+|---|---|---|---|
+| **两个对象各 2 字段** | 10 | 38 | **2** |
+| 两个对象各 1 字段 | 11 | 23 | **2** |
+| 一个对象 4 字段 | 12 | 3 | **1** |
+| 非数值字段 `null` | — | 40 | **3** |
+| 非数值字段 `"x"` | — | 43 | **4** |
+| 嵌套 `v={t,p:{a}}` | 12 | 176 | **81**（未做扁平化） |
+
+perftest 25/25 且 0 mismatch；`vnode_build` 2ms、`objfields` 28ms、
+`immutable_update` 24ms。探针全扫无 error。
+
+## 教训
+
+1. **静默失败是最大的成本。** 五次失败的根因不是设计错，是"错了但看不出来"。
+   花时间先做可见化，比直接改代码划算得多 —— 这一次就省掉了后面所有猜测。
+   推论：**诊断开关必须在被测的那个构建里生效**。`whale_dbg_env` 在 release
+   里恒为 0，等于诊断只在 debug 可用，而我们量的永远是 release。
+2. **"多处的同步改动"要先列清单。** 这七处是同一件事的七个面，任何一处漏掉
+   都让整件事静默失效。写下来、逐条打勾，比"改完试试"可靠。
+3. **命名空间冲突要主动检查。** 列变量和跳转标签都用 `L<n>`，只是过去
+   "碰巧"不撞（池从 `var_count` 起、标签用字节码偏移，都很小）。扩池就把
+   这个巧合打破了。前缀区分是最便宜的解法。
+4. **一个布局一份状态 → 一个对象一份状态。** 原来的 `whale_str_n == 0` 闸门
+   是"整个函数只有一个布局"的体现；改成按槽记录后，第二个对象才可能拆箱。
+   这个限制存在了很久，因为它在常见形状（一个对象）上完全看不出来。
+5. **先量化收益再动手。** "一个对象 3ms vs 两个对象 38ms"这个对照，让改动
+   的价值在动手前就是确定的，也让"改完没变快"能被立刻识别成失败而不是
+   "可能只是噪声"。
+
+## 下一步
+
+1. **嵌套扁平化**：`v.p.id` → 一列 `p.id`。收益 81ms → 约 3ms，比按槽布局的
+   缺口更大。需要给布局引入"路径名"（`whale_str_atoms` 存的是末段 atom，
+   要扩成路径），并改所有列查找。
+2. `whale_test` 里那 10 个编译失败是**既有**的设计内回退（不支持的 opcode
+   走 `whale_step_emit`，失败则整个函数保持解释），不是本轮引入的。
+3. 循环内拆箱：`o` 整体逃逸时循环体仍可纯列操作，出循环再物化一次。
+
+# <131>: 嵌套布局做成（v.p.a 78ms → 1ms）—— 存槽号，不物化
+
+SOLVED
+
+## 先定位到真正的那一行
+
+`<130>` 之后两对象形状已经 2ms，但嵌套仍慢。用四个只差一处的循环把它切开
+（best-of-5，20 万次）：
+
+| 形状 | 改前 | node |
+|---|---|---|
+| 一个对象 3 字段 | 1ms | 0 |
+| 两个对象，`p` **不**存进 `v` | 1ms | 0 |
+| 两个对象，`p` 存进 `v`，读 `p.a` | **71ms** | 0 |
+| 两个对象，`p` 存进 `v`，读 `v.p.a` | **78ms** | 0 |
+
+差别只有一处：`v = { c: ..., p: p }` 这个赋值。也就是说成本不在"嵌套读"，
+而在**把一个已布局的对象存进另一个对象的字段**——那时 `p` 被物化成堆对象
+（`whale_str_obj_slot` + `ObjNew` + 每列一次 `ObjDefineNum`），整个布局白做。
+
+`n_noP` 与 `n_loc` 只差这一行却差 70 倍，这个对照把目标钉死了。
+
+## 做法：列记"它指的是哪个槽"，而不是把对象搬过去
+
+`whale_col_struct[col]`：这个列存的是另一个已布局对象时，记它的槽号，否则 -1。
+
+- **写**（`OP_define_field` 的 struct 臂）：`WHALE_IS_STRUCT(tb)` 时记
+  `whale_col_struct[col] = WHALE_STRUCT_SLOT(tb)`，`sp[col] = 1`，**不分配**。
+  同一列再被赋数值时清回 -1（`whale_col_struct[col] = -1`）。
+- **读**（`OP_get_field` 的 struct 臂）：`whale_col_struct[col] >= 0` 时把栈槽
+  类型改成 `WHALE_STRUCT_T(that_slot)` —— 后续 `.a` 于是按 `p` 的布局解析，
+  直接读它的列。
+
+两条都是**编译期**性质（同一个字面量构建每轮重复），所以运行时零分支。
+
+## 实测（best-of-5）
+
+| 形状 | node | <130> | 现在 |
+|---|---|---|---|
+| `v.p.a` 嵌套读 | 0 | 78 | **1** |
+| `p.a` 直接读（p 存进 v） | 0 | 71 | **1** |
+| 两对象各 2 字段 | 10 | 2 | 2-6 |
+| 一个对象 4 字段 | 12 | 3 | 3 |
+
+perftest 25/25 且 0 mismatch，`vnode_build` 3ms、`objfields` 27ms、
+`immutable_update` 27ms。探针全扫无 error。
+
+## 边界（还没做）
+
+`u_array`（`p` 进数组）31ms、`u_call`（`p` 传参）61ms 仍是堆对象。这两个是
+**真逃逸**：数组和调用方都能观察到 `p` 的身份，不能只存槽号。按用户
+<129> 的意见，这类应该走"字段地址缓存折中"，而不是继续拆箱。
+
+`u_ret` / `u_prets` 的探针在 `i===0` 就 return 了，量不到东西，需要重写。
+
+## 教训
+
+1. **对照实验要把差别缩到一行。** `n_noP` 和 `n_loc` 只差
+   `p: p` 这一处，71 倍的差距立刻指出"物化"是唯一嫌疑。如果只测
+   `n_read` 和 `n_flat`，会误以为是"嵌套读"本身慢，方向就错了。
+2. **"存引用"不一定要"造对象"。** 一个已布局对象的字段指向另一个已布局
+   对象时，需要的只是"它在哪里"，不是"它作为一个 JSValue 长什么样"。
+   记槽号就够了，物化是白白付出。
+3. **编译期性质不要做成运行时判断。** `whale_col_struct[col] >= 0` 在编译期
+   就定了，读路径直接换类型，零 guard —— 和 <128> 的 `vslot` 是同一个道理。
+4. **先做能立刻验证的那一半。** 这一轮没有碰"真逃逸"（数组/传参），只做
+   了不逃逸的那部分，收益就已经是 78 → 1ms。逃逸那部分按用户的意见留给
+   字段地址缓存。
+
+# <132>: 嵌套布局做成（v.p.a 78ms → 1ms）+ goto16 漏检
+
+SOLVED（两件）
+
+## 一、嵌套布局：列记"它指的是哪个槽"
+
+### 先定位到真正的那一行
+
+`<130>` 之后两对象形状 2ms，但嵌套仍慢。四个只差一处的循环（best-of-5，
+20 万次）把它切开：
+
+| 形状 | 改前 | node |
+|---|---|---|
+| 一个对象 3 字段 | 1ms | 0 |
+| 两个对象，`p` **不**存进 `v` | 1ms | 0 |
+| 两个对象，`p` 存进 `v`，读 `p.a` | **71ms** | 0 |
+| 两个对象，`p` 存进 `v`，读 `v.p.a` | **78ms** | 0 |
+
+`n_noP` 与 `n_loc` 只差 `v = { c: ..., p: p }` 这一行，却差 70 倍。所以成本
+不在"嵌套读"，而在**把一个已布局对象存进另一个对象的字段**——那时 `p` 被
+物化成堆对象（`whale_str_obj_slot` + `ObjNew` + 每列一次 `ObjDefineNum`），
+前面做的布局全部白费。
+
+### 做法
+
+`whale_col_struct[col]`：这一列存的是另一个已布局对象时记它的槽号，否则 -1。
+
+- **写**（`OP_define_field` 的 struct 臂）：`WHALE_IS_STRUCT(tb)` 时记
+  `whale_col_struct[col] = WHALE_STRUCT_SLOT(tb)`、`sp[col] = 1`，**不分配**。
+  同一列再被赋数值时清回 -1。
+- **读**（`OP_get_field` 的 struct 臂）：`whale_col_struct[col] >= 0` 时把
+  栈槽类型改成 `WHALE_STRUCT_T(that_slot)`，后续 `.a` 按 `p` 的布局解析，
+  直接读它的列。
+
+两条都是**编译期**性质（同一个字面量构建每轮重复），运行时零分支 ——
+和 `<128>` 的 `vslot` 是同一个道理。
+
+### 实测（best-of-5）
+
+| 形状 | node | <130> | 现在 |
+|---|---|---|---|
+| `v.p.a` | 0 | 78 | **1** |
+| `p.a`（p 存进 v） | 0 | 71 | **1** |
+| 两对象各 2 字段 | 10 | 2 | 2 |
+| 一个对象 4 字段 | 12 | 3 | 3 |
+
+### 边界（未做）
+
+`p` 进数组 14ms、`p` 传参 16ms 仍是堆对象。这两个是**真逃逸**（数组和调用方
+能观察到 `p` 的身份），不能只记槽号。按用户意见走"字段地址缓存折中"。
+
+## 二、`OP_goto16` 从未被处理（真实覆盖率缺口）
+
+深嵌套用例（三层以上）编译失败，`WHALE_JIT_DUMP` 报
+`gen_ok=0 at line N`，加上新加的 `[bail] pos=... op=243 (goto16)` 才看清：
+**`OP_goto16` 在主循环里根本没有 case**，落到 `default` 分支后
+`whale_step_emit` 也拒绝（它是控制流指令），于是整个函数放弃。
+
+这个缺口一直存在：函数足够长时 QuickJS 会把 8 位跳转升级成 16 位，而
+生成器只认 `goto8` / `goto`。短函数永远碰不到，所以没人发现。
+
+修法有三处，缺一不可（又一次"多处同步改动"）：
+
+1. **pass 1 收集跳转目标**：`targets[tgt] = 1`，否则标签根本不生成
+   （症状是 `label 'L4' used but not defined`）。
+2. **主循环的 goto 臂**加 `case OP_goto16`，位移按 `(int16_t)` 读。
+3. `whale_step_is_control` 里 `OP_goto16` 已经在列（它本来就被当作控制流）。
+
+只改第 2 处会得到"标签未定义"，只改第 1 处会得到"goto16 没有 case"——
+和 `<130>` 的七处是同一类教训。
+
+### 效果
+
+| 形状 | 改前 | 现在 |
+|---|---|---|
+| 三层嵌套 `v.p.q.a` | 45ms | 45ms（仍失败：另一处 bail） |
+| 四层嵌套 `v.p.q.r.a` | 142ms | **67ms** |
+
+`d3` 仍失败在 `line 10734`（call 的目标类型不是 slot），是另一个独立问题。
+
+## 教训（本轮）
+
+1. **对照实验要把差别缩到一行。** `n_noP` vs `n_loc` 只差 `p: p`，71 倍的
+   差距立刻指出"物化"是唯一嫌疑。只测 `n_read` vs `n_flat` 会误判成
+   "嵌套读本身慢"，方向就错了。
+2. **"存引用"不一定要"造对象"。** 需要的只是"它在哪里"，不是"它作为
+   JSValue 长什么样"。记槽号就够了。
+3. **`[bail] op=N` 这种诊断值回票价。** `goto16` 的缺口存在了很久，
+   靠 `gen_ok=0 at line N` 只能定位到"哪个 arm 放弃"，加上 opcode 名才
+   立刻看出"这个 opcode 根本没处理"。
+4. **覆盖率缺口会随函数变长而出现。** 8 位→16 位跳转是编译器按长度自动
+   升级的，短用例永远测不到。这类缺口要么靠长用例，要么靠 opcode 表的
+   完整性检查。
+
+## 下一步
+
+1. `d3` 的 `line 10734`：call 的目标不是 slot（`useP` 那种把对象当参数
+   传的调用）。需要让"已布局对象作为参数"也有槽可走。
+2. 真逃逸（数组 / 传参）→ 字段地址缓存折中。
+3. 循环内拆箱：`o` 整体逃逸时循环体仍可纯列操作。
+
+# <133>: 每个字面量自己的布局（d5 1913ms → 22ms）+ 一次危险的 git checkout
+
+SOLVED（一件半）
+
+## 一、先纠正 <132> 的错误结论
+
+<132> 把 d3/d4/d5 慢归因于 `OP_goto16` 漏检和"call 目标不是 slot"。两者都
+不是主因。重测（release，预热到编译完成，直接调用，200 万次）暴露真相：
+
+| 形状 | node | 改前 | 改后 |
+|---|---|---|---|
+| d2 `v.p.a` | 7 | 11 | **11** |
+| d3 `v.p.q.a` | 7 | 45 | **12** |
+| d4 `v.p.q.r.a` | 8 | 67 | **17** |
+| d5 五层 | 9 | 1913 | **22** |
+
+`d3`/`d4` 在 <132> 里报的 45/67ms 其实是**探针的 helper**（`run(name, f)` /
+`bench(name, f)` 把被测函数当参数传），helper 本身没被编译，于是整轮走解释器。
+直接调用时它们早就接近 0ms。这个坑 <132> 已经踩过一次（`u_ret` 探针在
+`i===0` 就 return），这次又踩——教训写进下面第 1 条。
+
+## 二、真正的原因：布局并集被"每个字面量都付一遍"
+
+`<131>` 的 `whale_col_struct` 解决了"存引用"，但 `OP_object` 的布局仍然取
+**函数级的形状并集**：一个函数里所有访问点观察到的形状取并，得到 9 个字段名。
+于是五层嵌套的每个字面量（1~2 个字段）都要为这 9 个名字做：
+
+- 9 次 `sp[col] = 0`（presence flag）
+- 9 次 `C<col> = 0`（列清零）
+
+五层就是每轮 55 次 `sp` 写 + 90 次清零。实测 d5 = 1913ms，而把嵌套拆平
+（同样算术，只是不互相引用）是 0ms。差 2000 倍的唯一变量就是那些清零。
+
+**修法**：pass 1 给每个 `OP_object` 记它自己的 `define_field` 原子表
+（`whale_obj_atoms[slot][]`，按出现顺序），`OP_object` 用它而不是并集。
+
+`whale_slot_col(os, atom)` 改成查**该槽自己的**原子表
+（`whale_slot_atoms[os]`），不再查函数级 `whale_str_atoms`。这是关键：
+列号和原子表的索引必须属于同一个对象，否则列会错位。
+
+## 三、三处必须同步改（否则要么错、要么整函数回退）
+
+1. **列池大小**：从"2 × 并集宽度"改成"各字面量宽度之和"。d3 需要 1+2+2=5
+   列，旧规则只给 2，第三个字面量直接拒绝 → 整个函数回退解释器。
+2. **`fill` 路径的列基址**：`put_loc` 的 fill 一直从 0 开始用列。池按精确
+   大小算之后，先建字面量再 fill 的函数会撞列（`'C2' undeclared`）。
+   改成 `fbase = whale_pool_next`，并在 fill 时同样注册原子表。
+3. **字面量扫描的算子表**：扫描 `object` 之后的 `define_field` 序列，需要
+   认识值产生算子。漏了 `push_atom_value`（`{cls: "c" + i%3}`）和 `mod`
+   （`i % 3`）都会让扫描提前停止，布局又退回单字段。
+
+## 四、还修了 `growsShape` 的回归
+
+`var o = {p,q}; o.r = 0;` 的 `r` 不在字面量里。按字面量取原子表后，`o.r`
+找不到列，整个函数回退。修法：扫描到字面量结束后的 `put_loc`（拿到目标
+局部），继续向后收集同一个局部的 `put_field` 原子，直到该局部被重新赋值。
+
+## 五、实测
+
+perftest 25/25、0 mismatch；`vnode_build` 2ms（node 2ms）、`objshape` 70ms
+（node 45）、`objfields` 26ms（node 19）、`immutable_update` 22ms（node 13）。
+`whale_test` 报 `whale api test: ok`，10 个编译失败是既有设计内回退。
+探针全扫，只有 `numbug3.js` 失败——它本身有语法错误，与引擎无关。
+
+## 六、一次危险操作（必须记）
+
+中途为了回退一个临时实验，我执行了 `git checkout src/whale_jit.c`。
+这个文件在本轮**从未提交**，`git checkout` 直接丢弃了全部未提交改动
+（约 1400 行）。所幸 `temp/qjs_g16d.c` 是之前 `WHALE_JIT_SRC` 导出的完整
+副本，从它恢复了，并重新验证 d3=45/d4=67/d5=209 与丢失前一致。
+
+**规则**：在未提交的工作区里，永远不要用 `git checkout <file>` /
+`git restore <file>` 做"撤销我的临时改动"。用 `copy` 先存一份，改完
+`copy` 回来。或者先 `git stash`。
+
+## 教训
+
+1. **探针本身可能是被测对象。** 任何"通过参数传函数"的计时 helper 都会让
+   被测函数走另一条编译路径。要么直接调用，要么在 helper 里先预热到编译
+   完成再计时。`<132>` 的 45/67 和本轮的 1913 都因此报错过。
+2. **布局的粒度应该是"对象"，不是"函数"。** 并集在只有一个字面量时正确，
+   在多个不同形状的字面量时把每个都撑到最宽，代价是每轮 O(并集) 的清零。
+3. **一个布局一份原子表。** 列号必须和它所属对象的原子表一起解析，否则
+   两个对象的列会互相错位。`whale_slot_atoms[os]` 是这个不变量的载体。
+4. **池的大小要从"谁会用"推出来，不要猜倍数。** 旧规则 `pool *= 2` 在
+   两个字面量时够用，第三个就整函数回退——而失败是静默的。
+5. **扫描字节码要穷举算子。** 少一个 `push_atom_value` 或 `mod`，布局就
+   悄悄退回保守路径，性能数字变了但没有任何报错。
+
+## 下一步
+
+1. 真逃逸（`p` 进数组 144ms、`p` 传参 161ms）→ 字段地址缓存折中。
+2. 循环内拆箱：`o` 整体逃逸时循环体仍可纯列操作。
+3. `d_call` 的 `useP(o)` 仍是解释器（`call target is not a slot`），
+   可以让"已布局对象作为参数"也有槽。
+
+# <134>: 逃逸对象的融合构建（d_arr 164→100ms、d_call 198→120ms）
+
+SOLVED（部分）
+
+## 一、先量清楚逃逸的成本在哪
+
+<133> 之后 d2..d5 已经 0ms，剩下两个真逃逸形状。直接调用、200 万次、
+预热到编译完成：
+
+| 形状 | node | <133> | 现在 |
+|---|---|---|---|
+| d_arr（`p` 进数组） | 27 | 164 | **100** |
+| d_call（`p` 传参） | 3 | 198 | **120** |
+| d_ret（不逃逸） | 3 | 7 | 7 |
+
+把 d_arr 拆开（`escsplit.js` / `esccalls.js`）：
+
+| 探针 | 含义 | node | 改前 |
+|---|---|---|---|
+| `bare` | 空循环 + 同样算术 | 2 | 0 |
+| `store_num` | `a[0] = i` | 3 | 22 |
+| `one` | 对象循环外建一次，每轮 `a[0] = p` | 5 | 28 |
+| `four` | 每轮建对象再存 | 24 | 146 |
+
+**结论**：数组写不是问题（22 vs 28），问题是每轮建对象——而
+`alloc_only`（建对象但不逃逸，走 frame columns）只有 7ms。所以成本不是
+"分配"，是**逃逸路径上每轮 3 次 helper 调用**：`ObjNew` + `DefineNum`×2。
+
+## 二、做法：整字面量合成一次 JS_WhaleObjBuild
+
+`JS_WhaleObjBuild` 在 <119> 前后就已经写好（一次调用建完整个字面量），
+但生成器从未调用它。现在接上，在三条路径上都用：
+
+1. `OP_object` 的 plain fallback（`whale_plain_slots`）：pass 1 记下每个
+   字面量的 define_field 集合，emit 时把各字段值暂存进 `_wb[]`，在**最后
+   一个字段**处发一次 `ObjBuild`。
+2. frame-column 物化（`define_field` 的 struct 臂）与 `put_array_el` 的
+   struct 臂：列已经是 double，直接暂存后一次调用。
+3. 新增 `whale_abort_build()`：emit 阶段发现某个字段不是 double
+   （`{ id: i, cls: "c" + i % 3 }`）时，**先把已暂存的字段 flush 成一个
+   真实对象**，再让普通路径处理当前字段。没有这一步，对象从未被分配，
+   字段写进了上一轮的槽——vnode_build 从 2ms 掉到 13ms 就是这个。
+
+### 快路径：free list 复用的 shape 是稳定的
+
+`JS_WhaleObjBuild` 里加了一条：对象来自 free list 时它**已经带着上次的
+shape 和 prop 块**，所以逐个字段就是"写 prop[k].u.value"，不需要
+`JS_DefinePropertyValue`、不需要查 shape、不会 transition。校验是
+`prop_count >= n` 且前 n 个 atom/flags 逐个匹配，全数值时直接写。
+命中率 100%（`[str-stat] ObjBuild fast=` 与调用次数同步增长）。
+
+## 三、顺手修掉的两个既有 bug
+
+1. **`get_length` 没有声明 `_wsc.ai`**。`whale_has_array` 只在
+   `put_array_el`/`get_array_el` 时置位，而 `get_length` 也用同一组缓存。
+   一个只读 `a.length`、完全不碰元素的函数会 emit `_wsc.ai[0]` 却从未
+   声明它，TinyCC 报 `field not found: ai`，整个函数回退。之前没暴露是因为
+   这类函数通常先因为别的原因回退了。
+2. **`ru` 的闭合 `}` 丢在 fold sink 里**。`whale_emit_build` 自己
+   `fold_commit`，之后 push 的 `ru[i]=1; }` 要等下一次 commit 才出去；没有
+   下一次时那个 `{` 就永远没有 `}`，TinyCC 报 `cannot use local functions`
+   （实际是花括号不平衡）。改成单独 mark/commit。
+
+## 四、还有一道保险：跳进字面量中间
+
+融合把分配推迟到最后一个字段，所以**任何跳转目标落在字面量内部**都会
+读到未分配的槽。`whale_build_literal_ok` 现在拿 pass 1 的 `targets[]`
+检查 `(pos, end)` 区间，命中就不融合。这是"推迟副作用"这类改动的通用
+前置条件，不是这个用例特有。
+
+## 五、实测
+
+perftest 25/25、0 mismatch：`vnode_build` 2ms（node 2）、`objshape` 71ms
+（node 48）、`objfields` 28ms（node 18）、`immutable_update` 25ms（node 15）。
+`whale_test` ok（10 个失败是既有设计内回退）。探针全扫只有 `numbug3.js`
+失败——它本身语法错误。
+
+## 教训
+
+1. **"分配慢"要先排除"调用次数多"。** free list 已经 100% 命中时，剩下的
+   成本是每字段一次 helper 调用；把 4 次并成 1 次就是 146→99ms。先量
+   `bare` / `store_num` / `one` / `four` 四个点，比猜"GC 压力"可靠得多。
+2. **推迟副作用必须有"提前落地"的出口。** 融合把分配推到最后一个字段，
+   就必须处理"中途发现融不了"的情况——否则对象根本没被分配。这类设计
+   永远要配一个 abort 路径。
+3. **推迟分配要检查跳转目标。** 分配点从字面量开头移到末尾，中间任何
+   跳转目标都会看到未初始化的槽。
+4. **一个缓存组的所有使用者都要进声明门控。** `get_length` 用 `ai` 却不
+   触发 `whale_has_array`，是一类"同一个数组少列了一个 opcode"的 bug。
+5. **花括号也是 token。** fold sink 里的 `}` 和表达式一样需要 commit，
+   否则错误信息（`cannot use local functions`）指向完全无关的地方。
+
+## 下一步
+
+1. d_arr 剩余 ~73ms 在 `ObjBuild` + `ArrSetVal` 两次调用上，可以合成
+   "建对象并直接存进数组"的一次调用。
+2. d_call 120ms：`useP(o)` 仍是解释器（`call target is not a slot`），
+   需要让"已布局对象作为参数"也有槽。
+3. 循环内拆箱：`o` 整体逃逸时循环体仍可纯列操作。
+
+# <135>: 建对象并直接存进数组（一次调用）+ 两个融合缺陷
+
+SOLVED
+
+## 一、d_arr 剩下的两次调用并成一次
+
+`<134>` 之后 d_arr 是 `ObjBuild` + `ArrSetVal` 两次 helper 调用。`store_num`
+（只写数组）22ms、`one`（对象循环外建、只写数组）28ms，所以再并一次仍有
+空间。新增 `JS_WhaleObjBuildStore(arr, idx, obj, atoms, n, nums, mask)`：
+建字面量并写进数组元素，一次调用完成。
+
+`put_array_el` 的 struct 臂在"全数值列 + 非 reuse 循环"时走它：
+
+    _wb[0] = C0; _wb[1] = C1; _wsv[3] = <idx>;
+    if (!JS_WhaleObjBuildStore(ctx, 0, _wsv[3], 2, _wsc.wa, 2, _wb, 3)) ...
+
+reuse 循环（`ridx >= 0`）不合并——那里的语义就是"对象只建一次"。
+
+## 二、快路径里的 `JS_FreeValue` 是 400 万次空调用
+
+`JS_WhaleObjBuild` 的 free-list 快路径逐字段 `JS_FreeValue` 旧值，而那些值
+全是 double——函数只是查 tag 然后返回。2 字段 × 200 万次 = 400 万次
+out-of-line 调用。改成先查 `JS_VALUE_HAS_REF_COUNT`（宏），数值直接跳过：
+
+| 形状 | node | <134> | 现在 |
+|---|---|---|---|
+| d_arr | 27 | 100 | **94-97** |
+| d_call | 3 | 120 | **110-119** |
+| d_ret | 3 | 7 | 7 |
+
+## 三、两个融合缺陷（都由新写的 fusecorrect.js 抓出来）
+
+**缺陷 1：`set_loc` 不是 `put_loc`。** 字面量后面的目标局部可能是
+`set_loc`（在块里、或值还要用），而"收集同一局部后续字段"只认 `put_*`。
+`var o = {p,q}; o.r = 0;` 因此拿不到 `r` 的列，整函数回退。改成按
+`put_loc0-3 / put_loc8 / put_loc / set_loc0-3 / set_loc8 / set_loc` 六种
+形式取目标，扫描时用 `whale_writes_local`（它本来就覆盖 set_*）。
+
+**缺陷 2：字面量扫描不认识 `set_loc` 作为结尾。** 同源问题：`{p,q}` 后面
+跟 `set_loc0` 时扫描停在那里，`dst` 取不到。
+
+## 四、验证脚本
+
+`temp/jitprobe/fusecorrect.js`：9 个形状（全数值进数组、字符串字段、
+null 字段、传参、写数组后回读、字面量后加字段、两对象、四层嵌套、数组
+回读）。18 项断言，与 node 逐项对照。这一轮它抓出了上面两个缺陷，值得
+保留。
+
+## 五、实测
+
+perftest 25/25、0 mismatch（`vnode_build` 2ms / node 3、`objshape` 70 / 58、
+`objfields` 27-30 / 18、`immutable_update` 25 / 16）。`whale_test` ok。
+探针全扫只有 `numbug3.js`（本身语法错误）。`locals` 的 93ms 是单次噪声，
+重复跑稳定在 66-70。
+
+## 教训
+
+1. **宏和函数在热路径上是两回事。** `JS_FreeValue` 对数值只是查 tag，
+   但它是一次调用；400 万次就是几十毫秒。快路径里该用
+   `JS_VALUE_HAS_REF_COUNT` 先判。
+2. **字节码里的"存局部"有六种编码。** put_loc0-3 / put_loc8 / put_loc /
+   set_loc0-3 / set_loc8 / set_loc。只处理 put_* 会在块里静默失效。
+3. **写完融合要立刻写一个形状矩阵的对照脚本。** 这一轮的两个缺陷都不是
+   性能问题，是正确性/回退问题，靠计时完全看不出来。
+4. **探针要覆盖"写进去再读出来"。** 只写不读的数组形状会漏掉槽位复用的
+   问题（f9 就是为这个加的）。
+
+## 下一步
+
+1. d_call 的 110ms：`useP(o)` 仍是解释器（`call target is not a slot`）。
+   已定位到 `[merge] pos=42 slot=0 prev=1 now=122`——循环头把 `s` 的
+   NUM 与回边的 VAL 合并失败。需要让"已布局对象作为参数"也有稳定槽。
+2. d_arr 剩余的 ~70ms 与 node 的 27ms 之间还有两次调用（`ObjBuildStore`
+   本身 + 边界检查），可考虑把数组追加内联成指针写。
+
+# <136>: d_call 的 merge 冲突定位（self 读法与 VRFN 读法的类型不一致）
+
+TIPS（未修，已定位）
+
+## 现象
+
+`d_call`（`s += p.b + useP(p)`）从 <134> 的 120ms 降到 <135> 的 110ms，
+node 是 3ms。`useP` 本身是 `return o.a`，七个字节，早该被内联。
+
+## 定位
+
+`WHALE_JIT_DUMP=1 WHALE_MERGE_DBG=1`：
+
+    [merge] pos=42 slot=0 (of 3) prev=1 now=122 varc=3 sp=0 snap_sp=0 len=44
+
+`pos=42` 是 `return` 前的 `get_loc0`，也就是循环出口。`slot=0` 是累加器
+`s`，`prev=1` 是 `WHALE_T_NUM`，`now=122` 是 `WHALE_T_VAL(7)`。
+
+`[put_loc] L0 t=120` 出现在**第一遍编译**（`whale_assume_self = 1`）：
+`useP` 被当成 `WHALE_T_SELF`，走通用调用路径，结果一律标成
+`WHALE_VAL_T(ret_slot)`（whale_jit.c 里 `cur[func_slot] = WHALE_VAL_T(...)`）。
+于是 `s` 在这一遍成了 VAL，与循环头的 NUM 合并失败，**self 这一遍整函数
+编译失败**。
+
+第二遍（`whale_assume_self = 0`）把 `useP` 解析成 VRFN 并内联，
+`[vr-inline] pos=34 argc=1 rtype=1`，`s` 保持 NUM，这一遍编译成功——
+所以 d_call 实际跑的是 VRFN 那一遍。
+
+## 这意味着什么
+
+1. **self 那一遍的失败是"正常"的**（一个调用捕获闭包 helper 的函数本来
+   就没有可用的 self 读法），机制上靠 `if (!b->whale_jit_entry || selfref)`
+   兜住，正确。
+2. 但 d_call 仍比 node 慢 35 倍，说明 VRFN 那一遍的循环体里还有 5 次
+   helper：`ObjBuild`、`ObjSlotCopy`、两次 `ObjFieldPtr` 的 shape 缓存检查、
+   `VarRefIsFn`。其中 `ObjSlotCopy` 是纯粹的重复——`p` 刚由 `ObjBuild`
+   建在 slot 0，而局部 `p` 自己的 `loc_slot` 是 1，于是每轮多复制一次。
+
+## 可以做的（按收益排序）
+
+1. **让字面量直接建在目标局部自己的槽里**：`OP_object` 时若下一个
+   store 的局部已有 `loc_slot`，就用它而不是新分配。省掉每轮的
+   `ObjSlotCopy`。
+2. **`useP(o)` 这种"只读一个字段"的纯函数**：VRFN 内联后仍然走了
+   `ObjFieldPtr` 的缓存检查；可以识别"参数是刚建的字面量"并直接用列。
+3. `VarRefIsFn` 的守卫可以提到循环外（闭包槽在本帧内不会变，这是
+   `whale_vr_slot` 已经依赖的事实）。
+
+## 教训
+
+1. **两遍编译的失败信息会混在一起。** `[put_loc] L0 t=120` 和
+   `[merge] prev=1 now=122` 只看一遍会以为是类型推断 bug，实际是
+   self 那一遍的正常失败。看诊断要先按 `[gen] argc=...` 分段。
+2. **"哪个读法在跑"要显式确认。** d_call 跑的是第二遍；第一遍的
+   merge 失败与它的性能无关。
+3. **复制槽是白付的。** `loc_slot` 的分配和 `OP_object` 的槽分配是两个
+   独立的计数器，同一个对象因此常常被复制一次。这是下一轮最容易拿的
+   收益。
 
 
+# <137>: ARM64（含 Windows on ARM64）JIT 移植 + 去掉磁盘运行库搜索
+
+SOLVED（x64 本地验证；arm64 目标本机无交叉编译器，只能做宏级/语法级验证）
+
+## 用户要求
+1. 尝试 arm-v8a 编译：报 `clang-23: argument unused during compilation: '-c'`、
+   `libtcc1.c:143: #error unsupported CPU type`、`udiv_qrnnd undeclared`；
+   目标是 arm64 时又报 `whale_tcc_iface.c: no member named 'runtime_main'`。
+2. 澄清后的目标：**Windows ARM 也要能跑 JIT**；其他平台 TCC 支持的都允许，
+   不支持的关闭 JIT，保证兼容性（回退解释器）。
+3. 顺手清理：JIT 已改为内嵌 tcc runtime，但代码里还有在磁盘找
+   `libtccruntime.a` 的逻辑，应删掉。
+
+## 根因（三处，全部是"目标宏写死 x86_64 + PE"的连锁反应）
+- `xmake.lua` 对所有 target 无条件 `add_defines("TCC_TARGET_PE", "TCC_TARGET_X86_64")`。
+  交叉编译到 arm64 时，TCC 仍按 x86_64 后端编译，而 `libtcc1.c` 是按**宿主**
+  aarch64 预定义宏编译的：它走进 32 位 x86 的除法辅助块（`#if !__x86_64__ &&
+  !__arm__`），于是 `#error unsupported CPU type` + `udiv_qrnnd` 未声明。
+- 同一组宏让 `TCC_IS_NATIVE` 不成立（它要求 `__aarch64__ && TCC_TARGET_ARM64`），
+  而 `TCCState.runtime_main` 声明在 `#ifdef TCC_IS_NATIVE` 里 —— 于是
+  `whale_tcc_iface.c` 的 `s->runtime_main = NULL` 编译失败。这就是那条
+  "no member named 'runtime_main'"。
+- 内置的 TinyCC 0.9.27 的 `arm64-gen.c` / `arm64-link.c` / `tccpe.c`
+  **完全没有 ARM64-PE 支持**（`arm64-gen.c` 里 0 处 `TCC_TARGET_PE`），
+  所以即使目标宏改对，Windows ARM64 仍然跑不了 JIT。
+
+## 落地
+
+### 构建（xmake.lua）
+- `tcc_target_defines()` 按 `is_plat`/`is_arch` 返回目标宏：
+  Windows x64 → `TCC_TARGET_PE+TCC_TARGET_X86_64`；Windows arm64 →
+  `TCC_TARGET_PE+TCC_TARGET_ARM64`；Linux/macOS x86_64 → `TCC_TARGET_X86_64`；
+  arm64 → `TCC_TARGET_ARM64`；arm → `TCC_TARGET_ARM+TCC_ARM_EABI+TCC_ARM_HARDFLOAT`。
+- 返回 nil = TCC 没有该目标后端 → **不编译 TCC**、不定义 `WHALE_JIT_AVAILABLE`，
+  改为 `WHALE_JIT_OFF`，引擎照常构建（解释器），绝不让一个不支持的架构
+  把整个库编译失败。`whale_jit.c` 尾部给出同名桩实现（编译入口返回 0、
+  `JS_WhaleJitReady()` 返回 0、扩展编译返回 0），API 表面完全一致。
+
+### libtcc1.c
+- 32 位软件除法块从 `#if !__x86_64__ && !__arm__` 改成 `#if defined __i386__`
+  （与上游一致），删掉 `#else #error unsupported CPU type`。x86_64/arm64
+  硬件做这些运算，32 位 ARM 走 `__aeabi_*`（`lib/armeabi.c`）。
+- x86 80 位 `long double` 辅助（`__fixunsxfdi`/`__fixxfdi`）的守卫从
+  `#ifndef __arm__` 收紧为 `#if defined __i386__ || defined __x86_64__`：
+  aarch64 的 `long double` 是 IEEE binary128，这套 union 根本不描述它，
+  编过去只会得到一个**错的**函数（不是缺一个函数）。
+
+### Windows ARM64 PE 后端（照 TCC 上游 mob 分支移植）
+- `tccpe.c`：加 `TCC_TARGET_ARM64` 宏组（`REL_TYPE_DIRECT=R_AARCH64_ABS64`、
+  `R_XXX_THUNKFIX=R_AARCH64_ABS64`、`R_XXX_RELATIVE`、`R_XXX_FUNCCALL=
+  R_AARCH64_CALL26`、`IMAGE_FILE_MACHINE=0xAA64`、`RSRC_RELTYPE=3`）；
+  64/32 位头布局判断从 `TCC_TARGET_X86_64` 改为 `PTR_SIZE`；`PE_STDSYM`
+  同样；`pe_set_options` 给 ARM64 用 `0x140000000` 映像基址。
+- 导入 thunk：ARM64 用 24 字节 `ldr x16,[pc,#16]; ldr x16,[x16]; br x16; nop`，
+  重定位在 +16 的 8 字节字面量（x86 是 `jmp [IAT]`，ARM 是 `ldr ip/pc`）。
+- `.pdata`/`.xdata`：新增 ARM64 版 `pe_add_unwind_info` / `pe_add_unwind_data`，
+  每条函数一个 8 字节 pdata 条目（BeginAddress/UnwindData）+ 一个 xdata 头
+  （E=1、一个 epilog、save_fplr_x + set_fp + end）。`TCCState` 加 `uw_xsym`。
+- `pe_isafunc` 原来硬编码 `R_X86_64_PC32`（注释里已记录过这个 32/64 位打包
+  比较永不相等的老 bug），改为按目标取 `R_XXX_FUNCCALL`。
+- `libtcc.c` 的 `-Wl,-subsystem=` 分支把 ARM64 并入 x86 的列表（0.9.27 只给
+  ARM 留了 wince 一项，ARM64 走进去会 `else` 语法错）。
+
+### arm64-gen.c
+- 新增 PE 支持：`arm64_pe_param_off`（Windows ABI 的 home area 布局）、
+  `arm64_sub_sp`（>4KB 帧走 `__chkstk` 探测，PE 必需）、`gen_static_call`
+  （`bl` + `R_AARCH64_CALL26`）。
+- `arm64_pcs_aux`/`arm64_pcs` 加 variadic 参数（PE 下可变参数不走向量寄存器）；
+  所有调用点同步。
+- `gfunc_prolog` 记录 `arm64_func_start_offset`，prolog 的 `sub sp` 槽位从
+  2 条 nop 扩到 `ARM64_FUNC_STACK_SETUP_SLOTS`(6) 条（`__chkstk` 序列更长）。
+- `gfunc_epilog` 重写：先把槽位整体填 nop，再用 `arm64_sub_sp` 写入真实序列
+  （保证槽位长度固定、后续代码不位移），最后 `pe_add_unwind_data(...)`。
+
+### arm64-link.c
+- 补齐 `code_reloc`/`gotplt_entry_type`/`relocate` 的 ARM64 重定位：
+  `LDST8/16/32/64/128_ABS_LO12_NC`、`CONDBR19`、`TSTBR14`、`TLSLE_ADD_TPREL_*`。
+- `R_AARCH64_ADR_PREL_PG_HI21` 与 `CALL26/JUMP26` 的 PE 分支：弱未定义符号
+  在 PE 上解析为 0，ADRP 编不出来 → 直接物化 0 / 发 nop（上游同款）。
+- 新增 `relocate_reset()`：TCC 一个 state 会 relocate 多次（每个 JIT 函数一次），
+  `relocate()` 是**写入**而非加偏移，第二次 relocate 前必须把上次写过的位域
+  复位。按重定位类型分别复位（64 位字段清零、指令只清立即数位）。
+
+### tccrun.c
+- `set_pages_executable`：Windows 下 ARM/ARM64 追加 `FlushInstructionCache`
+  （x86 的 I-cache 是相干的，不需要）；非 Windows 用
+  `__builtin___clear_cache`，不再依赖 `lib/armflush.c` / `lib/lib-arm64.c`
+  里那些 TCC 专用实现（宿主 gcc/clang 编不过它们）。
+- 多次 relocate 的复位从 `#ifdef TCC_TARGET_X86_64` 扩到 x86_64 或 ARM64。
+- Windows 回溯的 `rt_get_caller_pc` 加 ARM64 分支（`uc->Pc`/`uc->Fp`）。
+
+### 去掉磁盘运行库搜索（用户第 3 点）
+- 删掉 `whale_jit.c` 里整套 `whale_jit_rt_dir()`：`WHALE_JIT_TCC_DIR` /
+  `WHALE_JIT_SRC_DIR` / `WHALE_JIT_RUNTIME_DIR` 环境变量、模块目录探测、
+  `whale_file_exists` / `whale_module_dir` / `whale_rt_candidate`、
+  `JS_WhaleSetJitRuntimeDir()`（公开 API，一并删）及其头文件声明。
+- `whale_jit_state_ensure()` 不再设 `tcc_set_lib_path`/`tcc_add_include_path`/
+  `tcc_add_library_path`：token 流已经解析完，生成的代码只引用宿主符号，
+  没有任何东西需要从文件里来。设了路径反而会让 TCC 在万一漏掉时去磁盘找
+  `libtcc1-*.a` —— 那正是发布版不该发生的事。
+- 探针函数（`JS_WhaleIrCompileAdd2`/`JS_WhaleIrAdd2C`/`JS_WhaleTokCompileAdd2`）
+  去掉 `tcc_dir` 参数；测试同步。
+- 头文件 `whalejs.h` 的 API 注释删除。
+
+## 验证（本机 x64，全部通过）
+- `xmake build` 全绿；`whale_test` ok（含 tok 编译、x64 直发、TCC 400xfibi 1ms、
+  gcc 后端 168ms/1ms）；`whale_wasm_test` ok；`whale_demo` 正确。
+- perftest 25/25，0 mismatch，entries 与改动前一致。
+- **藏起 `thirdparty/tcc-runtime` 后** whale_test 仍 ok、`%TEMP%/whalejs-tcc`
+  不再创建 —— 磁盘搜索确实已彻底移除。
+- arm64 侧只能做宏级验证：`gcc -fsyntax-only -DTCC_TARGET_PE -DTCC_TARGET_ARM64`
+  编 `whale_tcc_iface.c`（内含整个 libtcc）无 error；`-DWHALE_JIT_OFF` 编
+  `whale_jit.c` 无 error。**本机没有 aarch64 交叉工具链，真机验证要靠 CI。**
+
+## 教训
+1. **"目标宏"必须跟构建目标走**，写死一处会同时炸三个不相干的地方
+   （libtcc1 的 CPU 分支、TCCState 的字段可见性、PE 头布局）。
+2. **交叉编译的报错会指向错误的位置**：`no member named 'runtime_main'`
+   看起来像 iface 的 bug，实际是目标宏选错导致 `TCC_IS_NATIVE` 不成立。
+   先确认 `TCC_TARGET_*`/`TCC_IS_NATIVE` 的取值，再看具体报错。
+3. **上游分支是移植的参照物，但版本差距要看清楚**：0.9.27 的 arm64 后端
+   是纯 ELF 的，mob 分支才补了 PE；照抄前先确认哪些是"架构"、哪些是
+   "格式"。
+4. **不支持的平台要"关 JIT"而不是"编译失败"**：一个 `#error` 会把整个
+   库挡在门外，而解释器在哪个平台都能跑。
+5. **运行期零文件不只是"不写盘"**：搜索路径本身就是一条会去磁盘找文件的
+   代码路径，发布版应该连这条路径都不存在。
 
 
+## <137> 补充：arm64 后端接入后的两个真 bug（用户实测发现）
+
+用户在自己的 arm64 机器上实测，发现**大部分 perftest 用例结果全错**，且错得
+一模一样：`arith/bitops/branch/floatlit/ident/...` 全部返回
+`9.81925626730982e+25`。
+
+### 症状解读（先做这一步，比读代码快）
+这个 double 的位模式是 `0x45544e455f454c41`，按小端 ASCII 读是 `"ALE_ENTE"` ——
+它是 `"WHALE_ENTER_COUNT"` 的中间 8 字节。**所有用例返回同一个值**，说明不是
+各用例的算法错，而是 JIT 函数读到了一个固定的错误地址。这类"跨用例同一个垃圾值"
+永远先怀疑调用约定/参数位置，而不是语义。
+
+### bug 1：`arm64_pcs` 语义被我改错（致命，就是上面那个现象）
+我照 TCC 上游 mob 分支把 `arm64_pcs` 改成了
+`arm64_pcs(int variadic, int n, ...)`，其中 **n 是"含返回值条目"的总数**
+（函数体里再 `n - 1` 取参数个数）。但三个调用点还是 0.9.27 的语义
+（**n 是纯参数个数**）：
+
+- `gfunc_call`：`arm64_pcs(0, nb_args, ...)` → 应为 `arm64_pcs(nb_args, ...)`
+- `gfunc_prolog`：`arm64_pcs(0, n - 1, ...)` → 应为 `arm64_pcs(n - 1, ...)`
+- `gfunc_return`：`arm64_pcs(0, 0, ...)` → 应为 `arm64_pcs(0, ...)`
+
+结果 `arm64_pcs_aux` 每次都少算一个参数，**参数寄存器整体错位一格**：第一个
+参数从 x1 开始而不是 x0，于是 JIT 函数把调用者的某个寄存器当成第一个参数。
+
+**修法**：JIT 生成的函数永远不是可变参数，不需要 mob 的 variadic 特化，所以
+**整体回退到 0.9.27 的 PCS 语义**（`arm64_pcs_aux(int n, ...)` /
+`arm64_pcs(int n, ...)`），并删掉我加在 `arm64_pcs_aux` 里的 PE variadic 分支。
+验证方式：把当前文件与 `release_0_9_27` 原版逐行 diff，确认 PCS 区域**零差异**。
+
+### bug 2：ARM64 的 `.pdata` 在"多次 relocate"下会丢数据（潜在，x64 未受影响）
+我最初照 x86-64 的写法，用**一个共享的基址符号** `uw_sym` 给所有 `.pdata`
+条目做 `R_XXX_RELATIVE`，把 `start`/`end`/`d` 直接写进字段。这条路径有两个问题：
+
+1. `relocate()` 对 `R_AARCH64_RELATIVE` 是 `add32le(ptr, val - imagebase)`，
+   而 `val` 是共享基址符号的地址 —— **`start`/`d` 根本没进值**。
+2. WhaleJS 一个 TCCState 要 relocate 多次（每个 JIT 函数一次），
+   `tcc_relocate_ex()` 在每次 relocate 前会 `relocate_reset()` 把字段清零。
+   即使把值写进字段，第二次也会被清掉。
+
+**修法**：每个 `.pdata` 条目用**自己的符号**（`put_elf_sym(..., start, ...)`），
+让 `start`/`end`/`d` 乘在符号偏移上而不是字段里 —— 符号的 `st_value` 不参与
+`relocate_reset()`，任意多次 relocate 都正确。顺带删掉 `TCCState.uw_xsym`
+（不再需要）。x86-64 的原有写法保持不变（它本来就把值写进字段，且
+`relocate_reset` 会清零 —— 但 x86-64 路径下 `.pdata` 只在
+`TCC_OUTPUT_MEMORY` 且 `TCC_IS_NATIVE` 时用到，且 x64 的
+`pe_add_unwind_data` 我按同样思路改成了每符号偏移，行为等价）。
+
+### 顺带做的两处（非 bug，为 arm64 补优化与正确性）
+- **arm64 的 ELS 寄存器 pin**：`whale_pin_alloc` 原来只对 `TCC_TARGET_X86_64`
+  生效，arm64 上 `register` 退化成 no-op。现在 arm64 也 pin v0-v3（`TCC_TARGET_ARM64`
+  分支），并在 `JS_WhalePinInvalidate` 里按"全部 v0-v7 都是 caller-saved"清掩码。
+  这直接复用 x86 的 write-through 契约（`gv()` 从帧槽重载），不改任何其它逻辑。
+- **NAN boxing 兼容**：`quickjs.c` 里有 4 处直接摸 `v.u.float64` / `v->tag`，
+  在 32 位目标（`JS_NAN_BOXING`）下编不过。改成 `JS_VALUE_GET_FLOAT64()` /
+  `JS_VALUE_GET_INT()` / `JS_VALUE_GET_TAG()`；`whale_ver_key_of` 里
+  `(uintptr_t)x << 56` 在 32 位上是 UB（移位超过宽度），改用 `uint64_t` 打包。
+  `JS_VALUE_GET_PTR(v) == (uintptr_t)whale_vr_expect[i]` 的指针/整数比较也修了。
+
+### 教训
+1. **所有用例返回同一个垃圾值 = 调用约定问题**，不要先去查各用例的算法。
+   把那个值按字节读出来（这里直接拼出了 `"ALE_ENTE"`）往往一眼定性。
+2. **移植上游代码时，函数签名的"语义"比"形参个数"更容易错**。
+   `arm64_pcs(n)` → `arm64_pcs(variadic, n)` 不只是多一个参数，`n` 的含义也
+   变了。改签名必须逐个核对调用点，改完用 `release_0_9_27` 原版做逐行 diff
+   确认"除了新增的 PE 代码，其余零差异"。
+3. **"值写进字段"和"值写进符号"在多次 relocate 下不等价**。
+   `relocate_reset()` 只清字段，不清符号；任何跨 relocate 需要保留的量都应
+   放在符号偏移里。
+4. 用户实测的报错比我的语法级验证有价值得多 —— 本机没有 arm64 工具链时，
+   "编译通过"只能证明语法，跑不出这两个 bug。
 
 
+### <137> 补充 2：arm64 pin 只移植了一半 —— 撤回，正确性优先
+
+用户第二次实测（PCS 修好之后）：`arith/branch/floatlit/ident/locals/mixed`
+返回 **0**，`bitops` 差 3（60476 vs 60479）。这次不是"全部同一个值"，而是
+"多数为 0、个别差一点"——这个形状指向**读到了未初始化/错误的栈槽**，而不是
+调用约定整体错位。
+
+#### 根因
+我在上一轮"给 arm64 补 ELS 寄存器 pin"时，只补了 `whale_pin_alloc` 的
+寄存器分配和 `JS_WhalePinInvalidate` 的清位，**漏了 x86 路径最关键的一半**：
+
+`JS_WhaleXmmSpill()`（x86_64-gen.c）在**声明处**做两件事：
+```c
+loc -= 8;                       /* 1. 分配 home slot */
+gen_modrm(reg, VT_LOCAL, NULL, off);  /* 2. 把寄存器值存进去 */
+```
+而 `gv()` 的重载路径依赖这个 home slot 存在（"slot is authoritative"）。
+arm64 上没有对应实现，于是被 pin 的变量第一次读会按帧偏移去 load 一个
+**从未写过**的槽 —— 全零的栈刚好让多数用例得到 0；`bitops` 因为部分中间值
+先写后读，只差一点点。
+
+#### 修法
+**撤掉 arm64 的 pin 分支**，回到 no-op（`whale_pin_alloc` 直接返回 -1）。
+`register` 在 arm64 上退化成普通 double 局部变量：慢，但正确。同时在注释里
+写明"不要只加寄存器范围就重新启用，spill/restore 那一半必须一起来"。
+
+#### 教训
+1. **优化移植必须"成对"检查**：分配器 + 生命周期管理是一体的。x86 的 pin
+   由三部分组成（分配 / 声明时 spill / 调用时失效 + gv 重载），少任何一个
+   都不是"少一点优化"，而是**读错内存**。
+2. **"多数返回 0、个别差一点"是未初始化内存的典型特征**，和"全部同一个
+   垃圾值"（调用约定错位）要分开判断。
+3. 用户实测两次抓到的都是**语义级** bug，而我本机的语法检查全部通过。
+   没有目标平台时，"编译通过"只能证明语法；把这类改动标成"待真机验证"
+   比标成"完成"诚实。
+
+### 同轮修掉的两个编译警告（用户附带报的）
+- `tcc.h` 无条件 `#define _GNU_SOURCE`，而构建系统已经用 `-D_GNU_SOURCE`
+  传了一次 → 加 `#ifndef` 保护。
+- `tccpp.c:1421` 的 `"
+[%s]
+" + !(s->dflag & 32)` 是指针算术，clang 报
+  `-Wstring-plus-int`。虽然原意（跳过开头换行）正确，但写法危险 →
+  改成三元表达式选两个完整格式串，行为等价。
+
+
+# <138>: perftest 的 0ms 是 memoisation 命中，不是 JIT 快（+ 三个编译警告）
+
+SOLVED（测量口径）
+
+## 现象
+用户 clean 之后在 arm64 上跑 perftest，多数用例数值正确了（说明 <137> 的两个
+bug 已修），但出现了一批可疑的 **0ms**：`arr_methods`、`closure`、`fib`、
+`object`、`vnode_build`。同一批用例在 x64 上是有数字的。
+
+## 根因：memoisation，不是 JIT 快
+`JSFunctionBytecode.whale_pure` 在"JIT 编译成功 + 生成器证明只依赖参数"时置位，
+之后 `JS_CallInternal` 的快路径**先查结果表**，命中就直接返回、根本不进编译代码。
+perftest 的用例恰恰都是"同一个函数、同一组参数，调 N 次"的形状：
+
+- `fib.js`：`for (i<20) check = fib(26)` → 20 次里 19 次查表
+- `object.js`：`for (r<20) check = tally(200000)` → 同样
+- `arr_methods` / `closure` / `vnode_build` 也是同一模式
+
+所以 `ms` 只反映了一次真实执行加十九次表查找。
+
+**`entries` 列看不出来**：它统计的是"编译代码进入次数"，缓存命中根本不进入，
+所以 `fib` 显示 12（看起来正常），而实际只跑了 1 遍。perftest 顶部早有一段
+注释专门警告过这种"时间好 20 倍但 check 正确"的陷阱（当年 object.js 就踩过），
+但 memoisation 是后来加的，绕过了那个提醒。
+
+## 修法：加开关，让"测吞吐"和"测缓存"分开
+- `quickjs.c`：`if (pure1 && !getenv("WHALE_NO_MEMO"))` —— 只在安装 memo 时
+  查一次（每个函数一次，不是每次调用），不进入热路径。
+- `perftest/main.js`：跑 whalejs/qjs 时设 `WHALE_NO_MEMO=1`。
+
+memoisation 本身是**语义优化**（纯函数重复调用复用结果），不是加速技巧，
+所以引擎默认保留它是对的；只有基准测试需要关掉。
+
+## 修好后的真实数字（x64，node 对照）
+```
+arr_methods  6 / 10      原来 0
+closure      3 / 10      原来 0
+fib         32 / 76      原来 0   (entries 12→31)
+object      29 / 32      原来 0   (entries 1→20)
+vnode_build  4 / 2       原来 0
+```
+`fib` 从 0ms 变 76ms 最能说明问题：它原本 20 次调用只算 1 次。
+
+## 同轮修掉的三个编译警告
+- `tccpp.c:3733` `" %s" + s` → `s ? " %s" : "%s"`（指针算术，`-Wstring-plus-int`）。
+- `tccelf.c:174` / `tccpe.c:1437` `s->link->data + sym->st_name` 传给
+  `const char *` 形参 → 显式 `(const char *)` 转换（`-Wpointer-sign`）。
+- `tcc.h` 的 `#define _GNU_SOURCE` 加 `#ifndef` 保护（上一轮已修，此处确认）。
+
+## 教训
+1. **0ms 永远先怀疑"没跑"，不要当成性能好**。判据不是 `entries`（它只数编译
+   代码进入），而是"这个用例的形状会不会让优化把工作吃掉"。
+2. **语义优化会污染基准**。memoisation 让纯函数调用变成查表，这是正确行为，
+   但任何"重复调用测吞吐"的用例都会失真 —— 基准必须显式关掉它。
+3. **诊断开关要在热路径之外读**：`getenv` 在 memo 安装时读一次没问题，
+   但绝不能放进每次调用（`whale_entry_total` 那段注释记录了同样的教训：
+   每次调用一次 `getenv` 让 immutable_update 多花了 2.7s）。
+
+# <139>: WebAssembly 扩展落地 + TCCState 单例 + 剖析表 shape 悬空
+
+SOLVED
+
+## 三件事，一个共同点：都在"谁拥有这块内存"上出过问题
+
+### 1. wasm 扩展（新产物 `libWhaleJS-wasm.a`）
+
+单独编译的静态库：`src/whale_wasm.c`（绑定层）、`src/whale_wasm_c.c`（翻译器）、
+`src/whale_wasm_rt.c`（运行期辅助）、`thirdparty/wasm3`（0.9.2 核心）。
+只 include 公开头文件，引擎源码对它零依赖。
+
+- 挂载：`JS_WhaleInstallWasm(ctx)` / `JS_WhaleInstallWasmRuntime(rt)`，幂等。
+- 两条执行路径：翻译器把 wasm 函数体翻成 C 交给引擎唯一的 TCCState 编译；
+  翻不了的那一个函数继续由 wasm3 解释。**正确性从不依赖翻译器的覆盖率。**
+- 每个翻译过的函数额外生成一个统一入口 wrapper
+  `void f__w(slots_in, slot_out, mem, memsize, glob)`。绑定层只按这一种 ABI
+  调用，所以 0–8 个参数、任意类型组合都不需要枚举签名（之前手写的分派表只
+  覆盖到 2 个参数，3 个以上会静默掉回 wasm3）。浮点按位拷贝，不做数值转换。
+- `call` 只能指向已翻译的同模块函数（原生代码没有回解释器的重入路径），而被
+  调者可能排在后面，所以绑定层做**不动点翻译**。
+- 全局变量用实例私有的影子数组，跨原生/解释边界与 wasm3 的 `M3Global` 同步，
+  所以"部分翻译、部分解释"也能看到一致的值。
+- 中断：wasm3 路径靠 gas 计量 + 可挂起 runtime；翻译路径在每个循环回边检查，
+  按 4096 次摊薄（逐回边调用实测让 1MB 求和 202→259ms，摊薄后 114ms）。
+
+覆盖：i32/i64/f32/f64 全套数值与比较、数值转换与 reinterpret（含 trapping /
+saturating 截断）、局部/全局变量、block/loop/if/br/br_if、drop/select、直接
+call 与 return_call、load/store（含边界检查）、memory.size、return、
+unreachable。未覆盖：call_indirect、br_table、memory.grow、SIMD、异常、
+多返回值、import 调用。
+
+### 2. TCCState 改成严格单例
+
+`tcc_new()` 以前先调 `tcc_cleanup()`，而它**不是 per-state 的**：重置所有
+state 共享的 `sym_pools` / `sym_free_first`。所以第二次 `tcc_new()` 会让已经
+编译好的代码全部失效。实测两个症状：进程内第二个 `JSRuntime` 之后
+`tcc_get_symbol()` 在 `strcmp` 里崩；探测函数夹在两次 JIT 编译之间时，报
+"undefined symbol"。
+
+现在 `tcc_new()` 一旦 state 存在就直接返回它，`tcc_delete()` 对它是空操作。
+配套两件事：
+
+- `tcc_reloc_generation` 在每次 `tcc_relocate()` 递增，经
+  `JS_WhaleJitGeneration()` 暴露。**relocate 会搬动整个 state 的代码**，
+  缓存地址的一方要连同代号一起记，不一致就重新 `JS_WhaleFindSymbol()`。
+- 编译单元自己开合（`tccelf_begin_file`/`tccelf_end_file`），并在每次
+  relocate 前后清 `runtime_main`。否则 `pe_output_file()` 会把上次的入口符号
+  当成"这是个程序"，下次 relocate 注入无法解析的 `__runmain`，编译直接失败。
+
+删掉了原来的"进程级实例链表 + relocate 后批量重绑"：那个链表在
+`JSRuntime` 销毁后就是悬空指针，**两个 runtime、零翻译代码就能复现崩溃**。
+改成每个实例自己比对代号、按需重解析，不跨 runtime 持有任何指针。
+
+### 3. 剖析表里的 shape 悬空（WhaleNode 报的 bug）
+
+`whale_prof_record()` 把 `JSShape *` 直接存进 `WhaleProfSite.shape[]`，没加
+引用。shape 是引用计数的，最后一个对象一死就释放——而剖析窗口正是循环临时
+对象最容易被回收的时候，编译时 `JS_WhaleShapeFields()` 再去读就是已释放内存。
+WhaleNode 的复现：8 次跑崩 5 次，`WHALENODE_JIT=off` 时 0/10。
+
+修法：记录时 `js_dup_shape()`，站点被禁用/表被丢弃时释放
+（`whale_prof_site_release` / `whale_memo_discard`）。不变式恢复成
+"存进剖析表的指针由剖析表拥有"。
+
+## 验证
+
+- `whale_wasm_test`：翻译路径与 `WHALE_WASM_NOTRANSLATE=1` 两条路径都过，
+  期望值一致——后者独立验证了期望值不是照翻译器的行为写的。新增夹具覆盖
+  后置定义的跨函数调用、3/4 参数、混合类型、i32/f64 全局读改写、无参函数、
+  memory.size、drop/select；调试输出确认 11 个函数全部 `-> native`。
+- `whale_test`（引擎 API/JIT）、`whale_wasm_demo` 正常。
+- WhaleNode：`temp/repro_min_crash.js` 连跑 30 次 0 崩溃（修前 5/8）。
+- 多 runtime 生命周期：4 个 `JSRuntime` 依次创建/销毁并各自实例化 wasm，
+  全部正确（修前第 2 个就崩）。
+- vite 里嵌的两个 hash 模块（xxhash64 / md4）在 WhaleNode 下实例化并算出
+  与 Node 逐字节一致的摘要。
+
+## 顺手补的绑定缺口（WhaleNode 侧实际挡路的）
+
+- `new WebAssembly.Instance(module, imports)` 不存在 → 补上。
+- `WebAssembly.Module` / `Instance` 没有 `prototype`，导致
+  `x instanceof WebAssembly.Module` **抛异常**而不是返回 false，而 esbuild
+  的参数校验对每个参数都做这个判断 → 给两个构造器建了真正的 prototype，
+  并登记为对应 JSClass 的原型。
+
+## 已知差异（记录，未改）
+
+`WebAssembly.compile()` 返回 Module 本身而不是 `Promise<Module>`。真实加载器
+（vite 的 wasm 插件就是 `WebAssembly.compile(bytes).then(...)`）依赖它是
+thenable。改成异步是契约变更、会影响现有嵌入方和测试，所以留作显式决策。
+
+## 性能（同一 JSRuntime 内 A/B，`WHALE_WASM_NOTRANSLATE=1` 强制走 wasm3）
+
+| 用例 | wasm3 | 翻译器 | |
+|------|-------|--------|---|
+| memsum 1MB ×20 | 190 ms | **137 ms** | 1.39× |
+| LCG 1M ×20 | 159 ms | **109 ms** | 1.46× |
+
+**测量必须在同一个 JSRuntime 里做**：state 是进程级的，第二个
+`JS_NewRuntime` 之后再 relocate 会让符号表失效（既有问题，与 wasm 无关，
+纯 JS JIT 也能复现）。
+
+## 教训
+
+1. **"进程级单例 + 引用计数对象"是最容易出悬空指针的组合**。三处 bug 全在
+   这里：剖析表存了不拥有的 shape、实例链表存了别的 runtime 的实例、第二次
+   `tcc_new` 重置了共享的符号池。修法都是同一个方向：**明确所有权，用代号/
+   引用计数代替裸指针**。
+2. **探测函数也是消费者**。`JS_WhaleTokCompileAdd2` 之类自检代码同样往共享
+   state 里编译，它们的收尾漏一步（不清 `runtime_main`、不释放宏）就会让之后
+   的正常编译失败。单例化之后这类遗漏全部变成可见的。
+3. **不要在能跑通的测试上停下来**。`whale_wasm_test` 一开始就绿，但它没有
+   任何"已定义函数调用另一个已定义函数"的用例，也没有 3 个以上参数——新加的
+   `call` 路径和 wrapper ABI 全靠补夹具才被真正覆盖。另跑一遍
+   `WHALE_WASM_NOTRANSLATE=1` 是最便宜的期望值校验。
+
+见 current.md <139>

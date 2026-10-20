@@ -35,7 +35,21 @@
 # define REL_TYPE_DIRECT R_X86_64_64
 # define R_XXX_THUNKFIX R_X86_64_PC32
 # define R_XXX_RELATIVE R_X86_64_RELATIVE
+# define R_XXX_FUNCCALL R_X86_64_PC32
 # define IMAGE_FILE_MACHINE 0x8664
+# define RSRC_RELTYPE 3
+
+#elif defined TCC_TARGET_ARM64
+/* Windows on ARM64. 0.9.27 shipped no PE support for this target at all -
+   every one of the macros below was missing, and so was the import thunk and
+   the .pdata/.xdata unwind emission. They follow TCC's upstream mob branch. */
+# define ADDR3264 ULONGLONG
+# define PE_IMAGE_REL IMAGE_REL_BASED_DIR64
+# define REL_TYPE_DIRECT R_AARCH64_ABS64
+# define R_XXX_THUNKFIX R_AARCH64_ABS64
+# define R_XXX_RELATIVE R_AARCH64_RELATIVE
+# define R_XXX_FUNCCALL R_AARCH64_CALL26
+# define IMAGE_FILE_MACHINE 0xAA64
 # define RSRC_RELTYPE 3
 
 #elif defined TCC_TARGET_ARM
@@ -44,6 +58,7 @@
 # define REL_TYPE_DIRECT R_ARM_ABS32
 # define R_XXX_THUNKFIX R_ARM_ABS32
 # define R_XXX_RELATIVE R_ARM_RELATIVE
+# define R_XXX_FUNCCALL R_ARM_PC24
 # define IMAGE_FILE_MACHINE 0x01C0
 # define RSRC_RELTYPE 7 /* ??? (not tested) */
 
@@ -53,6 +68,7 @@
 # define REL_TYPE_DIRECT R_386_32
 # define R_XXX_THUNKFIX R_386_32
 # define R_XXX_RELATIVE R_386_RELATIVE
+# define R_XXX_FUNCCALL R_386_PC32
 # define IMAGE_FILE_MACHINE 0x014C
 # define RSRC_RELTYPE 7 /* DIR32NB */
 
@@ -122,7 +138,7 @@ typedef struct _IMAGE_OPTIONAL_HEADER {
     DWORD   SizeOfUninitializedData;
     DWORD   AddressOfEntryPoint;
     DWORD   BaseOfCode;
-#ifndef TCC_TARGET_X86_64
+#if PTR_SIZE == 4
     DWORD   BaseOfData;
 #endif
     /* NT additional fields. */
@@ -248,14 +264,10 @@ struct pe_header
     BYTE dosstub[0x40];
     DWORD nt_sig;
     IMAGE_FILE_HEADER filehdr;
-#ifdef TCC_TARGET_X86_64
+#if PTR_SIZE == 8
     IMAGE_OPTIONAL_HEADER64 opthdr;
 #else
-#ifdef _WIN64
     IMAGE_OPTIONAL_HEADER32 opthdr;
-#else
-    IMAGE_OPTIONAL_HEADER opthdr;
-#endif
 #endif
 };
 
@@ -530,7 +542,7 @@ static int pe_write(struct pe_info *pe)
     0x00000000, /*DWORD   TimeDateStamp; */
     0x00000000, /*DWORD   PointerToSymbolTable; */
     0x00000000, /*DWORD   NumberOfSymbols; */
-#if defined(TCC_TARGET_X86_64)
+#if PTR_SIZE == 8
     0x00F0, /*WORD    SizeOfOptionalHeader; */
     0x022F  /*WORD    Characteristics; */
 #define CHARACTERISTICS_DLL 0x222E
@@ -546,7 +558,7 @@ static int pe_write(struct pe_info *pe)
 },{
     /* IMAGE_OPTIONAL_HEADER opthdr */
     /* Standard fields. */
-#ifdef TCC_TARGET_X86_64
+#if PTR_SIZE == 8
     0x020B, /*WORD    Magic; */
 #else
     0x010B, /*WORD    Magic; */
@@ -558,12 +570,14 @@ static int pe_write(struct pe_info *pe)
     0x00000000, /*DWORD   SizeOfUninitializedData; */
     0x00000000, /*DWORD   AddressOfEntryPoint; */
     0x00000000, /*DWORD   BaseOfCode; */
-#ifndef TCC_TARGET_X86_64
+#if PTR_SIZE == 4
     0x00000000, /*DWORD   BaseOfData; */
 #endif
     /* NT additional fields. */
 #if defined(TCC_TARGET_ARM)
     0x00100000,	    /*DWORD   ImageBase; */
+#elif PTR_SIZE == 8
+    0x00400000,	    /*DWORD   ImageBase; */
 #else
     0x00400000,	    /*DWORD   ImageBase; */
 #endif
@@ -637,7 +651,7 @@ static int pe_write(struct pe_info *pe)
                 break;
 
             case sec_data:
-#ifndef TCC_TARGET_X86_64
+#if PTR_SIZE == 4
                 pe_header.opthdr.BaseOfData = addr;
 #endif
                 break;
@@ -1192,12 +1206,11 @@ static int pe_isafunc(int sym_index)
 {
     Section *sr = text_section->reloc;
     ElfW_Rel *rel, *rel_end;
-    /* The call sites that reference this symbol use the target's PC32
-       relocation (R_XXX_THUNKFIX, which is R_X86_64_PC32 here). The old code
-       compared against ELF32_R_INFO(sym, R_386_PC32): the 32-bit packing never
-       equals a 64-bit r_info, so every function read as data, no thunk jmp
-       was built, and calls jumped into the IAT instead of code. */
-    ElfW(Addr) info = ELFW(R_INFO)(sym_index, R_X86_64_PC32);
+    /* The call sites that reference this symbol use the target's call
+       relocation. Comparing against the wrong architecture's type made every
+       function read as data (no thunk jmp was built, and calls jumped into the
+       IAT instead of code). R_XXX_FUNCCALL is the right one per target. */
+    ElfW(Addr) info = ELFW(R_INFO)(sym_index, R_XXX_FUNCCALL);
     if (!sr)
         return 0;
     rel_end = (ElfW_Rel *)(sr->data + sr->data_offset);
@@ -1260,19 +1273,6 @@ static int pe_check_symbols(struct pe_info *pe)
                     char buffer[100];
                     WORD *p;
 
-                    offset = text_section->data_offset;
-                    /* add the 'jmp IAT[x]' instruction */
-#ifdef TCC_TARGET_ARM
-                    p = section_ptr_add(text_section, 8+4); // room for code and address
-                    (*(DWORD*)(p)) = 0xE59FC000; // arm code ldr ip, [pc] ; PC+8+0 = 0001xxxx
-                    (*(DWORD*)(p+2)) = 0xE59CF000; // arm code ldr pc, [ip]
-#else
-                    p = section_ptr_add(text_section, 8);
-                    *p = 0x25FF;
-#ifdef TCC_TARGET_X86_64
-                    *(DWORD*)(p+1) = (DWORD)-4;
-#endif
-#endif
                     /* add a helper symbol, will be patched later in
                        pe_build_imports */
                     sprintf(buffer, "IAT.%s", name);
@@ -1280,14 +1280,37 @@ static int pe_check_symbols(struct pe_info *pe)
                         symtab_section, 0, sizeof(DWORD),
                         ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
                         0, SHN_UNDEF, buffer);
-#ifdef TCC_TARGET_ARM
+
+                    offset = text_section->data_offset;
+                    /* add the 'jmp IAT[x]' instruction */
+#if defined(TCC_TARGET_ARM)
+                    p = section_ptr_add(text_section, 8+4); // room for code and address
+                    (*(DWORD*)(p)) = 0xE59FC000; // arm code ldr ip, [pc] ; PC+8+0 = 0001xxxx
+                    (*(DWORD*)(p+2)) = 0xE59CF000; // arm code ldr pc, [ip]
                     put_elf_reloc(symtab_section, text_section,
                         offset + 8, R_XXX_THUNKFIX, is->iat_index); // offset to IAT position
+#elif defined(TCC_TARGET_ARM64)
+                    /* 24 bytes: load the address of the IAT slot, load the
+                       slot, branch to it. The literal (8 bytes) sits at
+                       offset 16 and is the relocated part; the two nops keep
+                       the sequence 8-byte aligned like a real linker's
+                       thunk. */
+                    p = section_ptr_add(text_section, 24);
+                    write32le((unsigned char *)p + 0, 0x58000090);  /* ldr x16, [pc, #16] */
+                    write32le((unsigned char *)p + 4, 0xf9400210);  /* ldr x16, [x16] */
+                    write32le((unsigned char *)p + 8, 0xd61f0200);  /* br x16 */
+                    write32le((unsigned char *)p + 12, 0xd503201f); /* nop */
+                    put_elf_reloc(symtab_section, text_section,
+                        offset + 16, R_XXX_THUNKFIX, is->iat_index);
 #else
+                    p = section_ptr_add(text_section, 8);
+                    *p = 0x25FF;
+#ifdef TCC_TARGET_X86_64
+                    *(DWORD*)(p+1) = (DWORD)-4;
+#endif
                     put_elf_reloc(symtab_section, text_section, 
                         offset + 2, R_XXX_THUNKFIX, is->iat_index);
 #endif
-                    is->thk_offset = offset;
                 }
 
                 /* tcc_realloc might have altered sym's address */
@@ -1411,7 +1434,7 @@ static void pe_print_section(FILE * f, Section * s)
 
         if (s->sh_type == SHT_SYMTAB) {
             ElfW(Sym) *sym = (ElfW(Sym) *) (p + i);
-            const char *name = s->link->data + sym->st_name;
+            const char *name = (const char *)s->link->data + sym->st_name;
             fprintf(f, "  %04X  %04X  %04X   %02X    %02X    %02X   %04X  \"%s\"",
                     (unsigned)sym->st_name,
                     (unsigned)sym->st_value,
@@ -2055,30 +2078,120 @@ ST_FUNC void pe_add_unwind_data(unsigned start, unsigned end, unsigned stack)
 {
     TCCState *s1 = tcc_state;
     Section *pd;
-    unsigned o, n, d;
+    unsigned o, d;
     struct /* _RUNTIME_FUNCTION */ {
       DWORD BeginAddress;
       DWORD EndAddress;
       DWORD UnwindData;
-    } *p;
+    } *p;   /* only for sizeof; the fields are filled by relocations */
 
+    (void)stack;
     d = pe_add_uwwind_info(s1);
     pd = s1->uw_pdata;
     o = pd->data_offset;
-    p = section_ptr_add(pd, sizeof *p);
+    section_ptr_add(pd, sizeof *p);
 
-    /* record this function */
-    p->BeginAddress = start;
-    p->EndAddress = end;
-    p->UnwindData = d;
+    /* The three fields hold RVAs, produced by the relocation as
+       (symbol address - imagebase). The per-entry values (start/end/d) ride in
+       each symbol's own offset rather than in the field: relocate() *adds*
+       into the storage, and tcc_relocate_ex() zeroes it again before every
+       later relocate (WhaleJS compiles many functions into one state), so a
+       value baked into the field would be lost on the second compile. Keeping
+       it in the symbol survives any number of relocates. */
+    put_elf_reloc(symtab_section, pd, o,
+                  R_XXX_RELATIVE,
+                  put_elf_sym(symtab_section, start, 0, 0, 0,
+                              text_section->sh_num, ".uw_fn"));
+    put_elf_reloc(symtab_section, pd, o + 4,
+                  R_XXX_RELATIVE,
+                  put_elf_sym(symtab_section, end, 0, 0, 0,
+                              text_section->sh_num, ".uw_fn_end"));
+    put_elf_reloc(symtab_section, pd, o + 8,
+                  R_XXX_RELATIVE,
+                  put_elf_sym(symtab_section, d, 0, 0, 0,
+                              text_section->sh_num, ".uw_x"));
+}
+#elif defined TCC_TARGET_ARM64
+/* ARM64 unwind data. .pdata entries are 8 bytes (BeginAddress, UnwindData);
+   .xdata holds one header per function. The JIT never throws through its own
+   frames, but Windows still walks .pdata when an exception passes through
+   them, so a function without an entry makes the unwinder stop. */
+static Section *pe_add_unwind_info(TCCState *s1)
+{
+    Section *s;
 
-    /* put relocations on it */
-    for (n = o + sizeof *p; o < n; o += sizeof p->BeginAddress)
-        put_elf_reloc(symtab_section, pd, o, R_XXX_RELATIVE, s1->uw_sym);
+    if (NULL == s1->uw_pdata) {
+        s1->uw_pdata = find_section(s1, ".pdata");
+        s1->uw_pdata->sh_addralign = 4;
+    }
+    s = find_section(s1, ".xdata");
+    s->sh_addralign = 4;
+    return s;
+}
+
+ST_FUNC void pe_add_unwind_data(unsigned start, unsigned end, unsigned stack)
+{
+    TCCState *s1 = tcc_state;
+    Section *pd, *xd;
+    unsigned o, d, code_bytes, func_len;
+    unsigned char *q;
+    uint32_t header;
+    struct /* _RUNTIME_FUNCTION */ {
+        DWORD BeginAddress;
+        DWORD UnwindData;
+    } *p;
+    int epilog;
+
+    xd = pe_add_unwind_info(s1);
+    pd = s1->uw_pdata;
+
+    /* The prolog is always `stp x29,x30,[sp,#-N]!` followed by `mov x29,sp`
+       (see arm64-gen.c:gfunc_prolog), so one code record describes every
+       function: save_fplr_x + set_fp + end. */
+    func_len = (end - start) >> 2;
+    code_bytes = 0;
+    epilog = code_bytes;
+    code_bytes += 3; /* set_fp, save_fplr_x, end */
+    code_bytes = (code_bytes + 3) & ~3;
+
+    section_ptr_add(xd, -xd->data_offset & 3);
+    d = xd->data_offset;
+    q = section_ptr_add(xd, 4 + code_bytes);
+
+    /* Full ARM64 xdata header: E=1 with one epilog and no exception handler. */
+    header = (func_len & 0x3ffff)
+        | 1 << 21
+        | (epilog & 0x1F) << 22
+        | (code_bytes >> 2) << 27
+        ;
+    write32le(q, header);
+    q += 4;
+    *q++ = 0xE1; /* set_fp */
+    *q++ = 0x9B; /* save_fplr_x: stp x29,lr,[sp,#-224]! */
+    *q++ = 0xE4; /* end */
+    while ((unsigned)(q - (xd->data + d + 4)) < code_bytes)
+        *q++ = 0xE3; /* nop padding */
+
+    o = pd->data_offset;
+    section_ptr_add(pd, sizeof *p);
+    /* One symbol per entry, defined at the entry's own offset, so the
+       relocation supplies the complete RVA: `relocate()` adds
+       (symbol_addr - imagebase) into a field that starts at zero. Using one
+       shared base symbol instead would drop `start`/`d` from the value, and a
+       reset-to-zero before a re-relocate - which is what tcc_relocate_ex does
+       for every later JIT compile - would then lose them for good. */
+    put_elf_reloc(symtab_section, pd, o,
+                  R_XXX_RELATIVE,
+                  put_elf_sym(symtab_section, start, 0, 0, 0,
+                              text_section->sh_num, ".uw_fn"));
+    put_elf_reloc(symtab_section, pd, o + 4,
+                  R_XXX_RELATIVE,
+                  put_elf_sym(symtab_section, d, 0, 0, 0,
+                              xd->sh_num, ".uw_x"));
 }
 #endif
 /* ------------------------------------------------------------- */
-#ifdef TCC_TARGET_X86_64
+#if PTR_SIZE == 8
 #define PE_STDSYM(n,s) n
 #else
 #define PE_STDSYM(n,s) "_" n s
@@ -2163,6 +2276,11 @@ static void pe_set_options(TCCState * s1, struct pe_info *pe)
     } else {
 #if defined(TCC_TARGET_ARM)
         pe->imagebase = 0x00010000;
+#elif defined(TCC_TARGET_ARM64)
+        /* ARM64 images are conventionally based above 4 GB; the default
+           0x400000 is legal but unusual, and some loader paths assume the
+           high base. */
+        pe->imagebase = 0x140000000ULL;
 #else
         pe->imagebase = 0x00400000;
 #endif
@@ -2263,8 +2381,15 @@ ST_FUNC int pe_output_file(TCCState *s1, const char *filename)
 #ifdef TCC_IS_NATIVE
         pe.thunk = data_section;
         pe_build_imports(&pe);
-        s1->runtime_main = pe.start_symbol;
-#ifdef TCC_TARGET_X86_64
+        /* WhaleJS: runtime_main means "this state is a program". A nostdlib
+           memory state is not - it is the engine's JIT state, which only ever
+           hosts functions, and it is a process-wide singleton now, so every
+           relocate after the first would otherwise see the flag set by the
+           previous one, inject __runmain, and fail with an undefined symbol.
+           tcc_run() sets the field explicitly, so it is unaffected. */
+        if (!s1->nostdlib)
+            s1->runtime_main = pe.start_symbol;
+#if defined(TCC_TARGET_X86_64) || defined(TCC_TARGET_ARM64)
         s1->uw_pdata = find_section(s1, ".pdata");
 #endif
 #endif

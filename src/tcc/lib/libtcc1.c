@@ -107,9 +107,13 @@ union float_long {
 };
 
 /* XXX: we don't support several builtin supports for now */
-#if !defined __x86_64__ && !defined __arm__
-
-/* XXX: use gcc/tcc intrinsic ? */
+/* The 64-bit software division block below is 32-bit x86 assembly. Upstream
+   guards it with `#if defined __i386__`; the old `!__x86_64__ && !__arm__`
+   spelling also admitted aarch64, where neither the inline asm nor the
+   udiv_qrnnd contract exists, and the `#else #error` then failed every
+   aarch64 build. On x86_64/arm64 the hardware does these operations, and on
+   32-bit ARM arm-gen.c maps them to the __aeabi_* helpers (lib/armeabi.c),
+   so i386 is the only target that needs this code. */
 #if defined __i386__
 #define sub_ddmmss(sh, sl, ah, al, bh, bl) \
   __asm__ ("subl %5,%1\n\tsbbl %3,%0"					\
@@ -139,9 +143,6 @@ union float_long {
 	     : "=r" (__cbtmp) : "rm" ((USItype) (x)));			\
     (count) = __cbtmp ^ 31;						\
   } while (0)
-#else
-#error unsupported CPU type
-#endif
 
 /* most of this code is taken from libgcc2.c from gcc */
 
@@ -478,7 +479,7 @@ long long __ashldi3(long long a, int b)
 #endif
 }
 
-#endif /* !__x86_64__ */
+#endif /* __i386__ */
 
 /* XXX: fix tcc's code generator to do this instead */
 float __floatundisf(unsigned long long a)
@@ -589,7 +590,13 @@ long long __fixdfdi (double a1)
     return s ? ret : -ret;
 }
 
-#ifndef __arm__
+/* x86 80-bit extended `long double` layout only. On aarch64 `long double` is
+   IEEE binary128 (and its helpers live in lib/lib-arm64.c as __fixtfdi &
+   friends), so this union and the exponent macros above do not describe it -
+   compiling them there would produce a wrong function, not a missing one.
+   Upstream's `#ifndef __arm__` guard also lets aarch64 through; keep it to the
+   targets whose layout this code actually implements. */
+#if defined __i386__ || defined __x86_64__
 unsigned long long __fixunsxfdi (long double a1)
 {
     register union ldouble_long dl1;

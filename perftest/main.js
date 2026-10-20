@@ -116,6 +116,15 @@ function run(cmd, file, timeoutSeconds) {
     const wantEntries = /whalejs|qjs/.test(path.basename(cmd)) && !cmd.includes('c-');
 
     if (wantEntries) env.WHALE_ENTER_COUNT = '1';
+    /* Measure throughput, not the memo cache. The JIT memoises a compiled
+       function whose result depends only on its arguments, so `fib(26)` twenty
+       times runs the body once and answers the other nineteen from a table -
+       a correct check value with a time that says nothing about the code. The
+       cases are written as "call the same function N times" on purpose (that
+       is what a hot function looks like), so the switch has to come from here.
+       `entries` would not reveal it: memo hits never enter the compiled code. */
+    if (/whalejs|qjs/.test(path.basename(cmd)))
+        env.WHALE_NO_MEMO = '1';
 
     const r = spawnSync(cmd, [file], {
         encoding: 'utf8',

@@ -90,6 +90,8 @@ LIBTCCAPI int tcc_relocate(TCCState *s1, void *ptr)
 #endif
     tcc_relocate_ex(s1, ptr, ptr_diff); /* no more errors expected */
     dynarray_add(&s1->runtime_mem, &s1->nb_runtime_mem, ptr);
+    /* Every address tcc_get_symbol() handed out before this is now stale. */
+    tcc_reloc_generation++;
     return 0;
 }
 
@@ -209,7 +211,7 @@ static int tcc_relocate_ex(TCCState *s1, void *ptr, addr_t ptr_diff)
                so the bytes it patched last time have to go back to zero before
                they are patched again - otherwise every pass adds on top of the
                previous one and the machine code comes out corrupted. */
-#ifdef TCC_TARGET_X86_64
+#if defined(TCC_TARGET_X86_64) || defined(TCC_TARGET_ARM64)
             {
                 int i;
                 for (i = 1; i < s1->nb_sections; i++) {
@@ -327,8 +329,13 @@ static void set_pages_executable(void *ptr, unsigned long length)
 #ifdef _WIN32
     unsigned long old_protect;
     VirtualProtect(ptr, length, PAGE_EXECUTE_READWRITE, &old_protect);
+    /* ARM64 (and any Windows target that caches decoded instructions) must
+       also flush the instruction cache after writing code. x86 has a coherent
+       I-cache and needs nothing here. */
+# if defined(TCC_TARGET_ARM64) || defined(TCC_TARGET_ARM)
+    FlushInstructionCache(GetCurrentProcess(), ptr, length);
+# endif
 #else
-    void __clear_cache(void *beginning, void *end);
 # ifndef HAVE_SELINUX
     addr_t start, end;
 #  ifndef PAGESIZE
@@ -341,7 +348,16 @@ static void set_pages_executable(void *ptr, unsigned long length)
         tcc_error("mprotect failed: did you mean to configure --with-selinux?");
 # endif
 # if defined TCC_TARGET_ARM || defined TCC_TARGET_ARM64
+    /* The host compiler has a builtin for this; the TCC-specific
+       __clear_cache in lib/armflush.c (ARM) and lib/lib-arm64.c (ARM64) is
+       for code TCC itself compiles. Using the builtin keeps this file
+       buildable by gcc/clang without linking those runtime archives. */
+#  if defined __GNUC__ || defined __clang__
+    __builtin___clear_cache((char *)ptr, (char *)ptr + length);
+#  else
+    void __clear_cache(void *beginning, void *end);
     __clear_cache(ptr, (char *)ptr + length);
+#  endif
 # endif
 #endif
 }
@@ -813,7 +829,18 @@ static int rt_get_caller_pc(addr_t *paddr, CONTEXT *uc, int level)
 {
     addr_t fp, pc;
     int i;
-#ifdef _WIN64
+#if defined(_WIN64) && defined(TCC_TARGET_ARM64)
+    /* Windows on ARM64 reports PC/Fp in its own CONTEXT layout (Pc/Fp); the
+       x64 Rip/Rbp fields do not exist there. Guard on _M_ARM64 as well, so a
+       cross syntax-check against x64 headers still compiles. */
+# if defined(_M_ARM64) || defined(__aarch64__)
+    pc = uc->Pc;
+    fp = uc->Fp;
+# else
+    pc = 0;
+    fp = 0;
+# endif
+#elif defined(_WIN64)
     pc = uc->Rip;
     fp = uc->Rbp;
 #else

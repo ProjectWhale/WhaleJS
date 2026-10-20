@@ -34,6 +34,15 @@ ST_DATA struct TCCState *tcc_state;
 
 static int nb_states;
 
+/* Bumped by every tcc_relocate(). Relocating moves the code inside a state, so
+ * an address taken with tcc_get_symbol() before one is stale afterwards. The
+ * engine's JIT state is a process-wide singleton and every consumer (the JS JIT
+ * and the wasm extension) compiles into it, so a consumer that caches addresses
+ * has to notice a relocate it did not perform itself. This is that signal.
+ * Defined here rather than in the JIT because tcc_relocate() is the only place
+ * that knows. */
+unsigned tcc_reloc_generation;
+
 /********************************************************/
 
 #if ONE_SOURCE
@@ -727,11 +736,27 @@ static void tcc_cleanup(void)
     sym_free_first = NULL;
 }
 
+/* WhaleJS: ONE TCCState per process, forever.
+ *
+ * tcc_new() used to call tcc_cleanup() first, and that is not a per-state
+ * operation: it resets sym_pools and sym_free_first, which every state shares,
+ * and drops tcc_state. So a second tcc_new() silently invalidated every symbol
+ * already compiled into the first state - the next tcc_get_symbol() walked a
+ * freed string table (measured as a crash in strcmp() from find_elf_sym() when
+ * a second JSRuntime was created, and as "undefined symbol" errors when a
+ * probe called it in between two JIT compiles).
+ *
+ * Since the engine compiles everything - the JS JIT and the wasm extension -
+ * into this one state, creating another one is never what a caller wants. So
+ * the constructor is idempotent: once the state exists, tcc_new() returns it.
+ * Callers that want a fresh compilation unit use tccelf_begin_file() /
+ * tccelf_end_file() around their tokens, which is what the JIT already does. */
 LIBTCCAPI TCCState *tcc_new(void)
 {
     TCCState *s;
 
-    tcc_cleanup();
+    if (tcc_state)
+        return tcc_state;
 
     s = tcc_mallocz(sizeof(TCCState));
     if (!s)
@@ -924,6 +949,15 @@ LIBTCCAPI TCCState *tcc_new(void)
 
 LIBTCCAPI void tcc_delete(TCCState *s1)
 {
+    /* WhaleJS: the state is a process-wide singleton (see tcc_new), and the
+       engine's compiled code lives in its sections. Destroying it would free
+       the code every JIT'd function points at, and tcc_cleanup() would reset
+       the symbol pools shared by everything already compiled. Nothing in the
+       engine asks for that, so the singleton is never torn down; the OS
+       reclaims it at exit. */
+    if (s1 && s1 == tcc_state)
+        return;
+
     tcc_cleanup();
 
     /* free sections */
@@ -1414,7 +1448,7 @@ static int tcc_set_linker(TCCState *s, const char *option)
         } else if (link_option(option, "stack=", &p)) {
             s->pe_stack_size = strtoul(p, &end, 10);
         } else if (link_option(option, "subsystem=", &p)) {
-#if defined(TCC_TARGET_I386) || defined(TCC_TARGET_X86_64)
+#if defined(TCC_TARGET_I386) || defined(TCC_TARGET_X86_64) || defined(TCC_TARGET_ARM64)
             if (!strcmp(p, "native")) {
                 s->pe_subsystem = 1;
             } else if (!strcmp(p, "console")) {

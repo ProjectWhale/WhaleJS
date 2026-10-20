@@ -32,11 +32,20 @@ int JS_WhaleTccProbe(void)
    same clearing, the next pe_output_file() takes runtime_main as "run a
    program" and pe_add_runtime() injects __runmain plus the CRT libraries -
    whose symbols nobody can resolve, failing the compile. The gcc backend
-   calls this after loading its object. */
+   calls this after loading its object.
+
+   runtime_main only exists in a native build (TCCState declares it under
+   TCC_IS_NATIVE, because only then can tcc_run() execute the code). A
+   cross-compiling build has no such field and no tcc_run(), so this is a
+   no-op there - the same condition the field itself is declared under. */
 void JS_WhaleTccClearRuntimeMain(TCCState *s)
 {
+#ifdef TCC_IS_NATIVE
     if (s)
         s->runtime_main = NULL;
+#else
+    (void)s;
+#endif
 }
 
 /* The JIT registers every external the generated code references as a host
@@ -65,16 +74,14 @@ void JS_WhaleTccNoStdLibs(TCCState *s)
 /* define_stack snapshot for free_defines() at teardown (see tcc_compile()). */
 static Sym *whale_define_start;
 
-/* The framing shared by the emitters below. Returns 0 when the unit is open. */
-#define WHALE_IR_SETUP(s, tcc_dir, tag)                                     \
+/* The framing shared by the emitters below. Returns 0 when the unit is open.
+   No library/include path is set: these units only use built-in types and
+   self-contained code, and every external the JIT emits is a host symbol. */
+#define WHALE_IR_SETUP(s, tag)                                              \
     do {                                                                    \
-        char whale_lib[1024];                                               \
-        snprintf(whale_lib, sizeof(whale_lib), "%s/lib", (tcc_dir));        \
         (s) = tcc_new();                                                    \
         if (!(s))                                                           \
             return NULL;                                                    \
-        tcc_set_lib_path((s), (tcc_dir));                                   \
-        tcc_add_library_path((s), whale_lib);                               \
         /* no CRT libraries: this path only emits self-contained code */     \
         (s)->nostdlib = 1;                                                  \
         tcc_set_output_type((s), TCC_OUTPUT_MEMORY);                        \
@@ -116,20 +123,26 @@ static Sym *whale_define_start;
         sym_pop(&local_stack, NULL, 0);                                     \
         tccelf_end_file((s));                                               \
         tcc_close();                                                        \
+        /* pe_output_file() records the PE entry symbol in runtime_main on   \
+           every relocate; left set, the next relocate would inject an       \
+           unresolvable __runmain. Clear before (so this relocate does not    \
+           inject one) and after (so the state is clean for the next user -   \
+           the field is set again at the end of the relocate). */             \
+        JS_WhaleTccClearRuntimeMain(s);                                     \
+        /* tcc_relocate() already made the pages executable: VirtualProtect  \
+           on Windows, mprotect elsewhere. The old Windows-only re-protect   \
+           that lived here is gone, so the macro builds on every host. */    \
         if (tcc_relocate((s), TCC_RELOCATE_AUTO) >= 0) {                    \
             (out) = tcc_get_symbol((s), (name));                            \
-            if ((out)) {                                                    \
-                DWORD whale_old;                                            \
-                VirtualProtect((out), 4096, PAGE_EXECUTE_READWRITE, &whale_old); \
-            }                                                               \
         }                                                                   \
+        JS_WhaleTccClearRuntimeMain(s);                                     \
         (s)->error_set_jmp_enabled = 0;                                     \
     } while (0)
 
 /* Emit `double whale_ir_add(double a, double b) { return a + b; }`.
    The entry point of the whole route: with parameters there is no constant
    pool involved, so this isolates "does IR emission produce callable code". */
-void *JS_WhaleIrCompileAdd2(const char *tcc_dir)
+void *JS_WhaleIrCompileAdd2(void)
 {
     TCCState *s = NULL;
     CType ft, dt;
@@ -138,7 +151,7 @@ void *JS_WhaleIrCompileAdd2(const char *tcc_dir)
     TokenSym *ta, *tb, *tf;
     void *volatile fn = NULL;
 
-    WHALE_IR_SETUP(s, tcc_dir, "<whale-ir>");
+    WHALE_IR_SETUP(s, "<whale-ir>");
 
     tf = tok_alloc("whale_ir_add", 12);
     ta = tok_alloc("whale_a", 7);
@@ -245,19 +258,17 @@ done:
  * fastest way to find what IR emission is missing - and calling both tells us
  * whether the fault is in the code or in the state.
  * ---------------------------------------------------------------------- */
-void *JS_WhaleIrAdd2C(const char *tcc_dir)
+void *JS_WhaleIrAdd2C(void)
 {
-    char lib_dir[1024];
     TCCState *s;
     void *fn = NULL;
     const char *src = "double whale_ir_add(double a, double b) { return a + b; }";
 
-    snprintf(lib_dir, sizeof(lib_dir), "%s/lib", tcc_dir);
     s = tcc_new();
     if (!s)
         return NULL;
-    tcc_set_lib_path(s, tcc_dir);
-    tcc_add_library_path(s, lib_dir);
+    /* self-contained probe: no CRT libraries, no include/library path */
+    s->nostdlib = 1;
     tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
 
     if (tcc_compile_string(s, src) < 0)
@@ -285,9 +296,15 @@ void *JS_WhaleIrAdd2C(const char *tcc_dir)
         }
     }
 
+    /* pe_output_file() records the PE entry symbol in runtime_main on every
+       relocate; left set, the next relocate would inject an unresolvable
+       __runmain. The state is shared with the JIT, so this has to be cleared
+       here too, not only on the token path. */
+    JS_WhaleTccClearRuntimeMain(s);
     if (tcc_relocate(s, TCC_RELOCATE_AUTO) < 0)
         return NULL;
     fn = tcc_get_symbol(s, "whale_ir_add");
+    JS_WhaleTccClearRuntimeMain(s);
     if (whale_dbg_env("WHALE_IR_DEBUG"))
         fprintf(stderr, "  irC: entry=%p\n", fn);
     return fn;
@@ -686,19 +703,15 @@ static void whale_tok_build_add2(void)
 }
 
 /* Compile that function by driving TinyCC's parser with our tokens. */
-void *JS_WhaleTokCompileAdd2(const char *tcc_dir)
+void *JS_WhaleTokCompileAdd2(void)
 {
-    char lib_dir[1024];
     TCCState *s;
     void *fn = NULL;
 
-    snprintf(lib_dir, sizeof(lib_dir), "%s/lib", tcc_dir);
     s = tcc_new();
     if (!s)
         return NULL;
-    tcc_set_lib_path(s, tcc_dir);
-    tcc_add_library_path(s, lib_dir);
-    /* self-contained probe code: no CRT libraries needed */
+    /* self-contained probe code: no CRT libraries, no include/library path */
     s->nostdlib = 1;
     tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
 
@@ -728,12 +741,27 @@ void *JS_WhaleTokCompileAdd2(const char *tcc_dir)
 
     preprocess_end(s);
     free_inline_functions(s);
+    /* Same teardown as JS_WhaleCompileTokens. This matters now that tcc_new()
+       returns the engine's single state: a probe that skipped free_defines left
+       the builtin macros (__BASE_FILE__ and friends) defined, and the next JIT
+       compile warned about redefining them. */
+    free_defines(whale_define_start);
     sym_pop(&global_stack, NULL, 0);
+    sym_pop(&local_stack, NULL, 0);
+    global_label_stack = NULL;
+    local_label_stack = NULL;
     tccelf_end_file(s);
     tcc_close();
+    /* pe_output_file() records the PE entry symbol in runtime_main on every
+       relocate; left set, the next relocate injects an unresolvable __runmain. */
+    JS_WhaleTccClearRuntimeMain(s);
 
     if (tcc_relocate(s, TCC_RELOCATE_AUTO) >= 0)
         fn = tcc_get_symbol(s, "whale_ir_add");
+    /* the field is set again by every relocate, so clear it after this one too:
+       the state is shared with the JIT, which relocates again later */
+    JS_WhaleTccClearRuntimeMain(s);
+    s->error_set_jmp_enabled = 0;
     return fn;
 }
 /* ------------------------------------------------------------------------
@@ -864,11 +892,13 @@ int JS_WhaleCompileTokens(TCCState *s, void (*emit)(void *), void *emit_ctx)
     }
 
     if (whale_dbg_env("WHALE_IR_DEBUG")) {
+#ifdef TCC_TARGET_X86_64
         fprintf(stderr, "[isa] bits=0x%x sse2=%d sse4.2=%d avx2=%d (override with WHALE_ISA)\n",
                 s->isa_bits,
                 !!(s->isa_bits & WHALE_ISA_SSE2),
                 !!(s->isa_bits & WHALE_ISA_SSE42),
                 !!(s->isa_bits & WHALE_ISA_AVX2));
+#endif
         JS_WhaleTokDump();
     }
 
@@ -897,8 +927,9 @@ int JS_WhaleCompileTokens(TCCState *s, void (*emit)(void *), void *emit_ctx)
        symbol in runtime_main. pe_add_runtime() reads that field to decide
        whether to inject a start symbol, so once it is set a later relocate would
        define `main`/`__runmain` as UNDEF and pe_check_symbols() would fail the
-       compile. WhaleJS never runs a program out of this state, so clear it. */
-    s->runtime_main = NULL;
+       compile. WhaleJS never runs a program out of this state, so clear it.
+       (Native-only field: see JS_WhaleTccClearRuntimeMain.) */
+    JS_WhaleTccClearRuntimeMain(s);
 
     s->error_set_jmp_enabled = 0;
     return s->nb_errors == 0;
