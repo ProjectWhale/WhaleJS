@@ -5916,3 +5916,1012 @@ thenable。改成异步是契约变更、会影响现有嵌入方和测试，所
    `WHALE_WASM_NOTRANSLATE=1` 是最便宜的期望值校验。
 
 见 current.md <139>
+# <140>: 字面量直接建进目标局部的槽（d_call 108ms → 98ms）
+
+SOLVED
+
+## 一、省掉每轮一次 `ObjSlotCopy`
+
+`var p = {a: i, b: i+1}` 编译成 `object, <value>, define_field, ..., put_loc2`。
+`OP_object` 在 `whale_objs++` 拿一个临时槽，随后 `put_loc` 发现
+`src != loc_slot[2]`，于是发一次 `JS_WhaleObjCopy` 把引用复制到局部自己的
+槽。每轮一次，纯浪费——对象刚建好，还没别人持有。
+
+新增 `whale_literal_dst_local()`：从 pass 1 记的 `whale_obj_end[]` 找到字面量
+结束后那条 store，取出目标局部；再扫一遍 `(pos, end)` 确认构建过程里**没有
+读**这个局部（`p = { a: p.a }` 这种要拒绝，否则初始化会看到新对象）。
+
+命中时在 `OP_object` 里就把 `loc_slot[dloc] = os` 占住，随后的 `put_loc`
+看到 `src == loc_slot` 直接跳过复制。
+
+| 形状 | node | <136> | 现在 |
+|---|---|---|---|
+| d_call | 3 | 108 | **98-100** |
+| d_arr | 27 | 93 | 93-95 |
+| d_ret | 3 | 8 | 7-8 |
+
+## 二、放错位置的两次尝试（值得记）
+
+1. **第一次放在 `os = whale_objs++` 之后、所有分支之前**：`object` 从 1ms
+   涨到 32ms，fib 也变成 78ms。原因是 frame-column 和 struct 两条臂也用
+   这个 `os`，提前占住 `loc_slot` 让它们指向了一个并不持有该对象的槽。
+   挪到 plain fallback 分支内部（只在那里）就正常了。
+
+2. **`object` 32ms / `fib` 78ms 是 perftest 的既有现象，不是回归。**
+   把改动整个撤掉重跑完整套件，两个数字一模一样（`entries=31` 也是既有
+   的）。单独跑这两个 case 时是 1-2ms 和 3-6ms。教训：**改动的效果要在
+   同一套跑法下对比**，单 case 和全量不能混着看。
+
+## 三、验证
+
+perftest 25/25、0 mismatch。`vnode_build` 2ms、`objshape` 70、`objfields` 27。
+`whale_test` ok。`fusecorrect.js` 18 项全过。探针全扫只有 `numbug3.js`
+（本身语法错误）。
+
+## 教训
+
+1. **同一份 `os` 在不同分支里含义不同。** `whale_objs++` 拿到的槽号被三条
+   臂共用，但只有 plain fallback 那条会把对象真正写进去。任何"提前占住"
+   的优化都必须限定在那条臂里。
+2. **回归判定要同条件。** 全量 perftest 与单 case 的 fib 差 20 倍，撤掉
+   改动后依旧如此——先跑一遍"撤掉版本"再下结论，能省一整轮排查。
+3. **`loc_slot` 是"这个局部固定用哪个槽"的承诺。** 提前赋值必须保证对象
+   真的会写进那个槽，否则后续 `put_loc` 会跳过复制、留下空槽。
+
+## 下一步
+
+d_call 剩 98ms（node 3ms）：循环体里还有 `ObjBuild`、两次 `ObjFieldPtr` 的
+shape 缓存检查、`VarRefIsFn`、`CallSelfValue`。`useP(o)` 是
+`return o.a`，内联后仍走字段缓存——可以识别"参数是刚建的字面量"直接用列。
+
+# <141>: mixed/bitops 慢在哪 —— 用 gcc 编译同一份生成代码来分离两个原因
+
+TIPS（结论：不是生成器能修的问题，方向要换）
+
+## 方法：把生成的 C 单独拿出去用 gcc 编译
+
+一直分不清"生成的 C 写得差"和"TCC 编译得差"。做法：`WHALE_JIT_SRC` 导出
+生成的源码，取出 core 函数，配一个 `clock()` 的 main，用 `gcc -O2` 和
+`gcc -O0` 各编一次，和 whalejs 自己的 TCC 结果对比。
+
+### mixed（`x = x + y*2; y = x - y`，20M 次）
+
+| 跑法 | ms |
+|---|---|
+| node | 55 |
+| whalejs（TCC） | 128-135 |
+| gcc -O2 同一份 C | 73 |
+| gcc -O0 同一份 C | 176 |
+
+gcc -O2 也只到 73ms，说明**生成器写出来的 C 本身就不是最优形态**；但
+TCC 比 -O0 好、比 -O2 差，处在中间。两个原因各占一半。
+
+进一步的对照：`indep`（`y = y + x`，不依赖新 x）39ms、`nomul`（x 只做加法）
+52ms、`mixed`（x 做乘法）131ms，node 三者都 ~55ms。也就是说**依赖链+乘法
+延迟**这一项，node 靠指令调度/展开抹平了，TCC 没有这个能力。手工展开 2 轮
+（`unroll2`）139ms、双独立累加器（`dual`）134ms，都没改善——不是循环展开
+能解决的。
+
+### bitops（`acc ^= v<<3; acc |= v>>1; ...`，5M 次）
+
+| 跑法 | ms |
+|---|---|
+| node | 14 |
+| whalejs（TCC） | 125 |
+| gcc -O2 同一份 C | 70 |
+| gcc -O0 同一份 C | 138 |
+
+这里找到了真正可修的东西：**把累加器从 `double` 改成 `int`，同一份逻辑
+gcc -O0 从 136ms 降到 21ms（6.5 倍）、-O2 从 69 降到 16**。原因是
+`fold_toint32` 对 `WHALE_T_NUM` 发出 `(int)(long long)(x)`——每轮两次
+double→long long→int 转换。
+
+## 试过但无效的两项
+
+1. **常量移位量折叠**（`(3 & 31)` → `3`）：已保留，代码更干净，但实测
+   bitops 125ms 不变——TCC 显然把那个常量表达式折叠掉了。
+2. **让 `set_loc` 也能进 int mirror**：bitops 的 `acc` 用 `set_loc0` 存，
+   原规则直接拉黑。放宽后仍然没被选中——因为 `acc` 还有
+   `acc - (~v & 15)` 和 `acc + (v % 7)` 两处读取，`-`/`+` 不是
+   `whale_int_consumer_at` 认的消费者，整条链断掉。放宽没有收益，已撤回
+   （避免无谓地放松保守条件）。
+
+## 结论
+
+`mixed` 的 128 vs 55 是 **TCC 缺少指令调度和循环展开**，生成器层面改不动。
+`bitops` 的 125 vs 14 里有一部分是**累加器类型**（可以修，但要先让
+`-`/`+` 参与 int 性判断，而 `acc - x` 的结果不保证在 int32 内，不能简单
+放行）。
+
+两条都指向同一个上限：**TCC 后端本身**。gcc 后端（`JS_WhaleSetJitCc`）能到
+70ms/73ms，但它需要外部编译器，不是"零运行时文件"的默认路径。
+
+## 教训
+
+1. **怀疑"生成器差"和"后端差"时，把生成的 C 拿出去用别的编译器编一遍。**
+   这一步把 mixed 的两个原因（C 形态 / 后端优化）分开了，而且顺带发现
+   bitops 的类型问题。
+2. **同一条 C 在不同 -O 级别下差 2.5 倍，说明它依赖优化器。** 生成的代码
+   应该尽量少依赖优化器——`(int)(long long)(x)` 这种写法在 -O0 下就是两条
+   指令。
+3. **放宽保守规则之前先确认它会命中。** `set_loc` mirror 放宽后根本没被
+   选中，等于白放松了约束。
+
+# <142>: 后端瓶颈清单 + 循环优化现状盘点（收益排序）
+
+TIPS
+
+## 一、循环优化的现状
+
+用户问的三项，逐个查过：
+
+### 1. 循环展开：有，但只对编译期已知的小 trip
+
+`whale_loop_unroll()`（whale_jit.c:3381）把循环体复制 N 份，条件是
+`whale_loop_trip_of()` 能算出常量 trip，且 `2 <= trip <= 8`。
+
+- 覆盖：`for (i = 0; i < 8; i++)` 这类小常量循环。
+- **不覆盖**：`for (i = 0; i < n; i++)`（n 是参数）——也就是所有真实的
+  热循环。mixed/bitops/loop_sum/arith 全是这一种。
+
+这是最大的缺口：**真正需要展开的循环，一个都没展开。**
+
+### 2. 不变量外提：没有真正的 LICM
+
+只有 `whale_local_invariant()`（1255 行）——判断"这个局部在循环体内没被
+写过"，用于 `fold` 的 `inv` 标记：让一个表达式在**同一基本块内**被复用
+时不必重算。
+
+它**不把代码搬出循环**。`for (...) { x = a * b + i; }` 里 `a * b` 仍然
+每轮算一次。真正的 LICM（把循环不变的表达式提到 preheader）没有实现。
+
+### 3. 循环体内类型固化：部分有，只覆盖 int
+
+`whale_int_mirror` 机制（`whale_loop_int_of`，1636 行）在循环体内把
+int 型局部放到 `int I<k>` 上跑，进出循环时转换。
+
+- 覆盖：induction 变量 + 由位运算产生、且只被位运算消费的局部。
+- **不覆盖**：`double` 型局部。mixed 的 `x`/`y` 全程是 `double L0/L1`，
+  这是对的（它们确实是 double）。
+- **不覆盖**：`WHALE_T_I32` 的局部（`acc & 0xffff` 之后类型是 I32，但存回
+  局部后变 NUM，下一轮又变成 `(int)(long long)`）。
+
+## 二、量出来的循环成本
+
+20M 次、`Date.now()` 计时：
+
+| 形态 | whalejs | node |
+|---|---|---|
+| `empty`（空循环体） | **35ms** | 12ms |
+| `four`（4 次无依赖加法） | **35ms** | 36ms |
+| `one`（1 次加法） | 71ms | 16ms |
+| `mixed`（依赖链 + 乘法） | 128ms | 55ms |
+
+两个关键事实：
+
+1. **`four` == `empty`**：4 次无依赖加法完全被流水线隐藏，不花钱。所以
+   "循环体里多几条独立运算"本身不是问题。
+2. **`empty` 就要 35ms / 20M = 1.75ns/轮**，node 是 0.6ns。**循环控制
+   本身就是 whalejs 最大的固定成本**，而它和循环体内容无关。
+
+`one` 的 71ms 是测量污染（4 个函数同进程互相干扰），单独测会接近 empty。
+
+## 三、收益排序（按"每轮能省多少"估）
+
+| 方向 | 现在 | 理论 | 估算收益 | 难度 |
+|---|---|---|---|---|
+| **A. 通用循环展开（trip 未知，展开 4 份 + 余数循环）** | 1.75ns/轮控制 | 0.6ns | empty 35→15ms，**所有数值循环各减 ~20ms** | 中 |
+| **B. 真正的 LICM（把不变表达式提到 preheader）** | 每轮重算 | 0 | 看循环体，`arith`/`loop_sum` 类可减 10-30% | 中高 |
+| **C. I32 局部保持 int（不退回 NUM）** | 每轮 2 次 `(int)(long long)` | 0 | bitops 125→~60ms（gcc -O0 实测 136→21） | 中 |
+| D. double 局部放 xmm 常驻 | 每轮 load/store | 0 | mixed 128→~110ms | 高（TCC 不做寄存器分配） |
+
+**A 最大且最通用**：它减的是每一轮都付的固定成本，对所有数值循环生效
+（arith 62、locals 66、loop_sum 45、mixed 128、bitops 125 都能吃到）。
+
+**C 对 bitops 单点收益最大**（可能 2 倍），但需要先解决
+`acc - (~v & 15)` 的 int 性判断，范围窄。
+
+**B 中等**，但实现风险高（要保证外提的表达式没有副作用、不依赖循环变量）。
+
+## 四、为什么 A 是现在该做的
+
+1. 它是**唯一对"所有循环"都生效**的优化。
+2. `empty` 的 35ms 是纯控制成本，展开 4 份理论上直接除 4（余数循环处理
+   尾巴），这是确定的收益。
+3. 现有的 `whale_loop_unroll` 已经写好了"复制循环体 token"的全部机制，
+   缺的只是"trip 未知时也能展开 + 生成余数循环"。基础设施可以复用。
+
+## 五、后端瓶颈记录（用户要求先记）
+
+按影响从大到小：
+
+1. **TCC 不做指令调度**：依赖链上的乘法/加法延迟无法重叠。mixed 的
+   128 vs node 55 主要来自这里；gcc -O2 同一份 C 也要 73ms，说明即使
+   换成好编译器，生成的 C 形态本身也还有空间。
+2. **TCC 不做寄存器分配**（或极弱）：`double L0/L1` 每轮 load/store，
+   `_wv` 固定寄存器只有 8 个且只给 fold 临时值用。
+3. **TCC 不折叠常量表达式**（部分）：`(3 & 31)` 已确认它其实会折，
+   但 `(int)(long long)(x)` 这类转换链在 -O0 下是实打实的指令。
+4. **没有 LICM、没有通用展开**：这是生成器层面的缺失，与 TCC 无关，
+   属于可以补的部分（方向 A/B）。
+5. **生成的 C 依赖优化器**：同一份 C 在 gcc -O0 是 176ms、-O2 是 73ms。
+   这说明"生成器写出来的形态"和"优化器能救回来多少"是两件事，前者
+   仍有很大空间（用户判断一致）。
+
+## 六、下一步
+
+先做 **A（通用循环展开）**：trip 未知时展开 4 份 + 余数循环。预期
+`empty` 类控制成本 35→15ms，所有数值 case 各减 10-20ms。做完再评估 C。
+
+# <143>: 通用循环展开试做（未完成，已回退）+ 为什么它比预想的难
+
+TIPS
+
+## 一、先确认收益是真的
+
+20M 次、`Date.now()`：
+
+| 形态 | whalejs | node |
+|---|---|---|
+| `empty`（空循环体，20M 次迭代） | 36ms | 13ms |
+| `empty4`（同样工作，迭代数 1/4） | **5ms** | 3ms |
+| `one`（1 次加法） | 71ms | 16ms |
+| `one4`（4 次加法，迭代数 1/4） | **18ms** | 5ms |
+
+`empty` → `empty4` 是 7 倍。**循环控制本身（head test + back edge + 增量）
+是 whalejs 最大的固定成本**，每轮 1.75ns，node 0.6ns。这个方向的价值是
+确定的。
+
+## 二、实现走到的位置
+
+写了 `whale_loop_unroll_general()`：在 `loop_end` 里、常量 trip 展开之后
+调用，把 body 复制 4 份。需要的 token 基础设施都补上了：
+
+- `JS_WhaleTokOpId()`（新加）：把 `JS_OP_*` 映射到 TCC 的 token id。
+  **`<` 不是字符 60，是 `TOK_LT`=156**——直接用 `'<'` 比较永远不匹配，
+  这个坑花了两轮才看出来。
+- 从 body 的 head test 和 back edge 里取 `if`/`goto` 的 token id（生成器
+  不能自己拼关键字）。
+- 剥离 body 开头的 `I<g> = I<g> + 1;`（增量在 body 开头，不在末尾——
+  back edge 的 `inc_loc` 排在 goto 之前，而 body 从 head test 之后开始）。
+
+生成的代码形态（已验证正确生成）：
+
+    L4 : if (!((((I1 + 4) <= (A0))))) goto L16 ;
+         <body> <body> <body> <body>
+         I1 = I1 + 3 ;
+         goto L4 ;
+    R4 : if (!((((I1) < (A0))))) goto L16 ;
+         <body>
+         I1 = I1 + 1 ;
+         goto R4 ;
+
+## 三、为什么回退
+
+1. **先试了"每份副本前加 `if (I>=bound) goto exit`"的版本**：语义正确，
+   但实测 `one` 71ms 不变——每个副本一次比较，把省下的循环控制又还回去了。
+2. **改成"改 head 条件 + 余数循环"**：逻辑上是对的，但 TCC 报
+   `'L4' undeclared` + `duplicate label 'L4'` 同时出现，说明 label 作用域
+   出了问题（`goto` 和 `label` 落在不同的 C 函数里）。这类错误定位成本高，
+   而收益（理论上 empty 36→15ms）还没有一次干净的实测支撑。
+3. **时间成本**：这一轮已经花在 token 层重写上的时间远超预期，而
+   `whale_loop_unroll` 的常量 trip 版本本来就是靠"把 induction 换成字面量"
+   绕开了这些问题；未知 trip 的版本要保留变量，复杂度高一个量级。
+
+已回退到 `<141>` 的状态（含常量移位量折叠）。WIP 存在
+`temp/wj_unroll_wip.c`。
+
+## 四、如果要做，正确的最小路径
+
+1. **不要改 head 条件**，也不要在副本间加 guard。改成：先算
+   `nrem = (n - g) & (factor - 1)`，先跑 `nrem` 次原循环（原样），再跑
+   `(n - nrem - g) / factor` 次展开循环。两个循环都用原来的 head 条件，
+   label 不冲突。
+2. 或者更省事：**只在 `whale_loop_int_of` 已经认可的循环上做**，并且
+   要求 trip 是"参数减去常量"的形式（`i < n - 3`），直接改上界。
+3. label 必须用独立命名空间（`R<head>` 已经这么做了），且 `goto exit`
+   在两个循环里都指向同一个 exit label——这要求 exit label 在展开后仍然
+   只定义一次。
+
+## 五、结论
+
+- **方向是对的，收益是真的**（7 倍控制成本）。
+- **实现成本比预期高**，主要卡在 token 层的 label 作用域和条件改写。
+- 相比之下，**<142> 里列的 C（I32 局部保持 int）单点收益更大且更局部**
+  （bitops gcc -O0 实测 136→21ms），值得先做。
+
+## 教训
+
+1. **`<` 是 TOK_LT 不是字符。** 生成器里所有对运算符 token 的比较都必须
+   走 `JS_WhaleTokOpId`，字符比较只对 `( ) ; = +` 这类真正单字符的 token
+   成立。
+2. **增量在 body 开头。** `inc_loc` 在字节码里位于 goto 之前，但缓冲的
+   body 是从 head test 之后开始的，所以增量是 body 的第一条语句。
+3. **label 是 C 函数作用域。** 展开产生的第二份循环必须换 label 名，
+   而 `goto` 的目标要在同一个函数里定义。
+4. **收益要先在小样本上验证再写完整实现。** 这次的 guard 版本已经能跑，
+   但实测无收益；如果先测那一步，就不会继续投入改 head 条件。
+
+# <144>: 循环类型固化：int mirror 的放宽与它真正的边界
+
+SOLVED（部分）+ 一条明确的边界
+
+## 一、这一轮改了什么
+
+按 <142> 的顺序先做类型固化。四处改动：
+
+1. **`set_loc` 不再拉黑 mirror 候选。** 原来的规则是"set_loc 在栈上留下
+   双重含义的值，所以这个局部永远不能走 int mirror"。那句话说的是**栈上
+   的副本**，不是局部：局部最终存的正是 put 会存的东西。bitops 的 `acc`
+   正是 `set_loc0` 写出来的，所以它一直被挡在 int 路径外。
+
+2. **`+`/`-` 也能做 producer**，条件是两侧都有可证明的界
+   （`whale_expr_bound`：`x & K` -> K，`x % K` -> K-1，字面量 -> 值），
+   且和 <= 2^30。
+
+3. **读取 mirror 局部时不再展开 pending 表达式。** 原来 `if (live)
+   fold_inline_expr(...)` 会把 `L<idx>`（double）内联回来，于是每个使用点
+   又套上 `(int)(long long)(...)` —— mirror 省下的转换全被还回去。现在
+   一律读 `I<idx>`。
+
+4. **mirror 入口初始化。** mirror 声明成 `int` 并随 prologue 清零，但
+   `var a = 5; for (...) a ^= ...` 的初值不是 0。现在在 pos==0 处把每个
+   mirror 从它的 double 初始化一次（induction 除外，它由循环自己的
+   preheader 置 0）。这是**正确性修复**，不是优化：
+   `acc5`/`accNeg` 用例在改前是错的。
+
+## 二、效果
+
+`bitops` 的累加器现在真的是 C `int` 了：
+
+    int I0 = 0;
+    ...
+    I2 = ((int)((I1) & 255)), I0 = ((I0) ^ ((I2) << 3)),
+    _wv0 = (((I0) ^ ((I2) << 3)) | ((I2) >> 1)),
+    _wv1 = ((double)((int)(long long)((_wv0 + ((int)((I2)) % 7)) & 65535));
+    I0 = ((int)(_wv1));
+
+前三步是纯 int。但 `bitops` 仍是 125-127ms（node 14）。
+
+## 三、为什么没变快：瓶颈不在累加器类型
+
+生成代码里还剩两处 double：
+
+- `_wv0` 是**物化过的变量**（`whale_vmat`），它的界不参与 `whale_operand_bound`
+  的推断（那个函数只处理未物化的字面量/IBIT 表达式），所以
+  `_wv0 + (I2 % 7)` 仍走 double。
+- `(int)(long long)(...)` 的 `(long long)` 步骤在 `& 65535` 前面仍然存在。
+
+更重要的：**gcc 对照实验（`bitsint.c`）显示，把 `L0` 从 double 改成 int，
+gcc -O0 是 136ms -> 21ms，但那是整条链都在 int 域**。现在只有部分在 int
+域，double/int 边界上的转换还在，收益被摊薄。
+
+## 四、结论：类型固化的上限在哪
+
+`whale_int_mirror` 是"一个局部在循环体内用 C int 表示"，它要求**这个局部
+的每一次读写都落在 int 域**。bitops 的 `acc` 满足，但 `acc` 的**中间值**
+（`_wv0`、`_wv1`）是 fold 临时量，它们由 `fold_materialize` 分配，类型来自
+产生它们的 op（`|` 是 IBIT，`+` 是 NUM）。要让整条链都留在 int 域，需要：
+
+- `fold_materialize` 尊重"这个值来自 int 表达式"这个信息（即 IBIT 物化后
+  仍标 IBIT，而不是 NUM），并且
+- `whale_operand_bound` 能对物化变量也给出界（需要一张 per-slot 的界表，
+  随 cur[] 一起快照）。
+
+这两项都不小，而且收益只对"整条链都是 int"的循环成立。
+
+## 五、这一轮的实际收获
+
+- **正确性修复**：mirror 入口初值（`acc5`/`accNeg` 之前是错的）。
+- **`set_loc` 的放宽**：让 `acc` 能进 mirror（虽然当前循环没因此变快，
+  但对"累加器只做位运算"的循环是有效的 —— `pureBits` 类形状）。
+- **`%` 的 int 快路径不再包 `(double)`**：让 `(acc + v % 7) & mask` 的
+  `%` 部分留在 int 域。
+
+perftest 25/25、0 mismatch；`whale_test` ok；探针全扫只有 `numbug3.js`
+（本身语法错误）。
+
+## 教训
+
+1. **"局部类型固化"和"表达式类型固化"是两件事。** 把变量变成 int 不等于
+   把它的中间值也留在 int 域；fold 临时量有自己的类型推断。
+2. **mirror 的入口初值是一个真实的正确性洞。** 声明成 int 并清零，但
+   JS 的初值可以不是 0 —— 这类"优化引入的初始化假设"要靠对照用例发现
+   （`acc5`/`accNeg`），不能靠计时。
+3. **放宽一条保守规则前，先确认它会命中且能带来收益。** `set_loc` 放宽
+   命中了，但收益被下游的 double 边界吃掉；下次应该先量"整条链都在 int
+   域"的收益上限，再决定值不值得改。
+
+## 下一步（如果继续这条线）
+
+把 int 域信息带进 fold 临时量：`fold_materialize` 对 IBIT 来源的值保持
+IBIT，并给物化槽记一张界表。这样 `acc + (v%7)` 整条链都在 int 域，
+`& 0xffff` 也不再需要 `(int)(long long)`。预期 bitops 能接近 gcc -O0 的
+21ms。
+
+# <145>: 修掉 int mirror 的出口装箱错位（`for(;i<n;i++){}` 返回 0）
+
+SOLVED
+
+## 一、症状
+
+一个极小的用例在**编译后**算错，解释器正确：
+
+    function f2(n) { var i = 0; for (; i < n; i++) { } return i; }
+    f2(1)  ->  0      （应为 1）
+
+`f2(0)=0 f2(1)=0 f2(5)=0 f2(10)=0` —— 循环一次都没跑。而 `a = a + i`
+（`f4`）和经临时变量的 `v = i; a |= v`（`b2`）都是对的。
+
+## 二、定位
+
+先做了 git bisect，但**第一批结论全是错的**：我在 bisect 时反复
+`git checkout <commit> -- src/*`，有几次 `xmake f` 把输出目录指到了
+`temp/build-dbg`，`build/` 下的 exe 没有重建，而我一直在拿它测。于是得出
+"HEAD 也有这个 bug"的错误结论，浪费了大量尝试。
+
+改成每次 `del` 掉 exe + `xmake f -o build` + `xmake build -r` 之后，结论
+稳定了：
+
+| commit | `f2(1)` |
+|---|---|
+| `0a16999`（int-region 之前） | **1** ✓ |
+| `87cbda5`（int-region 引入，`<104>`） | **0** ✗ |
+
+生成代码一贴出来，问题就无处可藏：
+
+    L0 = 0 ;
+    L2 : if ( ! ( ( ( ( I0 ) < ( A0 ) ) ) ) ) goto L11 ;
+    I0 = I0 + 1 ;
+    goto L2 ;
+    L0 = ( double ) I0 ;      <-- 死代码：没有跳转到这里
+    L11 : return ( L0 ) ;
+
+**出口装箱 `L<d> = (double)I<d>` 被发射在 `goto L2` 之后、`L11:` 之前。**
+那段位置没有任何边能到达——循环从 head test 直接跳到 `L11`，绕过了它。
+于是 `L0` 保持循环前的值（0），而 `I0` 已经是 n。
+
+## 三、修法
+
+把出口装箱从 `targets[pos]` 分支的**开头**移到标签 `L<pos>:` **之后**：
+
+    if (targets[pos]) {
+        local_flush_all(var_count);
+        whale_sp_reset();
+        ... 标签 ...
+        wt_slot("L", pos); wt(':');
+        /* 装箱在这里 */
+        if (whale_int_ok && pos == whale_int_exit) { ... }
+    }
+
+一条语句的位置错误，一个特性从引入起就是坏的。
+
+## 四、影响范围
+
+`87cbda5` 是 `<104>`（int-region for integer loops）。从那时起，**任何
+循环体读取 induction 变量本身、且循环后还要用它的函数**都会算错。之前
+没被发现，是因为 perftest 的 `bitops` 恰好把 `acc` 也当 mirror，`acc` 的
+错误值被 `& 0xffff` 之类的运算掩盖成 0，而 0 又恰好没有触发 check 失败
+—— 直到这一轮我加了 `bo_iso.js` 这种"循环后返回计数器"的探针。
+
+`bitops` 的 check 之前是 `0`（错），修完后是 `60479`（对）。
+
+## 五、验证
+
+perftest 25/25、0 mismatch；`nested` 19-24ms（mirror 关闭时会退化到
+70ms，说明 mirror 对纯循环控制有 3.7 倍价值，不能简单关掉）；`bitops`
+125ms、check 正确；`whale_test` ok；`fusecorrect.js` 全过；探针全扫只有
+`numbug3.js`（本身语法错误）。
+
+## 教训
+
+1. **bisect 必须保证"源码变了，二进制一定重建"。** 我 memory 里记着
+   "stale binaries"这条，这次还是踩了。规矩：`del` 目标 exe，显式
+   `xmake f -o <dir>`，再 `xmake build -r`，然后 `dir` 看一眼时间戳。
+2. **"循环后返回计数器"是最小的 mirror 探针。** `for(;i<n;i++){} return i`
+   比任何复杂基准都先暴露这类错误，应该放进常驻探针集。
+3. **死代码不会报错。** 那段装箱在 C 里完全合法，TCC 照单全收，只是没人
+   跳到它。这类 bug 只能靠"读生成代码、对照跳转"发现，靠跑基准发现不了。
+4. **不要因为一个 bug 就关掉整个特性。** 我一度用 `if (0)` 关掉 int-region，
+   `nested` 立刻从 19ms 退化到 70ms。特性是对的，错的是一个语句的位置。
+
+# <146>: fib 的真实差距在 TCC 的代码质量，不在调用约定
+
+TIPS（记录，未改代码）
+
+## 一、先澄清两件事
+
+### 1. 之前 fib 的 6ms 是 memo 命中，不是快
+
+perftest 设 `WHALE_NO_MEMO=1`（为了让"同一函数调 20 次"真的算 20 次）。
+不设时 fib 是 4ms，设了是 77-92ms。`fib(26)` 单次在两种设置下都是 3-4ms，
+说明 4ms 那个数是**结果缓存**答的：20 次调用只算了一次。
+
+对照 node：同样 20 次，node 32ms。所以真实差距是 **77-92 对 32**，约
+2.4-2.9 倍，不是之前以为的 13 倍。
+
+### 2. 递归没有走引擎，已经是直接调用 core
+
+生成的代码里，两个递归点都是：
+
+    _r = whale_jit_core_1 ( ctx , args , _an , & _dd , & _cref , var_refs ) ;
+
+**直接调用编译出来的 core 函数**，不经过 `JS_CallInternal`、不装箱、不建
+帧。`entries=31` 容易误读：它只统计"从引擎进入编译代码"的次数，39 万次
+递归全在 core 内部，不进那个计数。
+
+## 二、差距在哪：量出来的
+
+把生成的 core 原样抽出来，用 gcc 编译，逐项去掉开销：
+
+| 版本 | -O0 | -O2 |
+|---|---|---|
+| 原样（CheckStack 每个调用点 + `_wsv` 往返） | **4ms** | 1ms |
+| CheckStack 提到入口（每层一次而不是每点两次） | 3ms | 2ms |
+| 再去掉 `_wsv` 往返（结果留在局部变量） | **2ms** | 1ms |
+
+`fib(26)` 一层约 39 万次递归，`-O0` 4ms 对 `-O2` 1ms —— **这就是 TCC 与
+gcc -O2 的差距本身**。而 whalejs 实测每次 3.9-4.6ms，正好落在 `-O0` 那一
+格。所以：
+
+- core 里能省的是 **4ms → 2ms**（CheckStack 提到入口 + 去掉 `_wsv` 往返），
+  确定收益，改动局部；
+- 剩下的 2ms vs node 的 1.6ms 是 **TCC 不做指令调度/寄存器分配**，生成器
+  层面改不动（<141>/<142> 已记录）。
+
+## 三、关于"自己实现调用约定"
+
+用户提出：递归大量重复，可以考虑自定义调用约定而不是通用栈。
+
+**实测不支持这个方向**：递归已经是裸 C 函数调用（core 直接调 core），
+参数通过 `_an[]` 数组传递、结果通过返回值——这已经是最简的调用约定，
+比任何自定义 ABI 都薄。差距不在调用约定，在 TCC 生成的指令质量。
+
+真要说调用约定还有优化空间，只有一处：`_an[1]` 这个数组。它每次递归都在
+栈上开一个数组，而参数只有一个。改成直接传 double 参数（按 arity 生成
+`core_n1(double A0)` 这样的变体）能省一次数组寻址，但按 `-O0` 的测量，
+这部分在 4ms 里占不到 0.5ms。
+
+## 四、值得做的两项（确定收益，各约 25%）
+
+1. **`CheckStack` 从每个调用点提到函数入口。** 现在每层递归检查两次
+   （两个调用点各一次），提到 core 开头只检查一次。栈溢出保护不减弱：
+   每次进入 core 仍然检查。
+2. **递归结果不绕 `_wsv[]`。** 现在是 `_r = core(...)` 然后
+   `_wsv[n] = _r`，后面再从 `_wsv[n]` 读。`_r` 已经是局部变量，直接用它
+   就行——需要把 `_r` 的声明提到函数作用域，按调用点编号（`_r0.._r7`）。
+
+两项都在生成器里，改动局部，不碰引擎。
+
+## 五、教训
+
+1. **`entries` 不是调用次数。** 它只统计引擎进入编译代码的次数，递归在
+   core 内部完成，不会计入。用 `entries` 判断"有没有走编译代码"是对的，
+   判断"算了多少次"是错的。
+2. **memo 会伪造性能。** 同一函数同一参数调 N 次，不开 `WHALE_NO_MEMO`
+   时量到的是 1 次。任何"循环调用同一个纯函数"的基准都必须关掉它。
+3. **先把生成的代码抽出来用别的编译器编一遍，再决定优化方向。**
+   这一步直接排除了"调用约定"这个方向，把目标锁定在 core 内部的
+   CheckStack 和 `_wsv` 往返上。
+
+# <147>: fib 的两项尝试：CheckStack 提到入口（保留）+ 结果直用 `_r`（回退）
+
+TIPS
+
+## 一、CheckStack 从每个调用点提到 core 入口（保留）
+
+自递归调用点原来每个都发一次 `JS_WhaleCheckStack`，fib 一层两次。现在
+core 开头检查一次（`whale_gen_self_ref` 时），调用点不再检查。
+
+栈保护不减弱：自调用直接进 core，core 入口是每层第一个执行的东西。
+
+**实测收益：没有测出来**（fib 77-92ms 波动，改动前后同区间）。理论上省
+39 万次 out-of-line 调用，但在 TCC 生成的代码里这部分被其他开销盖住。
+保留它是因为它不增加任何风险、代码更干净，而且对更深的递归有边际收益。
+
+## 二、递归结果直接留在 `_r`（回退）
+
+想法：`_r = core(...)` 之后又 `_wsv[n] = _r`，后面再从 `_wsv[n]` 读。
+`_r` 已经是局部变量，直接用它应该省一次 store + 一次 load。
+
+**这个改法是错的**，生成出来是 `return (_r + _r)`：
+
+    L7 : { double _an[1]; double _r = 0; int _dd = 0;
+           _r = whale_jit_core_1(...);
+           { double _an[1]; double _r = 0; int _dd = 0;
+             _r = whale_jit_core_1(...);
+             return (_r + _r); } }
+
+`_r` 是**块内局部变量**，两个调用点各有自己的 `_r`。把结果槽直接命名成
+`_r` 之后，两个调用点都指向同一个名字，后一个覆盖前一个。值池里的
+`_wsv[n]` 之所以存在，正是因为每次调用要有**自己**的名字。
+
+已回退。如果还要做这个优化，正确做法是给每个调用点分配独立的函数级局部
+（`_r0`, `_r1`, ...），而不是共用一个 `_r`。
+
+## 三、结论：fib 的差距是 TCC 的代码质量
+
+<146> 里量过：把生成的 core 抽出来用 gcc 编，`-O0` 是 4ms、`-O2` 是 1ms
+（`fib(26)` 单次）。whalejs 实测每次 3.9-4.6ms，正好落在 `-O0` 那一格。
+
+core 内部能省的两项（CheckStack 提到入口、结果不绕值池）在 `-O0` 下合计
+只值约 2ms/4ms，而且第二项的正确实现（每调用点独立局部）还没做。
+
+**用户提出的"自定义调用约定"方向已排除**：递归已经是裸 C 函数调用
+（core 直接调 core），参数走 `_an[]`、结果走返回值，没有比这更薄的约定。
+差距在指令质量，不在约定。
+
+## 四、教训
+
+1. **块内局部变量不能跨块共享名字。** `_r` 在每个 `{ }` 里都是新的；用它
+   当"这个调用的结果"意味着两个调用点会撞名。值池（每次分配新名字）正是
+   为了避免这件事——**看起来冗余的那次拷贝，是命名的来源**。
+2. **改完要看生成代码，不要只看数字。** `_r + _r` 这个错误在计时上完全
+   看不出来（它甚至更快），只有读生成的 C 才看得见。
+3. **"没有测出收益"也要如实记录。** CheckStack 那项我保留了，但它没有
+   可测收益；不写下来，下次会有人以为它是优化。
+
+
+# <148>: 合并两局部读取的类型传播 bug（前端）——顺带回答“能不能魔改 TCC”
+
+TIPS
+
+## 一、缘起：用户问“允许魔改 tcc，工作量小就这轮解决，大就先记录”
+
+为判定工作量，先看 TCC 到底为数值循环生成了什么。手段：
+`WHALE_JIT_SRC=<file>` 导出**生成的 C**，`WHALE_JIT_OBJ=<dir>`（debug 构建）导出
+**机器码**后 `objdump -D -b binary -m i386:x86-64` 反汇编。两边都拿到了。
+
+`function f(n){var a=0,i;for(i=0;i<n;i++){a=a|i;}return a;}` 的循环体原本是：
+
+    L4 : if (!((I1) < (A0))) goto L16 ;
+    _wv0 = ((double)((int)(long long)((I0)) | (int)(long long)((I1)))) ;
+    I1 = I1 + 1 ;
+    I0 = ((int)(_wv0)) ;
+    goto L4 ;
+
+对应机器码里每轮有 `movsxd` + `cvtsi2sd` + `or` + `cvttsd2si`
+——**两次类型转换及一个 double 临时变量**，而这些正是
+int mirror（注 <关于 int 镜像的笔记）存在的意义——mirror 本该让循环在
+**纯整数** 上跑。所以问题不在 TCC，在**生成的 C**。
+
+参照：gcc `-O0` 对同一个循环也是每个局部变量都进栈（`movl -8(%rbp),%eax; orl ...`），
+所以“没有优化器”是共同背景，TCC 并不是异类。真正的负担是前端多给的那两次转换。
+
+## 二、根因：`OP_get_loc0_loc1` 报了旧类型
+
+QuickJS 对 `a | i`（两个操作数恰好是 local 0/1）发 **合并指令**
+`OP_get_loc0_loc1`。该分支（`whale_jit.c` get_loc0_loc1 case）用 `local_inline()`
+正确地发出了镜像名 `I0`/`I1`，**但把 `cur[0]`/`cur[1]`（循环前存的旧类型）
+推进了值栈**。于是接着的 `|` 看到 `NUM | NUM`，走了非 intclean 分支：
+`(double)((int)(long long)(...) | ...)`。`fold_toint32` 对 NUM 操作数的 `(long long)`
+截断是语义上必要的（包含超范围 double），但镜像本来就是 int。
+
+一句话：**发了 int 的名字，报了 double 的类型**。单条 `get_loc` 走 `whale_load_analyze`
+（在第 985-988 行对镜像读取拒绝 `L<idx>` 短路），不经过 `cur[]`，所以
+`local_inline` 那条路径没问题；只有合并指令把类型从 `cur[]` 直接拷贝了。
+
+## 三、修法
+
+`get_loc0_loc1` 推类型时，镜像且非常量局部（常量局部走字面量，不是镜像）
+推 `WHALE_T_IBIT`（裸 int，零转换），否则维持 `cur[]`：
+
+    cur[var_count + sp]     = (!whale_lo_c[0] && whale_int_ok && whale_loop_depth > 0
+                               && whale_int_mirror[0]) ? WHALE_T_IBIT : cur[0];
+    cur[var_count + sp + 1] = (!whale_lo_c[1] && whale_int_ok && whale_loop_depth > 0
+                               && whale_int_mirror[1]) ? WHALE_T_IBIT : cur[1];
+
+修后生成的 C：
+
+    L4 : if (!((I1) < (A0))) goto L16 ;
+    I0 = ((int)(((I0) | (I1)))) ;
+    I1 = I1 + 1 ;
+    goto L4 ;
+
+机器码循环体只剩 `or eax,ecx` + `add eax,1`，`movsxd`/`cvtsi2sd`/`cvttsd2si`
+全消失。**实测**：`orloop`（`a=a|i`，5e6×5）**35ms → 9ms**，node 同环境 14-17ms
+——这类报表上首次**超过 V8**。
+
+## 四、验证
+
+- perftest（25 cases）全过，0 不匹配；`bitops`/`loop_sum`/`locals` 不受影响
+  （它们是 double 域或混合循环，不走 int mirror —见第五节）。
+- 新探针 `temp/jitprobe/fusedmirror.js`：or/and/xor 累加器 + 退出盒子（`return a+i`）
+  全部与解释器一致。
+- `whale_test`：`whale api test: ok`。
+- 185 个探针扇扫：仅已知的 `numbug3.js`（语法错误）。
+
+## 五、为什么 `bits`（bitops 用例）还是没变快
+
+`bitops` 的 `acc` 同时参与 `+`/`-` 和 `^`/`|`，`whale_loop_int_of` 的**保守
+保定规则**（只有纯 bitwise 生产的 put 才能入 mirror；一旦该
+局部在循环内跟 `+`/`-`/`set_loc` 混用就拉黑，见 1789-1822 行的 `no_mirror`）
+不允许把 `acc` 放进镜像。它只能靠 `v`（`i & 255`）这种纯 bitwise
+中间量，对整体帮助有限。要真正加速 `bitops`，需要**范围分析**（证明
+`acc` 的 `+`/`-` 不会离开 int32 范围，从而也可镜像）——这是下一个独立的
+、更大的改动，不是本次抽出的 bug。已记录，留作循环优化候选。
+
+## 六、结论：不需要魔改 TCC
+
+- TCC **忠实编译了手里的 C**。生成 C 有冗余转换时，TCC 不会替你消
+  掉——它也不该。改 TCC（加优化器/寄存器分配）是大工程；而本次发现
+  的性能损失根本不在 TCC，在前端发错了类型。
+- 所以**本轮不改 TCC**，改前端；这正好符合用户的另一条指导：类型固化是
+  **前端的事**，后端拿到带类型名的整数就该生成整数代码。
+- 下一步方向（记录）：①范围分析让 `bitops` 类混合累加器也可镜像；
+  ②真正的 LICM；③通用循环展开（用户已给出正确方法：循环外算 `n-3`，
+  4 次无守卫拷贝，再处理尾部）。
+
+## 七、教训
+
+1. **“能不能改后端”先看后端到底拿到了什么。**把生成的 C 和反汇编
+   对着看，一眼就能分清“后端拉夸”还是“前端发了废话”。本次属于后者。
+2. **合并指令（`get_loc0_loc1` 类）容易漏类型。**它绕过了 `whale_load_analyze`
+   的统一拒绝逻辑，直接从 `cur[]` 拷贝——以后加合并 opcode 时，类型
+   推导要跟单条路径对齐。
+3. **`entries=1` 不代表循环跑在编译代码里。**`bitops` 也是 `entries=1`，
+   但很多局部仍在 double 域。要看循环体的生成 C。
+
+
+# <149>: 循环内代数恒等式未折叠（前端的另一个循环遗漏，已记录）
+
+TIPS
+
+## 一、现象
+
+`perftest/cases/ident.js`（代数恒等式：`x*1.0` / `1.0*x` / `x/1.0` / `x-0.0`）
+whalejs **48ms** vs node **9ms**。代码原本的意图就是这些恒等式应该消失。
+
+拿到生成的 C（`WHALE_JIT_SRC`），循环体是：
+
+    L0 = L0 ;                                                  /* s*1.0, 1.0*s — 成功 */
+    _wv0 = ((((L0) / (1)) - (0)) + (((I1) & 3))) ;             /* s/1.0, s-0.0 — 失败 */
+    I1 = I1 + 1 ;
+    L0 = (_wv0) ;
+
+**`x*1.0`/`1.0*x` 折叠了，`x/1.0`、`x-0.0` 没有**——`(L0)/(1)` 和 `(...)-(0)`
+是真的除法/减法。而且这两个恒等式**单独放一个循环里会折**
+（`div1_only.js`：`L0 = L0 ;`）——所以是**组合/顺序** 才触发。
+
+## 二、机制（已定位）
+
+- 恒等式折叠只在 **pass-2 peephole**（`whale_jit.c` 7925-7968 行）里，
+  它要求**两个操作数都是 `whale_load_analyze` 能认的装载**（`ok1 && ok2`）。
+- `s = s * 1.0` 执行后，`s` 变成一个 **pending 自拷贝**（`local_set` 延迟，
+  `L0 = L0`）。再走 `s = s / 1.0` 时，对 `s` 的读取在 `whale_load_analyze`
+  的 977 行被**拒绝**（“延迟局部不能当 `L<idx>` 读”）→ `ok1=0`
+  → peephole 跳过 → 走通用二元路径（11312-11321），而通用路径**没有恒等式处理**，
+  直接发 `fold_inline(sp-2); wt_op; fold_inline(sp-1)`。
+- 为什么单独放能折：那时 `s` 还是常量局部（或 `L0` 读取），
+  `ok1 && ok2` 成立，peephole 生效。
+
+一句话：**恒等式只在 peephole 里，而 peephole 只看得见两个“装载”；
+一旦左操作数是延迟局部（一个待定表达式），折叠就不发生。**
+
+## 三、为什么本轮不动手
+
+`ident` 这个恒等式不在用户列的三个重点（展开/LICM/类型固化）
+里，且修法要动的正是**延迟局部机制**——而该机制在 `ident` 上已有
+记录在案的回退（`local_set` 4189 行的注释：强制物化自拷贝在 ident 上
+86→120ms+）。在这里加恒等式需要同时：①判断单参一个 token 是不是**数值字面量**
+（`len==1` 不够——`L0` 也是一个 token，会读到 `gw_num` 的垃圾值；
+mod 站点 11339 行用 `tb == WHALE_T_ICONST` 避开这个坑，但 `1.0` 走 `push_const`
+报的是 `WHALE_T_NUM`，进不了那个分支）；②在通用路径重复一套恒等式逻辑
+（与 peephole 不一致的风险）。难度不算小、风险在热路径上，按用户“想好再动手”
+的要求，**本轮记录，不动手**。
+
+## 四、候选修法（给下一轮）
+
+①给字面量一个能区分的类型（比如 `push_const` 的 int 报 `WHALE_T_ICONST`，
+  float 新增一个 `WHALE_T_FCONST` 并把值放进 `whale_vexpr`/`gw_num`），而不是
+  一律 `WHALE_T_NUM`；
+②把 peephole 里的恒等式提成小函数，两个路径（peephole + 通用二元）共用；
+③新探针：`x*1.0`/`1.0*x`/`x/1.0`/`x-0.0` 分别在「首次与连续赋值」两种上下文下
+  比对值与生成 C（确保 `-0 - 0 == -0`、不能把 `x+0`/`x*0` 当恒等式）。
+
+## 五、教训
+
+1. **同一个代数恒等式在两个上下文里行为不同，是“延迟局部”在切断优化。**
+   `s=s*1.0` 之后 `s` 不再是一个装载。
+2. **`len==1` 不等于字面量。**单 token 可能是标识符；只有带类型
+   保证（ICONST/新 FCONST）才能读 `gw_num`。
+3. **发现开销但修法风险大时，记录比硬上好。**本次已在同一轮
+   落地一个低风险的前端循环优化（<148>），ident 这个留下来。
+
+
+# <150>: 循环优化两项落地：代数恒等式补全 + 通用 4x 展开
+
+TIPS
+
+## 一、先用 C 实验确定哪个方向有钱可赚
+
+用户要求做循环优化（展开 / LICM / 循环体内类型固化）。上一轮已知 TCC
+的代码质量相当于 gcc `-O0`（<146>），所以先用 `-O0` 把三个方向各量一遍，
+避免白实现：
+
+    -O0（2e7 次迭代）        原始   优化后
+    double 累加器，加 register   71ms    18ms   ← 4x
+    int 累加器（已是内存 RMW）  16ms    16ms   ← 无
+    mixed（两个互相依赖），加 register 158ms  53ms  ← 3x
+    LICM（不变量已提到外面）   77ms    73ms   ← 无
+    4x 展开（double 累加器）  86ms    71ms   ← 有限
+    4x 展开（int 累加器）     62ms    48ms   ← 有限
+
+结论：在 `-O0` 下**寄存器固定是最大的一块**（而 WhaleJS 已经有 ELS
+pin，见 tccgen.c 的 `register` 插标）；LICM 几乎不值钱；展开有限但正向。
+所以本轮做两件事：补全恒等式（它在 ident 上占到了主要成本）、通用 4x 展开。
+
+## 二、恒等式补全（修 <149> 记录的遗留）
+
+<149> 记录了 `x/1.0`、`x-0.0` 在循环里不折叠：恒等式只在 pass-2 peephole
+（7925 行附近），而它要求两个操作数都是 `whale_load_analyze` 能认的
+装载；`s = s * 1.0` 使 `s` 变成延迟局部，再读就被拒绝。
+
+**修法**：把恒等式加到**通用二元路径**（11369 行附近）。判定字面量靠
+新增的 `JS_WhaleTokCDouble()`（tcc iface）+ `whale_lit_val()`：**必须看 token id**——
+`len==1` 不够，`L0` 也是一个 token，拿它去读 `gw_num` 是垃圾值。三条规则：
+
+- `x * 1.0`、`1.0 * x` → x
+- `x / 1.0` → x
+- `x - 0.0` → x，**但只限 +0**：`x - (-0.0)` 会把 -0 变成 +0。`whale_lit_is_pos_zero()`
+  用 `1.0/v` 的符号判正负零（不能用 `v == 0.0`）。
+- **不做** `x + 0.0`（-0 + 0 是 +0）、`x * 0`（NaN * 0 是 NaN）。
+
+新探针 `temp/jitprobe/identities.js` 把这些全覆盖了：正常值 + 负零符号
+（`-0 - 0` 得 -Inf，`-0 - (-0)` 得 +Inf）+ NaN 传递。全过。
+
+**实测**：`ident` 17-18ms → **5ms**（node 8ms）。生成的 C 里 `((L0)/(1))-(0)` 消失。
+
+## 三、通用 4x 展开（`whale_loop_unroll4`）
+
+原有展开只认**常量次数 ≤ 8** 的循环（`whale_loop_unroll`），热循环
+`for (i = 0; i < n; i++)` 一个都不算。新增一个路径，复用 `whale_loop_int_of`
+已经证明的形状（`g = 0`、`g < K`、`inc_loc g`、无调用）。
+
+按用户给的方法：**循环外算边界，4 次无守卫拷贝，再处理尾部**。生成的形状：
+
+    Lhead:  if (!((g) < (K - 3))) goto RuN;      /* 四个一组 */
+            body body body body
+            goto Lhead;
+    RuN:    if (!((g) < (K))) goto Lexit;        /* 原测试原样复用 */
+            body
+            goto RuN;
+
+**不改写增量语句**：每份拷贝照跑原来的 `g = g + 1`，四份就是 +4，
+尾部再 +1。这比“把增量提到组尾”安全得多：不需要理解每份拷贝里
+计数器到底被读了几次、被写了几次。`K - 3` 对任何 K 都对（请求“再来四次”，
+不够就交给尾部）；NaN 下两个测试都为假，行为一致。
+
+### 两个坑（都是实测撞出来的）
+
+1. **`!(g) < x` 不是 `!((g) < x)`**。第一版漏了一层括号，生成
+   `if (!(I3) < (A0 - 3))`——变成 `(!I3) < ...`，完全错误的测试。
+2. **`:` 不一定是标签**。第一版把循环体里每个 `X :` 当标签收集并改名，
+   而 `cond ? 1 : 0` 也会产生 `: `，于是 bitops 的 `i & 255` 里那个字面量 0 被改成
+   标签名 `Ru1_0_0`，生成 `i & Ru1_0_0` → `'Ru1_0_0' undeclared` → bitops 回退到解释器
+   （534ms）。**现在直接拒绝含 `:` 或 `goto` 的循环体**，四份拷贝完全不需要改名。
+   代价：分支循环（bitops、loop_sum、sieve）不展开——这也是后续可做的点（见第五节）。
+
+另外一个坑：`wt()`/`wk()`/`wt_slot()` 发的是 **fold sink**，不是输出；
+必须 `fold_mark()` → 发 → `fold_commit(mark)`。第一版没 commit，标签和 `if` 根本没进输出。
+且 commit 后要 `JS_WhaleTokSinkTruncate(mark)` 把 sink 收回，否则每个循环头都在一个
+固定大小的工作区里白占位。封成 `unroll_emit()`。
+
+容量也要**事先算完**：每次发就直写输出，中途超限返回 0 会留下
+半个循环，`loop_end` 还会把原体再追一遍。
+
+## 四、实测（中位数，7 次，`WHALE_NO_UNROLL4` 对照）
+
+    case         开       关    差
+    ident         5       18    -13      （再加上恒等式：原本 48）
+    nested       11       20     -9
+    locals       63       67     -4
+    sieve        63       66     -3
+    mixed       130      128     +2
+    arith        62       62      0
+    bitops      125      125      0
+    loop_sum     45       44     +1
+
+展开在**真实生成代码里确实有收益**，比上面 gcc `-O0` 微基准里的
+收益大——因为每轮测试里还有 `(double)I` 转换和循环变量的存取，
+四次变一次直接把它们分摊了。快速展开对循环体很小的情况（arith）中性，
+对有四个存取的 mixed 略亏（+），属于正常波动。
+
+## 五、后续（已记录，本轮未做）
+
+1. **分支循环的展开**：现在拒绝含 `:`/`goto` 的体。正确做法：标签定义的判定
+   必须是“前一个 token 是 `;`/`{`/`}`（语句边界）且后一个是 `:`”，`goto`
+   目标只认 `goto X ;` 里的 X。只有这两种位置才能改名。
+2. **循环体内类型固化的剩下一块**：bitops 的 `acc` 同时参与 `+`/`-` 和
+   `^`/`|`，因为没有范围分析而进不了 int mirror（<148> 第五节）。
+   真正的 LICM 已经有一半（同一基本块的不变量复用），C 实验说明
+   剩下那半不值钱，不优先。
+3. **寄存器固定仍是最大一块**（`-O0` 实验 71→18ms）。现有 ELS pin 只管
+   `info->loop_count == 1 && !whale_loop_has_call`，且池子只有 4 个（<117> 拓到 4）。
+   `mixed`/`locals` 已经拿到了 pin（`[pin] d=0 heat=3`），但生成的 C 里仍有可看见的
+   写回存储（write-through 保证 home slot 权威）——它们的剩余差距在这里。
+
+## 六、教训
+
+1. **先用目标代码质量做微基准，再写优化。**本轮若不先量，会把
+   LICM（几乎不值钱）当成重点去写。
+2. **改写 token 流时，“看起来像标签”不等于标签。**`:` 也是三元运算符的
+   一部分；不确定就拒绝，不要改名。
+3. **发 token 记得 mark/commit**。这个坑上一次就踩过（<30>/<32>），这次又踩了：
+   `wt()` 不是直写输出。
+4. **探针里的“参考实现”也要有侶份保护。**第一版 unroll4 探针用
+   `while` 写参照，循环计数一错就死循环，表现为“整个探针挂住”、什么也不输出。
+   后来改成直接对照 node 算好的数组。
+
+
+# <151>: promise reaction BEFORE/AFTER —`await` 也能带上异步上下文
+
+SOLVED
+
+## 问题
+
+WhaleNode 报（`doc-internal/whalejs-async-hook.md`）：`AsyncLocalStorage` 在
+`await` 之后拿不到 store。原因是引擎的 promise hook 只在 thenable 解析
+（`js_promise_resolve_thenable_job`）周围发 BEFORE/AFTER，普通 reaction 没有。
+
+关键点：**`await` 不走 JS 可见的 `then`**，它直接调
+`perform_promise_then`，所以任何对 `Promise.prototype.then` 的 JS 包装都看不到
+它。两条路径最终都落到 `promise_reaction_job`，钩子放这里一次覆盖两者。
+
+## 三处，都不是"加两行"那么简单
+
+### 1. job 要带上是哪个 promise
+
+两处 enqueue 都加第 6 个参数。但**带哪一个**有讲究：Node 报的是 reaction
+**将要 settle 的那个** promise，不是被 reaction 的那个。
+
+- `.then()`：从 resolving function 的 `JSPromiseFunctionData.promise` 读派生
+  promise。如果报源 promise，在两个 promise 于**不同** `run()` 作用域创建时
+  就会恢复错的上下文——这正是 JS 包装当初要遮住的情形。
+- `await`：resolving funcs 属于 async 函数的帧（`JS_CLASS_ASYNC_FUNCTION_RESOLVE`），
+  没有派生 promise，回退到被 await 的那个（它在 await 时创建，位于 await 的
+  上下文里，是对的）。
+
+### 2. `await` 必须真的创建 throwaway capability
+
+`js_async_function_resume` 里原本按规范注释"no need to create
+'thrownawayCapability'"，把 `resolving_funcs1` 全设 `JS_UNDEFINED`。但它是
+**唯一在 await 上下文里创建的 promise**，也是 hook 要报的那个。不建它，
+`await <别处创建的 promise>` 就会报那个外来 promise、恢复错 store——promise
+被缓存或跨上下文共享时立刻可见。Node 每个 await 也分配一个，理由相同；结果
+settle 它，没人观察。
+
+### 3. AFTER 在 reaction settle 之后，不是之前
+
+Node 的顺序是 BEFORE → handler → RESOLVE → AFTER。第一版把 AFTER 放在
+`JS_Call(func, ...)`（即 settle）之前，序列变成 `B R A` 顺序反了。改到最后，
+但**不可捕获错误那条早返回路径上仍要补一次 AFTER**——host 在 BEFORE 压栈，
+不弹就永久泄漏上下文栈。
+
+`js_promise_resolve_thenable_job` 的那一对是**另一个** promise，保留；两对是
+嵌套关系，不是重复。
+
+## 验证
+
+- 新增 `tests/promise/test_promise_hook.c`（target `whale_promise_test`）：
+  检查 `.then` / `await` / rejection 的钩子序列，以及 BEFORE/AFTER 配平
+  （每个 BEFORE 都有 AFTER，深度从不为负，结束时归零）。
+- WhaleNode：`repro_await_als.js` 与 node 输出一致；
+  `temp/als_semantics.js` 四种情形（外部 promise 的 .then、内部 .then、
+  await 外部 promise、await null）全部与 node 相同；
+  全量 suite **334 passed / 0 failed**。
+
+## 教训
+
+1. **"规范说不用建"不等于"没有可观察的副作用"**。throwaway capability 在
+   语义上确实没人用，但它是 hook 唯一的身份来源——删掉它，钩子就报错了对象。
+2. **钩子报哪个对象，和钩子在哪儿发，是两个独立决策**。先确定"谁是这次
+   reaction 的 promise"，再决定在哪发；只做后者会得到"看起来触发了但上下文
+   还是错的"。
+3. **顺序也是契约**。`B R A` 和 `B A R` 都能让"压栈/弹栈配平"通过，只有
+   对照 Node 的真实序列才看得出错。
+4. WhaleNode 侧的 `resolve` 钩子原来会 `storeOf.delete(promise)`——已 settle
+   的 promise（`await null`、`Promise.resolve(x).then`）在 reaction 之前就发
+   RESOLVE，一删就把上下文丢了。改用 WeakMap 不删（随 promise 一起回收）。
+
+见 current.md <151>
