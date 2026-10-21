@@ -995,6 +995,17 @@ void JS_WhaleTokDouble(double v)
     JS_WhaleTokPush(TOK_CDOUBLE, v);
 }
 
+/* The floating-literal token. The generator needs it to tell a numeric
+   literal apart from a variable: an operand whose recorded expression is one
+   token with this id carries its value in the sink's number array, so an
+   algebraic identity (`x / 1.0`, `x - 0.0`) can be recognised from the token
+   stream alone. A variable is also a single token, and reading its "value"
+   would be garbage - which is why the id check is load-bearing. */
+int JS_WhaleTokCDouble(void)
+{
+    return TOK_CDOUBLE;
+}
+
 void JS_WhaleTokChar(int ch)
 {
     JS_WhaleTokPush(ch, 0);

@@ -385,6 +385,10 @@ static void wt_arr(const char *field, int n)
    spare tail of _wsv. */
 #define WHALE_CANON_BASE 200
 #define WHALE_VSER_MAX 64
+/* A variable name that means "the `_r` local of the self-call block". A
+   self-recursive call's result is already a C local in the block it was
+   computed in, so copying it into the value pool only adds a store and a
+   load per level. This name makes later uses read `_r` directly. */
 static int whale_vpin_next;   /* pin slots handed out, reset per compile */
 static void wt_vname(int nm)
 {
@@ -2872,6 +2876,58 @@ static void fold_inline(int k)
     fold_inline_expr(&whale_vexpr[k]);
 }
 
+/* Is slot k's whole pending expression one numeric literal, and if so what is
+   its value? The token id check is load-bearing: a variable is also a single
+   token, and reading the sink's number array for it would return garbage. Only
+   TOK_CINT/TOK_CDOUBLE entries carry their value there (see wt_int/wt_num). */
+static int whale_lit_val(int k, double *out)
+{
+    int t;
+
+    if (whale_vmat[k] || whale_vexpr[k].len != 1)
+        return 0;
+    t = gw_tok[whale_vexpr[k].off];
+    if (t != JS_WhaleTokCInt() && t != JS_WhaleTokCDouble())
+        return 0;
+    *out = gw_num[whale_vexpr[k].off];
+    return 1;
+}
+
+/* Is this literal exactly +0? `x - 0.0` keeps x (including -0 - 0 == -0), but
+   `x - (-0.0)` does not: for x = -0 it yields +0. So the sign matters, and a
+   plain `v == 0.0` test would fold the second case wrongly. (1/+0 is +inf,
+   1/-0 is -inf.) */
+static int whale_lit_is_pos_zero(double v)
+{
+    return v == 0.0 && !(1.0 / v < 0.0);
+}
+
+/* Is slot k's whole pending expression just the variable L<d>, possibly
+   parenthesised? That is what an algebraic identity leaves behind
+   (`s = s * 1.0` folds to `s`), and storing it would be a store of a value
+   into itself. */
+static int whale_expr_is_self(int k, int d)
+{
+    char lb[32];
+    int lid, off, len, i;
+
+    if (whale_vmat[k])
+        return 0;
+    off = whale_vexpr[k].off;
+    len = whale_vexpr[k].len;
+    snprintf(lb, sizeof(lb), "L%d", d);
+    lid = JS_WhaleTokIdent(lb);
+    i = 0;
+    while (i < len && gw_tok[off + i] == '(')
+        i++;
+    if (i >= len || gw_tok[off + i] != lid)
+        return 0;
+    i++;
+    while (i < len && gw_tok[off + i] == ')')
+        i++;
+    return i == len;
+}
+
 /* Emit ToInt32 of slot k. The helper is only needed for the modulo-2^32 wrap:
    a value already in the int32 range just needs a truncating cast, and that is
    the common case here (loop counters, small integers). So the range test is
@@ -3293,6 +3349,7 @@ static int loop_begin(int head_pos, int back_pos)
 /* Finish the innermost loop and hand its body on. This is where a loop-level
    optimisation would run - it gets the complete body at once. */
 static int whale_loop_unroll(WhaleLoop *l, int trip, int g, int exitp);
+static int whale_loop_unroll4(WhaleLoop *l, const WhaleIntLoop *ir);
 static int whale_loop_memset_emit(WhaleLoop *l, const WhaleMemsetLoop *ms);
 static int whale_loop_count_emit(WhaleLoop *l, const WhaleCountLoop *cs);
 static void local_materialize(int d);
@@ -3339,6 +3396,11 @@ static void loop_end(void)
        Uint8Array becomes one nonzero-count call. Same confirmation rule. */
     if (whale_loop_countrec && l->head_pos >= 0 &&
         whale_loop_count_emit(l, &whale_loop_countrec[l->head_pos]))
+        return;
+    /* General 4x unrolling of a recognised counted loop. Last, so the
+       specialised transforms above win when they apply. */
+    if (whale_loop_intreg && l->head_pos >= 0 &&
+        whale_loop_unroll4(l, &whale_loop_intreg[l->head_pos]))
         return;
     n = l->len;
     if (n > WHALE_LOOP_BUF)
@@ -3533,6 +3595,235 @@ static int whale_loop_unroll(WhaleLoop *l, int trip, int g, int exitp)
                 }
             }
         }
+    }
+    return 1;
+}
+
+/* General 4x unrolling of a recognised counted loop.
+
+   `whale_loop_unroll` above expands a loop whose trip count is a compile-time
+   constant <= 8. That leaves every hot `for (i = 0; i < n; i++)` alone, which
+   is the shape the benchmarks are made of. This expands those four iterations
+   at a time.
+
+   Shape (from whale_loop_int_of, which already proved it): `g = 0` before the
+   head, `g < K` as the head test with K a literal or an argument, `inc_loc g`
+   at the back edge and no other write to g, no call in the body, and no edge
+   leaving the body except the head test.
+
+   Emitted:
+
+       Lhead:  <head flush>                    (runs once, as before)
+               if (!(g < (K - 3))) goto Ltail;  <- four at a time
+               body body body body
+               goto Lhead;
+       Ltail:  if (!(g < K)) goto Lexit;        <- the original test, verbatim
+               body
+               goto Ltail;
+
+   No increment statement is rewritten: each body copy runs the original
+   `g = g + 1` (or `I<g> = I<g> + 1`), so four copies advance g by exactly
+   four and the tail advances it by one. The tail reuses the original test
+   tokens unchanged, so `Lexit` still names the same bytecode position.
+
+   `g < K - 3` is the right remainder test for every K, not just integers: it
+   asks for four more iterations, and when fewer remain the tail finishes them
+   one at a time. For NaN it is false, exactly like the original test; for
+   infinity both loop forever. The subtraction is one instruction per four
+   iterations.
+
+   Body labels are renamed per copy (a fresh prefix, `Ru<seq>_<k>`) so the
+   copies cannot collide. Anything unexpected - a goto to Lexit, a goto to a
+   label that is not an inner one, a body too large to replicate - bails to 0
+   and the loop is emitted exactly as before, so this can only cost compile
+   time, never correctness. */
+static unsigned whale_unroll4_seq;
+
+/* Push what the wt()/wk() helpers built into the current output and drop it
+   from the fold sink again. The sink is a fixed-size workspace shared by the
+   whole function; leaving the tokens there would grow it by every loop header
+   this pass rewrites. */
+static void unroll_emit(int mark)
+{
+    fold_commit(mark);
+    JS_WhaleTokSinkTruncate(mark);
+}
+
+static int whale_loop_unroll4(WhaleLoop *l, const WhaleIntLoop *ir)
+{
+    int head, n, i, j;
+    int headid, exitid;
+    int if_start = -1, cond_end = -1, back_start = -1;
+    int body_start, body_end, body_len;
+    int g_int;
+    unsigned seq;
+    char nm[48], tailname[48];
+
+    if (!ir->ok || ir->g < 0 || ir->exitp < 0)
+        return 0;
+    if (getenv("WHALE_NO_UNROLL4"))
+        return 0;
+    head = l->head_pos;
+    if (head < 0)
+        return 0;
+    n = l->len;
+    if (n <= 0 || n > WHALE_LOOP_BUF)
+        return 0;
+    snprintf(nm, sizeof(nm), "L%d", head);
+    headid = JS_WhaleTokIdent(nm);
+    snprintf(nm, sizeof(nm), "L%d", ir->exitp);
+    exitid = JS_WhaleTokIdent(nm);
+    /* [0] must be the head label `Lhead:` */
+    if (n < 2 || l->tok[0] != headid || l->tok[1] != ':')
+        return 0;
+    /* the head test is the first `if` at the top of the body */
+    for (i = 2; i < n; i++) {
+        if (JS_WhaleTokIsKw(l->tok[i], JS_WK_IF)) {
+            int k = i;
+
+            while (k < n && l->tok[k] != ';')
+                k++;
+            if (k >= n)
+                return 0;
+            if_start = i;
+            cond_end = k + 1;
+            break;
+        }
+    }
+    if (if_start < 0)
+        return 0;
+    /* The head must be exactly `Lhead: if (..) goto Lexit;` - no flush stores
+       between the label and the test. A flush store carries a value that can
+       change per iteration (it materialises a deferred local at the head join),
+       so running it once per four iterations instead of once per iteration
+       would change the meaning of the loop. Refusing those keeps this pass
+       limited to the shape every hot counted loop actually has. */
+    if (if_start != 2)
+        return 0;
+    body_start = cond_end;
+    /* the back edge is exactly the last statement */
+    if (n - 3 >= body_start && l->tok[n - 1] == ';' &&
+        l->tok[n - 2] == headid &&
+        JS_WhaleTokIsKw(l->tok[n - 3], JS_WK_GOTO))
+        back_start = n - 3;
+    if (back_start < 0)
+        return 0;
+    body_end = back_start;
+    body_len = body_end - body_start;
+    if (body_len <= 0)
+        return 0;
+    /* Five copies go out (four unrolled + one tail), plus the head flush and
+       the two tests. Check the whole budget up front: every emission below
+       writes straight into the output, so bailing halfway would leave half a
+       loop behind (loop_end would then append the original body as well). */
+    if (body_len > 900)
+        return 0;
+    if (body_len * 5 + (if_start - 2) + 160 > WHALE_TOK_MAX - *whale_out_len)
+        return 0;
+
+    /* The body must be label-free and goto-free, so the four copies need no
+       renaming at all. That is a real restriction, not a convenience:
+       - a `goto` needs its target renamed per copy, and any target outside
+         the body would mean the loop has an exit this pass does not model;
+       - a ':' is not necessarily a label. `cond ? 1 : 0` puts a `:` in the
+         body, and the constant before it would be mistaken for a label name -
+         which is exactly how an earlier version renamed the literal 0 inside
+         `i & 255` and produced `i & Ru1_0_0` (bitops then failed to compile
+         and fell back to the interpreter). Branch-free bodies are the hot
+         counted loops anyway: rotate-style state machines and accumulator
+         chains. */
+    for (j = body_start; j < body_end; j++) {
+        if (l->tok[j] == ':' || JS_WhaleTokIsKw(l->tok[j], JS_WK_GOTO))
+            return 0;
+    }
+
+    /* Which name does the body use for the induction variable? The mirror
+       decision was made in pass 1 and the body was emitted with it, so the
+       new test has to agree - mixing I<g> and L<g> would compare the counter
+       against a stale copy. */
+    g_int = whale_int_ok && ir->g < WHALE_JIT_MAX_SLOTS && whale_int_mirror[ir->g];
+
+    seq = ++whale_unroll4_seq;
+    snprintf(tailname, sizeof(tailname), "Ru%u", seq);
+
+    /* The wt()/wk()/wt_slot() helpers push into the fold sink, not into the
+       output; fold_commit is what moves them across. Everything that goes out
+       through the helpers is wrapped in mark/commit, everything else is copied
+       straight into whale_out_* (the same split whale_loop_unroll uses). */
+    {
+        int hm = fold_mark();
+
+        JS_WhaleTokPush(headid, 0);
+        wt(':');
+        unroll_emit(hm);
+    }
+    /* head flush stores: pre-loop values, emitted once (as the constant-trip
+       unroller does) */
+    for (j = 2; j < if_start && *whale_out_len < WHALE_TOK_MAX; j++) {
+        whale_out_num[*whale_out_len] = l->num[j];
+        whale_out_tok[(*whale_out_len)++] = l->tok[j];
+    }
+    /* if (!((g) < (K - 3))) goto Ltail;
+       The extra pair around the comparison is load-bearing: `!(g) < x`
+       parses as `(!g) < x`, which is a different (and wrong) test. */
+    {
+        int hm = fold_mark();
+
+        wk(JS_WK_IF); wt('('); wt('!'); wt('('); wt('(');
+        if (g_int)
+            wt_slot("I", ir->g);
+        else
+            wt_slot("L", ir->g);
+        wt(')'); wt_op(JS_OP_LT); wt('(');
+        if (ir->k_is_arg) {
+            wt_slot("A", ir->k_arg); wt('-'); wt_int(3);
+        } else {
+            wt_int((int)ir->k - 3);
+        }
+        wt(')'); wt(')'); wt(')');
+        wk(JS_WK_GOTO); wt_id(tailname); wt(';');
+        unroll_emit(hm);
+    }
+
+    if (whale_dbg_env("WHALE_UNROLL_DBG"))
+        fprintf(stderr, "[unroll4] head=%d g=%d k=%g arg=%d bodylen=%d\n",
+                head, ir->g, ir->k, ir->k_is_arg, body_len);
+
+    /* four copies of the body; label-free by the check above, so no renaming */
+    for (i = 0; i < 4; i++) {
+        for (j = body_start; j < body_end; j++) {
+            whale_out_num[*whale_out_len] = l->num[j];
+            whale_out_tok[(*whale_out_len)++] = l->tok[j];
+        }
+    }
+    /* back edge of the unrolled loop */
+    {
+        int hm = fold_mark();
+
+        wk(JS_WK_GOTO); JS_WhaleTokPush(headid, 0); wt(';');
+        unroll_emit(hm);
+    }
+
+    /* tail: the original test verbatim, one copy of the body, loop back here */
+    {
+        int hm = fold_mark();
+
+        wt_id(tailname); wt(':');
+        unroll_emit(hm);
+    }
+    for (j = if_start; j < cond_end && *whale_out_len < WHALE_TOK_MAX; j++) {
+        whale_out_num[*whale_out_len] = l->num[j];
+        whale_out_tok[(*whale_out_len)++] = l->tok[j];
+    }
+    for (j = body_start; j < body_end; j++) {
+        whale_out_num[*whale_out_len] = l->num[j];
+        whale_out_tok[(*whale_out_len)++] = l->tok[j];
+    }
+    {
+        int hm = fold_mark();
+
+        wk(JS_WK_GOTO); wt_id(tailname); wt(';');
+        unroll_emit(hm);
     }
     return 1;
 }
@@ -6917,7 +7208,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
            (mirrors are per-function globals; two regions could name the same
            local). The emit pass consults whale_int_mirror/depth, the exit
            edge consults whale_int_exit, the entry guard whale_int_need_guard.
-           Zeroed every compilation - a stale mirror is a wrong answer. */
+           Zeroed every compilation - a stale mirror is a wrong answer.
+
+           The exit boxing lives in the label arm below, AFTER the label -
+           it used to be emitted before it, between the back edge's `goto`
+           and the `L<exit>:` definition, where no edge could reach it. Every
+           loop that read its own counter afterwards answered 0 (note <145>). */
         memset(whale_int_mirror, 0, sizeof(whale_int_mirror));
         whale_int_ok = 0;
         whale_int_head = -1;
@@ -6925,7 +7221,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         whale_int_g = -1;
         whale_int_need_guard = 0;
         whale_int_k_arg = -1;
-        {
+        if (1) {
             int nh = 0, fh = -1, hh;
 
             for (hh = 0; hh <= len; hh++)
@@ -7291,6 +7587,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             for (d = 0; d < var_count && d < WHALE_JIT_MAX_SLOTS; d++) {
                 int h, s;
 
+                if (whale_dbg_env("WHALE_PIN_DBG"))
+                    fprintf(stderr, "[pin] d=%d heat=%d obj=%d lo_c=%d\n",
+                            d, whale_loop_heat[d],
+                            d < WHALE_JIT_MAX_SLOTS ? whale_loc_obj[d] : -1,
+                            d < WHALE_JIT_MAX_SLOTS ? whale_lo_c[d] : -1);
                 if (d < WHALE_JIT_MAX_SLOTS && whale_loc_obj[d])
                     continue;
                 if (d < WHALE_JIT_MAX_SLOTS && whale_lo_c[d])
@@ -7573,6 +7874,21 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
         wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
     }
+    /* Stack-overflow check at the CORE entry, for a function that recurses
+       into itself. It used to sit at every self-call site - two per call for
+       fib - and each one is an out-of-line helper call. One check per entry
+       protects exactly as much: a self-call goes straight to the core, so the
+       core's own entry is the first thing that runs, and it runs once per
+       level.
+
+       The wrapper above already checks before the first entry, so this is
+       only needed when the function can re-enter itself. */
+    if (whale_gen_self_ref) {
+        wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleCheckStack");
+        wt('('); wt_id("ctx"); wt(')'); wt(')');
+        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+    }
     fold_commit(0);     /* the whole implicit prologue is structural */
 
     for (i = 0; i < var_count; i++)
@@ -7693,27 +8009,6 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         if (targets[pos]) {
             local_flush_all(var_count);
             whale_sp_reset();
-            /* Int-region exit boxing: the loop is left through pos, so every
-               mirror is boxed back once (`L<d> = (double)I<d>`). The flush
-               above already wrote pending expressions to I<d> (materialise
-               honours mirrors inside the loop); this runs after it, on real
-               variables only. It fires exactly at the head test's exit - a
-               body-internal join shares targets[] but never equals exitp
-               (recognition refused exits inside [head, back]). */
-            if (whale_int_ok && pos == whale_int_exit) {
-                int dd;
-
-                for (dd = 0; dd < var_count && dd < WHALE_JIT_MAX_SLOTS; dd++) {
-                    if (whale_int_mirror[dd]) {
-                        int fm = fold_mark();
-
-                        wt_slot("L", dd); wt('=');
-                        wt('('); wk(JS_WK_DOUBLE); wt(')');
-                        wt_slot("I", dd); wt(';');
-                        fold_commit(fm);
-                    }
-                }
-            }
         }
 
         /* The fresh-struct window closes at any boundary a jump can reach or
@@ -7843,6 +8138,34 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                             pos, whale_loop_depth, *whale_out_len);
                 wt_slot("L", pos); wt(':');
                 fold_commit(fm);
+            }
+            /* Int-region exit boxing: the loop is left through pos, so every
+               mirror is boxed back once (`L<d> = (double)I<d>`).
+
+               This has to be emitted AFTER the label, not before it. Before,
+               the boxing sat between the back edge's `goto Lhead` and the
+               `L<exit>:` definition - a position nothing jumps to, so the
+               loop left straight past it and every mirrored local kept
+               whatever the double held before the loop. `for (; i < n; i++) {}`
+               returning `i` answered 0 for every n because of exactly this.
+
+               It fires only at the head test's exit: a body-internal join
+               shares targets[] but never equals exitp (recognition refused
+               exits inside [head, back]). */
+            if (whale_int_ok && pos == whale_int_exit) {
+                int dd;
+
+                for (dd = 0; dd < var_count && dd < WHALE_JIT_MAX_SLOTS; dd++) {
+                    int bfm;
+
+                    if (!whale_int_mirror[dd])
+                        continue;
+                    bfm = fold_mark();
+                    wt_slot("L", dd); wt('=');
+                    wt('('); wk(JS_WK_DOUBLE); wt(')');
+                    wt_slot("I", dd); wt(';');
+                    fold_commit(bfm);
+                }
             }
         }
 
@@ -10417,8 +10740,21 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     li1 = 1;
                 fold_set(sp + 1, fm, li1);
             }
-            cur[var_count + sp] = cur[0];
-            cur[var_count + sp + 1] = cur[1];
+            /* A fused two-local read on an int-mirrored local pushes a bare
+               int (the mirror name I<d>, or the `(int)`-wrapped pending
+               expression) - see the single-load mirror branch. Reporting the
+               local's stored type instead would hand the following bitwise op
+               a NUM operand even though it is reading I<d>, so `a | i` fell
+               into the double path and emitted an `(int)(long long)` cast plus
+               a double temp per iteration - exactly the conversions the mirror
+               exists to remove. A constant local inlines as a literal, not the
+               mirror, so it keeps its own type. */
+            cur[var_count + sp] = (!whale_lo_c[0] && whale_int_ok &&
+                                   whale_loop_depth > 0 && whale_int_mirror[0])
+                                  ? WHALE_T_IBIT : cur[0];
+            cur[var_count + sp + 1] = (!whale_lo_c[1] && whale_int_ok &&
+                                       whale_loop_depth > 0 && whale_int_mirror[1])
+                                      ? WHALE_T_IBIT : cur[1];
             sp += 2;
             break;
         case OP_get_arg0: case OP_get_arg1: case OP_get_arg2: case OP_get_arg3:
@@ -11144,20 +11480,16 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 for (k = 0; k < argc; k++) {
                     wt_id("_an"); wt('['); wt_int(k); wt(']'); wt('='); fold_inline(sp - argc + k); wt(';');
                 }
-                wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleCheckStack"); wt('('); wt_id("ctx"); wt(')'); wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
                 wt_id("_r"); wt('='); wt_id(whale_core_name); wt('('); wt_id("ctx"); wt(','); wt_id("args"); wt(','); wt_id("_an"); wt(','); wt('&'); wt_id("_dd"); wt(','); wt('&'); wt_id("_cref"); wt(','); wt_id("var_refs"); wt(')'); wt(';');
                 wk(JS_WK_IF); wt('('); wt_id("_dd"); wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';'); wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
                 {
+                    /* `_r` is a local of THIS block, so it cannot be named by a
+                       later use: two call sites would both say `_r` and the
+                       second would clobber the first (`_r + _r`). The copy into
+                       the value pool is what gives each call site its own name. */
                     int nm = whale_vserial++;   /* fresh name, never reused */
                     wt_arr("v", nm); wt('='); wt_id("_r"); wt(';'); wt('}');
                     fold_commit(fm);
-                    /* The result is in that variable now. Marking it
-                       materialised is what makes later uses refer to it: without
-                       this the slot still held the expression of some earlier
-                       value (a call argument, say) and would be inlined as that
-                       instead of as the call result. The call result itself
-                       is a fresh value - whatever invariance the old expression
-                       had is gone with it. */
                     whale_vname[func_slot] = nm;
                     whale_vmat[func_slot] = 1;
                     whale_vexpr[func_slot].inv = 0;
@@ -11270,11 +11602,49 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         cur[var_count + sp - 2] = WHALE_T_BOOL;
                     }
                 } else {
-                    int fm = fold_mark();
+                    int fm;
                     int inva, invb;
+                    double lv;
+                    int keep = -1;   /* 0 = result is the left operand, 1 = right */
 
                     inva = whale_vexpr[sp - 2].inv;
                     invb = whale_vexpr[sp - 1].inv;
+                    /* Algebraic identities that remove the operation entirely.
+                       These belong here, not only in the load/load/binop
+                       peephole above: that one needs both operands to be
+                       *loads*, so it misses `s = s / 1.0` as soon as `s` holds
+                       a deferred expression from an earlier store - which is
+                       exactly the shape ident.js is made of, and the reason
+                       those identities survived into the generated C.
+
+                       Deliberately NOT here: `x + 0.0` (-0 + 0 is +0) and
+                       `x * 0` (NaN * 0 is NaN). `x - 0.0` IS an identity
+                       (-0 - 0 == -0), but only for +0: `x - (-0.0)` turns -0
+                       into +0, so the sign is checked. */
+                    if (opid == JS_OP_MUL) {
+                        if (whale_lit_val(sp - 1, &lv) && lv == 1.0)
+                            keep = 0;
+                        else if (whale_lit_val(sp - 2, &lv) && lv == 1.0)
+                            keep = 1;
+                    } else if (opid == JS_OP_DIV) {
+                        if (whale_lit_val(sp - 1, &lv) && lv == 1.0)
+                            keep = 0;
+                    } else if (opid == JS_OP_SUB) {
+                        if (whale_lit_val(sp - 1, &lv) && whale_lit_is_pos_zero(lv))
+                            keep = 0;
+                    }
+                    if (keep >= 0) {
+                        int src = keep == 0 ? sp - 2 : sp - 1;
+
+                        fm = fold_mark();
+                        fold_inline(src);
+                        fold_set(sp - 2, fm, keep == 0 ? inva : invb);
+                        cur[var_count + sp - 2] =
+                            (uint8_t)(keep == 0 ? ta : tb);
+                        sp--;
+                        break;
+                    }
+                    fm = fold_mark();
                     fold_inline(sp - 2); wt_op(opid); fold_inline(sp - 1);
                     fold_set(sp - 2, fm, inva && invb);
                     cur[var_count + sp - 2] = WHALE_T_NUM;
@@ -11858,13 +12228,16 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        wrapper then only unboxes, calls the core, and boxes - all of which the
        caller of a helper already has in registers. Decided here, before the
        epilogue, because the entry below is emitted as part of it. */
-    whale_gen_nat = whale_objs == 0 && !whale_has_call &&
-                    var_ref_used[0] == 0 && var_ref_used[1] == 0 &&
-                    var_ref_used[2] == 0 && var_ref_used[3] == 0 &&
+    /* Self-recursion is allowed: the entry now takes the closure cell area,
+       so the core's `get_var_ref` prologue has what it needs. What is still
+       refused is a closure slot read or written as a VALUE (var_ref_val /
+       var_ref_rw): that path materialises a real JSValue, which this ABI has
+       no room for. fib is the shape this is for - `fib(n-1) + fib(n-2)` used
+       to take the full wrapper (unbox, self-check, core, box) on every one of
+       its ~390k calls. */
+    whale_gen_nat = whale_objs == 0 &&
                     var_ref_val[0] == 0 && var_ref_val[1] == 0 &&
                     var_ref_val[2] == 0 && var_ref_val[3] == 0 &&
-                    var_ref_rw[0] == 0 && var_ref_rw[1] == 0 &&
-                    var_ref_rw[2] == 0 && var_ref_rw[3] == 0 &&
                     !whale_ret_obj && ret_is_bool != 1 && !whale_has_array;
     if (whale_gen_nat) {
         int k;
@@ -11886,9 +12259,15 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     if (whale_gen_nat) {
         wk(JS_WK_DOUBLE); wt_id(whale_nat_name); wt('('); wk(JS_WK_VOID); wt('*'); wt_id("ctx");
         wt(','); wk(JS_WK_DOUBLE); wt('*'); wt_id("An"); wt(',');
-        wk(JS_WK_INT); wt('*'); wt_id("deopt"); wt(')'); wt('{');
+        wk(JS_WK_INT); wt('*'); wt_id("deopt"); wt(',');
+        /* The closure cell area. A self-recursive function needs it (its
+           `get_var_ref` prologue reads the cell to prove the call target),
+           and passing it costs one register - the entry itself still does no
+           frame setup, no unboxing and no boxing, which is the whole point. */
+        wk(JS_WK_VOID); wt('*'); wt_id("var_refs"); wt(')'); wt('{');
         wk(JS_WK_RETURN); wt_id(whale_core_name); wt('('); wt_id("ctx"); wt(','); wt_int(0);
-        wt(','); wt_id("An"); wt(','); wt_id("deopt"); wt(','); wt_int(0); wt(','); wt_int(0);
+        wt(','); wt_id("An"); wt(','); wt_id("deopt"); wt(','); wt_int(0);
+        wt(','); wt_id("var_refs");
         wt(')'); wt(';'); wt('}');
     }
     /* engine entry: unbox the arguments once, run core, box the result */

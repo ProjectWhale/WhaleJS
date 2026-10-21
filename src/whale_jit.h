@@ -465,6 +465,10 @@ void JS_WhaleTokOp(int o);
 int JS_WhaleTokIsKw(int tok, int w);
 /* the integer-literal token, for spelling an unrolled induction variable. */
 int JS_WhaleTokCInt(void);
+/* the floating-literal token. Lets the generator tell a numeric literal from
+   a variable in the token stream: only a literal's token carries its value in
+   the sink's number array. */
+int JS_WhaleTokCDouble(void);
 /* the token id for an identifier (token-table lookup, same id for same name). */
 int JS_WhaleTokIdent(const char *name);
 

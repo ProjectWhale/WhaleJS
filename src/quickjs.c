@@ -4025,8 +4025,11 @@ static int whale_fast_call(JSContext *ctx, JSValue func, int argc,
             }
         }
         if (ok) {
-            double r = ((double (*)(JSContext *, double *, int *))
-                        b->whale_nat_entry)(ctx, dargs, &ddeopt);
+            /* The closure cell area travels with the call: a self-recursive
+               callee's core proves its call target through it. */
+            double r = ((double (*)(JSContext *, double *, int *, void *))
+                        b->whale_nat_entry)(ctx, dargs, &ddeopt,
+                                            (void *)p->u.func.var_refs);
 
             if (!ddeopt) {
                 *ret = whale_box_number(ctx, r);
