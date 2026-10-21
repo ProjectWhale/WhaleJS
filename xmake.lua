@@ -290,6 +290,19 @@ target("whale_test")
     add_defines(qjs_defines)
     link_whale(true)
 
+-- Promise hook 测试：xmake run whale_promise_test
+-- 单独一个 target，因为 tests/whale 下的文件都链进 whale_test，而那个测试自己
+-- 有 main()。
+target("whale_promise_test")
+    set_kind("binary")
+    set_rundir("$(projectdir)")
+    set_languages("c11")
+    add_deps("whalejs_static")
+    add_files("tests/promise/*.c")
+    add_includedirs(SRC)
+    add_defines(qjs_defines)
+    link_whale(false)
+
 -- 嵌入示例：只 include 公开头文件、只链 libwhalejs.a，验证分发形态本身可用。
 -- 不参与打包（归档里没有 demo exe）。
 target("whale_demo")

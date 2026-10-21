@@ -25764,16 +25764,33 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
                 goto fail;
             }
 
-            /* Note: no need to create 'thrownawayCapability' as in
-               the spec */
-            for(i = 0; i < 2; i++)
-                resolving_funcs1[i] = JS_UNDEFINED;
-            res = perform_promise_then(ctx, promise,
-                                       vc(resolving_funcs),
-                                       vc(resolving_funcs1));
+            /* The throwaway capability IS needed, despite the spec's "no need
+               to create" note: it is the only promise created in the awaiting
+               context, and the promise hook reports it as the reaction's
+               target. Without it, `await <promise created elsewhere>` would
+               report that foreign promise, whose INIT fired in a different
+               context - which is exactly what breaks AsyncLocalStorage for a
+               cached or shared promise. Node allocates one per await for the
+               same reason. The result settles it and nobody observes it. */
+            {
+                JSValue thrownaway = JS_NewPromiseCapability(ctx, resolving_funcs1);
+
+                if (JS_IsException(thrownaway)) {
+                    JS_FreeValue(ctx, promise);
+                    for(i = 0; i < 2; i++)
+                        JS_FreeValue(ctx, resolving_funcs[i]);
+                    goto fail;
+                }
+                res = perform_promise_then(ctx, promise,
+                                           vc(resolving_funcs),
+                                           vc(resolving_funcs1));
+                JS_FreeValue(ctx, thrownaway);
+            }
             JS_FreeValue(ctx, promise);
-            for(i = 0; i < 2; i++)
+            for(i = 0; i < 2; i++) {
                 JS_FreeValue(ctx, resolving_funcs[i]);
+                JS_FreeValue(ctx, resolving_funcs1[i]);
+            }
             if (res)
                 goto fail;
         }
@@ -59876,20 +59893,77 @@ static void promise_reaction_data_free(JSRuntime *rt,
 #define promise_trace(...)
 #endif
 
+/* The promise a reaction belongs to, for the BEFORE/AFTER hooks.
+ *
+ * Node reports the promise returned by .then() - the one the reaction will
+ * settle - not the promise being reacted to. The difference shows up whenever
+ * the two were created in different contexts:
+ *
+ *     const p = Promise.resolve(1);          // context A
+ *     als.run({id: 'B'}, () => p.then(f));   // context B
+ *
+ * Node runs f in B. The derived promise is created inside the .then() call, so
+ * its INIT carries B and the reaction restores B later. Reporting the source
+ * promise here would restore A, which is the wrong context - and it is also the
+ * case a JS wrapper around Promise.prototype.then had to paper over.
+ *
+ * `await` has no derived promise: its resolving functions belong to the async
+ * function's frame (JS_CLASS_ASYNC_FUNCTION_RESOLVE), so there is nothing to
+ * read a promise from. The awaited promise is created at await time, inside the
+ * awaiting context, so it is the right target - that is `fallback`.
+ *
+ * Returns a borrowed reference. */
+static JSValueConst promise_reaction_target(JSContext *ctx,
+                                            JSValueConst resolving_func,
+                                            JSValueConst fallback)
+{
+    JSObject *p;
+    JSPromiseFunctionData *fd;
+
+    if (JS_VALUE_GET_TAG(resolving_func) != JS_TAG_OBJECT)
+        return fallback;
+    p = JS_VALUE_GET_OBJ(resolving_func);
+    if (p->class_id != JS_CLASS_PROMISE_RESOLVE_FUNCTION &&
+        p->class_id != JS_CLASS_PROMISE_REJECT_FUNCTION)
+        return fallback;
+    fd = p->u.promise_function_data;
+    if (!fd || !JS_IsObject(fd->promise))
+        return fallback;
+    return fd->promise;
+}
+
 static JSValue promise_reaction_job(JSContext *ctx, int argc,
                                     JSValueConst *argv)
 {
-    JSValueConst handler, func;
+    JSValueConst handler, func, promise;
     JSValue res, res2;
     JSValueConst arg;
     bool is_reject;
+    JSRuntime *rt;
 
-    assert(argc == 5);
+    assert(argc == 6);
     handler = argv[2];
     is_reject = JS_ToBool(ctx, argv[3]);
     arg = argv[4];
+    promise = argv[5];
+    rt = ctx->rt;
 
     promise_trace(ctx, "promise_reaction_job: is_reject=%d\n", is_reject);
+
+    /* BEFORE/AFTER bracket the handler, not the thenable resolution above.
+       Node's ordering is INIT -> BEFORE -> handler -> AFTER -> RESOLVE, and a
+       host (AsyncLocalStorage and everything built on it) needs this pair to
+       restore per-promise context while the reaction runs. Both `await` and
+       .then() land in this one job, so firing here covers both - a JS wrapper
+       around Promise.prototype.then cannot see an `await`, which goes straight
+       to perform_promise_then.
+       The pair for a thenable's own resolution in
+       js_promise_resolve_thenable_job is a different promise and stays; the
+       two nest, they do not duplicate. */
+    if (rt->promise_hook) {
+        rt->promise_hook(ctx, JS_PROMISE_HOOK_BEFORE, promise, JS_UNDEFINED,
+                         rt->promise_hook_opaque);
+    }
 
     if (JS_IsUndefined(handler)) {
         if (is_reject) {
@@ -59900,10 +59974,18 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
     } else {
         res = JS_Call(ctx, handler, JS_UNDEFINED, 1, &arg);
     }
+
     is_reject = JS_IsException(res);
     if (is_reject) {
-        if (unlikely(JS_IsUncatchableError(ctx->rt->current_exception)))
+        if (unlikely(JS_IsUncatchableError(ctx->rt->current_exception))) {
+            /* AFTER still has to run: a host that pushed on BEFORE must pop,
+               or its context stack leaks for the rest of the program. */
+            if (rt->promise_hook) {
+                rt->promise_hook(ctx, JS_PROMISE_HOOK_AFTER, promise,
+                                 JS_UNDEFINED, rt->promise_hook_opaque);
+            }
             return JS_EXCEPTION;
+        }
         res = JS_GetException(ctx);
     }
     func = argv[is_reject];
@@ -59916,6 +59998,14 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
         res2 = JS_UNDEFINED;
     }
     JS_FreeValue(ctx, res);
+
+    /* AFTER is last, which is Node's order: the reaction settles its promise
+       (RESOLVE) by calling the resolving function above, then reports itself
+       finished. Firing it before that call would put RESOLVE after AFTER. */
+    if (rt->promise_hook) {
+        rt->promise_hook(ctx, JS_PROMISE_HOOK_AFTER, promise, JS_UNDEFINED,
+                         rt->promise_hook_opaque);
+    }
 
     return res2;
 }
@@ -59940,7 +60030,7 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
     JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
     struct list_head *el, *el1;
     JSPromiseReactionData *rd;
-    JSValueConst args[5];
+    JSValueConst args[6];
 
     if (!s || s->promise_state != JS_PROMISE_PENDING)
         return; /* should never happen */
@@ -59966,7 +60056,12 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
         args[2] = rd->handler;
         args[3] = js_bool(is_reject);
         args[4] = value;
-        JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
+        /* The reaction's own promise, so the job can bracket the handler with
+           BEFORE/AFTER (see promise_reaction_job). For a .then() reaction that
+           is the derived promise, not the one being reacted to; `await` has no
+           derived promise and falls back to the awaited one. */
+        args[5] = promise_reaction_target(ctx, rd->resolving_funcs[0], promise);
+        JS_EnqueueJob(ctx, promise_reaction_job, 6, args);
         list_del(&rd->link);
         promise_reaction_data_free(ctx->rt, rd);
     }
@@ -60779,7 +60874,7 @@ static __exception int perform_promise_then(JSContext *ctx,
         for(i = 0; i < 2; i++)
             list_add_tail(&rd_array[i]->link, &s->promise_reactions[i]);
     } else {
-        JSValueConst args[5];
+        JSValueConst args[6];
         call_promise_rejection_tracker(ctx, promise, true);
         i = s->promise_state - JS_PROMISE_FULFILLED;
         rd = rd_array[i];
@@ -60788,7 +60883,8 @@ static __exception int perform_promise_then(JSContext *ctx,
         args[2] = rd->handler;
         args[3] = js_bool(i);
         args[4] = s->promise_result;
-        JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
+        args[5] = promise_reaction_target(ctx, rd->resolving_funcs[0], promise);
+        JS_EnqueueJob(ctx, promise_reaction_job, 6, args);
         for(i = 0; i < 2; i++)
             promise_reaction_data_free(ctx->rt, rd_array[i]);
     }
