@@ -7030,4 +7030,32 @@ pick、memo insert）原来用调用方的 `argc`，但 `arg_allocated_size` 为
 5. **gdb 上看不到的符号要自己造**：release 库 strip 了，先用
    `--cxflags="-g -O0"` 重建静态库再链，才拿到 `whale_jit_gen` 的行号与局部值。
 
+
+## 更正（同一轮内）
+
+上面「WhaleNode 的 WIP 自身 bootstrap 就挂」**是错的**，那条结论来自一次
+坏掉的构建状态，不是源码：
+
+- 我先为了拿行号把 WhaleJS 的 `cxflags` 改成 `-g -O0`，之后又清成 `""`；
+  这中间 WhaleNode 被反复 `xmake f` 重配（release/debug/jslib-precompile 来回切）。
+- 结果是 `build/.deps/whalenode/.../wn_embed_gen.c.d` 记着「生成文件存在」，
+  而 `build/.gens/.../wn_embed_gen.c` 已经被 `rmdir` 删掉。`wn.embed` 的
+  `depend.on_changed` 因此跳过重生成，编译阶段报
+  `fatal error: wn_embed_gen.c: No such file or directory`；能链上的旧 exe
+  用的是半套产物（部分 `.qbc` 缺失），于是 bootstrap 里的
+  `internal/http_c` 走了 source track、`EventEmitter` 在 `class X extends EE`
+  时还不是构造函数 → `parent class must be constructor`。
+- 判定证据当时看反了：我用「HEAD 引擎库 + WIP 源码」复现，就下了"WIP 源码的
+  问题"的结论，但那次构建**同样**是这套坏掉的 embed 缓存——两边共有的变量是
+  构建状态，不是引擎库。
+- 真正修好只需：删 `build/.gens/.../release`、删两个 `wn_embed_gen.c*.d`、
+  `xmake build -y whalenode`。之后 **WIP 源码自身完全正常**：`obf_n.js 12`
+  12 轮全过，`tests/run-all.js` **353 passed / 0 failed**。
+
+教训：`depend.on_changed` 的判定输入里没有「输出文件是否还在」。手动删
+`build/.gens` 而不删 `build/.deps` 会留下"已生成"的假记录。清理生成物时
+`.gens` 和 `.deps` 必须一起删；换 `-m`/`-p` 配置来回验 A/B 时尤其容易踩。
+另外「两个变量里选一个当原因」之前，先确认第三个共有变量（构建状态）不是
+真正的原因。
+
 见 current.md <152>
