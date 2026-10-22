@@ -193,6 +193,14 @@ typedef struct FnCtx {
 
     WasmCModule *mod;
     int func_index;
+    /* Makes this function's C labels unique. The translator compiles every
+       function of a module into the engine's one TCCState, and the labels all
+       used to be `Lb0`, `Lb1`, ... - so the second translated function with a
+       loop collided with the first ("duplicate label 'Lb1'"). Set from the
+       symbol name, which the binding already makes unique per module+function.
+       Sized for the longest such name (`whale_wasm_<u32>_<u32>`) so the copy
+       cannot truncate into a collision. */
+    char label_scope[48];
     /* The functions this body calls, so the emitted unit declares exactly
        those and not the whole module. */
     unsigned char callees[WASM_C_MAX_FUNCS];
@@ -441,23 +449,34 @@ static void put_semi(FnCtx *f)
 
 static void put_label(FnCtx *f, const char *prefix, int label)
 {
-    char nm[24];
+    char nm[80];
 
     if (f->quiet)
         return;
-    snprintf(nm, sizeof(nm), "%s%d", prefix, label);
+    /* The prefix carries the translated function's own symbol, so two functions
+       translated into the same C unit cannot collide. C labels are scoped to
+       the function, so this is belt-and-braces - but TinyCC's parser reported
+       "duplicate label" for labels in *different* functions of the same unit
+       once (the token stream is one unit, and the label stack is checked before
+       the function scope is entered), so the uniqueness is load-bearing. */
+    snprintf(nm, sizeof(nm), "%s_%s%d", prefix, f->label_scope, label);
     id(nm);
     ch(':');
+    /* A label must be followed by a statement. Without this, a block that ends
+       right before its enclosing `}` leaves `Lb1: }`, which TinyCC warns about
+       ("deprecated use of label at end of compound statement") and which is
+       not valid C in every dialect. A null statement is. */
+    ch(';');
 }
 
 static void put_goto(FnCtx *f, int label)
 {
-    char nm[24];
+    char nm[80];
 
     if (f->quiet)
         return;
     kw(WK_GOTO);
-    snprintf(nm, sizeof(nm), "Lb%d", label);
+    snprintf(nm, sizeof(nm), "Lb_%s%d", f->label_scope, label);
     id(nm);
     ch(';');
 }
@@ -620,6 +639,23 @@ static int ctrl_push(FnCtx *f, int kind, int has_result, WType rt)
     return 1;
 }
 
+/* `br` out of the function: the outermost control frame is the body itself,
+ * and its `end` emits a `return` rather than a label. A `goto` to it would
+ * name a label nothing defines - the parse then runs off the end of the token
+ * stream ("identifier expected" past the last token). Branching to the body
+ * means "return the carried value", so emit exactly that. */
+static void emit_return_value(FnCtx *f, struct Ctrl *c, int value_reg)
+{
+    if (f->quiet)
+        return;
+    kw(WK_RETURN);
+    if (c->has_result && value_reg >= 0)
+        put_reg(f, value_reg);
+    else
+        inum(0);
+    ch(';');
+}
+
 static void emit_br(FnCtx *f, uint32_t depth)
 {
     int target;
@@ -645,11 +681,74 @@ static void emit_br(FnCtx *f, uint32_t depth)
         }
         r = f->stk_reg[f->sp - 1];
         f->sp--;
+        if (c->kind == 3) {
+            emit_return_value(f, c, r);
+            return;
+        }
         put_assign(f, c->result_reg);
         put_reg(f, r);
         put_semi(f);
+    } else if (c->kind == 3) {
+        emit_return_value(f, c, -1);
+        return;
     }
     put_goto(f, c->label);
+}
+
+/* `br_if`: the condition is popped, and the target block's carried value is
+ * moved into its result slot only on the taken path. wasm keeps that value on
+ * the stack when the branch is NOT taken - it is the fallthrough value - so
+ * this peeks rather than pops. emit_br() cannot be used: it pops, which is
+ * correct for a plain `br` (the code after is unreachable) and wrong here.
+ *
+ * Both passes must run the same stack effect. They used to diverge - pass 1
+ * returned early on f->quiet without touching the stack at all - and pass 2
+ * then failed with "value stack underflow" on a body pass 1 had accepted. */
+static void emit_br_if(FnCtx *f, uint32_t depth, int cond)
+{
+    int target;
+    struct Ctrl *c;
+
+    if ((int)depth >= f->depth) {
+        fail(f, "br_if depth out of range");
+        return;
+    }
+    target = f->depth - 1 - (int)depth;
+    c = &f->ctrl[target];
+
+    if (c->has_result) {
+        if (f->sp <= 0) {
+            fail(f, "br_if without a value");
+            return;
+        }
+        if (f->stk_type[f->sp - 1] != c->result) {
+            fail(f, "br_if value type mismatch");
+            return;
+        }
+    }
+    if (f->quiet)
+        return;
+
+    kw(WK_IF);
+    ch('(');
+    put_reg(f, cond);
+    ch(')');
+    ch('{');
+    if (c->has_result) {
+        if (c->kind == 3) {
+            emit_return_value(f, c, f->stk_reg[f->sp - 1]);
+        } else {
+            put_assign(f, c->result_reg);
+            put_reg(f, f->stk_reg[f->sp - 1]);
+            put_semi(f);
+            put_goto(f, c->label);
+        }
+    } else if (c->kind == 3) {
+        emit_return_value(f, c, -1);
+    } else {
+        put_goto(f, c->label);
+    }
+    ch('}');
 }
 
 /* A block closing: its result, if any, moves into the result slot. */
@@ -1081,15 +1180,11 @@ static void translate(FnCtx *f)
             uint32_t d = rd_u32(f);
             int cond = popreg(f, T_I32);
 
-            if (!f->ok || f->quiet)
+            if (!f->ok)
                 break;
-            kw(WK_IF);
-            ch('(');
-            put_reg(f, cond);
-            ch(')');
-            ch('{');
-            emit_br(f, d);
-            ch('}');
+            emit_br_if(f, d, cond);
+            if (!f->ok)
+                return;
             break;
         }
 
@@ -2115,6 +2210,10 @@ static void run_pass(FnCtx *f, int quiet)
     f->func_index = j->func_index;
     f->nparams = j->nparams;
     f->nresults = j->nresults;
+    /* Labels are built from the function's own symbol, which the binding makes
+       unique per (module, function). Two translated functions in the same
+       TCCState must not share a label name. */
+    snprintf(f->label_scope, sizeof(f->label_scope), "%s", j->name);
     for (i = 0; i < j->nparams; i++) {
         f->params[i] = j->params[i];
         f->local_type[i] = j->params[i];

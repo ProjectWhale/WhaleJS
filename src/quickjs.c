@@ -3845,6 +3845,7 @@ int JS_WhaleCpoolFuncInfo(JSContext *ctx, const JSValue *cpool, int idx,
     out->var_count = b->var_count;
     out->stack_size = b->stack_size;
     out->var_ref_count = b->var_ref_count;
+    out->closure_var_count = b->closure_var_count;
     out->cpool_count = b->cpool_count;
     out->cpool = b->cpool;
     out->prefer_gcc = b->whale_jit_gcc;
@@ -4153,6 +4154,19 @@ static int whale_fast_call(JSContext *ctx, JSValue func, int argc,
     }
     for (pval = local_buf; pval < stack_buf; pval++)
         JS_FreeValue(ctx, *pval);
+    /* The compiled entry signals "a host call inside the body threw" by
+       returning JS_EXCEPTION with *deopt cleared (see the wrapper's deopt == 2
+       branch). That is NOT a result: reporting success here handed the
+       exception to the caller as if the call had returned, so a `try` around it
+       took its own `return` path instead of the `catch`. Measured:
+       `try { boom(); return 111 } catch (e) { return 222 }` answered 111 as soon
+       as boom was compiled. Report failure instead - the exception is already
+       pending and the caller's catch takes it. */
+    if (JS_IsException(whale_ret)) {
+        rt->current_stack_frame = sf->prev_frame;
+        return 0;
+    }
+    /* An exception is not a result, so it must never reach the memo table. */
     if (unlikely(b->whale_pure))
         whale_memo_insert(ctx, (WhaleMemo *)b->whale_memo, argc, args,
                           js_dup(whale_ret));
@@ -4243,7 +4257,11 @@ int JS_WhaleVarRefFuncInfo(JSContext *ctx, int idx,
     if (fp->class_id != JS_CLASS_BYTECODE_FUNCTION)
         return 0;
     vrs = fp->u.func.var_refs;
-    if (!vrs || idx < 0 || idx >= 4 || !out)
+    /* fp->u.func.var_refs is the closure environment, sized by
+       function_bytecode->closure_var_count - so that is the bound, not 4.
+       The caller (the generator) only keeps four entries, so a wider closure
+       is refused there; this check just keeps the index inside the array. */
+    if (!vrs || idx < 0 || idx >= fp->u.func.function_bytecode->closure_var_count || !out)
         return 0;
     vr = vrs[idx];
     if (!vr || !vr->pvalue)
@@ -4266,6 +4284,7 @@ int JS_WhaleVarRefFuncInfo(JSContext *ctx, int idx,
     out->var_count = b->var_count;
     out->stack_size = b->stack_size;
     out->var_ref_count = b->var_ref_count;
+    out->closure_var_count = b->closure_var_count;
     out->cpool_count = b->cpool_count;
     out->cpool = b->cpool;
     out->loops = b->whale_loops;
@@ -4786,6 +4805,12 @@ static int whale_memo_lookup(WhaleMemo *m, int argc, const JSValue *argv, JSValu
         }
         if (!hit)
             continue;
+        /* A stored exception is not a value. Entries are only created for real
+           results now, but an older entry (or a future insert path) must not be
+           replayed as one - returning JS_EXCEPTION here would look like a
+           success to the caller. */
+        if (JS_IsException(e->result))
+            continue;
         e->last_hit = m->tick;
         *out = js_dup(e->result);
         return 1;
@@ -5234,6 +5259,7 @@ static void whale_ver_rejit(JSContext *ctx, JSFunctionBytecode *b)
     info.var_count = b->var_count;
     info.stack_size = b->stack_size;
     info.var_ref_count = b->var_ref_count;
+    info.closure_var_count = b->closure_var_count;
     info.cpool_count = b->cpool_count;
     info.cpool = b->cpool;
     info.loops = b->whale_loops;
@@ -5332,6 +5358,7 @@ static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b,
         info.var_count = b->var_count;
         info.stack_size = b->stack_size;
         info.var_ref_count = b->var_ref_count;
+        info.closure_var_count = b->closure_var_count;
         info.cpool_count = b->cpool_count;
         info.cpool = b->cpool;
         /* The loops the compiler found (see WhaleLoop). Opaque to the generator,
@@ -22083,6 +22110,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSStackFrame sf_s, *sf = &sf_s;
     uint8_t *pc;
     int opcode, arg_allocated_size, i;
+    int whale_argc;          /* entries of arg_buf that actually hold a value */
     JSValue *local_buf, *stack_buf, *var_buf, *arg_buf, *sp, ret_val, *pval;
     JSValue *obj_slots;
     int whale_obj_n;         /* object slots reserved for this frame */
@@ -22179,6 +22207,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     sf->is_strict_mode = b->is_strict_mode;
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
     arg_buf = (JSValue *)argv;
+    /* arg_buf is not always the caller's argv: with a missing argument or
+       COPY_ARGV the engine copies the arguments into local_buf, and then only
+       b->arg_count slots are live there - the caller's extra arguments are not
+       copied. Anything that walks arg_buf by index must use this count, not the
+       caller's argc. Measured: array.every passes (element, index, array) to a
+       callback that declares one parameter, so argc=3, arg_count=1, and the
+       shape-key walk read arg_buf[1..2] out of the uninitialised tail of
+       local_buf - a leftover tag of JS_TAG_OBJECT made it dereference 0x55. */
+    whale_argc = arg_allocated_size ? b->arg_count : argc;
     sf->arg_count = argc;
     sf->cur_func = unsafe_unconst(func_obj);
     var_refs = p->u.func.var_refs;
@@ -22250,7 +22287,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     ctx = b->realm; /* set the current realm */
 
     /* WhaleJS: �??��统�??（JIT 代码生成接入前先�????数，�?src/whalejs.h�?*/
-    whale_jit_ready = !whale_on_call(ctx, b, arg_buf, argc);
+    whale_jit_ready = !whale_on_call(ctx, b, arg_buf, whale_argc);
 
     /* WhaleJS: native entry ready -> run it. The frame stays current while
        the JIT code runs (it may re-enter the engine for self-recursion). On
@@ -22289,7 +22326,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    self-check argument stays the main entry: entry2 swapping
                    below is orthogonal (closure readings, not shapes). */
                 int ver_gen = 0;
-                void *ver_entry = whale_ver_pick(ctx, b, arg_buf, argc, &ver_gen);
+                void *ver_entry = whale_ver_pick(ctx, b, arg_buf, whale_argc, &ver_gen);
                 void *run_entry = ver_entry ? ver_entry : b->whale_jit_entry;
 
                 whale_ret = ((JSValue (*)(JSContext *, JSValue *, JSValue *, int *, JSValue, void *, void *))run_entry)
@@ -22355,9 +22392,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             for (pval = local_buf; pval < stack_buf; pval++)
                 JS_FreeValue(ctx, *pval);
             /* Remember the result, so the next call with the same arguments can
-               skip all of this. Only pure numeric functions get here. */
-            if (unlikely(b->whale_pure))
-                whale_memo_insert(ctx, (WhaleMemo *)b->whale_memo, argc, arg_buf,
+               skip all of this. Only pure numeric functions get here.
+               An EXCEPTION is never a result: the compiled entry hands one back
+               as JS_EXCEPTION (the wrapper clears *deopt for that case, so this
+               branch is taken), and memoising it made every later call with the
+               same arguments replay the exception as if it were a value.
+               Measured: `function d(x){ try { boom(); return 111 } catch(e){ return 222 } }`
+               returned 111 from call 100 on, because boom - a pure function that
+               always throws - had memoised its throw. */
+            if (unlikely(b->whale_pure) && !JS_IsException(whale_ret))
+                whale_memo_insert(ctx, (WhaleMemo *)b->whale_memo, whale_argc, arg_buf,
                                   js_dup(whale_ret));
             rt->current_stack_frame = sf->prev_frame;
             return whale_ret;

@@ -6925,3 +6925,109 @@ Node 的顺序是 BEFORE → handler → RESOLVE → AFTER。第一版把 AFTER 
    RESOLVE，一删就把上下文丢了。改用 WeakMap 不删（随 promise 一起回收）。
 
 见 current.md <151>
+
+
+# <152>: 静默误编译四连 + closure 表越界（vite/obfuscator 的 not a function 与二次崩溃）
+
+SOLVED
+
+## 问题
+
+WhaleNode 的两个反馈：①vite 的 `vite-plugin-javascript-obfuscator` 拉起
+inversify 装饰器工厂，工厂被 JIT 编译（第 100 次调用）后返回垃圾值，报
+`TypeError: not a function`；②这个修好之后，连续调 `Obfuscator.obfuscate()`
+第 1 次就段错误（0xC0000005）。
+
+## 第一个：四个静默误编译（都能编译成功并返回错值）
+
+逐个是独立洞，共同点是「生成器以为某个值只被一种消费者读，就省略了它的
+发射/类型」：
+
+1. **`OP_fclosure` 在非声明位置被整个省略**。原逻辑假定
+   `push_const; fclosure; put_locN` 是声明、可整段消掉；但 `return function(){}`
+   是 `fclosure; return`，没有 store，于是发射为空、函数"编译成功"却返回垃圾。
+   这正是装饰器工厂的形态。修：只有 `whale_store_local` 认出的声明形态才可省略，
+   否则 `WHALE_STEP_INSTEAD_OF_BAILING()`。
+
+2. **`whale_fast_call` 把异常当成功**。编译入口 body 内 host call 抛出时返回
+   `JS_EXCEPTION` 且清空 `*deopt`（表示"异常已 pending，别再解释这帧"），
+   fast call 却 `return 1` 当作"调用成功返回了异常值"。于是
+   `try { f(); return 111 } catch { return 222 }` 在 f 编译后返回 111。修：
+   `JS_IsException(whale_ret)` 时返回 0，异常已经是 pending，调用方 catch 接住。
+
+3. **`OP_get_field` 后接 `OP_return` 时结果没当 slot**。原判据只看"下一条是否
+   还是 field 读"，`return c._d` 于是走了数值路径、返回 helper 的 deopt 值 0。
+   修：判据加上 `OP_return`/`OP_return_undef`。
+
+4. **memo 缓存了异常**。`function d(x){ try { boom(); return 111 } catch { return 222 } }`
+   从第 100 次调用起返回 111，因为总是抛异常的纯函数 `boom` 把它的"异常结果"
+   存进了 memo，之后同参数直接回放。修：插入和查找都拒 `JS_IsException`，
+   且 `OP_catch`/`OP_throw` 处 `whale_gen_pure = 0`（能抛的函数根本不进 memo）。
+
+另外两处一起修的：`OP_call`/`OP_call_method` 的 throw 现在路由到开着的 catch
+（原来 exception 直接离开函数，try 自己的 return 被当成功路径走到）；
+`OP_get_loc` 的 `WHALE_T_FN` 分支显式要求下一条是 call（省略发射只在被当 call
+target 消费时合法，这点原来是"消费者的性质"而非这行的性质——正是 fclosure 洞的成因）。
+
+## 第二个：closure 表越界（4 项数组按 6 索引）
+
+修完上面的，第 1 次 obfuscate 通过，第 4 次崩在 `whale_jit_gen` 读
+`whale_vr_info[vidx].byte_code` = `0x2200000021`。
+
+根因：门槛写成了 `if (info->var_ref_count > 4) return 0;`，但 **`var_ref_count`
+数的是"本函数自己的、被其子函数捕获的局部"，不是"本函数能命名的闭包槽数"**。
+后者是 `closure_var_count`（`get_var_ref`/`put_var_ref` 的索引空间）。一个
+`var_ref_count == 0` 但引用 6 个外层变量的函数因此通过门槛，`whale_vr_slot/
+_fn/_info`（各 4 项）、`_p0.._p3` 声明被按 4/5 索引——读栈上的垃圾当
+`byte_code` 指针、并发射未声明的 `_p4`。
+
+修：`JSWhaleFuncInfo` 加 `closure_var_count`（三处填充点）；门槛改成
+`closure_var_count > 4`；`JS_WhaleVarRefFuncInfo` 的界从硬编码 4 改成
+`function_bytecode->closure_var_count`；两处 `get_var_ref`/`put_var_ref`
+分支加 `idx < 0 || idx >= 4` 的 belt-and-braces 守卫。
+
+顺带：`JS_CallInternal` 里按索引遍历 `arg_buf` 的地方（shape key、version
+pick、memo insert）原来用调用方的 `argc`，但 `arg_allocated_size` 为真时
+`arg_buf` 是 `local_buf`、只有 `b->arg_count` 个槽是活的。`array.every` 给单参
+回调传 `(element, index, array)` → argc=3/arg_count=1，读了 `local_buf[1..2]`
+的未初始化尾巴（残留 tag 指向 `0x55`）。新增 `whale_argc`。
+
+## 验证
+
+- WhaleJS：`whale_test` ok；`whale_wasm_test` ok（翻译路径与
+  `WHALE_WASM_NOTRANSLATE=1` 两条）；`whale_promise_test` ok。
+- 新 JS 探针 `tests/whale/jit-fclosure-*.js`（fclosure 的 return/value 位置）、
+  `tests/whale/jit-many-closures.js`（4/5/6 个闭包变量 + 写成 call target），
+  JIT on/off 输出一致。
+- WhaleNode：committed 代码 + 修复后的引擎库，`temp/obf_n.js 12` 12 轮全部通过；
+  `tests/run-all.js` **353 passed / 0 failed**；perftest 25 例无回退。
+- `obfuscate()` 单次调用从此成功（修 1-4 之前直接抛 not a function）。
+
+## 未完成 / 需要知道
+
+- WhaleNode 工作树里有一批**未提交的 WIP**（bytecode-only embed：`lib/internal/
+  module.js` 优先用 `.qbc`、`xmake.lua` 只给 bootstrap 对保留 source、
+  `mod_native.c` 加 `embeddedExists`/`embeddedBytecode`）。这套 WIP **自身**在
+  bootstrap 阶段就挂（`parent class must be constructor` at `<http-classes>`），
+  **与本次引擎修复无关**：用 HEAD 的引擎库同样复现，`--jslib-precompile=n` 也复现。
+  用 committed 的 WhaleNode 代码 + 修复后的引擎库则完全正常，所以引擎侧不需要
+  为它改任何东西；那是 WhaleNode 自己的下一轮工作。
+- 剩下那些 `whale_jit.c:1: error: undefined symbol 'IAT.*'` / `invalid operands`
+  是**编译失败回退解释器**的日志（obfuscator 里大量函数本就编不过），不是错误行为。
+
+## 教训
+
+1. **"这个类型只会被 X 消费"是消费者的性质，不是产生它的那行的性质**。所有
+   「省略发射」都要在省略点重新验证那条唯一合法路径，否则一个没预期到的消费者
+   （`return function(){}`）就得到静默垃圾——比崩溃更糟的失效模式。
+2. **异常不是值**。任何"成功返回一个 JSValue"的路径都要先问 `JS_IsException`；
+   memo 这种按值缓存的表尤其要拒异常，否则一次 throw 被永久回放。
+3. **名字相近的计数要查清楚定义再当界**。`var_ref_count` vs
+   `closure_var_count` 差一个词、含义完全不同；用错的那个做数组界 = 读栈上垃圾。
+4. **故障可能在改动之前就存在**：第 4 轮的崩溃是修 1-4 之后才暴露的（旧库第 1 轮就抛
+   异常退出，永远到不了第 4 轮），不是修复引入的。区分"我引入的"和"我暴露的"要用
+   stash 对照，不能靠猜。
+5. **gdb 上看不到的符号要自己造**：release 库 strip 了，先用
+   `--cxflags="-g -O0"` 重建静态库再链，才拿到 `whale_jit_gen` 的行号与局部值。
+
+见 current.md <152>

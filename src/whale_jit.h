@@ -59,6 +59,12 @@ typedef struct JSWhaleFuncInfo {
     int var_count;
     int stack_size;
     int var_ref_count;
+    /* Number of closure slots this function's bytecode can name. This is the
+       index space of get_var_ref/put_var_ref, and it is NOT var_ref_count:
+       that one counts the function's own locals that its children captured.
+       A function can have var_ref_count 0 and still read five enclosing
+       variables, so anything that bounds closure indices must use this. */
+    int closure_var_count;
     int cpool_count;
     const JSValue *cpool;
     /* The loops the compiler found in this function, or NULL when it found none.

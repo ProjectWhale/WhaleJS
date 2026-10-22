@@ -6386,6 +6386,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        generated code needs is "which label do I jump to". Empty means no handler is
        open, and then there is nothing to catch: the operation deopts as before. */
     int whale_catch_tgt[WHALE_CATCH_MAX];
+    /* The object slot OP_catch parked the handler's incoming value in, one per
+       open handler. A throw from a CALL has to write the pending exception
+       there before jumping, or the handler reads the undefined the non-throwing
+       path left behind. */
+    int whale_catch_slot[WHALE_CATCH_MAX];
     int whale_catch_depth = 0;
     /* every field access site in this function, as the offset the profile table is
        keyed by (opcode offset + 1). The candidate test is asked at the FUNCTION
@@ -6460,7 +6465,14 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         return 0;
     if (stack_size <= 0 || stack_size > WHALE_JIT_MAX_SLOTS)
         return 0;
-    if (info->var_ref_count > 4)
+    /* The closure-slot tables below (whale_vr_slot/_fn/_info, the _p cells) are
+       four entries wide, so a function that can name a fifth enclosing variable
+       is refused. The bound is closure_var_count - the get_var_ref index space -
+       NOT var_ref_count, which counts the function's own locals its children
+       captured. Checking the wrong one let a function with var_ref_count 0 and
+       six captured variables through: the generator then read whale_vr_info[4]
+       and emitted `_p4` for a cell it never declared. */
+    if (info->closure_var_count > 4)
         return 0;
 
     targets = calloc(1, len + 1);
@@ -7329,6 +7341,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("k"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_VOID); wt_id("JS_WhaleObjSlotUndef"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("k"); wt(')'); wt(';');
+    /* Move a pending exception into the handler's slot. The generated code uses
+       JS_WhaleObjSlot (already declared below) plus these two, so a `catch` can
+       be entered from a CALL's throw and not only from an OP_throw. */
+    wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_WhaleTakeException"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_VOID); wt_id("JS_WhaleObjSlotEmptyString"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("k"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleObjSlotAtom"); wt('(');
@@ -7452,6 +7469,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wk(JS_WK_DOUBLE); wt_id("v"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_WhaleObjGet"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("k"); wt(')'); wt(';');
+    /* Park a JSValue in a slot. The catch path uses it to move a pending
+       exception into the handler's slot, so the prototype's JSValue parameter
+       has to be declared or the argument goes in the wrong register. */
+    wk(JS_WK_EXTERN); wk(JS_WK_VOID); wt_id("JS_WhaleObjSlot"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("k"); wt(',');
+        wt_id("JSValue"); wt_id("v"); wt(')'); wt(';');
     /* Raising. Without this prototype TinyCC declares it implicitly, the JSValue
        argument is passed as an int, and the generated code fails to parse - which
        is what an `implicit declaration of function 'JS_WhaleThrow'` warning next
@@ -8493,18 +8516,27 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             break;
         case OP_fclosure:
         case OP_fclosure8:
-            /* A function declaration. The pre-scan recorded which pool entry the
-               local ends up holding, and that is what a call will use, so there
-               is nothing to emit - pushing the closure as a value would put a
-               function where the type system expects a number. The store that
-               follows is part of the declaration and goes with it. */
+            /* A function *declaration* is `push_const M; fclosure; put_locN`,
+               and the pre-scan recorded which pool entry that local ends up
+               holding - so the whole sequence can be elided, because a later
+               call through the local expands the closure in place.
+
+               A closure in any other position is a value, and emitting nothing
+               for it leaves garbage where the caller reads a result. The
+               common shape is `return function () {...}`: `fclosure; return`,
+               no store at all. That was silently miscompiled - the function
+               compiled "successfully" and returned a broken value, which is
+               the worst failure mode there is (WhaleNode hit it as a bare
+               `TypeError: not a function` from a decorator factory that had
+               gone hot). Only the declaration shape may be elided. */
             {
                 int npos = pos + sz;
                 int s4 = (npos < len) ? whale_op_size_of(pc[npos]) : 0;
                 int ln = (s4 > 0) ? whale_store_local(pc, len, npos, s4) : -1;
 
-                if (ln >= 0)
-                    pos = npos + s4;
+                if (ln < 0)
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }   /* not a declaration */
+                pos = npos + s4;
             }
             break;
 
@@ -9787,13 +9819,22 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                    node in vnode_build). Read it as a parked value instead. */
                 if ((WHALE_IS_OBJ(ta) || WHALE_IS_VAL(ta)) &&
                     whale_fields < WHALE_FIELD_CACHE) {
-                    /* Does the very next instruction read a field of this value?
-                       Then the result must stay a slot, and the numeric arm below
-                       would be the wrong shape for it. */
+                    /* Does the very next instruction read a field of this value,
+                       or return it? Either way the result must stay a slot: the
+                       numeric arm below would be the wrong shape for it.
+                       `return c._d` is the second case, and it was missing - the
+                       read then took the numeric path and the function returned
+                       the helper's deopt value (0) instead of the object. That is
+                       a silent wrong answer, and it broke every function of the
+                       form `function f(o) { return o.field; }` once compiled
+                       (measured: `getDict(c) { return c._d; }` answered 0 with a
+                       real object behind the field). */
                     int npos = pos + sz;
 
                     if (npos < len && (pc[npos] == OP_get_field ||
-                                       pc[npos] == OP_get_field2)) {
+                                       pc[npos] == OP_get_field2 ||
+                                       pc[npos] == OP_return ||
+                                       pc[npos] == OP_return_undef)) {
                         int os = whale_objs++;
 
                         fc = whale_fields++;
@@ -10301,7 +10342,35 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     sp++;
                     break;
                 }                if (whale_loc_fn[idx] >= 0) {
-                    /* this local holds a function this compilation can see */
+                    /* This local holds a function this compilation can see
+                       through. The read emits nothing: the callee is expanded
+                       at its call site, so no C variable is needed.
+
+                       That is only sound if every consumer of this type is a
+                       call site. Today it is - but that is a property of the
+                       consumers, not of this line, and it is exactly the
+                       assumption that broke OP_fclosure: an elided push is
+                       garbage the moment something reads it as a value. So
+                       check the one thing that makes the elision legal, rather
+                       than trusting the type to be consumed. */
+                    int npos2 = pos + sz;
+                    int s5 = (npos2 < len) ? whale_op_size_of(pc[npos2]) : 0;
+                    int nxt_op = (s5 > 0 && npos2 < len) ? (int)pc[npos2] : -1;
+
+                    /* Only a call expands it. A store is NOT safe here even
+                       though `var h = g; h()` looks like it should be: the
+                       pre-scan records whale_loc_fn only for the local the
+                       declaration's own store writes, so the copy's type is
+                       T_FN while its local has no recorded callee. Reading it
+                       back then takes the general path and loads a C variable
+                       that was never emitted. Calls only; everything else -
+                       stores, returns, arguments, fields - deopts. */
+                    if (nxt_op != OP_call0 && nxt_op != OP_call1 &&
+                        nxt_op != OP_call2 && nxt_op != OP_call3 &&
+                        nxt_op != OP_call && nxt_op != OP_call_method &&
+                        nxt_op != OP_tail_call && nxt_op != OP_tail_call_method) {
+                        { WHALE_STEP_INSTEAD_OF_BAILING(); }
+                    }
                     cur[var_count + sp] = WHALE_T_FN;
                     whale_slot_fn[sp] = whale_loc_fn[idx];
                     sp++;
@@ -10789,6 +10858,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         case OP_get_var_ref:
             {
                 int idx = (op == OP_get_var_ref) ? (int)whale_get_u16(pc + pos + 1) : op - OP_get_var_ref0;
+                /* The closure tables are four entries wide; a stream that named a
+                   fifth variable would index past them. closure_var_count > 4 is
+                   refused up front, so this is a belt-and-braces check on a
+                   misaligned decode rather than a live case. */
+                if (idx < 0 || idx >= 4)
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 /* A slot used as a call target is checked once at the entry to
                    be this very function (self-recursion). Any other use is an
                    enclosing closure's variable, read here as a number. */
@@ -10899,6 +10974,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                                                  : op - OP_put_var_ref0;
                 int fm;
 
+                if (idx < 0 || idx >= 4)
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 if (!whale_type_is_num(cur[var_count + sp - 1]))
                     { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 whale_gen_pure = 0;   /* writes captured state */
@@ -11052,8 +11129,22 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 wt('('); wt_id("ctx"); wt(','); wt_int(WHALE_CALL_BASE + argc + 1); wt(',');
                 wt_int(WHALE_CALL_BASE + argc); wt(','); wt_int(argc); wt(',');
                 wt_int(WHALE_CALL_BASE); wt(','); wt_int(ret_slot); wt(')'); wt(')');
-                wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(2); wt(';');
-                wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                /* `arr.push(x)` inside a try throws the same way a plain call
+                   does, so it needs the same routing - see the OP_call site. */
+                wt('{');
+                if (whale_catch_depth > 0) {
+                    int ct = whale_catch_tgt[whale_catch_depth - 1];
+
+                    wt_id("JS_WhaleObjSlot"); wt('('); wt_id("ctx"); wt(',');
+                    wt_int(whale_catch_slot[whale_catch_depth - 1]); wt(',');
+                    wt_id("JS_WhaleTakeException"); wt('('); wt_id("ctx"); wt(')');
+                    wt(')'); wt(';');
+                    wk(JS_WK_GOTO); wt_slot("L", ct); wt(';');
+                } else {
+                    wt('*'); wt_id("deopt"); wt('='); wt_int(2); wt(';');
+                    wk(JS_WK_RETURN); wt_int(0); wt(';');
+                }
+                wt('}');
                 fold_commit(fm);
                 cur[var_count + sp_new] = (ret_slot < 0)
                     ? (uint8_t)WHALE_T_UNKNOWN : WHALE_VAL_T(ret_slot);
@@ -11463,8 +11554,27 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     }
                     wt_int(argc); wt(','); wt_int(WHALE_CALL_BASE); wt(',');
                     wt_int(ret_slot); wt(')'); wt(')');
-                    wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(2); wt(';');
-                    wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                    /* The call threw. Route it to the local handler when one is
+                       open - otherwise the exception would leave the function and
+                       the try's own `return` would be reached as if the call had
+                       succeeded (measured: `try { f(); return 0; } catch (e) {...}`
+                       returned 0 with f throwing). With no handler open the old
+                       deopt=2 path is right: the exception is pending and the
+                       frame must not run again. */
+                    wt('{');
+                    if (whale_catch_depth > 0) {
+                        int ct = whale_catch_tgt[whale_catch_depth - 1];
+
+                        wt_id("JS_WhaleObjSlot"); wt('('); wt_id("ctx"); wt(',');
+                        wt_int(whale_catch_slot[whale_catch_depth - 1]); wt(',');
+                        wt_id("JS_WhaleTakeException"); wt('('); wt_id("ctx"); wt(')');
+                        wt(')'); wt(';');
+                        wk(JS_WK_GOTO); wt_slot("L", ct); wt(';');
+                    } else {
+                        wt('*'); wt_id("deopt"); wt('='); wt_int(2); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';');
+                    }
+                    wt('}');
                     fold_commit(fm);
                     cur[var_count + func_slot] = (ret_slot < 0)
                         ? (uint8_t)WHALE_T_UNKNOWN : WHALE_VAL_T(ret_slot);
@@ -12051,7 +12161,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                 if (whale_catch_depth >= WHALE_CATCH_MAX)
                     { WHALE_STEP_INSTEAD_OF_BAILING(); }
-                whale_catch_tgt[whale_catch_depth++] = tgt;
+                whale_catch_tgt[whale_catch_depth] = tgt;
                 /* The catch block expects the exception value where it begins. On
                    the path that reaches it without throwing, that is undefined; the
                    throw path overwrites the same slot with the real value. */
@@ -12069,7 +12179,19 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                        An object slot, never a number: invariance is moot. */
                     fold_set(sp, fm, 0);
                     cur[var_count + sp] = WHALE_VAL_T(os);
+                    whale_catch_slot[whale_catch_depth] = os;
                 }
+                whale_catch_depth++;
+                /* A function with a handler must never be memoised. The memo is
+                   keyed on the arguments alone and stores the value the body
+                   returned - but a body that can throw may return through its
+                   `try` on one call and throw on the next, and the two are
+                   indistinguishable to a key of arguments. Measured: a pure
+                   function whose call always threw still memoised the try's
+                   `return 111`, and every later call with that argument replayed
+                   111 without running the body at all. Clearing the flag here
+                   (and at OP_throw) keeps such a function out of the table. */
+                whale_gen_pure = 0;
                 sp++;
             }
             break;
@@ -12094,6 +12216,11 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                    function to handle, it leaves on the return path. */
                 int tgt = (whale_catch_depth > 0)
                     ? whale_catch_tgt[whale_catch_depth - 1] : -1;
+
+                /* A function that can throw must not be memoised - see OP_catch.
+                   This covers the `try { ... } catch (e) { throw ... }` shape,
+                   where the handler itself is the thrower. */
+                whale_gen_pure = 0;
 
                 ta = cur[var_count + sp - 1];
                 if (!WHALE_IS_VAL(ta) && !WHALE_IS_OBJ(ta) && !whale_type_is_num(ta))
@@ -12505,6 +12632,7 @@ WHALE_HOST_SYM(JS_WhaleVarRefIsFn),
     WHALE_HOST_SYM(JS_WhaleObjSlotNull),
     WHALE_HOST_SYM(JS_WhaleObjSlotEmptyString),
     WHALE_HOST_SYM(JS_WhaleObjSlotUndef),
+    WHALE_HOST_SYM(JS_WhaleTakeException),
     WHALE_HOST_SYM(JS_WhaleThrow),
     WHALE_HOST_SYM(JS_WhaleObjSlotAtom),
     WHALE_HOST_SYM(JS_WhaleObjDefineValue),
