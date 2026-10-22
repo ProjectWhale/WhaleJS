@@ -35,7 +35,7 @@ static int failures;
  *   (import "env" "addtwo" (func (param i32 i32) (result i32)))
  *   (memory (export "memory") 1 2)
  *   (func (export "add")     (param i32 i32) (result i32))   i32.add
- *   (func (export "poke")    (param i32 i32))                i32.store8
+ *   (func (export "poke")    (param i32 i32))                i32.store
  *   (func (export "peek")    (param i32) (result i32))       i32.load8_u
  *   (func (export "grow")    (param i32) (result i32))       memory.grow
  *   (func (export "callimp") (param i32) (result i32))       call log; +100
@@ -79,6 +79,98 @@ static const unsigned char THROW_MODULE[] = {
     0x03, 0x02, 0x01, 0x00,
     0x07, 0x05, 0x01, 0x01, 0x67, 0x00, 0x01,
     0x0a, 0x06, 0x01, 0x04, 0x00, 0x10, 0x00, 0x0b,
+};
+
+/*
+ * Exported globals.
+ *
+ * (module
+ *   (global $acc (export "acc") (mut i32) (i32.const 5))
+ *   (global $k   (export "k")   f64 (f64.const 1.5))
+ *   (func (export "getacc") (result i32) global.get $acc)
+ * )
+ */
+static const unsigned char GLOBAL_MODULE[] = {
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    /* type: () -> i32 */
+    0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f,
+    /* funcs: one, type 0 */
+    0x03, 0x02, 0x01, 0x00,
+    /* globals: (mut i32)=5, (f64)=1.5 */
+    0x06, 0x12, 0x02,
+    0x7f, 0x01, 0x41, 0x05, 0x0b,
+    0x7c, 0x00, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x3f, 0x0b,
+    /* exports: acc(global 0), k(global 1), getacc(func 0) */
+    0x07, 0x14, 0x03,
+    0x03, 0x61, 0x63, 0x63, 0x03, 0x00,
+    0x01, 0x6b, 0x03, 0x01,
+    0x06, 0x67, 0x65, 0x74, 0x61, 0x63, 0x63, 0x00, 0x00,
+    /* code: global.get 0; end */
+    0x0a, 0x06, 0x01, 0x04, 0x00, 0x23, 0x00, 0x0b,
+};
+
+/*
+ * A module with a custom section, for Module.customSections.
+ *
+ * (module
+ *   (custom "producer" "ABC")
+ * )
+ * The custom section is id 0: name length 8, "producer", then 3 payload bytes.
+ */
+static const unsigned char CUSTOM_MODULE[] = {
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x0c, 0x08, 0x70, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x65, 0x72,
+    0x41, 0x42, 0x43,
+};
+
+/*
+ * Store widths.
+ *
+ * (module
+ *   (memory (export "memory") 1)
+ *   (func (export "st32")  (param i32 i32) i32.store)
+ *   (func (export "st8")   (param i32 i32) i32.store8)
+ *   (func (export "st16")  (param i32 i32) i32.store16)
+ *   (func (export "stf64") (param i32 f64) f64.store)
+ *   (func (export "ld32")  (param i32) (result i32) i32.load)
+ *   (func (export "ldf64") (param i32) (result f64) f64.load)
+ * )
+ *
+ * The opcode numbers are the spec's: 0x36 i32.store, 0x37 i64.store,
+ * 0x38 f32.store, 0x39 f64.store, 0x3a i32.store8, 0x3b i32.store16. The
+ * translator read them shifted by two, so `i32.store` emitted a one-byte store
+ * and the upper three bytes were silently lost - which is what corrupted
+ * es-module-lexer's offset table under Vite.
+ */
+static const unsigned char STORE_MODULE[] = {
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    /* types: (i32,i32)->(), (i32,f64)->(), (i32)->i32, (i32)->f64 */
+    0x01, 0x15, 0x04,
+    0x60, 0x02, 0x7f, 0x7f, 0x00,
+    0x60, 0x02, 0x7f, 0x7c, 0x00,
+    0x60, 0x01, 0x7f, 0x01, 0x7f,
+    0x60, 0x01, 0x7f, 0x01, 0x7c,
+    /* functions */
+    0x03, 0x07, 0x06, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03,
+    /* memory: 1 page */
+    0x05, 0x03, 0x01, 0x00, 0x01,
+    /* exports */
+    0x07, 0x35, 0x07,
+    0x04, 0x73, 0x74, 0x33, 0x32, 0x00, 0x00,             /* st32 */
+    0x03, 0x73, 0x74, 0x38, 0x00, 0x01,                   /* st8 */
+    0x04, 0x73, 0x74, 0x31, 0x36, 0x00, 0x02,             /* st16 */
+    0x05, 0x73, 0x74, 0x66, 0x36, 0x34, 0x00, 0x03,       /* stf64 */
+    0x04, 0x6c, 0x64, 0x33, 0x32, 0x00, 0x04,             /* ld32 */
+    0x05, 0x6c, 0x64, 0x66, 0x36, 0x34, 0x00, 0x05,       /* ldf64 */
+    0x06, 0x6d, 0x65, 0x6d, 0x6f, 0x72, 0x79, 0x02, 0x00, /* memory */
+    /* code */
+    0x0a, 0x39, 0x06,
+    0x09, 0x00, 0x20, 0x00, 0x20, 0x01, 0x36, 0x02, 0x00, 0x0b,  /* i32.store  */
+    0x09, 0x00, 0x20, 0x00, 0x20, 0x01, 0x3a, 0x00, 0x00, 0x0b,  /* i32.store8 */
+    0x09, 0x00, 0x20, 0x00, 0x20, 0x01, 0x3b, 0x01, 0x00, 0x0b,  /* i32.store16*/
+    0x09, 0x00, 0x20, 0x00, 0x20, 0x01, 0x39, 0x03, 0x00, 0x0b,  /* f64.store  */
+    0x07, 0x00, 0x20, 0x00, 0x28, 0x02, 0x00, 0x0b,              /* i32.load   */
+    0x07, 0x00, 0x20, 0x00, 0x2b, 0x03, 0x00, 0x0b,              /* f64.load   */
 };
 
 /*
@@ -243,6 +335,50 @@ static void eval_and_check_string(JSContext *ctx, const char *src,
     JS_FreeValue(ctx, v);
 }
 
+/* Evaluate src, drain the promise job queue, then compare globalThis.__result.
+ * The async APIs (compileStreaming / instantiateStreaming) resolve in a job, so
+ * a synchronous read would only ever see "[object Promise]". */
+static void eval_and_check_async(JSContext *ctx, const char *src,
+                                 const char *expected, const char *what)
+{
+    JSValue v = JS_Eval(ctx, src, strlen(src), "<wasm-test>", JS_EVAL_TYPE_GLOBAL);
+    JSValue global, r;
+    const char *s;
+    int jobs = 0;
+
+    if (JS_IsException(v)) {
+        JSValue e = JS_GetException(ctx);
+
+        s = JS_ToCString(ctx, e);
+        printf("FAIL %s: exception %s\n", what, s ? s : "?");
+        if (s)
+            JS_FreeCString(ctx, s);
+        JS_FreeValue(ctx, e);
+        failures++;
+        return;
+    }
+    JS_FreeValue(ctx, v);
+    {
+        JSContext *job_ctx = NULL;
+
+        while (JS_ExecutePendingJob(JS_GetRuntime(ctx), &job_ctx) > 0) {
+            if (++jobs > 10000)
+                break;
+        }
+    }
+    global = JS_GetGlobalObject(ctx);
+    r = JS_GetPropertyStr(ctx, global, "__result");
+    JS_FreeValue(ctx, global);
+    s = JS_ToCString(ctx, r);
+    if (!s || strcmp(s, expected) != 0) {
+        printf("FAIL %s: got %s, expected %s\n", what, s ? s : "(null)", expected);
+        failures++;
+    }
+    if (s)
+        JS_FreeCString(ctx, s);
+    JS_FreeValue(ctx, r);
+}
+
 int main(void)
 {
     JSRuntime *rt;
@@ -275,6 +411,10 @@ int main(void)
     JS_SetPropertyStr(ctx, global, "__mod", mod_ab);
     JS_SetPropertyStr(ctx, global, "__bad", bad_ab);
     JS_SetPropertyStr(ctx, global, "__throwmod", throw_ab);
+    JS_SetPropertyStr(ctx, global, "__custom",
+        JS_NewArrayBufferCopy(ctx, CUSTOM_MODULE, sizeof(CUSTOM_MODULE)));
+    JS_SetPropertyStr(ctx, global, "__globals",
+        JS_NewArrayBufferCopy(ctx, GLOBAL_MODULE, sizeof(GLOBAL_MODULE)));
     JS_FreeValue(ctx, global);
 
     eval_and_check_string(ctx,
@@ -344,6 +484,55 @@ int main(void)
         "ok",
         "1", "bad module rejected");
 
+    /* Module introspection: exports/imports are read from the bytes without
+       instantiating anything, which is how a bundler inspects a module. */
+    eval_and_check_string(ctx,
+        "var mm = new WebAssembly.Module(__mod);\n"
+        "var ex = WebAssembly.Module.exports(mm);\n"
+        "var im = WebAssembly.Module.imports(mm);\n"
+        "var names = ex.map(function (e) { return e.name + ':' + e.kind; }).join(',');\n"
+        "var inames = im.map(function (e) { return e.module + '/' + e.name; }).join(',');\n"
+        "names + '|' + inames",
+        "add:0,poke:0,peek:0,grow:0,callimp:0,dbl:0,inc64:0,impzero:0,impadd:0,memory:2"
+        "|env/log,env/zero,env/addtwo",
+        "Module.exports/imports");
+
+    /* customSections returns the matching custom sections' payloads. */
+    eval_and_check_string(ctx,
+        "var cm = new WebAssembly.Module(__custom);\n"
+        "var s = WebAssembly.Module.customSections(cm, 'producer');\n"
+        "s.length + ':' + s[0].length + ':' + s[0][0]",
+        "1:3:65", "Module.customSections");
+
+    /* an empty custom section name list must not throw */
+    eval_and_check_string(ctx,
+        "WebAssembly.Module.customSections(new WebAssembly.Module(__mod), 'nope').length",
+        "0", "customSections missing name");
+
+    /* Streaming API: source is anything with arrayBuffer() (a Response, a
+       Blob), or a raw buffer. Both return promises. */
+    eval_and_check_async(ctx,
+        "var src = { arrayBuffer: function () { return Promise.resolve(__mod); } };\n"
+        "WebAssembly.compileStreaming(src).then(function (m) {\n"
+        "  globalThis.__result = WebAssembly.Module.exports(m).length;\n"
+        "});",
+        "10", "compileStreaming");
+
+    eval_and_check_async(ctx,
+        "var src2 = { arrayBuffer: function () { return Promise.resolve(__mod); } };\n"
+        "WebAssembly.instantiateStreaming(src2, imports).then(function (r) {\n"
+        "  globalThis.__result = r.instance.exports.add(20, 22) + ':' +\n"
+        "    (r.module instanceof WebAssembly.Module);\n"
+        "});",
+        "42:true", "instantiateStreaming");
+
+    /* A source that rejects must reject the returned promise. */
+    eval_and_check_async(ctx,
+        "var bad = { arrayBuffer: function () { return Promise.reject(new Error('nope')); } };\n"
+        "WebAssembly.compileStreaming(bad).then(function () { globalThis.__result = 'resolved'; },\n"
+        "                                     function (e) { globalThis.__result = 'rejected:' + e.message; });",
+        "rejected:nope", "compileStreaming rejection");
+
     /* memory.grow detaches the old buffer and hands out a new one */
     eval_and_check_string(ctx,
         "var g = WebAssembly.instantiate(__mod, imports).instance;\n"
@@ -353,6 +542,69 @@ int main(void)
         "var b1 = g.exports.memory.buffer;\n"
         "(b0 !== b1) + ':' + b0.byteLength + ':' + n0 + ':' + b1.byteLength",
         "true:0:65536:131072", "grow detaches");
+
+    /* memory.grow as a JS method: returns the previous page count. __mod
+       declares (memory 1 2), so exactly one page of headroom. */
+    eval_and_check_string(ctx,
+        "var gi = WebAssembly.instantiate(__mod, imports).instance;\n"
+        "var mem = gi.exports.memory;\n"
+        "var before = mem.buffer.byteLength / 65536;\n"
+        "var prev = mem.grow(1);\n"
+        "var after = mem.buffer.byteLength / 65536;\n"
+        "prev + ':' + before + ':' + after",
+        "1:1:2", "Memory.grow method");
+
+    /* growing past the declared maximum answers -1 (not an exception) */
+    eval_and_check_string(ctx,
+        "var gm = WebAssembly.instantiate(__mod, imports).instance;\n"
+        "gm.exports.memory.grow(0) + ':' + gm.exports.memory.grow(100000)",
+        "1:-1", "Memory.grow over the limit");
+
+    /* ---- store widths ---- */
+    {
+        JSValue g4, sab;
+
+        g4 = JS_GetGlobalObject(ctx);
+        sab = JS_NewArrayBufferCopy(ctx, STORE_MODULE, sizeof(STORE_MODULE));
+        JS_SetPropertyStr(ctx, g4, "__storemod", sab);
+        JS_FreeValue(ctx, g4);
+
+        /* Every store opcode writes the width its opcode names. This is the
+           bug WhaleNode hit through es-module-lexer: the translator's store
+           table was shifted by two, so `i32.store` (0x36) emitted a 1-byte
+           store and everything above the low byte was lost. */
+        eval_and_check_string(ctx,
+            "var s = WebAssembly.instantiate(__storemod, {}).instance.exports;\n"
+            "var m = new Uint8Array(s.memory.buffer);\n"
+            "var r = [];\n"
+            /* i32.store 0x11223344 -> 44 33 22 11 */
+            "s.st32(0, 0x11223344);\n"
+            "r.push([m[0],m[1],m[2],m[3]].map(function(x){return x.toString(16)}).join(' '));\n"
+            "r.push(s.ld32(0).toString(16));\n"
+            /* i32.store8 -> only byte 0 */
+            "m.fill(0); s.st8(0, 0x11223344);\n"
+            "r.push([m[0],m[1],m[2],m[3]].map(function(x){return x.toString(16)}).join(' '));\n"
+            /* i32.store16 -> bytes 0,1 */
+            "m.fill(0); s.st16(0, 0x11223344);\n"
+            "r.push([m[0],m[1],m[2],m[3]].map(function(x){return x.toString(16)}).join(' '));\n"
+            /* f64.store 1.5 -> 00 00 00 00 00 00 f8 3f */
+            "m.fill(0); s.stf64(0, 1.5);\n"
+            "r.push([m[0],m[7]].map(function(x){return x.toString(16)}).join(' '));\n"
+            "r.push(s.ldf64(0));\n"
+            "JSON.stringify(r)",
+            "[\"44 33 22 11\",\"11223344\",\"44 0 0 0\",\"44 33 0 0\",\"0 3f\",1.5]",
+            "store widths");
+
+        /* A single-module process is the case that used to break: the first
+           module instantiated got native code and every later one did not.
+           Instantiating twice must give the same answers both times. */
+        eval_and_check_string(ctx,
+            "var a = WebAssembly.instantiate(__storemod, {}).instance.exports;\n"
+            "var b = WebAssembly.instantiate(__storemod, {}).instance.exports;\n"
+            "a.st32(0, 0x11223344); b.st32(0, 0x55667788);\n"
+            "a.ld32(0).toString(16) + ':' + b.ld32(0).toString(16)",
+            "11223344:55667788", "two instantiations both store correctly");
+    }
 
     /* ---- cross-function calls, globals, wide signatures ---- */
     {
@@ -401,6 +653,32 @@ int main(void)
             "xi.exports.sel(11, 22, 1) + ':' + xi.exports.sel(11, 22, 0)",
             "11:22", "drop and select");
     }
+
+    /* Exported globals: a real WebAssembly.Global-shaped object with `.value`,
+       which is what an emscripten/assemblyscript module exports as __heap_base
+       and what vite's es-module-lexer reads on its first parse. */
+    eval_and_check_string(ctx,
+        "var xg = WebAssembly.instantiate(__globals, {}).instance.exports;\n"
+        "xg.acc.value + ',' + xg.k.value + ',' + xg.getacc()",
+        "5,1.5,5", "exported globals readable");
+
+    /* a mutable exported global can be written and the wasm sees it */
+    eval_and_check_string(ctx,
+        "var xg2 = WebAssembly.instantiate(__globals, {}).instance.exports;\n"
+        "xg2.acc.value = 40;\n"
+        "xg2.acc.value + ',' + xg2.getacc()",
+        "40,40", "mutable exported global");
+
+    /* an immutable one ignores the write (silently in sloppy mode; the value
+       stays what the module initialised it to) */
+    eval_and_check_string(ctx,
+        "var xg3 = WebAssembly.instantiate(__globals, {}).instance.exports;\n"
+        "var before = xg3.k.value;\n"
+        "var ok = 0;\n"
+        "try { xg3.k.value = 1; } catch (e) { ok = 1; }\n"
+        "ok + ':' + (xg3.k.value === before)",
+        "0:true", "immutable exported global");
+
 
     /* ---- translator regressions (vite's embedded oxc module) ---- */
     {

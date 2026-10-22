@@ -89,6 +89,7 @@ typedef struct WasmClasses {
     JSClassID module;
     JSClassID instance;
     JSClassID memory;
+    JSClassID global;
 } WasmClasses;
 
 #define WASM_MAX_RUNTIMES 16
@@ -117,9 +118,10 @@ static WasmClasses *wasm_classes_get(JSRuntime *rt)
            whether the entry is stale. */
         if (JS_IsRegisteredClass(rt, c->module) &&
             JS_IsRegisteredClass(rt, c->instance) &&
-            JS_IsRegisteredClass(rt, c->memory))
+            JS_IsRegisteredClass(rt, c->memory) &&
+            JS_IsRegisteredClass(rt, c->global))
             return c;
-        c->module = c->instance = c->memory = 0;
+        c->module = c->instance = c->memory = c->global = 0;
     }
     if (!c) {
         for (i = 0; i < WASM_MAX_RUNTIMES; i++) {
@@ -135,6 +137,7 @@ static WasmClasses *wasm_classes_get(JSRuntime *rt)
     JS_NewClassID(rt, &c->module);
     JS_NewClassID(rt, &c->instance);
     JS_NewClassID(rt, &c->memory);
+    JS_NewClassID(rt, &c->global);
     return c;
 }
 
@@ -545,6 +548,186 @@ static int wasm_globals_init(WasmCore *core)
 }
 
 /* ------------------------------------------------------------------ */
+/* exported globals                                                    */
+/* ------------------------------------------------------------------ */
+/* A `WebAssembly.Global`-shaped object over one slot of the module's global
+ * array. Consumers read and write `.value`; a mutable global is one cell seen
+ * through both this object and the translated code's shadow.
+ *
+ * The index is the module's global index (imports first), which is what the
+ * export section names. `type` is wasm's value type byte. */
+typedef struct WasmGlobalObj {
+    JSRuntime *jrt;
+    WasmCore *core;
+    int index;
+    int type;
+    int mutable_;
+} WasmGlobalObj;
+
+static void js_wasm_global_finalizer(JSRuntime *rt, JSValueConst val)
+{
+    JSClassID cid;
+    WasmGlobalObj *g = JS_GetAnyOpaque(val, &cid);
+
+    if (g) {
+        wasm_core_unref(g->core);
+        js_free_rt(rt, g);
+    }
+}
+
+static JSValue js_wasm_global_value_getter(JSContext *ctx, JSValueConst this_val)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    WasmClasses *cls = wasm_classes_find(rt);
+    JSClassID cid;
+    WasmGlobalObj *g;
+
+    g = JS_GetAnyOpaque(this_val, &cid);
+    if (!cls || !g || cid != cls->global)
+        return JS_ThrowTypeError(ctx, "not a WebAssembly.Global");
+    if (!g->core->globals || g->index < 0 || g->index >= g->core->nglobals)
+        return JS_UNDEFINED;
+    {
+        unsigned long long raw = g->core->globals[g->index];
+
+        switch (g->type) {
+        case 0x7f: return JS_NewInt32(ctx, (int32_t)(uint32_t)raw);
+        case 0x7e: return JS_NewInt64(ctx, (int64_t)raw);
+        case 0x7d: {
+            float f;
+            uint32_t bits = (uint32_t)raw;
+            memcpy(&f, &bits, sizeof(f));
+            return JS_NewFloat64(ctx, (double)f);
+        }
+        case 0x7c: {
+            double d;
+            memcpy(&d, &raw, sizeof(d));
+            return JS_NewFloat64(ctx, d);
+        }
+        default:   return JS_UNDEFINED;
+        }
+    }
+}
+
+static JSValue js_wasm_global_value_setter(JSContext *ctx, JSValueConst this_val,
+                                           JSValueConst val)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    WasmClasses *cls = wasm_classes_find(rt);
+    JSClassID cid;
+    WasmGlobalObj *g;
+    unsigned long long raw = 0;
+
+    g = JS_GetAnyOpaque(this_val, &cid);
+    if (!cls || !g || cid != cls->global)
+        return JS_ThrowTypeError(ctx, "not a WebAssembly.Global");
+    if (!g->mutable_)
+        return JS_ThrowTypeError(ctx, "global is immutable");
+    if (!g->core->globals || g->index < 0 || g->index >= g->core->nglobals)
+        return JS_UNDEFINED;
+    switch (g->type) {
+    case 0x7f: {
+        int32_t v;
+
+        if (JS_ToInt32(ctx, &v, val))
+            return JS_EXCEPTION;
+        raw = (uint32_t)v;
+        break;
+    }
+    case 0x7e: {
+        int64_t v;
+
+        if (JS_ToInt64(ctx, &v, val))
+            return JS_EXCEPTION;
+        raw = (unsigned long long)v;
+        break;
+    }
+    case 0x7d: {
+        double d;
+
+        if (JS_ToFloat64(ctx, &d, val))
+            return JS_EXCEPTION;
+        {
+            float f = (float)d;
+            uint32_t bits;
+
+            memcpy(&bits, &f, sizeof(bits));
+            raw = bits;
+        }
+        break;
+    }
+    case 0x7c: {
+        double d;
+
+        if (JS_ToFloat64(ctx, &d, val))
+            return JS_EXCEPTION;
+        memcpy(&raw, &d, sizeof(d));
+        break;
+    }
+    default:
+        return JS_UNDEFINED;
+    }
+    g->core->globals[g->index] = raw;
+    /* Push it back to wasm3 too: a function that still runs there reads the
+       M3Global cell, not this shadow. */
+    wasm_globals_store(g->core);
+    return JS_UNDEFINED;
+}
+
+/* Build the object for export `index` (a global index in the module's space). */
+static JSValue wasm_global_object(JSContext *ctx, WasmCore *core, int index)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    WasmClasses *cls = wasm_classes_find(rt);
+    JSValue obj, getter, setter;
+    WasmGlobalObj *g;
+    JSAtom atom;
+    int type = 0x7f;
+    int is_mut = 0;
+
+    if (!cls || !core->mod || index < 0 || (uint32_t)index >= core->mod->numGlobals)
+        return JS_UNDEFINED;
+    {
+        M3Global *mg = &core->mod->globals[index];
+
+        /* wasm3 keeps the value type as its own enum; map it back to the wasm
+           byte the JS side expects. */
+        switch (mg->type) {
+        case c_m3Type_i32: type = 0x7f; break;
+        case c_m3Type_i64: type = 0x7e; break;
+        case c_m3Type_f32: type = 0x7d; break;
+        case c_m3Type_f64: type = 0x7c; break;
+        default:           type = 0x7f; break;
+        }
+        is_mut = mg->isMutable ? 1 : 0;
+    }
+    obj = JS_NewObjectClass(ctx, cls->global);
+    if (JS_IsException(obj))
+        return obj;
+    g = js_mallocz(ctx, sizeof(*g));
+    if (!g) {
+        JS_FreeValue(ctx, obj);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+    g->jrt = rt;
+    g->core = wasm_core_ref(core);
+    g->index = index;
+    g->type = type;
+    g->mutable_ = is_mut;
+    JS_SetOpaque(obj, g);
+    atom = JS_NewAtom(ctx, "value");
+    getter = JS_NewCFunction2(ctx, (JSCFunction *)js_wasm_global_value_getter,
+                              "get value", 0, JS_CFUNC_getter, 0);
+    setter = is_mut
+        ? JS_NewCFunction2(ctx, (JSCFunction *)js_wasm_global_value_setter,
+                           "set value", 1, JS_CFUNC_setter, 0)
+        : JS_UNDEFINED;
+    JS_DefinePropertyGetSet(ctx, obj, atom, getter, setter, JS_PROP_CONFIGURABLE);
+    JS_FreeAtom(ctx, atom);
+    return obj;
+}
+
+/* ------------------------------------------------------------------ */
 /* linear memory view                                                  */
 /* ------------------------------------------------------------------ */
 /* Drop the cached buffer if memory.grow moved the block. */
@@ -612,6 +795,51 @@ static JSValue js_wasm_memory_buffer_getter(JSContext *ctx, JSValueConst this_va
     if (!cls || !m || cid != cls->memory)
         return JS_ThrowTypeError(ctx, "not a WebAssembly.Memory");
     return wasm_core_memory_buffer(ctx, m->core);
+}
+
+/* memory.grow(delta) -> previous page count, or -1 when it cannot grow.
+ *
+ * The memory belongs to the module, so the resize goes through wasm3's own
+ * ResizeMemory: that keeps the interpreter and the translated code looking at
+ * the same block. The cached ArrayBuffer is detached by
+ * wasm_core_refresh_memory on the next access, which is what the spec asks for
+ * (the old buffer is left detached at length 0). */
+static JSValue js_wasm_memory_grow(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    WasmClasses *cls = wasm_classes_find(rt);
+    JSClassID cid;
+    WasmMemory *m;
+    WasmCore *core;
+    int64_t delta = 0;
+    IM3Memory mem;
+    uint64_t old_pages;
+
+    m = JS_GetAnyOpaque(this_val, &cid);
+    if (!cls || !m || cid != cls->memory)
+        return JS_ThrowTypeError(ctx, "not a WebAssembly.Memory");
+    core = m->core;
+    if (argc > 0 && JS_ToInt64(ctx, &delta, argv[0]))
+        return JS_EXCEPTION;
+    if (delta < 0)
+        return JS_ThrowRangeError(ctx, "grow: delta must not be negative");
+    if (!core->mod || core->mod->numMemories < 1)
+        return JS_NewInt32(ctx, -1);
+    mem = core->mod->memories[0];
+    if (!mem)
+        return JS_NewInt32(ctx, -1);
+    old_pages = mem->numPages;
+    /* wasm's limit is 65536 pages; ResizeMemory refuses anything past the
+       declared maximum and returns an error, which the spec maps to -1. */
+    if (delta > 0) {
+        if (ResizeMemory(core->rt, mem, old_pages + (uint64_t)delta))
+            return JS_NewInt32(ctx, -1);
+        /* the block moved or grew: drop the stale view before anyone reads it */
+        core->mem_ptr = NULL;
+        core->mem_size = 0;
+    }
+    return JS_NewInt64(ctx, (int64_t)old_pages);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1589,12 +1817,23 @@ static JSValue wasm_build_exports(JSContext *ctx, WasmCore *core)
                         JS_DefinePropertyGetSet(ctx, obj, atom, getter,
                                                 JS_UNDEFINED, JS_PROP_CONFIGURABLE);
                         JS_FreeAtom(ctx, atom);
+                        /* memory.grow: the spec's method, and the one a loader
+                           that sizes its memory tightly needs at startup. */
+                        JS_SetPropertyStr(ctx, obj, "grow",
+                            JS_NewCFunction(ctx, js_wasm_memory_grow, "grow", 1));
                         JS_SetPropertyStr(ctx, exports, name, obj);
                         have_memory = 1;
                     } else {
                         js_free(ctx, mem);
                         JS_FreeValue(ctx, obj);
                     }
+                } else if (kind == 3) {                 /* global */
+                    JSValue g = wasm_global_object(ctx, core, (int)index);
+
+                    if (!JS_IsUndefined(g) && !JS_IsException(g))
+                        JS_SetPropertyStr(ctx, exports, name, g);
+                    else
+                        JS_FreeValue(ctx, g);
                 }
             }
         }
@@ -1711,6 +1950,199 @@ static JSValue wasm_instantiate_module(JSContext *ctx, JSValueConst module_obj,
         fprintf(stderr, "[inst-mod] setopaque=%d class=%u\n",
                 JS_SetOpaque(obj, core), cls->instance);
     return obj;
+}
+
+/* Settle a value that may be a promise, then run `fn` with the result.
+ *
+ * `fn` is a C callback, not a JS function: the streaming APIs need to compile
+ * the bytes they receive, and compiling is a C operation. So this wraps the
+ * callback in a JS closure (`JS_NewCClosure` carries the pointer) and calls
+ * `Promise.resolve(value).then(closure)`. Using the engine's own promise keeps
+ * ordering and rejection propagation right - a hand-rolled job would have to
+ * re-implement both. */
+typedef JSValue (*WasmValueFn)(JSContext *ctx, void *opaque, JSValueConst value);
+
+typedef struct WasmThunk {
+    WasmValueFn fn;
+    void *opaque;
+} WasmThunk;
+
+static JSValue wasm_then_thunk(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv, int magic, void *opaque)
+{
+    WasmThunk *t = opaque;
+
+    (void)this_val; (void)magic;
+    if (!t)
+        return JS_ThrowTypeError(ctx, "wasm: thunk lost its callback");
+    if (argc < 1)
+        return JS_ThrowTypeError(ctx, "wasm: missing value");
+    return t->fn(ctx, t->opaque, argv[0]);
+}
+
+static void wasm_thunk_free(void *opaque)
+{
+    WasmThunk *t = opaque;
+
+    /* js_free needs a context; the finalizer has none, and the struct is
+       tiny - leaking one allocation per streaming call would still be wrong,
+       so it goes through free() rather than js_free. */
+    free(t);
+}
+
+static JSValue wasm_then(JSContext *ctx, JSValueConst value, WasmValueFn fn,
+                         void *opaque)
+{
+    JSValue global, promise_ctor, resolved, thenfn, thunk, out, args[1];
+    WasmThunk *t;
+
+    global = JS_GetGlobalObject(ctx);
+    promise_ctor = JS_GetPropertyStr(ctx, global, "Promise");
+    JS_FreeValue(ctx, global);
+    if (!JS_IsFunction(ctx, promise_ctor)) {
+        JS_FreeValue(ctx, promise_ctor);
+        return JS_ThrowInternalError(ctx, "wasm: no Promise");
+    }
+    {
+        JSValue resolve = JS_GetPropertyStr(ctx, promise_ctor, "resolve");
+
+        if (!JS_IsFunction(ctx, resolve)) {
+            JS_FreeValue(ctx, resolve);
+            JS_FreeValue(ctx, promise_ctor);
+            return JS_ThrowInternalError(ctx, "wasm: no Promise.resolve");
+        }
+        args[0] = JS_DupValue(ctx, value);
+        resolved = JS_Call(ctx, resolve, promise_ctor, 1, args);
+        JS_FreeValue(ctx, args[0]);
+        JS_FreeValue(ctx, resolve);
+    }
+    JS_FreeValue(ctx, promise_ctor);
+    if (JS_IsException(resolved))
+        return resolved;
+    t = malloc(sizeof(*t));
+    if (!t) {
+        JS_FreeValue(ctx, resolved);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+    t->fn = fn;
+    t->opaque = opaque;
+    thunk = JS_NewCClosure(ctx, wasm_then_thunk, "then",
+                           wasm_thunk_free, 1, 0, t);
+    if (JS_IsException(thunk)) {
+        free(t);
+        JS_FreeValue(ctx, resolved);
+        return thunk;
+    }
+    thenfn = JS_GetPropertyStr(ctx, resolved, "then");
+    if (!JS_IsFunction(ctx, thenfn)) {
+        JS_FreeValue(ctx, thenfn);
+        JS_FreeValue(ctx, thunk);
+        JS_FreeValue(ctx, resolved);
+        return JS_ThrowInternalError(ctx, "wasm: promise without then");
+    }
+    args[0] = thunk;
+    out = JS_Call(ctx, thenfn, resolved, 1, args);
+    JS_FreeValue(ctx, thenfn);
+    JS_FreeValue(ctx, thunk);
+    JS_FreeValue(ctx, resolved);
+    return out;
+}
+
+/* WebAssembly.instantiateStreaming(source, imports) -> Promise<{module, instance}>
+ * and compileStreaming(source) -> Promise<Module>.
+ *
+ * The spec's source is a Response (or a promise of one) whose body is read as
+ * an ArrayBuffer. Both are pure JS-level glue: the engine exposes the sync
+ * `compile`/`instantiate`, and the async contract is what a loader actually
+ * calls. WhaleNode's mod_wasm_compat.c supplies these when the binding does not;
+ * providing them here means a bare embedder (no Node surface) gets them too. */
+static JSValue wasm_compile_from_value(JSContext *ctx, void *opaque, JSValueConst value)
+{
+    (void)opaque;
+    return wasm_module_new(ctx, value);
+}
+
+static JSValue js_wasm_compile_streaming(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv)
+{
+    JSValue body, out;
+
+    (void)this_val;
+    if (argc < 1)
+        return JS_ThrowTypeError(ctx, "compileStreaming: argument required");
+    if (JS_IsObject(argv[0])) {
+        body = JS_GetPropertyStr(ctx, argv[0], "arrayBuffer");
+        if (JS_IsFunction(ctx, body)) {
+            JSValue buf = JS_Call(ctx, body, argv[0], 0, NULL);
+
+            JS_FreeValue(ctx, body);
+            body = buf;
+        } else {
+            JS_FreeValue(ctx, body);
+            body = JS_DupValue(ctx, argv[0]);
+        }
+    } else {
+        body = JS_DupValue(ctx, argv[0]);
+    }
+    if (JS_IsException(body))
+        return body;
+    out = wasm_then(ctx, body, wasm_compile_from_value, NULL);
+    JS_FreeValue(ctx, body);
+    return out;
+}
+
+typedef struct WasmInstOpaque {
+    JSValue imports;
+} WasmInstOpaque;
+
+static JSValue wasm_instantiate_from_value(JSContext *ctx, void *opaque, JSValueConst value)
+{
+    WasmInstOpaque *o = opaque;
+    JSValue mod = wasm_module_new(ctx, value);
+    JSValue inst, ret;
+
+    if (JS_IsException(mod))
+        return mod;
+    inst = wasm_instantiate_module(ctx, mod, o->imports);
+    if (JS_IsException(inst)) {
+        JS_FreeValue(ctx, mod);
+        return inst;
+    }
+    ret = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, ret, "module", mod);
+    JS_SetPropertyStr(ctx, ret, "instance", inst);
+    return ret;
+}
+
+static JSValue js_wasm_instantiate_streaming(JSContext *ctx, JSValueConst this_val,
+                                             int argc, JSValueConst *argv)
+{
+    JSValue body, out;
+    WasmInstOpaque o;
+
+    (void)this_val;
+    if (argc < 1)
+        return JS_ThrowTypeError(ctx, "instantiateStreaming: argument required");
+    if (JS_IsObject(argv[0])) {
+        body = JS_GetPropertyStr(ctx, argv[0], "arrayBuffer");
+        if (JS_IsFunction(ctx, body)) {
+            JSValue buf = JS_Call(ctx, body, argv[0], 0, NULL);
+
+            JS_FreeValue(ctx, body);
+            body = buf;
+        } else {
+            JS_FreeValue(ctx, body);
+            body = JS_DupValue(ctx, argv[0]);
+        }
+    } else {
+        body = JS_DupValue(ctx, argv[0]);
+    }
+    if (JS_IsException(body))
+        return body;
+    o.imports = argc > 1 ? argv[1] : JS_UNDEFINED;
+    out = wasm_then(ctx, body, wasm_instantiate_from_value, &o);
+    JS_FreeValue(ctx, body);
+    return out;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1834,6 +2266,228 @@ static JSValue js_wasm_compile(JSContext *ctx, JSValueConst this_val,
 }
 
 /* ------------------------------------------------------------------ */
+/* Module introspection: exports / imports / customSections            */
+/* ------------------------------------------------------------------ */
+
+/* Parse the export section into [{name, kind, index}]. `kind` uses the spec's
+   numbering: 0 function, 1 table, 2 memory, 3 global. Kept separate from
+   wasm_build_exports, which builds the live Instance surface; this is the
+   static view a bundler reads without instantiating anything. */
+static JSValue wasm_module_exports(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    WasmModule *m;
+    size_t len = 0;
+    uint8_t *buf;
+    WasmReader r;
+    JSValue out;
+
+    /* Static method: the module is argv[0], not `this`. */
+    (void)this_val;
+    if (argc < 1)
+        return JS_ThrowTypeError(ctx, "Module.exports: argument required");
+    m = JS_GetOpaque(argv[0], wasm_classes_get(JS_GetRuntime(ctx))->module);
+    if (!m)
+        return JS_ThrowTypeError(ctx, "not a WebAssembly.Module");
+    buf = JS_GetArrayBuffer(ctx, &len, m->bytes);
+    if (!buf || len < 8)
+        return JS_NewArray(ctx);
+    out = JS_NewArray(ctx);
+    if (JS_IsException(out))
+        return out;
+    r.p = buf + 8;
+    r.end = buf + len;
+    r.ok = 1;
+    while (r.p < r.end && r.ok) {
+        uint8_t id = *r.p++;
+        uint32_t size = wasm_uleb(&r);
+        const uint8_t *sec;
+
+        if (!r.ok || (size_t)(r.end - r.p) < size)
+            break;
+        sec = r.p;
+        r.p += size;
+        if (id == 7) {
+            WasmReader er;
+            uint32_t n, k;
+
+            er.p = sec;
+            er.end = sec + size;
+            er.ok = 1;
+            n = wasm_uleb(&er);
+            for (k = 0; k < n && er.ok; k++) {
+                uint32_t nlen = wasm_uleb(&er);
+                JSValue e, nm;
+
+                if (!er.ok || (size_t)(er.end - er.p) < nlen)
+                    break;
+                nm = JS_NewStringLen(ctx, (const char *)er.p, nlen);
+                er.p += nlen;
+                e = JS_NewObject(ctx);
+                JS_SetPropertyStr(ctx, e, "name", nm);
+                JS_SetPropertyStr(ctx, e, "kind",
+                    JS_NewInt32(ctx, (int)*er.p++));
+                JS_SetPropertyStr(ctx, e, "index",
+                    JS_NewInt32(ctx, (int)wasm_uleb(&er)));
+                JS_SetPropertyUint32(ctx, out, k, e);
+            }
+            break;
+        }
+    }
+    return out;
+}
+
+/* Parse the import section into [{module, name, kind}]. */
+static JSValue wasm_module_imports(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    WasmModule *m;
+    size_t len = 0;
+    uint8_t *buf;
+    WasmReader r;
+    JSValue out;
+
+    (void)this_val;
+    if (argc < 1)
+        return JS_ThrowTypeError(ctx, "Module.imports: argument required");
+    m = JS_GetOpaque(argv[0], wasm_classes_get(JS_GetRuntime(ctx))->module);
+    if (!m)
+        return JS_ThrowTypeError(ctx, "not a WebAssembly.Module");
+    buf = JS_GetArrayBuffer(ctx, &len, m->bytes);
+    if (!buf || len < 8)
+        return JS_NewArray(ctx);
+    out = JS_NewArray(ctx);
+    if (JS_IsException(out))
+        return out;
+    r.p = buf + 8;
+    r.end = buf + len;
+    r.ok = 1;
+    while (r.p < r.end && r.ok) {
+        uint8_t id = *r.p++;
+        uint32_t size = wasm_uleb(&r);
+        const uint8_t *sec;
+
+        if (!r.ok || (size_t)(r.end - r.p) < size)
+            break;
+        sec = r.p;
+        r.p += size;
+        if (id == 2) {
+            WasmReader ir;
+            uint32_t n, k;
+
+            ir.p = sec;
+            ir.end = sec + size;
+            ir.ok = 1;
+            n = wasm_uleb(&ir);
+            for (k = 0; k < n && ir.ok; k++) {
+                uint32_t mlen = wasm_uleb(&ir);
+                JSValue e, mn;
+                uint32_t flen;
+                uint8_t kind;
+
+                if (!ir.ok || (size_t)(ir.end - ir.p) < mlen)
+                    break;
+                mn = JS_NewStringLen(ctx, (const char *)ir.p, mlen);
+                ir.p += mlen;
+                flen = wasm_uleb(&ir);
+                if (!ir.ok || (size_t)(ir.end - ir.p) < flen) {
+                    JS_FreeValue(ctx, mn);
+                    break;
+                }
+                e = JS_NewObject(ctx);
+                JS_SetPropertyStr(ctx, e, "module", mn);
+                JS_SetPropertyStr(ctx, e, "name",
+                    JS_NewStringLen(ctx, (const char *)ir.p, flen));
+                ir.p += flen;
+                kind = *ir.p++;
+                JS_SetPropertyStr(ctx, e, "kind", JS_NewInt32(ctx, (int)kind));
+                /* skip the descriptor so the next entry starts in the right
+                   place - it is what the reader would otherwise trip on */
+                if (kind == 0) {
+                    (void)wasm_uleb(&ir);
+                } else if (kind == 1) {
+                    (void)ir.p++;               /* elem type */
+                    if (wasm_uleb(&ir) & 1)
+                        (void)wasm_uleb(&ir);
+                } else if (kind == 2) {
+                    if (wasm_uleb(&ir) & 1)
+                        (void)wasm_uleb(&ir);
+                } else if (kind == 3) {
+                    ir.p += 2;                  /* valtype, mutability */
+                }
+                JS_SetPropertyUint32(ctx, out, k, e);
+            }
+            break;
+        }
+    }
+    return out;
+}
+
+/* customSections(module, name) -> array of Uint8Array payloads. Only the
+   custom sections (id 0) whose name matches are returned, which is what a
+   toolchain looks for when it reads producer metadata. */
+static JSValue wasm_module_custom_sections(JSContext *ctx, JSValueConst this_val,
+                                           int argc, JSValueConst *argv)
+{
+    WasmModule *m;
+    size_t len = 0;
+    uint8_t *buf;
+    const char *want;
+    size_t want_len = 0;
+    WasmReader r;
+    JSValue out;
+    uint32_t idx = 0;
+
+    (void)this_val;
+    if (argc < 2)
+        return JS_ThrowTypeError(ctx, "Module.customSections: arguments required");
+    m = JS_GetOpaque(argv[0], wasm_classes_get(JS_GetRuntime(ctx))->module);
+    if (!m)
+        return JS_ThrowTypeError(ctx, "not a WebAssembly.Module");
+    want = JS_ToCStringLen(ctx, &want_len, argv[1]);
+    if (!want)
+        return JS_EXCEPTION;
+    buf = JS_GetArrayBuffer(ctx, &len, m->bytes);
+    out = JS_NewArray(ctx);
+    if (!buf || len < 8 || JS_IsException(out)) {
+        if (want)
+            JS_FreeCString(ctx, want);
+        return out;
+    }
+    r.p = buf + 8;
+    r.end = buf + len;
+    r.ok = 1;
+    while (r.p < r.end && r.ok) {
+        uint8_t id = *r.p++;
+        uint32_t size = wasm_uleb(&r);
+        const uint8_t *sec;
+
+        if (!r.ok || (size_t)(r.end - r.p) < size)
+            break;
+        sec = r.p;
+        r.p += size;
+        if (id == 0) {
+            WasmReader cr;
+            uint32_t nlen;
+
+            cr.p = sec;
+            cr.end = sec + size;
+            cr.ok = 1;
+            nlen = wasm_uleb(&cr);
+            if (cr.ok && (size_t)(cr.end - cr.p) >= nlen &&
+                nlen == want_len && (want_len == 0 || !memcmp(cr.p, want, nlen))) {
+                JS_SetPropertyUint32(ctx, out, idx++,
+                    JS_NewUint8ArrayCopy(ctx, cr.p + nlen,
+                                         (size_t)(cr.end - (cr.p + nlen))));
+            }
+        }
+    }
+    if (want)
+        JS_FreeCString(ctx, want);
+    return out;
+}
+
+/* ------------------------------------------------------------------ */
 /* install                                                             */
 /* ------------------------------------------------------------------ */
 int JS_WhaleInstallWasmRuntime(JSRuntime *rt)
@@ -1847,6 +2501,9 @@ int JS_WhaleInstallWasmRuntime(JSRuntime *rt)
     };
     static const JSClassDef memory_def = {
         "WebAssembly.Memory", .finalizer = js_wasm_memory_finalizer,
+    };
+    static const JSClassDef global_def = {
+        "WebAssembly.Global", .finalizer = js_wasm_global_finalizer,
     };
 
     if (!rt)
@@ -1862,6 +2519,8 @@ int JS_WhaleInstallWasmRuntime(JSRuntime *rt)
         JS_NewClass(rt, cls->instance, &instance_def);
     if (!JS_IsRegisteredClass(rt, cls->memory))
         JS_NewClass(rt, cls->memory, &memory_def);
+    if (!JS_IsRegisteredClass(rt, cls->global))
+        JS_NewClass(rt, cls->global, &global_def);
     return 0;
 }
 
@@ -1883,6 +2542,11 @@ int JS_WhaleInstallWasm(JSContext *ctx)
         JS_NewCFunction(ctx, js_wasm_compile, "compile", 1));
     JS_SetPropertyStr(ctx, wasm, "instantiate",
         JS_NewCFunction(ctx, js_wasm_instantiate, "instantiate", 2));
+    JS_SetPropertyStr(ctx, wasm, "compileStreaming",
+        JS_NewCFunction(ctx, js_wasm_compile_streaming, "compileStreaming", 1));
+    JS_SetPropertyStr(ctx, wasm, "instantiateStreaming",
+        JS_NewCFunction(ctx, js_wasm_instantiate_streaming,
+                        "instantiateStreaming", 2));
 
     /* Both constructors get a real prototype object. Without one the function
        has no `prototype` property, and `x instanceof WebAssembly.Module` -
@@ -1894,6 +2558,14 @@ int JS_WhaleInstallWasm(JSContext *ctx)
     proto = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, proto, "constructor", JS_DupValue(ctx, ctor));
     JS_SetPropertyStr(ctx, ctor, "prototype", JS_DupValue(ctx, proto));
+    /* The spec puts these on the constructor, not the prototype:
+       WebAssembly.Module.exports(m) / .imports(m) / .customSections(m, name). */
+    JS_SetPropertyStr(ctx, ctor, "exports",
+        JS_NewCFunction(ctx, wasm_module_exports, "exports", 1));
+    JS_SetPropertyStr(ctx, ctor, "imports",
+        JS_NewCFunction(ctx, wasm_module_imports, "imports", 1));
+    JS_SetPropertyStr(ctx, ctor, "customSections",
+        JS_NewCFunction(ctx, wasm_module_custom_sections, "customSections", 2));
     JS_SetPropertyStr(ctx, wasm, "Module", ctor);
     JS_SetClassProto(ctx, wasm_classes_get(JS_GetRuntime(ctx))->module,
                       JS_DupValue(ctx, proto));

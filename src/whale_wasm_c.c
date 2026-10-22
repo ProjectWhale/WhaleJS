@@ -811,11 +811,12 @@ static int width_of(int opcode)
     case 0x2e: case 0x2f: case 0x32: case 0x33: return 2;
     case 0x28: case 0x2a: case 0x34: case 0x35: return 4;
     case 0x29: case 0x2b: return 8;
-    /* stores */
-    case 0x36: case 0x39: return 1;
-    case 0x37: case 0x3a: return 2;
-    case 0x38: case 0x3b: case 0x3d: return 4;
-    case 0x3c: case 0x3e: return 8;
+    /* stores - the spec's numbering, the same one store_type uses */
+    case 0x36: case 0x38: return 4;             /* i32.store, f32.store */
+    case 0x37: case 0x39: return 8;             /* i64.store, f64.store */
+    case 0x3a: case 0x3c: return 1;             /* i32.store8, i64.store8 */
+    case 0x3b: case 0x3d: return 2;             /* i32.store16, i64.store16 */
+    case 0x3e: return 4;                        /* i64.store32 */
     default:   return 0;
     }
 }
@@ -878,32 +879,40 @@ static WType load_result(int opcode)
     }
 }
 
-/* Store opcodes, by the spec's numbering:
- *   0x36 i32.store8   0x37 i32.store16   0x38 i32.store
- *   0x39 i64.store8   0x3a i64.store16   0x3b i64.store32   0x3c i64.store
- *   0x3d f32.store    0x3e f64.store
+/* Store opcodes, by the spec's numbering. The widths are part of the opcode:
+ *   0x36 i32.store    0x37 i64.store    0x38 f32.store    0x39 f64.store
+ *   0x3a i32.store8   0x3b i32.store16  0x3c i64.store8   0x3d i64.store16
+ *   0x3e i64.store32
+ *
+ * This table used to be shifted by two (0x36 was read as i32.store8), so a
+ * 4-byte `i32.store` emitted a 1-byte store and everything but the low byte was
+ * lost. It stayed hidden because nothing wrote memory through a translated
+ * function in the test set - es-module-lexer, the one real module that reached
+ * the native path, builds its offset table that way, which is what surfaced it.
  */
 static WType store_value(int opcode)
 {
-    if (opcode >= 0x36 && opcode <= 0x38) return T_I32;
-    if (opcode >= 0x39 && opcode <= 0x3c) return T_I64;
-    if (opcode == 0x3d) return T_F32;
-    if (opcode == 0x3e) return T_F64;
-    return T_NONE;
+    switch (opcode) {
+    case 0x36: case 0x3a: case 0x3b: return T_I32;   /* i32.store / store8 / store16 */
+    case 0x37: case 0x3c: case 0x3d: case 0x3e: return T_I64;
+    case 0x38: return T_F32;
+    case 0x39: return T_F64;
+    default:   return T_NONE;
+    }
 }
 
 static const char *store_type(int opcode)
 {
     switch (opcode) {
-    case 0x36: return "unsigned char";        /* i32.store8 */
-    case 0x37: return "unsigned short";       /* i32.store16 */
-    case 0x38: return "unsigned int";         /* i32.store */
-    case 0x39: return "unsigned char";        /* i64.store8 */
-    case 0x3a: return "unsigned short";       /* i64.store16 */
-    case 0x3b: return "unsigned int";         /* i64.store32 */
-    case 0x3c: return "unsigned long long";   /* i64.store */
-    case 0x3d: return "float";                /* f32.store */
-    case 0x3e: return "double";               /* f64.store */
+    case 0x36: return "unsigned int";         /* i32.store */
+    case 0x37: return "unsigned long long";   /* i64.store */
+    case 0x38: return "float";                /* f32.store */
+    case 0x39: return "double";               /* f64.store */
+    case 0x3a: return "unsigned char";        /* i32.store8 */
+    case 0x3b: return "unsigned short";       /* i32.store16 */
+    case 0x3c: return "unsigned char";        /* i64.store8 */
+    case 0x3d: return "unsigned short";       /* i64.store16 */
+    case 0x3e: return "unsigned int";         /* i64.store32 */
     default:   return NULL;
     }
 }
