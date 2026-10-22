@@ -492,6 +492,14 @@ JSValue JS_WhaleNewBool(JSContext *ctx, int b)
 {
     return JS_NewBool(ctx, b);
 }
+/* JS_UNDEFINED is a macro, so generated code cannot name it. A function whose
+   every exit is `return;` (the empty body, `return;`, and every noop callback
+   a front end hands to a library) has to hand back exactly that value. */
+JSValue JS_WhaleUndefined(JSContext *ctx)
+{
+    (void)ctx;
+    return JS_UNDEFINED;
+}
 JSValue whale_jit_box_num(JSContext *ctx, double d)
 {
     if (d >= -2147483648.0 && d <= 2147483647.0) {
@@ -6358,6 +6366,18 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     unsigned *assign_cnt = NULL;   /* weighted access count */
     int unreachable = 0;
     int ret_is_bool = -1;
+    /* Every exit is `return;` - the empty body, `return;`, and the noop
+       callbacks a front end hands to libraries. Those return undefined, which
+       is not a number, so the entry wrapper must not box `_r`. Kept separate
+       from ret_is_bool because the two shapes cannot mix (see OP_return). */
+    int ret_is_undef = 0;
+    /* The function has both `return;` and `return <value>` - the usual
+       `function (err) { if (err) return; doWork(); }` shape. Neither the double
+       return nor the single-shape wrapper can carry two result kinds, so both
+       travel through ret_obj, which is already the out-parameter for object
+       returns. Decided by a pre-scan because the first return arm is emitted
+       before the last one is seen. */
+    int ret_mixed = 0;
     /* object slots handed out (each new object takes one) and object-property
        cache pairs. File-scope, shared with the inliner - see their declaration;
        reset here, which is what makes one compile independent of the last. */
@@ -6461,10 +6481,16 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        whole function away. That is exactly what happened to immutable_update. */
     int whale_str_obj_slot = -1;
 
-    if (!info->is_normal)
+    if (!info->is_normal) {
+        if (whale_dbg_env("WHALE_JIT_DUMP"))
+            fprintf(stderr, "[gen] refused: not a normal function\n");
         return 0;
-    if (stack_size <= 0 || stack_size > WHALE_JIT_MAX_SLOTS)
+    }
+    if (stack_size < 0 || stack_size > WHALE_JIT_MAX_SLOTS) {
+        if (whale_dbg_env("WHALE_JIT_DUMP"))
+            fprintf(stderr, "[gen] refused: stack_size=%d\n", stack_size);
         return 0;
+    }
     /* The closure-slot tables below (whale_vr_slot/_fn/_info, the _p cells) are
        four entries wide, so a function that can name a fifth enclosing variable
        is refused. The bound is closure_var_count - the get_var_ref index space -
@@ -6472,8 +6498,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        captured. Checking the wrong one let a function with var_ref_count 0 and
        six captured variables through: the generator then read whale_vr_info[4]
        and emitted `_p4` for a cell it never declared. */
-    if (info->closure_var_count > 4)
+    if (info->closure_var_count > 4) {
+        if (whale_dbg_env("WHALE_JIT_DUMP"))
+            fprintf(stderr, "[gen] refused: closure_var_count=%d\n",
+                    info->closure_var_count);
         return 0;
+    }
 
     targets = calloc(1, len + 1);
     seen = calloc(1, len + 1);
@@ -7043,6 +7073,30 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         if (args_num[i])
             args_val[i] = 0;
 
+    /* A function with both `return;` and `return <value>` - the
+       `function (err) { if (err) return; work(); }` callback shape. The emit
+       pass has to know before it reaches the FIRST return arm whether the
+       function mixes shapes, because that arm decides how every result travels
+       (see OP_return/OP_return_undef). One extra linear scan; the bytecode walk
+       is already three of them. */
+    {
+        int n_undef = 0, n_value = 0;
+
+        for (pos = 0; pos < len; ) {
+            int op = pc[pos];
+            int sz = whale_op_size_of(op);
+
+            if (sz <= 0 || pos + sz > len)
+                break;
+            if (op == OP_return_undef)
+                n_undef++;
+            else if (op == OP_return)
+                n_value++;
+            pos += sz;
+        }
+        ret_mixed = (n_undef > 0 && n_value > 0);
+    }
+
     /* pass 2: emit tokens. Nothing here builds text - the generator pushes
        tokens into TinyCC's parser directly, so there is no lexer and no
        keyword table, and keywords are compile-time constants. */
@@ -7314,6 +7368,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_DOUBLE); wt_id("d"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_WhaleNewBool"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("b"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wt_id("JSValue"); wt_id("JS_WhaleUndefined"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(')'); wt(';');
     /* typed-array helpers (WHALE_T_OBJ). Declared like everything else: with no
        prototype TinyCC applies the C89 implicit declaration, a `double` argument
        then goes to the wrong register, and every call silently turns into a
@@ -12261,6 +12317,45 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 sp--;
             }
             break;
+        /* `return;` and the empty body. It pushes nothing, so there is no value
+           to lower - just the return itself. Refusing this opcode (it used to
+           fall through to the default step path, which classifies every return
+           as control flow) meant the single most common callback shape in
+           front-end code never compiled: every `() => {}`, every empty
+           lifecycle method, every placeholder handler. */
+        case OP_return_undef:
+            {
+                int fm;
+
+                fm = fold_mark();
+                whale_comma_close();
+                if (ret_mixed) {
+                    /* Both result kinds travel through ret_obj, so this arm and
+                       the value arm agree on one channel. */
+                    ret_is_undef = 1;
+                    whale_ret_obj = 1;
+                    wt('*'); wt_id("ret_obj"); wt('='); wt_id("JS_WhaleUndefined"); wt('(');
+                    wt_id("ctx"); wt(')'); wt(';');
+                    wk(JS_WK_RETURN); wt_int(0); wt(';');
+                    fold_commit(fm);
+                    unreachable = 1;
+                    break;
+                }
+                if (whale_ret_obj || ret_is_bool != -1)
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); } /* mixed return shapes */
+                ret_is_undef = 1;
+                /* core's result is a double and the entry wrapper boxes it, so
+                   the undefined cannot travel that way. The wrapper's
+                   ret_is_undef tail returns JS_WhaleUndefined itself; core only
+                   has to report "no deopt". Deliberately not routed through
+                   ret_obj: that flag also means "can return an object", which
+                   would turn off the numeric fast entry for a function that has
+                   no result at all. */
+                wk(JS_WK_RETURN); wt_int(0); wt(';');
+                fold_commit(fm);
+                unreachable = 1;
+            }
+            break;
         case OP_return:
             {
                 int fm;
@@ -12269,6 +12364,36 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 if (whale_dbg_env("WHALE_OP_DBG"))
                     fprintf(stderr, "[ret] pos=%d sp=%d t=%d num=%d\n",
                             pos, sp, t, whale_type_is_num(t));
+                /* Mixed shapes (see ret_mixed): every result leaves through
+                   ret_obj so a `return;` arm and this one can coexist.
+                   The type test comes first: a value this ABI cannot box has to
+                   be refused before any token is emitted, because a committed
+                   statement cannot be taken back. */
+                if (ret_mixed) {
+                    if (!WHALE_IS_OBJLIKE(t) && t != WHALE_T_BOOL &&
+                        !whale_type_is_num(t))
+                        { WHALE_STEP_INSTEAD_OF_BAILING(); }
+                    fm = fold_mark();
+                    whale_comma_close();
+                    wt('*'); wt_id("ret_obj"); wt('=');
+                    if (WHALE_IS_OBJLIKE(t)) {
+                        wt_id("JS_WhaleObjGet"); wt('('); wt_id("ctx"); wt(',');
+                        wt_int(WHALE_SLOT(t)); wt(')');
+                    } else if (t == WHALE_T_BOOL) {
+                        wt_id("JS_WhaleNewBool"); wt('('); wt_id("ctx"); wt(',');
+                        wt('('); fold_inline(sp - 1); wt(')');
+                        wt_op(JS_OP_NE); wt_int(0); wt(')');
+                    } else {
+                        wt_id("whale_jit_box_num"); wt('('); wt_id("ctx"); wt(',');
+                        fold_inline(sp - 1); wt(')');
+                    }
+                    wt(';');
+                    wk(JS_WK_RETURN); wt_int(0); wt(';');
+                    fold_commit(fm);
+                    whale_ret_obj = 1;
+                    unreachable = 1;
+                    break;
+                }
                 if (WHALE_IS_OBJLIKE(t)) {
                     /* The slot holds the reference; hand a duplicate of it to
                        the caller through ret_obj so the two do not compete for
@@ -12365,7 +12490,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     whale_gen_nat = whale_objs == 0 &&
                     var_ref_val[0] == 0 && var_ref_val[1] == 0 &&
                     var_ref_val[2] == 0 && var_ref_val[3] == 0 &&
-                    !whale_ret_obj && ret_is_bool != 1 && !whale_has_array;
+                    !whale_ret_obj && ret_is_bool != 1 && !whale_has_array &&
+                    !ret_is_undef && !ret_mixed;   /* its result is not a double */
     if (whale_gen_nat) {
         int k;
         for (k = 0; k < arg_count; k++)
@@ -12470,15 +12596,25 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     wk(JS_WK_IF); wt('('); wt('*'); wt_id("deopt"); wt(')'); wk(JS_WK_RETURN); wt_id("whale_jit_box_num"); wt('('); wt_id("ctx"); wt(','); wt_int(0); wt(')'); wt(';');
     /* An array or object result came back through ret_obj instead. Only a
        function that can actually return one gets the check - a numeric one
-       should not pay a comparison per call. */
-    if (whale_ret_obj) {
-        wk(JS_WK_IF); wt('('); wt_id("_ret"); wt('.'); wt_id("tag"); wt_op(JS_OP_NE); wt_int(3); wt(')');
+       should not pay a comparison per call.
+       A bare `return;` is its own case: core returns 0 and the value is always
+       undefined, so neither the tag test nor the boxing applies.
+       Mixed shapes are the third case: `_ret` is always the result (it may be
+       undefined, which the tag test would reject), so return it as it is. */
+    if (ret_mixed) {
         wk(JS_WK_RETURN); wt_id("_ret"); wt(';');
-    }
-    if (ret_is_bool == 1) {
-        wk(JS_WK_RETURN); wt_id("JS_WhaleNewBool"); wt('('); wt_id("ctx"); wt(','); wt_id("_r"); wt_op(JS_OP_NE); wt_int(0); wt(')'); wt(';');
+    } else if (ret_is_undef) {
+        wk(JS_WK_RETURN); wt_id("JS_WhaleUndefined"); wt('('); wt_id("ctx"); wt(')'); wt(';');
     } else {
-        wk(JS_WK_RETURN); wt_id("whale_jit_box_num"); wt('('); wt_id("ctx"); wt(','); wt_id("_r"); wt(')'); wt(';');
+        if (whale_ret_obj) {
+            wk(JS_WK_IF); wt('('); wt_id("_ret"); wt('.'); wt_id("tag"); wt_op(JS_OP_NE); wt_int(3); wt(')');
+            wk(JS_WK_RETURN); wt_id("_ret"); wt(';');
+        }
+        if (ret_is_bool == 1) {
+            wk(JS_WK_RETURN); wt_id("JS_WhaleNewBool"); wt('('); wt_id("ctx"); wt(','); wt_id("_r"); wt_op(JS_OP_NE); wt_int(0); wt(')'); wt(';');
+        } else {
+            wk(JS_WK_RETURN); wt_id("whale_jit_box_num"); wt('('); wt_id("ctx"); wt(','); wt_id("_r"); wt(')'); wt(';');
+        }
     }
     wt('}');
     fold_commit(tail_mark);
@@ -12616,6 +12752,7 @@ WHALE_HOST_SYM(JS_WhaleVarRefIsFn),
     WHALE_HOST_SYM(whale_jit_unbox_num),
     WHALE_HOST_SYM(JS_WhaleNewFloat64),
     WHALE_HOST_SYM(JS_WhaleNewBool),
+    WHALE_HOST_SYM(JS_WhaleUndefined),
     WHALE_HOST_SYM(JS_WhaleToInt32),
     WHALE_HOST_SYM(JS_WhaleDeoptNote),
     WHALE_HOST_SYM(JS_WhaleDeoptWhy),

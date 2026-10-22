@@ -243,6 +243,35 @@ int main(void)
         printf("  [tcc] 400x fibi(30) = %.0f ms\n", ms);
     }
 
+    /* 9b. A void function must be compiled, not merely correct. `return;` used
+       to fall through to the per-instruction step path, which classifies every
+       return as control flow and refuses the whole function - so the most
+       common callback shape in front-end code (empty handler, `() => {}`,
+       `function (err) { if (err) return; ... }`) never compiled at all. The
+       result was right either way, which is exactly why it went unnoticed;
+       only the compiled counter shows it. */
+    {
+        double v;
+
+        JS_WhaleGetJitStats(ctx, &st);
+        {
+            uint32_t compiled_before = st.compiled;
+
+            v = eval_number(ctx,
+                "function v0(){} function v1(){return;} function v2(){return undefined;}"
+                "function v3(x){ if (x>0) return; return 7; }"
+                "var n=0; for (var k=0;k<400;k++){ v0(); v1(); v2(); n += (v3(k-200)===undefined)?1:0; } n");
+            /* v3 returns undefined for x>0, i.e. k=201..399: 199 calls. */
+            CHECK(v == 199.0);
+            JS_WhaleGetJitStats(ctx, &st);
+            /* All four are straight-line or single-branch bodies with no
+               objects, so each must reach the compiled state. */
+            CHECK(st.compiled >= compiled_before + 4);
+            printf("  [void] compiled %u function(s)\n",
+                   st.compiled - compiled_before);
+        }
+    }
+
     /* 10. gcc backend: compile one marked function through gcc -c, linked
        in-process by TinyCC itself (no .dll, no LoadLibrary). Needs a MinGW
        gcc; the driver comes from WHALE_TEST_GCC or the well-known install
