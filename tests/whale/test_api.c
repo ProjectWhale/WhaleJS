@@ -272,6 +272,45 @@ int main(void)
         }
     }
 
+    /* 9c. A branch that is itself a jump target must still get its label.
+       `if (a) ...; else if (c) ...` makes the second branch the destination of
+       the first, and the emitter fuses `<cmp>; if` into one `if (..) goto` -
+       consuming the branch instruction. Before the fuse checked the span, the
+       label at that position was never defined and TinyCC rejected the whole
+       unit ("label used but not defined"), so the function silently ran on the
+       interpreter. The answer was right either way; only the compiled counter
+       shows it. Measured on Vite: 94,973 stderr lines before the fix, 0 after. */
+    {
+        double v;
+
+        JS_WhaleGetJitStats(ctx, &st);
+        {
+            uint32_t compiled_before = st.compiled;
+
+            v = eval_number(ctx,
+                "function ws(c){"
+                "  if (c === 32) return true;"
+                "  if (c >= 9 && c <= 13) return true;"
+                "  if (c < 160) return false;"
+                "  if (c === 160) return true;"
+                "  if (c === 5760) return true;"
+                "  if (c >= 8192 && c <= 8202) return true;"
+                "  if (c === 8232) return true;"
+                "  if (c === 8233) return true;"
+                "  return false;"
+                "}"
+                "var n=0; for (var k=0;k<400;k++) if (ws(k % 300)) n++; n");
+            CHECK(v == 13.0);
+            JS_WhaleGetJitStats(ctx, &st);
+            /* ws must compile. The script's own top-level wrapper is not a
+               normal function and is refused for an unrelated reason, so the
+               count is "at least one", not "no failures". */
+            CHECK(st.compiled > compiled_before);
+            printf("  [fuse] compiled %u function(s)\n",
+                   st.compiled - compiled_before);
+        }
+    }
+
     /* 10. gcc backend: compile one marked function through gcc -c, linked
        in-process by TinyCC itself (no .dll, no LoadLibrary). Needs a MinGW
        gcc; the driver comes from WHALE_TEST_GCC or the well-known install

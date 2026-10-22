@@ -883,6 +883,23 @@ static int whale_next_is_branch(const uint8_t *pc, int len, int pos, int sz,
     *isz_out = nisz;
     return 1;
 }
+/* A fused compare+branch consumes the branch instruction without emitting the
+   label that belongs at its position. That is fine only when nothing jumps to
+   the branch itself; when something does (`if (a) b = 1; else if (c) ...`
+   compiles to a branch that is also a jump target), the label must still be
+   defined or the unit fails to parse with "label used but not defined".
+
+   Returns 1 when the span [from, to) is free of jump targets. */
+static int whale_fuse_span_clear(const uint8_t *targets, int from, int to)
+{
+    int k;
+
+    for (k = from; k < to; k++)
+        if (targets[k])
+            return 0;
+    return 1;
+}
+
 /* A load-like opcode, resolved. The emitter needs two steps because the
    peepholes must look at two loads before deciding what to emit, and tokens
    cannot be pushed speculatively. */
@@ -6264,6 +6281,24 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         }
         fprintf(stderr, "\n");
     }
+    /* Full bytecode listing under WHALE_JIT_DUMP=2: when a unit fails to
+       compile, the opcode stream is what identifies the construct - the label
+       name in the parser's complaint only says which slot of the output. */
+    if (getenv("WHALE_JIT_DUMP") && atoi(getenv("WHALE_JIT_DUMP")) >= 2) {
+        int k = 0;
+
+        fprintf(stderr, "[ops] len=%d:", info->byte_code_len);
+        while (k < info->byte_code_len) {
+            int o = info->byte_code[k];
+            int s = whale_op_size_of(o);
+
+            fprintf(stderr, " %d:%s", k, whale_op_name(o));
+            if (s <= 0)
+                break;
+            k += s;
+        }
+        fprintf(stderr, "\n");
+    }
     /* The loops the compiler gave us. Printed here so the generator side of the
        hand-over can be checked without emitting anything yet. */
     if (whale_dbg_env("WHALE_LOOP_DBG") && info->loop_count > 0) {
@@ -6592,6 +6627,18 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
             if (whale_dbg_env("WHALE_OP_DBG"))
                 fprintf(stderr, "[tgt8] pos=%d op=%d tgt=%d\n", pos, op, tgt);
+            if (tgt < 0 || tgt > len) {
+                /* A jump outside the bytecode is not something the generator
+                   can follow: its label would never be defined, and the emitted
+                   `goto L<tgt>` would fail to parse. Refuse the function here,
+                   where the reason is still visible, instead of letting the
+                   parser report "label used but not defined" on a unit nobody
+                   can trace back to an opcode. */
+                if (getenv("WHALE_JIT_DUMP"))
+                    fprintf(stderr, "[tgt8] out of range: pos=%d op=%d tgt=%d len=%d\n",
+                            pos, op, tgt, len);
+                { whale_out_line = __LINE__; goto out; }
+            }
             targets[tgt] = 1;
             if (tgt < pos)              /* backward jump: a loop back edge */
                 loop_back[tgt] = pos;
@@ -6615,6 +6662,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
             if (whale_dbg_env("WHALE_OP_DBG"))
                 fprintf(stderr, "[tgt] pos=%d op=%d tgt=%d\n", pos, op, tgt);
+            if (tgt < 0 || tgt > len) {
+                if (whale_dbg_env("WHALE_JIT_DUMP"))
+                    fprintf(stderr, "[tgt] out of range: pos=%d op=%d tgt=%d len=%d\n",
+                            pos, op, tgt, len);
+                { whale_out_line = __LINE__; goto out; }
+            }
             targets[tgt] = 1;
             if (tgt < pos)
                 loop_back[tgt] = pos;
@@ -8355,7 +8408,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                            mirrors the unfused push-plus-if (a BOOL slot is
                            recorded and then consumed): only the emitted shape
                            differs. */
-                        if (whale_next_is_branch(pc, len, p4 + l4, 0, &btgt, &bis_true, &bisz)) {
+                        if (whale_next_is_branch(pc, len, p4 + l4, 0, &btgt, &bis_true, &bisz) &&
+                            whale_fuse_span_clear(targets, p4 + l4, p4 + l4 + bisz)) {
                             int fm, cf;
 
                             local_flush_all(var_count);
@@ -11725,7 +11779,8 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                        That mirroring is load-bearing - skipping the fold_set
                        left stale slot types behind and broke objshape's
                        escaped phase with an empty `v[] = ()` store. */
-                    if (whale_next_is_branch(pc, len, pos, sz, &btgt, &bis_true, &bisz)) {
+                    if (whale_next_is_branch(pc, len, pos, sz, &btgt, &bis_true, &bisz) &&
+                        whale_fuse_span_clear(targets, pos + sz, pos + sz + bisz)) {
                         int fm, cf;
                         int inva, invb;
 
@@ -12862,6 +12917,88 @@ WHALE_HOST_SYM(JS_WhaleCallMethodValue),
    backend included. That is not a coupling that can be designed away: the table
    is where the names live. Created once and shared; the symbols registered with
    it are what the TinyCC path resolves generated calls against. */
+/* ---------------------------------------------------------------------------
+   TinyCC's error sink.
+
+   There used to be none, so `error1()` in libtcc.c fell through to
+   `fprintf(stderr, ...)`: a parse error printed a `label 'L18' used but not
+   defined` line, and - far worse - every later `tcc_relocate()` re-walked the
+   whole state's undefined-symbol list and printed one `error: undefined symbol`
+   line per entry. One failed unit therefore produced six figures of output on
+   a real project (measured: 94,973 lines on a Vite dev server), burying the
+   one line that mattered.
+
+   The sink collects instead: the first message is kept (that is the useful
+   one - it names the actual error), the rest are counted, and one line is
+   printed per compilation from the failure report. WHALE_JIT_VERBOSE prints
+   them all, which is what a debugging session wants. */
+static char whale_tcc_first_error[256];
+static int whale_tcc_error_count;
+
+static void whale_tcc_error_sink(void *opaque, const char *msg)
+{
+    (void)opaque;
+    if (whale_tcc_error_count == 0)
+        snprintf(whale_tcc_first_error, sizeof(whale_tcc_first_error),
+                 "%s", msg ? msg : "?");
+    whale_tcc_error_count++;
+}
+
+static void whale_tcc_error_reset(void)
+{
+    whale_tcc_first_error[0] = '\0';
+    whale_tcc_error_count = 0;
+}
+
+/* Rendered on the TinyCC side, which is a separate translation unit: the token
+   spellings are TinyCC's, so that is where the renderer lives. */
+int JS_WhaleRenderStream(const int *tok, const double *num, int n, char **out);
+void JS_WhaleRenderFree(char *p);
+
+/* Report what the last compilation's sink collected, once. Called on the
+   failure path only, so a successful compile costs nothing. */
+static void whale_tcc_error_report(const char *unit)
+{
+    if (whale_tcc_error_count <= 0)
+        return;
+    if (getenv("WHALE_JIT_VERBOSE")) {
+        fprintf(stderr, "whale jit: %s: %s%s\n", unit, whale_tcc_first_error,
+                whale_tcc_error_count > 1 ? " (and more)" : "");
+    } else {
+        fprintf(stderr, "whale jit: %s failed: %s%s\n", unit,
+                whale_tcc_first_error,
+                whale_tcc_error_count > 1 ? " (and more)" : "");
+    }
+    whale_tcc_error_reset();
+}
+
+/* WHALE_JIT_FAILSRC=<dir>: on a failed compile, write the generated C for that
+   unit to <dir>/<unit>.c. The parser's complaint names a label or a token
+   position; the source is what says which construct produced it. Debug-only
+   convenience, and it costs one getenv per failure. */
+static void whale_jit_dump_failed_src(const char *unit)
+{
+    const char *dir = getenv("WHALE_JIT_FAILSRC");
+    char path[512];
+    char *text = NULL;
+    int n;
+    FILE *f;
+
+    if (!dir || !*dir)
+        return;
+    n = JS_WhaleRenderStream(go_tok, go_num, go_len, &text);
+    if (n <= 0 || !text)
+        return;
+    snprintf(path, sizeof(path), "%s/%s.c", dir, unit);
+    f = fopen(path, "wb");
+    if (f) {
+        fwrite(text, 1, (size_t)n, f);
+        fclose(f);
+        fprintf(stderr, "whale jit: wrote %s\n", path);
+    }
+    JS_WhaleRenderFree(text);
+}
+
 static int whale_jit_state_ensure(void)
 {
     TCCState *s;
@@ -12884,6 +13021,9 @@ static int whale_jit_state_ensure(void)
        src/tcc/lib/libtcc1.c). Tell TCC to skip the CRT libraries, so no
        libtcc1 / msvcrt / kernel32 file has to exist anywhere. */
     JS_WhaleTccNoStdLibs(s);
+    /* Collect TinyCC's diagnostics instead of letting them go straight to
+       stderr - see whale_tcc_error_sink. Installed once, on the state. */
+    tcc_set_error_func(s, NULL, whale_tcc_error_sink);
     for (int i = 0; i < WHALE_HOST_SYM_COUNT; i++)
         tcc_add_symbol(s, whale_host_syms[i].name, whale_host_syms[i].addr);
     whale_jit_state = s;
@@ -12959,6 +13099,7 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
     /* Drive TinyCC's parser with the tokens the generator pushed: no source
        text is parsed and no header is read. */
     (void)src;
+    whale_tcc_error_reset();
     if (!JS_WhaleCompileTokens(s, whale_gen_cb, NULL)) {
         /* Which side of the hand-off failed matters: the generator bailing on an
            opcode is a different problem from the tokens not parsing or TinyCC
@@ -12966,6 +13107,12 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
         if (getenv("WHALE_JIT_DUMP"))
             fprintf(stderr, "whale jit: compile failed (gen_ok=%d at line %d)\n",
                     whale_gen_ok, whale_out_line);
+        whale_tcc_error_report(whale_core_name);
+        /* Only a unit the generator finished is worth dumping: when it bailed
+           (gen_ok 0) the stream is truncated, so the rendered source is just
+           the prologue and says nothing about the failure. */
+        if (whale_gen_ok)
+            whale_jit_dump_failed_src(whale_core_name);
         goto fail;
     }
     /* Diagnostics: write the object out so the machine code TinyCC actually
@@ -12987,11 +13134,23 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
         }
     }
 #endif
-    if (tcc_relocate(s, TCC_RELOCATE_AUTO) < 0)
+    whale_tcc_error_reset();
+    if (tcc_relocate(s, TCC_RELOCATE_AUTO) < 0) {
+        whale_tcc_error_report(whale_core_name);
+        /* Only a unit the generator finished is worth dumping: when it bailed
+           (gen_ok 0) the stream is truncated, so the rendered source is just
+           the prologue and says nothing about the failure. */
+        if (whale_gen_ok)
+            whale_jit_dump_failed_src(whale_core_name);
         goto fail;
+    }
     fn = tcc_get_symbol(s, whale_entry_name);
-    if (!fn)
+    if (!fn) {
+        if (getenv("WHALE_JIT_VERBOSE"))
+            fprintf(stderr, "whale jit: %s: symbol not found after relocate\n",
+                    whale_entry_name);
         goto fail;
+    }
 
     if (whale_dbg_env("WHALE_JIT_DUMP"))
         fprintf(stderr, "whale jit: %s -> %p\n", whale_entry_name, fn);

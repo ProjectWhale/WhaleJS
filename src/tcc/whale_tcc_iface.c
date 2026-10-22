@@ -774,6 +774,11 @@ void JS_WhaleTokDump(void);
 
 int JS_WhaleCompileTokens(TCCState *s, void (*emit)(void *), void *emit_ctx)
 {
+    /* Set once tcc_open_bf/tccelf_begin_file have run, so the longjmp path
+       unwinds exactly what was opened. A failure inside preprocess_start
+       happens before the unit exists and must not run end_file on it. */
+    int unit_open = 0;
+
     if (!s)
         return 0;
     /* the lexer must be off until we have tokens to give it: a previous run that
@@ -841,13 +846,30 @@ int JS_WhaleCompileTokens(TCCState *s, void (*emit)(void *), void *emit_ctx)
            function never runs. Do the same unwinding on this path: otherwise the
            symbol/label stacks keep this unit's entries and the next compile in
            the process trips over them (label_pop() would then define labels
-           through put_extern_sym() against a symbol table that no longer exists). */
+           through put_extern_sym() against a symbol table that no longer exists).
+
+           tccelf_end_file() is part of that unwind, and leaving it out is what
+           made one failed unit poison every later link: it is the function that
+           converts this unit's symbols and rewrites its relocations against the
+           merged table. Skipped, the half-parsed unit's undefined references
+           (IAT.memmove, IAT.JS_WhaleCheckStack, ...) stayed in the shared
+           state's symbol table, and every later tcc_relocate() walked them and
+           reported one `undefined symbol` per entry - 94,973 lines on a Vite
+           dev server. It also restores the section/symbol offsets that
+           begin_file() moved, so the next unit starts where this one would
+           have. tcc_close() drops the buffered file the same way. */
         whale_tok_active = 0;
         free_defines(whale_define_start);
         sym_pop(&global_stack, NULL, 0);
         sym_pop(&local_stack, NULL, 0);
         global_label_stack = NULL;
         local_label_stack = NULL;
+        if (unit_open) {
+            preprocess_end(s);
+            tccelf_end_file(s);
+            tcc_close();
+            unit_open = 0;
+        }
         s->error_set_jmp_enabled = 0;
         return 0;
     }
@@ -860,6 +882,7 @@ int JS_WhaleCompileTokens(TCCState *s, void (*emit)(void *), void *emit_ctx)
     file->buffer[0] = 0;   /* an empty translation unit, not garbage */
     file->buf_ptr = file->buffer;
     tccelf_begin_file(s);
+    unit_open = 1;         /* from here on the longjmp path has a unit to unwind */
     preprocess_start(s, 0);
     tcc_debug_start(s);
 
