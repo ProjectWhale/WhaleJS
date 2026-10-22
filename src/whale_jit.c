@@ -1461,6 +1461,8 @@ static int whale_loop_trip_of(const uint8_t *pc, int len, int head, int back,
     double kv = 0;
     int q, qsz, writes = 0;
 
+    (void)targets;   /* the entry check scans the whole function instead */
+
     if (head < 0 || back <= head || back >= len)
         return 0;
     /* back edge is `...; inc_loc g; goto head` with the goto at `back`.
@@ -1539,6 +1541,38 @@ static int whale_loop_trip_of(const uint8_t *pc, int len, int head, int back,
         if (!whale_push_lit(pc, len, pp, &kv, &vl) || kv != 0)
             return 0;
         (void)cond;
+    }
+    /* No edge may enter this loop from outside.
+       The expander drops `Lhead:` - the body is inlined K times - so a label at
+       the head must not be anyone else's destination. The back edge is the one
+       legitimate reference and it is at `back`; every other reference to
+       `[head, back]` would have to come from outside the loop, because the loop
+       above already refused any in-body branch whose target is outside the
+       body. Scan the whole function for a branch into the range.
+       Same rule as the fused compare+branch (whale_fuse_span_clear): an
+       optimisation that consumes an instruction must not consume a label
+       somebody else jumps to. */
+    {
+        int q;
+
+        for (q = 0; q < len; ) {
+            int qo = (int)pc[q];
+            int qsz = whale_op_size_of(qo);
+            int t2 = -1;
+
+            if (qsz <= 0 || q + qsz > len)
+                break;
+            if (qo == OP_goto8 || qo == OP_if_false8 || qo == OP_if_true8) {
+                if (q + 1 < len)
+                    t2 = q + 1 + (int8_t)pc[q + 1];
+            } else if (qo == OP_goto || qo == OP_if_false || qo == OP_if_true) {
+                if (q + 4 < len)
+                    t2 = q + 1 + (int32_t)whale_get_u32(pc + q + 1);
+            }
+            if (t2 >= head && t2 <= back && q != back)
+                return 0;   /* an edge from outside the loop into it */
+            q += qsz;
+        }
     }
     /* single incrementing write, no call, no foreign exit inside */
     for (q = head; q <= back; ) {
@@ -8646,6 +8680,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
                 if (ln < 0)
                     { WHALE_STEP_INSTEAD_OF_BAILING(); }   /* not a declaration */
+                /* The store is skipped, not emitted - so it must not be a jump
+                   target, or its label disappears and the unit fails to parse
+                   with "label used but not defined". Same rule as the fused
+                   compare+branch (see whale_fuse_span_clear). */
+                if (!whale_fuse_span_clear(targets, npos, npos + s4))
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 pos = npos + s4;
             }
             break;

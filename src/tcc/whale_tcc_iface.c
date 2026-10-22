@@ -74,6 +74,12 @@ void JS_WhaleTccNoStdLibs(TCCState *s)
 /* define_stack snapshot for free_defines() at teardown (see tcc_compile()). */
 static Sym *whale_define_start;
 
+/* Set once the framing below has opened a unit. The longjmp path uses it to
+   unwind exactly what was opened - the same asymmetry that made a failed JIT
+   unit poison the shared state (see JS_WhaleCompileTokens): a unit that is
+   begun but never ended leaves its symbols and relocations behind. */
+static int whale_ir_unit_open;
+
 /* The framing shared by the emitters below. Returns 0 when the unit is open.
    No library/include path is set: these units only use built-in types and
    self-contained code, and every external the JIT emits is a host symbol. */
@@ -87,13 +93,23 @@ static Sym *whale_define_start;
         tcc_set_output_type((s), TCC_OUTPUT_MEMORY);                        \
         if (setjmp((s)->error_jmp_buf) != 0) {                              \
             (s)->error_set_jmp_enabled = 0;                                 \
+            if (whale_ir_unit_open) {                                       \
+                free_defines(whale_define_start);                           \
+                sym_pop(&global_stack, NULL, 0);                            \
+                sym_pop(&local_stack, NULL, 0);                             \
+                preprocess_end((s));                                        \
+                tccelf_end_file((s));                                       \
+                tcc_close();                                                \
+                whale_ir_unit_open = 0;                                     \
+            }                                                               \
             goto done;                                                      \
         }                                                                   \
         (s)->nb_errors = 0;                                                 \
         (s)->error_set_jmp_enabled = 1;                                     \
-        whale_define_start = define_stack;                                 \
+        whale_define_start = define_stack;                                  \
         tcc_open_bf((s), (tag), 0);                                         \
         tccelf_begin_file((s));                                             \
+        whale_ir_unit_open = 1;                                             \
         preprocess_start((s), 0);                                           \
         cur_text_section = NULL;                                            \
         funcname = "";                                                      \
@@ -123,6 +139,7 @@ static Sym *whale_define_start;
         sym_pop(&local_stack, NULL, 0);                                     \
         tccelf_end_file((s));                                               \
         tcc_close();                                                        \
+        whale_ir_unit_open = 0;                                             \
         /* pe_output_file() records the PE entry symbol in runtime_main on   \
            every relocate; left set, the next relocate would inject an       \
            unresolvable __runmain. Clear before (so this relocate does not    \
@@ -716,10 +733,24 @@ void *JS_WhaleTokCompileAdd2(void)
     tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
 
     /* Guard exactly like JS_WhaleCompileTokens: the lexer must be off before
-       anything defines a builtin macro, and any error must not leave it on. */
+       anything defines a builtin macro, and any error must not leave it on.
+       The unit is unwound on this path too: tcc_new() returns the engine's one
+       state, so a probe that left a half-parsed unit behind would poison every
+       later JIT compile in the process. */
     whale_tok_active = 0;
     if (setjmp(s->error_jmp_buf) != 0) {
         whale_tok_active = 0;
+        if (whale_ir_unit_open) {
+            free_defines(whale_define_start);
+            sym_pop(&global_stack, NULL, 0);
+            sym_pop(&local_stack, NULL, 0);
+            global_label_stack = NULL;
+            local_label_stack = NULL;
+            preprocess_end(s);
+            tccelf_end_file(s);
+            tcc_close();
+            whale_ir_unit_open = 0;
+        }
         s->error_set_jmp_enabled = 0;
         return NULL;
     }
@@ -730,6 +761,7 @@ void *JS_WhaleTokCompileAdd2(void)
     file->buffer[0] = 0;   /* empty unit, not garbage */
     file->buf_ptr = file->buffer;
     tccelf_begin_file(s);
+    whale_ir_unit_open = 1;
     preprocess_start(s, 0);
     tcc_debug_start(s);
 
