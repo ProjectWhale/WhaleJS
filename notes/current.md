@@ -7059,3 +7059,82 @@ pick、memo insert）原来用调用方的 `argc`，但 `arg_allocated_size` 为
 真正的原因。
 
 见 current.md <152>
+
+
+# <153>: `return;` 从来没能编译过——空函数/void 回调的 JIT 缺口
+
+SOLVED
+
+## 问题
+
+用户反馈：修完 <152> 后重新 xmake 两个工程、跑真实 vite 项目，报错还是一样；
+另外希望空函数能**编译进去**而不是被拒绝。
+
+先说结论：<152> 的修复是好的，用户看到"还是失败"是因为 **WhaleNode 的
+vendored 库被换回了旧版**——`thirdparty/whalejs/lib/libwhalejs.a` 当时是
+2,481,002 字节（= 修复前的 HEAD），而不是 2,484,544（修复后）。`xmake` 只是
+把那个旧 `.a` 链进 exe，所以行为当然不变。用修复后的库重链之后：
+
+- 真实 vite 项目（`aipaint-prompt-web`，带 `vite-plugin-javascript-obfuscator`）
+  dev server **4.8s ready**，`/` 与 `/src/main.ts` 都 200 且内容是正确转译的模块；
+- `Obfuscator.obfuscate()` 连续 12 轮全过。
+
+## 空函数为什么没编译
+
+`function empty(){}` 的字节码是单个 `OP_return_undef`。生成器的 switch 里
+**没有这个 case**，于是落到 `default` → `WHALE_STEP_INSTEAD_OF_BAILING()` →
+`whale_step_emit` 又因为 `whale_step_is_control()` 把 `return`/`return_undef`
+一律算作控制流而拒绝 → 整个函数放弃编译。
+
+这条路径上"结果是对的"（解释器跑了），所以任何只比输出的测试都发现不了；
+只有 `JS_WhaleGetJitStats().compiled` 能证明。
+
+顺带发现两个同类小洞：
+
+- 门槛写的是 `if (stack_size <= 0) return 0;`，但操作数栈为空（0）是合法的——
+  生成器只按声明的 stack 索引 `cur[]`。真正的界是 `< 0`。
+- 三个提前 return 都没有诊断输出，`WHALE_JIT_DUMP` 下看不出是被哪道门拒的。
+  现在每道门都打一行 `[gen] refused: ...`。
+
+## 三种返回形态
+
+- **全部 `return;`**：core 返回 0，entry wrapper 返回 `JS_WhaleUndefined()`
+  （新增宿主符号——`JS_UNDEFINED` 是宏，生成的 C 里没法命名它）。
+  故意**不**走 `ret_obj`：那个标志同时表示"能返回对象"，会把一个根本没有
+  返回值的函数的数值快速入口关掉。
+- **全部 `return <value>`**：不变。
+- **两者混合**（`function (err) { if (err) return; work(); }`，前端里极常见）：
+  double 返回和单形态 wrapper 都装不下两种结果，于是**两种都走 `ret_obj`**
+  ——它本来就是对象返回的出参，复用即可；wrapper 直接 `return _ret`。
+  混合与否由**发射前的一遍预扫描**决定，因为发射走到第一个 return 时还看不到
+  最后一个。
+
+混合返回接受 对象/slot、bool、数值；其它类型 deopt，且**类型判断在发射任何
+token 之前**——已提交的语句收不回来。
+
+## 验证
+
+- `test_api.c` 新增一段用 `compiled` 计数断言四个 void 形态都编译了
+  （结果本来就对，只有计数能证明修复）：`[void] compiled 4 function(s)`。
+- 新增 `tests/whale/jit-void-return.js`（1510 checks，含 `typeof`/`length`/
+  `call`/`apply`/`new`/`forEach`/`map` 回调）与
+  `tests/whale/jit-mixed-return.js`（3203 checks，number/bool/string/object × void）。
+- `whale_test` / `whale_wasm_test`（两路径）/ `whale_promise_test` 全 ok；
+  <152> 的三个探针仍全过。
+- WhaleNode：`obf_n.js 12` 12 轮、`run-all.js` **351 passed / 2 failed**。
+  那两个失败（`test-child-sync` 的 stdin input、`test-stream-v8` 的 UTF-8
+  往返）**在旧引擎库上同样失败**，与本次改动无关。
+- perftest 25 例无回退。
+
+## 教训
+
+1. **"库没换"是最便宜的假设，要先排除**。用户说"链接完还是失败"，而工作区
+   里的 vendored `.a` 是旧版——字节数一对就看出来了。查哈希/大小，别先怀疑代码。
+2. **一个 opcode 没有 case 就等于"这个形状永远不编译"**，而且因为解释器兜底，
+   所有输出对照测试都会通过。覆盖率的真相在 `compiled` 计数里，不在答案里。
+3. **"结果正确"和"编译成功"是两个独立断言**。这次两个都要写进测试：前者防止
+   语义回归，后者防止覆盖率悄悄退回解释器。
+4. 混合形态的判定必须**预扫描**：单遍发射在遇到第一个 return 时信息不全，
+   而 wrapper 的尾部形态是全局属性。
+
+见 current.md <153>
