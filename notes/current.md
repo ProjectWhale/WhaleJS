@@ -7138,3 +7138,77 @@ token 之前**——已提交的语句收不回来。
    而 wrapper 的尾部形态是全局属性。
 
 见 current.md <153>
+
+
+# <155>: 融合分支吃掉标签 + 失败单元污染共享 TCCState
+
+SOLVED
+
+## 问题
+
+WhaleNode 报（`doc-internal/whalejs-jit-failed-unit-flood.md`）：一个 JIT 单元
+编译失败后，进程往 stderr 写几万到十几万行 `undefined symbol`。真实 Vite 项目
+上实测 **94,973 行**，把唯一有用的那行错误埋掉了。
+
+## 两个缺陷
+
+### 1. 洪水：失败单元留在共享 TCCState 里
+
+`whale_tcc_compile` 全进程共用一个 `TCCState`，而
+`JS_WhaleCompileTokens` 的 **longjmp 路径没有调用 `tccelf_end_file()`** ——
+那正是把本单元的符号合并、把 relocation 改写到合并表的函数。跳过它，半解析
+单元的未定义引用（`IAT.memmove`、`IAT.JS_WhaleCheckStack`、…）就留在共享符号表
+里；之后每次 `tcc_relocate()` 都会遍历整张表，每条打一行 `error: undefined
+symbol`。一次失败 → 六位数输出。
+
+修：longjmp 路径补上 `preprocess_end` / `tccelf_end_file` / `tcc_close`，
+用 `unit_open` 标志守卫（`preprocess_start` 内部失败时单元还不存在，不能
+end 一个没开始的 file）。
+
+另外装了 TinyCC 的错误接收器（`tcc_set_error_func`）**收集而不是打印**，
+每次失败由 `whale_tcc_error_report` 报一行。`WHALE_JIT_VERBOSE` 才打原始消息。
+
+### 2. 真正的根因：融合分支吃掉了跳转目标的标签
+
+`<cmp>; if_false` 被融合成一条 `if (..) goto`，**消耗掉分支指令而不发射它
+位置上的标签**。只要没有东西跳到那条分支，这没问题——但
+`a === 32 || (a >= 9 && a <= 13)` 不是：第二个比较的分支正好是第一个分支的
+跳转目标。
+
+结果：`label 'L18' used but not defined`，TinyCC 拒绝整个单元，函数静默退回
+解释器。**答案一直是对的**（解释器跑了），所以任何只比输出的测试都发现不了。
+
+修：两处融合点在跳过前检查区间内有没有 `targets[]`
+（`whale_fuse_span_clear`）；有就不融合，走未融合形态，标签正常发射。
+
+## 定位过程（值得记的部分）
+
+1. 先加 `tcc_set_error_func`，把 94,973 行压到 18 行，真错误浮出来。
+2. `WHALE_JIT_DUMP=2` 打印完整字节码，`WHALE_JIT_FAILSRC=<dir>` 导出失败单元
+   的生成 C —— 两者一起才能把 `label 'L18'` 对回具体 opcode。
+3. 字节码 `pos=5 if_true8 tgt=18` 而 `[target] pos=18` 从未出现，但
+   `targets[18]=1` —— 说明 18 是被融合路径**跳过**的那条 `if_false8`。
+4. 用 `git stash` 关掉修复重跑 Vite：日志回到 58,301 行，确认因果。
+
+## 验证
+
+- `test_api.c` 新增 `[fuse]` 断言：`ws()` 必须真的编译（用 `compiled` 计数，
+  因为结果本来就对）。
+- 新增 `tests/whale/jit-fuse-label.js`（17 checks，含 70,000 码点全表比对）。
+- Vite 真实项目：日志 94,791 行 → **4 行**，`/` 与 `/src/main.ts` 均 200。
+- WhaleNode 全量 suite：**366 passed / 0 failed**（原 354——多出来的 12 个
+  正是过去被推回解释器的函数现在编译了）。
+- perftest 25 例无回退；`whale_test` / `whale_wasm_test` / `whale_promise_test` ok。
+
+## 教训
+
+1. **一个共享 state 的"半失败单元"会毒化后面所有成功的编译**。longjmp 路径
+   必须和正常路径做完全对称的收尾——漏一个 `tccelf_end_file` 就是六位数输出。
+2. **融合优化必须检查它跳过的东西有没有外部引用**。分支指令不只是指令，它还
+   可能是别人的跳转目标。
+3. **"结果正确"掩盖了"从未编译"**。这类 bug 只有 `compiled` 计数能发现；
+   每个 JIT 修复都该配一条计数断言。
+4. **默认错误出口是 stderr 就等于没有错误处理**。装接收器，收集、计数、一行
+   汇报；原始消息留给 `WHALE_JIT_VERBOSE`。
+
+见 current.md <155>
