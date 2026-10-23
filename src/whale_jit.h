@@ -105,9 +105,39 @@ typedef struct JSWhaleFuncInfo {
    arguments have to sit in JSValues the collector can see for as long as the
    callee runs, and slots are the only such place the generated code has. Object
    literals and arrays take slots from 0, so they must stay below the base - the
-   generator refuses a function that allocates past it. */
-#define WHALE_CALL_BASE 20
+   generator refuses a function that allocates past it.
+ 
+   This used to be 20, which was wrong: everything below the base is named
+   through a type byte, and a type byte can only carry 15 slots (see
+   WHALE_OBJ_MAX). The base is now exactly that limit, so "below the base" and
+   "encodable" are the same set. The call scratch above it is spelled as plain
+   integer literals in the generated code and is unaffected. */
+#define WHALE_CALL_BASE 15
 #define WHALE_CALL_SLOTS (WHALE_OBJ_SLOTS - WHALE_CALL_BASE)
+
+/* The highest object slot a *type byte* can name.
+ *
+ * WHALE_OBJ_T/VAL_T/ARR_T/STRUCT_T put the slot in the high nibble as slot+1
+ * and the type in the low nibble, because cur[] is a uint8_t array that is
+ * snapshotted at every jump target - a parallel slot array would need its own
+ * snapshot handling. That leaves 4 bits: slots 0..14. Slot 15 encodes as
+ * 0x08, which decodes back as slot -1; slot 19 encodes as 0x48, which decodes
+ * as slot 3.
+ *
+ * The frame budget is 28 slots (raised from 12 for immutable_update), which is
+ * fine for the frame - but only the first 15 are encodable, so WHALE_CALL_BASE
+ * is pinned to that. A wrong slot number here is a read of somebody else's
+ * slot: a silent wrong answer whose symptom moves with the memory layout, which
+ * is what WhaleNode hit in esrap (a `node.type` read returning a number, so
+ * `.includes` threw "not a function"). */
+#define WHALE_OBJ_MAX 15
+/* The two numbers are one invariant, so state it once: every slot that is
+   written into a type byte is allocated below WHALE_CALL_BASE, and every slot
+   below WHALE_CALL_BASE must be encodable. If either constant is ever raised
+   on its own, this stops the build instead of turning into a wrong answer. */
+#if WHALE_CALL_BASE > WHALE_OBJ_MAX
+#error "WHALE_CALL_BASE exceeds WHALE_OBJ_MAX: those slots cannot be encoded in a type byte"
+#endif
 /* object-property inline-cache pairs the generated code can declare */
 #define WHALE_FIELD_CACHE 24
 

@@ -2767,8 +2767,17 @@ static uint8_t    *whale_vmat;    /* 1 = already forced into a variable */
    pending expression records the name as a token, so rewriting the variable
    afterwards would change the value the pending expression reads. Each
    materialisation therefore takes a fresh name, and `v<k>` is only ever the
-   *first* one. References go through whale_vname[k]. */
-static int whale_vname[WHALE_JIT_MAX_SLOTS];  /* slot -> name number */
+   *first* one. References go through whale_vname[k].
+   
+   Indexed by operand-stack slot, and the stack can reach
+   stack_size + WHALE_INLINE_EXTRA (an inlined body pushes above the caller's
+   declared depth). Sizing this by WHALE_JIT_MAX_SLOTS alone was an
+   out-of-bounds write for any function with stack_size near the cap:
+   `whale_vname[sp] = nm` at sp >= 64 landed in whatever static followed,
+   which is why a wrong answer appeared or vanished depending on the
+   process's memory layout. */
+#define WHALE_STACK_SLOTS (WHALE_JIT_MAX_SLOTS + WHALE_INLINE_EXTRA + 1)
+static int whale_vname[WHALE_STACK_SLOTS];  /* slot -> name number */
 /* Single-assignment constant locals: lo_c[d] means local d is a compile-time
    constant lo_cv[d] everywhere afterwards. Written by put_loc (fast path and
    generic path), read by the analyser and by local_inline below - a deferred
@@ -2813,7 +2822,10 @@ static int whale_out_line;
    with one cannot take the self-recursion path, because that path packs its
    arguments into a double array. Set just before the call routes. */
 static int whale_call_obj_arg;
-static int whale_slot_fn[WHALE_JIT_MAX_SLOTS];
+/* Which pool entry the stack slot holds a function for. Indexed by operand
+   stack slot, so it needs the same headroom as whale_vname (an inlined body
+   pushes above the caller's declared depth). */
+static int whale_slot_fn[WHALE_STACK_SLOTS];
 static int whale_vserial;                     /* next unused name number */
 
 /* Everything encoded from now on goes into the workspace. */
@@ -3096,6 +3108,15 @@ static void fold_obj_field_load(int os, int atom, int fc, int fc2, int nm,
         wt('?'); wt('('); wk(JS_WK_DOUBLE); wt(')'); wt_arr("fp", fc); wt_op(JS_OP_ARROW); wt_id("u"); wt_op(JS_OP_DOT); wt_id("int32");
         wt(':'); wt_id("JS_WhaleObjValueNum"); wt('('); wt_id("ctx"); wt(','); wt_arr("fp", fc); wt(','); wt_id("deopt"); wt(')');
         wt(';');
+        /* The cold fallback above DEOPTS for a value that is not a number (it
+           sets *deopt and answers 0). Everything after it - the normalisation
+           write below - must not run in that case: it writes the 0 back into
+           the object's real field and flips its tag to float64, so the string
+           that was there is destroyed for every later call. Measured:
+           `function f(x) { return x.kind === 'a'; }` answered true on the
+           first ~20 calls and false for ever after, because the object's
+           `kind` had been overwritten with 0 by the call that deopted. */
+        wk(JS_WK_IF); wt('('); wt('*'); wt_id("deopt"); wt(')'); wk(JS_WK_RETURN); wt_int(0); wt(';');
         /* normalise: the value just loaded is a number (anything else deopted
            inside the dispatch above), so writing it back as float64 makes the
            tag 8 for every later trip. One extra store on the first trip only. */
@@ -6558,6 +6579,18 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     if (stack_size < 0 || stack_size > WHALE_JIT_MAX_SLOTS) {
         if (whale_dbg_env("WHALE_JIT_DUMP"))
             fprintf(stderr, "[gen] refused: stack_size=%d\n", stack_size);
+        return 0;
+    }
+    /* Same bound for the locals: several tables below are indexed by local
+       number (whale_loc_fn, whale_lo_c, whale_int_mirror, whale_loop_heat, the
+       per-local object flags), and every one of them is WHALE_JIT_MAX_SLOTS
+       wide. A function with more locals than that used to be accepted and then
+       wrote past the end of those statics - a corruption whose symptom depended
+       on what the linker had placed after them, which is why the same script
+       could pass in one build and fail in the next. */
+    if (var_count < 0 || var_count > WHALE_JIT_MAX_SLOTS) {
+        if (whale_dbg_env("WHALE_JIT_DUMP"))
+            fprintf(stderr, "[gen] refused: var_count=%d\n", var_count);
         return 0;
     }
     /* The closure-slot tables below (whale_vr_slot/_fn/_info, the _p cells) are
@@ -12236,10 +12269,18 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         case OP_dup:
             if (sp <= 0)
                 { WHALE_STEP_INSTEAD_OF_BAILING(); }
-            /* both slots share the expression. It has no side effects, so
-               inlining it twice is fine. */
+            /* Both slots share the expression. It has no side effects, so
+               inlining it twice is fine - but the *name* has to travel too.
+               When the source is already materialised (vmat 1), the copy
+               inherits that flag, so fold_materialize_live skips it and
+               fold_inline emits whale_vname[copy] - which was never written
+               and still holds whatever an earlier slot left there. Measured:
+               `a.line < b.line || !(a.line > b.line) && a.column < b.column`
+               compiled to a branch on `b.line` instead of on the `!` result,
+               so the function answered true where it should answer false. */
             whale_vexpr[sp] = whale_vexpr[sp - 1];
             whale_vmat[sp] = whale_vmat[sp - 1];
+            whale_vname[sp] = whale_vname[sp - 1];
             cur[var_count + sp] = cur[var_count + sp - 1];
             sp++;
             break;
@@ -12359,6 +12400,10 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             cur[var_count + sp - 2] = cur[var_count + sp - 1];
             whale_vexpr[sp - 2] = whale_vexpr[sp - 1];
             whale_vmat[sp - 2] = whale_vmat[sp - 1];
+            /* the name travels with the value: a materialised slot's vmat says
+               "read whale_vname[k]", and a stale name there reads a different
+               variable (see the OP_dup arm). */
+            whale_vname[sp - 2] = whale_vname[sp - 1];
             sp--;
             break;
         case OP_throw:
@@ -13192,7 +13237,7 @@ static int whale_tcc_compile(JSContext *ctx, const char *src, void **entry_out, 
         goto fail;
     }
 
-    if (whale_dbg_env("WHALE_JIT_DUMP"))
+    if (getenv("WHALE_JIT_DUMP"))
         fprintf(stderr, "whale jit: %s -> %p\n", whale_entry_name, fn);
 
 

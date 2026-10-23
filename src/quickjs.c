@@ -4977,11 +4977,108 @@ static void whale_prof_arm(JSContext *ctx, JSFunctionBytecode *b);
    the same for all of them, so the threshold follows the expected payoff. */
 static int whale_hot_threshold(JSFunctionBytecode *b)
 {
+    /* WHALE_JIT_HOT=<n> pins the threshold for debugging: it makes a
+       miscompile show up in seconds instead of after a hundred calls, and it
+       is the only practical way to bisect "which function, when compiled,
+       produces the wrong answer" in a large dependency graph. */
+    static int forced = -1;
+
+    if (forced < 0) {
+        const char *e = getenv("WHALE_JIT_HOT");
+        forced = (e && *e) ? atoi(e) : 0;
+        if (forced < 1)
+            forced = 0;
+    }
+    if (forced)
+        return forced;
     if (b->whale_loop_count >= 2)
         return 10;
     if (b->whale_loop_count == 1)
         return b->byte_code_len > 64 ? 20 : 50;
     return WHALE_JIT_HOT_THRESHOLD;
+}
+
+/* WHALE_JIT_SKIP=<name>[,<name>...]: refuse to compile a function by name.
+   With WHALE_JIT_HOT pinning the threshold low, the set of compiled functions
+   is small, and skipping one at a time identifies which one produces the wrong
+   answer - a couple of runs instead of reading generated C for the whole
+   dependency graph. Names come from b->func_name, which is what
+   WHALE_JIT_DUMP=1 prints as [hot-fn]. */
+static int whale_jit_skip_name(JSFunctionBytecode *b)
+{
+    static char *list;
+    static int tried;
+    static int allow_first = -1;
+    static int compiles;
+    const char *nm;
+    size_t nlen;
+
+    if (!tried) {
+        const char *e = getenv("WHALE_JIT_SKIP");
+        const char *f = getenv("WHALE_JIT_ALLOW_FIRST");
+
+        tried = 1;
+        if (e && *e)
+            list = (char *)e;   /* getenv storage lives for the process */
+        if (f && *f)
+            allow_first = atoi(f);
+    }
+    /* WHALE_JIT_ALLOW_FIRST=<n>: let the first n *compiles* through and refuse
+       everything after. Bisecting on n finds the culprit compile by position,
+       which is far more reliable than by name - a name can be empty, shared by
+       several functions, or changed by a minifier. Only calls that would
+       actually compile are counted; a hot function's later calls must not
+       consume the budget. */
+    if (allow_first >= 0) {
+        int skip;
+
+        if (b->whale_jit_entry || b->whale_jit_tried)
+            return 0;               /* not a compile: not our business */
+        skip = compiles++ >= allow_first;
+        if (getenv("WHALE_JIT_DUMP")) {
+            const char *nm2 = b->func_name
+                ? JS_AtomToCString(b->realm, b->func_name) : NULL;
+
+            fprintf(stderr, "[compile-ord] %d%s %s len=%d\n", compiles - 1,
+                    skip ? " (skipped)" : "", nm2 ? nm2 : "?", b->byte_code_len);
+            if (nm2)
+                JS_FreeCString(b->realm, nm2);
+        }
+        return skip;
+    }
+    if (!list)
+        return 0;
+    /* a lone `*` disables the JIT entirely, which is the baseline every
+       bisection compares against. Checked before the name, because an
+       anonymous function has no name to match and would otherwise escape. */
+    if (list[0] == '*' && list[1] == '\0')
+        return 1;
+    if (!b->func_name)
+        return 0;
+    nm = JS_AtomToCString(b->realm, b->func_name);
+    if (!nm)
+        return 0;
+    nlen = strlen(nm);
+    {
+        const char *p = list;
+
+        while (*p) {
+            const char *q = strchr(p, ',');
+            size_t seg = q ? (size_t)(q - p) : strlen(p);
+
+            if (seg == nlen && !memcmp(p, nm, nlen)) {
+                if (getenv("WHALE_JIT_DUMP"))
+                    fprintf(stderr, "[skip-fn] %s\n", nm);
+                JS_FreeCString(b->realm, nm);
+                return 1;
+            }
+            if (!q)
+                break;
+            p = q + 1;
+        }
+    }
+    JS_FreeCString(b->realm, nm);
+    return 0;
 }
 
 /* Tier-2 (re-JIT) gate. Tier 2 is the expensive recompile - whole-function
@@ -5307,6 +5404,13 @@ static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b,
     whale_prof_maybe_arm(ctx, b);
     if (b->whale_call_count < whale_hot_threshold(b))
         return 0;
+    /* WHALE_JIT_SKIP=<name>[,<name>...] refuses to compile a function by name.
+       It exists to bisect "which compiled function produces the wrong answer"
+       in a large dependency graph: with the threshold forced low the set of
+       compiled functions is small, and skipping one at a time identifies the
+       culprit in a couple of runs instead of reading generated C. */
+    if (whale_jit_skip_name(b))
+        return 0;
     if (b->whale_jit_entry || b->whale_jit_tried) {
         /* Tier 1 is live (or failed): count toward the tier-2 recompile.
            The tier-2 attempt reuses the whole path below with a hotter flag;
@@ -5339,6 +5443,16 @@ static int whale_on_call(JSContext *ctx, JSFunctionBytecode *b,
         fprintf(stderr, "[hot] count=%u threshold=%d loops=%d bytelen=%d\n",
                 b->whale_call_count, whale_hot_threshold(b),
                 b->whale_loop_count, b->byte_code_len);
+    if (getenv("WHALE_JIT_DUMP") && b->func_name) {
+        /* WHALE_JIT_DUMP=3 also names the function, which is what makes a
+           miscompile traceable back to a source construct. */
+        const char *nm = JS_AtomToCString(b->realm, b->func_name);
+
+        if (nm) {
+            fprintf(stderr, "[hot-fn] %s\n", nm);
+            JS_FreeCString(b->realm, nm);
+        }
+    }
     {
         static int whale_op_probe;
         if (!whale_op_probe && whale_dbg_env("WHALE_JIT_DUMP")) {
