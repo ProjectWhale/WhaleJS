@@ -7212,3 +7212,123 @@ end 一个没开始的 file）。
    汇报；原始消息留给 `WHALE_JIT_VERBOSE`。
 
 见 current.md <155>
+
+
+# <156>: 字段缓存把 deopt 值写回对象 + 槽位编码溢出 + dup 丢名字
+
+SOLVED
+
+## 问题
+
+WhaleNode 跑真实 Svelte 项目报：
+
+```
+[vite] Internal server error: not a function
+  Plugin: vite-plugin-svelte:compile
+  File: .../src/widgets/TagSelector.svelte
+    at visit (node_modules/esrap/src/context.js:95:18)
+```
+
+`context.js:95` 是 `node.type.includes('TS')` —— **`node.type` 不是字符串**。
+同一份组件反复编译还会产出**不同结果**（1057 / 1055 / 1044 字符，有时直接抛
+异常），说明是 JIT 的静默误编译，不是 Svelte 的问题。
+
+## 三个独立的洞
+
+### 1. 字段缓存把 deopt 值写回了对象本身
+
+缓存字段读的冷路径：解析字段指针 → 按 tag 分派。int32/float64 内联处理，
+其它类型调 `JS_WhaleObjValueNum`，它**设 `*deopt` 并返回 0**。但分派之后那段
+「归一化」代码（把值按 float64 写回，让后续 trip 走稳态路径）**照样执行**：
+
+```c
+v = (tag == 8) ? fp->u.float64 : (tag == 0) ? (double)fp->u.int32
+                                          : JS_WhaleObjValueNum(...);   /* deopt! */
+fp->u.float64 = v;      /* 把 0 写进对象真实字段 */
+fp->tag = 8;            /* 把字段 tag 改成 float64 */
+```
+
+字符串字段于是被**永久改成 0**。`function f(x) { return x.kind === 'a'; }`
+前 20 次对、之后永远错——而且对象本身已被破坏，退回解释器也救不回来。
+esrap 正是用这条路径读 `node.type`，所以编译器看到的是数字，
+`.includes` 自然 `not a function`。
+
+修：归一化前先 `if (*deopt) return 0;`。
+
+### 2. `WHALE_CALL_BASE = 20`，但类型字节只能装 15 个槽
+
+对象槽位编码在类型字节里：低 4 位是类型，高 4 位是 slot+1（因为 `cur[]` 是
+uint8_t 数组、要在每个跳转目标处快照，槽号必须随类型一起走）。4 位只能装
+0..14：
+
+| slot | 编码 | 解回 |
+|---|---|---|
+| 14 | 0xf8 | 14 ✓ |
+| 15 | 0x08 | **-1** |
+| 19 | 0x48 | **3** |
+| 27 | 0xc8 | **11** |
+
+`immutable_update` 当初把 base 从 8 提到 20，于是槽 15..19 写进类型字节后
+**指向别人的槽**——读到的是另一个对象的值。这就是"症状随内存布局变化"的来源。
+
+修：`WHALE_CALL_BASE` 改回 15，并加 `#error` 把两个常量钉死
+（`WHALE_CALL_BASE > WHALE_OBJ_MAX` 直接编译失败）。base 之上的调用暂存槽是
+用整数字面量拼进生成代码的，不受影响。
+
+### 3. `OP_dup` 复制了 vexpr/vmat，没复制 vname
+
+源槽已经物化（vmat=1）时，副本继承了 vmat，于是 `fold_materialize_live` 跳过它，
+`fold_inline` 去读 `whale_vname[副本]`——那个位置从没写过，还是更早某个槽的名字。
+
+`a.line < b.line || !(a.line > b.line) && a.column < b.column` 因此**拿
+`b.line` 去分支**，而不是拿 `!` 的结果。`OP_nip_catch` 的槽移动同样漏了。
+
+### 顺带两个越界写
+
+- `whale_vname` / `whale_slot_fn` 按操作数栈槽号索引，而栈能到
+  `stack_size + WHALE_INLINE_EXTRA`，数组却只按 `WHALE_JIT_MAX_SLOTS` 分配；
+- `var_count` 从来没有对着那一堆 per-local 表做上限检查。
+
+两者都加了门。
+
+## 定位手法（这轮真正的收获）
+
+这类 bug 没有任何输出能看出来——答案错得"合理"，而且症状随布局变化。所以加了
+四个诊断开关，然后**二分**：
+
+- `WHALE_JIT_HOT=<n>` 压低热点阈值（几秒内就能复现，不用等 100 次调用）；
+- `WHALE_JIT_DUMP=1` 打 `[hot-fn] <名字>`，`=2` 打完整字节码；
+- `WHALE_JIT_SKIP=<名字>|*` 按名字拒绝编译（`*` = 全关，二分基线）；
+- `WHALE_JIT_ALLOW_FIRST=<n>` 只放前 n 次**编译**通过，其余拒绝。
+
+最后这个最有效：按名字二分不可靠（匿名函数没名字、压缩后重名），按**序号**
+二分可靠。`n=204` 正常、`n=205` 出错 → 第 205 次编译就是元凶；它的字节码
+`push_atom_value; get_arg0; get_field; strict_eq; return` 正是
+`x.kind === 'a'` / `node.type.includes` 的形态。
+
+## 验证
+
+- 新增 `tests/whale/jit-field-deopt.js`（3603 checks，覆盖字符串/布尔/数字字段、
+  普通读、表分派、`.includes`）；**修复前在第 100 个 check 就失败**。
+- `whale_test` / `whale_wasm_test`（两路径）/ `whale_promise_test` ok；
+  之前六个 JS 探针全过。
+- Svelte 真实项目：`TagSelector.svelte`、`TagEditor.svelte`、`App.svelte`、
+  `main.ts` 全部 200，日志里 `not a function` **0 次**（修复前每轮必现）。
+- perftest 25 例无回退；WhaleNode 全量 **363 passed / 3 failed**，三个失败
+  （child-sync 的 stdin input、stderr 捕获、stream-v8 的 UTF-8）**在旧引擎库上
+  完全相同**——其中两个是因为 PATH 上的 `node` 其实就是 whalenode 自己的副本，
+  子进程的 stderr 带上了它自己的 JIT 摘要，属环境问题。
+
+## 教训
+
+1. **"冷路径设了 deopt"不等于"后面的代码不会跑"**。deopt 是一个返回值约定，
+   不是控制流；每个 deopt 之后都必须显式 `return`。
+2. **一个 4 bit 的字段位宽，是一个必须写下来的上限**。槽预算从 12 提到 28 时
+   没人检查编码能力，于是 15..27 全成了别名。把不变量写成 `#error`，
+   下次改常量会立刻炸在编译期而不是运行期。
+3. **复制槽位状态要复制全套**。vexpr/vmat/vname 是一组，漏一个就是读到别人的
+   变量——而且只在"源槽已物化"时发作。
+4. **静默误编译只能靠二分，不能靠读代码**。按编译序号二分是最快的路径；
+   按名字二分在压缩代码上基本无效。
+
+见 current.md <156>
