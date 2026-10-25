@@ -151,6 +151,50 @@ ST_FUNC void tccelf_begin_file(TCCState *s1)
 #endif
 }
 
+/* Discard everything the current translation unit wrote, instead of merging it
+   the way tccelf_end_file() does.
+
+   end_file() is the *success* path: it truncates the symbol table back to where
+   the unit started and then re-adds each of the unit's symbols through
+   set_elf_sym(), which is how they become part of the shared table. That is
+   exactly right for a unit that compiled, and exactly wrong for one that did
+   not - a half-parsed unit's undefined references (memset, JS_WhaleCheckStack,
+   ...) get re-added as real global undefined symbols and stay there forever.
+
+   The next tcc_relocate() then walks them in pe_check_symbols(), pe_add_import()
+   builds `IAT.memset` for the function-type ones, and that helper is itself
+   SHN_UNDEF - so the relocate after that reports `undefined symbol 'IAT.memset'`
+   and every later compile in the process fails. WhaleNode measured this as
+   "one failed unit poisons the whole JIT": a leaf function with no loop and no
+   call failed after an unrelated function had failed before it.
+
+   Rolling back is only sound because the caller has already torn down the parser
+   state (sym_pop, label stacks, defines) and will not use this unit's symbols.
+   Every section's data_offset returns to the sh_offset begin_file() recorded, so
+   the unit's text/data/reloc bytes are dropped too. */
+ST_FUNC void tccelf_rollback_file(TCCState *s1)
+{
+    Section *s;
+    int i;
+
+    for (i = 1; i < s1->nb_sections; i++) {
+        s = s1->sections[i];
+        if (s->data_offset > s->sh_offset)
+            s->data_offset = s->sh_offset;
+    }
+    /* begin_file() swapped the symbol table's hash and reloc pointers so that
+       symbol lookup stays linear while the unit is being built. Undo it here as
+       well: end_file() is what normally restores them. */
+    s = s1->symtab;
+    if (!s->hash && s->reloc) {
+        s->hash = s->reloc;
+        s->reloc = NULL;
+    }
+#if defined TCC_TARGET_X86_64 && defined TCC_TARGET_PE
+    s1->uw_sym = 0;
+#endif
+}
+
 /* At the end of compilation, convert any UNDEF syms to global, and merge
    with previously existing symbols */
 ST_FUNC void tccelf_end_file(TCCState *s1)

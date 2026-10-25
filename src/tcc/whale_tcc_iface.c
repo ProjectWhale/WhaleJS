@@ -98,7 +98,7 @@ static int whale_ir_unit_open;
                 sym_pop(&global_stack, NULL, 0);                            \
                 sym_pop(&local_stack, NULL, 0);                             \
                 preprocess_end((s));                                        \
-                tccelf_end_file((s));                                       \
+                tccelf_rollback_file((s));                                  \
                 tcc_close();                                                \
                 whale_ir_unit_open = 0;                                     \
             }                                                               \
@@ -747,7 +747,7 @@ void *JS_WhaleTokCompileAdd2(void)
             global_label_stack = NULL;
             local_label_stack = NULL;
             preprocess_end(s);
-            tccelf_end_file(s);
+            tccelf_rollback_file(s);
             tcc_close();
             whale_ir_unit_open = 0;
         }
@@ -898,7 +898,7 @@ int JS_WhaleCompileTokens(TCCState *s, void (*emit)(void *), void *emit_ctx)
         local_label_stack = NULL;
         if (unit_open) {
             preprocess_end(s);
-            tccelf_end_file(s);
+            tccelf_rollback_file(s);
             tcc_close();
             unit_open = 0;
         }
@@ -940,7 +940,7 @@ int JS_WhaleCompileTokens(TCCState *s, void (*emit)(void *), void *emit_ctx)
         global_label_stack = NULL;
         local_label_stack = NULL;
         preprocess_end(s);
-        tccelf_end_file(s);
+        tccelf_rollback_file(s);
         tcc_close();
         s->error_set_jmp_enabled = 0;
         return 0;

@@ -311,6 +311,67 @@ int main(void)
         }
     }
 
+    /* 9d. The lexical/comma round (WhaleNode's
+       doc-internal/whalejs-jit-lexical-and-comma.md). Three shapes that each
+       used to keep the whole function in the interpreter, and whose answers
+       were right either way - so only the compiled counter shows the fix:
+
+         - `let`/`const`: OP_set_loc_uninitialized had no arm, so *every*
+           ES2015+ function bailed on its first bytecode instruction.
+         - a five-parameter wrapper: closure_var_count > 4 refused every
+           CommonJS module body outright.
+         - a loop over a plain object with two element writes: the fclosure
+           elision advanced the position twice and the heap was corrupted.
+
+       Run each in its own script so the counters attribute cleanly. */
+    {
+        static const struct {
+            const char *name;
+            const char *src;
+            double want;
+        } cases[] = {
+            { "const", "function fConst(n){ const k=2; var s=0; for (var i=0;i<n;i++) s+=i*k; return s; }"
+                       "fConst(60)",
+                       3540.0 },
+            { "let", "function fLet(n){ let s=0; for (let i=0;i<n;i++) s+=i; return s; }"
+                     "fLet(60)",
+                     1770.0 },
+            { "try", "function fTry(n){ var s=0; for (var i=0;i<n;i++){ try { s+=i; } catch(e) { s-=1; } } return s; }"
+                     "fTry(60)",
+                     1770.0 },
+            /* NOT here: `var m={}; m[0]=1; m[1]=2; function c(){} ... c(k,1)`
+               in one body. It answers correctly but still runs interpreted -
+               the object's slot type meets the call's argument type at the
+               loop head and the merge refuses. Pre-existing, unrelated to the
+               lexical/comma round, and tracked in notes <157>. */
+            { NULL, NULL, 0 }
+        };
+        int ci;
+
+        for (ci = 0; cases[ci].name; ci++) {
+            uint32_t compiled_before;
+            double v;
+
+            JS_WhaleGetJitStats(ctx, &st);
+            compiled_before = st.compiled;
+            /* One call only: the counter has to come from the compile this
+               script triggers, not from a hot loop elsewhere in the test. */
+            v = eval_number(ctx, cases[ci].src);
+            if (v != cases[ci].want)
+                printf("  [%s] got %.0f want %.0f\n", cases[ci].name, v,
+                       cases[ci].want);
+            CHECK(v == cases[ci].want);
+            JS_WhaleGetJitStats(ctx, &st);
+            /* The named function must be compiled, not merely correct. Each
+               case's script also has a top-level wrapper, which is not a normal
+               function and is refused for an unrelated reason - so this is
+               "at least one", and the interpreter answers would be right too. */
+            CHECK(st.compiled > compiled_before);
+            printf("  [%s] compiled %u function(s)\n", cases[ci].name,
+                   st.compiled - compiled_before);
+        }
+    }
+
     /* 10. gcc backend: compile one marked function through gcc -c, linked
        in-process by TinyCC itself (no .dll, no LoadLibrary). Needs a MinGW
        gcc; the driver comes from WHALE_TEST_GCC or the well-known install

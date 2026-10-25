@@ -7332,3 +7332,189 @@ uint8_t 数组、要在每个跳转目标处快照，槽号必须随类型一起
    按名字二分在压缩代码上基本无效。
 
 见 current.md <156>
+
+
+# <157>: 词法作用域 / 逗号融合 / 失败单元回滚（WhaleNode 七条）+ 循环边界融合
+
+SOLVED（七条全修）/ OPEN（一条新发现的旧问题）
+
+## 来源
+
+WhaleNode `doc-internal/whalejs-jit-lexical-and-comma.md`，七条都在原版
+`whalejs.exe` 上复现过（不是封装层）。按报告自己的优先级修。
+
+## 1（致命）堆损坏 0xC0000374：fclosure 省略把 pos 推进两次
+
+`OP_fclosure8` 的声明形式省略跟随的存储，代码写的是
+`pos = npos + s4`（存储之后的下一条），而循环尾已经会
+`pos += sz`——于是每次省略都跳过**两条**指令。`var __m = {};`
+里被跳的是 `object`/`set_loc0`，对象没上栈，紧接着的 `swap`
+在 `sp=1` 下跑，`fold_materialize(-1)` 写到 `whale_vexpr[]` 之前，
+堆损坏在下一次分配时报出来。修：`pos = npos + s4 - sz`。
+
+同时加了两道结构性防护（这类错不应该只能靠人看出来）：
+
+- **每条指令的栈深度检查**（`sp` 小于该 opcode 的 `n_pop` 则干净地 bail）。
+  必须放在**跳转目标状态恢复之后**，不然 catch 处理器的第一条
+  `put_loc` 会误报（`goto` 到处理器之间的死代码已经把栈降到 0）。
+- **`fold_materialize(k)` 对 `k < 0 || k >= WHALE_STACK_SLOTS` 直接返回**。
+
+连带修了 `OP_swap`：它对两个操作数都调 `fold_materialize`，而对象/数组/停放值
+的 fold 缓冲区本来就是空的，于是发出 `_wsv[n] = ( ) ;`（TinyCC
+`identifier expected`）。`{}` 后接 `swap` 就是 `obj[key] = v`。
+
+## 2（高）let/const 让整个函数永久失去 JIT
+
+`OP_set_loc_uninitialized`（96）没有分支，而它是进入词法作用域时的第一条
+字节码——于是任何含 `let`/`const` 的函数都在第 0 条就 bail。实测 4.6×
+（415 vs 90 ns/call）。
+
+TDZ 哨兵是 `JS_UNINITIALIZED`，编译后的任何值都不可能是它；而读取走
+`OP_get_loc_check`，它只能在声明之前失败（那时引擎抛异常，根本不会跑到这里）。
+于是：写哨兵 = 把槽位标 UNKNOWN；`get_loc_check`、`put_loc_check`、
+`put_loc_check_init` **并入 `get_loc`/`put_loc` 臂**（不能单独开一个）。
+
+**合并是关键不是整洁**：我第一版给 `get_loc_check` 写了自己的 emit，
+它绕过了 int-mirror 读取路径，`for (let i...)` 的计数器从此永远读到陈旧的
+包装值——**死循环**，不是错值。同样必须把 `post_inc`/`post_dec` 加进
+`whale_is_pure_num_op`、把 `put_loc_check`、`set_loc_uninitialized` 加进 `assign_cnt` 的
+写入统计（否则计数器被当成单次赋值常量，常量传播把循环头折成字面量 0）。
+
+## 3（高）逗号融合重复发射
+
+源头在 `whale_step_emit`：`fm = fold_mark()` 取在操作数物化**之前**，而每个
+物化都会 `fold_commit` 自己那一段到输出；token sink 里的那一段还在，
+于是一次 `fold_commit(fm)` 又把它拷了一遍。逗号序列的 `,` 也在 sink 里，
+一并重发——就是报告里那个带前导逗号的非法 C。修：
+mark 改到物化之后。
+
+## 4（高）失败单元永久污染共享 TCCState
+
+`tccelf_end_file()` 是**成功路径**：把符号表截回单元起点再把
+本单元符号逐个 `set_elf_sym` 并回去——对编译成功的单元完全正确，
+对半解析的单元则把它的 `SHN_UNDEF` 引用变成真的全局未定义符号。
+下一次 `tcc_relocate` 走 `pe_check_symbols`，`pe_add_import` 为函数型符号造出
+`IAT.memset`，而它自己也是 `SHN_UNDEF`，再下一次就报
+`undefined symbol 'IAT.memset'`——**永久**，后面每个单元都失败。
+
+修：新增 `tccelf_rollback_file()`（`tccelf_end_file` 的失败对偶），把每个
+section 的 `data_offset` 退回 `begin_file` 记下的 `sh_offset`（代码/数据/reloc
+字节一并丢弃）并把 symtab 的 hash/reloc 指针还原。四个 longjmp
+收尾点全改用它（成功路径不动）。
+
+## 5（中）生成器覆盖缺口 + 全局变量
+
+- **`closure_var_count > 4` 拒绝掉每个 CJS 模块包装器**（`(exports,
+  require, module, __filename, __dirname)` 就是五个）。表改到 `WHALE_VR_MAX=16`；
+  但 `WHALE_VRFN_T` 把索引压进类型字节的高 4 位，所以 VRFN 路径另用
+  `WHALE_VRFN_MAX=15` 单独限制（超出的走停放 VAL，函数仍然编译）。
+- **`fclosure` 在非声明位置**（`var g = function(){}`、`return function(){}`、IIFE）现在
+  用真的帮手 `JS_WhaleCpoolClosure`（跟解释器 `OP_fclosure8` 一样调
+  `js_closure`，共享捕获单元）建真闭包当停放值传。
+- **`OP_set_name`**：`var g = function(){}` 是 `fclosure8; set_name; put_loc`，`set_name` 在
+  中间使声明识别失败；现在两处（预扫 + 发射）都跨过它，并用
+  `JS_WhaleObjSetName` 发名字（纯装饰，不影响结果）。
+- **`try/catch` 在循环里**：处理器是异常进入的跳转目标，线性扫描不会
+  给它记录入口状态（拿到的是 goto 之后死代码的 sp=0）。修：`OP_catch`
+  自己把入口快照写下去（跟解释器一致：栈退到 `catch` 时的深度、
+  异常值在 catch 槽）。
+- **`if_false8` 的条件是停放值**（`d.getTime() === 0` 产生的包装布尔）：新增
+  `JS_WhaleObjToBool` 转真值，结果是普通 double，下游不变。
+- **全局变量**（用户明确要求）：`console.log(x)` 是 `get_var console;
+  get_field2 log; <args>; call_method`，全局是**接收者**不是被调者，而 `get_field2`
+  没有停放接收者的臂。新增：`get_field2` 在紧随 `call_method` 时把方法停放成
+  VAL；`whale_feeds_call_as_callee` 把 `call_method`/`tail_call_method` 也算作消费点。
+
+## 6（中）模块体浅栈慢 100 倍
+
+未展开。报告已证明与 JIT 无关、WhaleNode 已用三层转发绕过。保留。
+
+## 7（低）duplicate label 'L4'
+
+确实是第 3 条的下游（重发语句把 `L4:` 也发了第二遍）。修完 3 后消失。
+
+## 发现一个新问题（OPEN）：重读同一个局部变量时计数器翻倍
+
+这不在七条里，也**不是本轮引入的**（`f9ba23f` 上同样复现，字节一样），
+记在这里供下一轮：
+
+```js
+function q(){ var s=0,i; for(i=0;i<16;i++) s+=i+i; return i; }
+q(); q(); q();
+q();      // -> 31，应为 16
+```
+
+形状极其具体：循环体内**同一局部变量读两次并参与同一表达式**
+（`s+=i+i`），且 trip 足大（实测 K≤16 才发作，K≤15 正常）。计数器最终
+值是 `2K-1`，即**每次迭代加了两次**（K=32 时 63）。
+
+已排除（每项都单独验过）：memo（`WHALE_NO_MEMO`）、逗号融合
+（`WHALE_NO_COMMA`）、两个卷展开器（`WHALE_NO_UNROLL`/`WHALE_NO_UNROLL4`）、
+函数极简入口（`WHALE_NO_NAT`）、int-region 镜像（该单元的生成 C 里
+根本没有 `I1`）。
+
+**关键矛盾**：`WHALE_CORE_SRC=1` 吐出的完整 token 流（TinyCC 实际解析的
+东西）是对的——
+
+```c
+L4 : if ( ! ( ( ( L1 < 16 ) ) ) ) goto L19 ;
+L0 = ( ( ( L0 ) + ( ( L1 ) + ( L1 ) ) ) ) , L1 = ( L1 + 1 ) ;
+goto L4 ;
+L19 : return ( L1 ) ;
+```
+
+它不可能返回 31。所以跑的不是这个单元，或者 `An`/`_r` 的传递有问题。
+我用过的手段：编译序号二分（`WHALE_JIT_ALLOW_FIRST`）、名字跳过
+（`WHALE_JIT_SKIP=q`）、单元名唯一性（`fn_1`/`fn_2` 确实不同）、
+两个读法都编译（`selfref`）。还没找到。
+
+已知的下一步：在生成的 core 里插一个 `JS_WhaleDeoptWhy(ctx, 8000)` 印记，
+看它到底有没有跑（我试过一次，但那次拓印到的是先前编译的单元）。
+
+## 同期做的性能工作
+
+**minmax 的比较合并**（用户报了回退）。它不是本轮引入的：
+`ba3deef`（当时写着"追平 node"）上就已经是 82–85ms 对节点 49ms。
+根因是两个独立的：
+
+1. `fold_set()` 的**长度上限**也管到了合并比较。`v < lo` 展开后 25 token，
+   上限 24，于是它被物化成 `_wsv[0] = (v < lo)` 再测一次——正好是合并
+   想消掉的两次内存操作。新增 `fold_set_nocap()`：立即被消费的表达式
+   不适用上限（上限是为了防待延范围在逗号序列里撞 TCC 表达式
+   求值器，而它下一条语句就发出了）。
+2. `whale_load_analyze` 拒绝把待延局部变量当作读取（对的），但这让
+   `var v = <expr>; if (v < lo)` 两个操作数都不成立、合并不发。两处都要改。
+
+结果：minmax 90 → **66ms**（node 49ms），生成代码里 `_wsv[0]` 消失、比较直接
+进了 `if`。剩下的差距在内层 8 次循环未展开，下一轮再看。
+
+## 验证
+
+- `whale_test` / `whale_promise_test` / `whale_wasm_test`（两条路径）全 ok。
+- `test_api.c` 新增 `[let]`/`[const]`/`[try]` 的 **compiled 计数断言**（答案对不代表
+  编译成功）。
+- 新探针 `tests/whale/jit-lexical.js`：let/const 六种形状、循环内建闭包、循环内
+  try/catch（含真抛）、`new Date`、捕获修改、五参 CJS 包装器——且
+  `letCounter(1e6)` 用大 trip 把死循环变成失败而不是卡住。
+- 八个旧探针全过。
+- WhaleNode `doc-internal/whalejs-jit-lexical-and-comma.md` 的十个脚本：堆损坏、let 矩阵、
+  逗号、污染涉及全部转为干净失败或成功（“干净失败”都是第 3条修好后
+  才能看到的新信息）。
+- perftest 25 项无回退，minmax 提升。
+
+## 教训
+
+1. **索引拼接必须与消费端一起看**。`WHALE_VRFN_T` 的高 4 位已经是类型位，
+   把索引上限从 4 提到 16 会让 15 变成别名（同 `<156>`）。表宽度和
+   编码位宽是两个独立的上限。
+2. **合并 opcode 臂不是整洁，是正确性**。给 `get_loc_check` 单开一个 emit
+   会绕过镜像读取，结果是死循环而不是错值——同一类对象必须共用一条
+   路径，否则修一个漏一个。
+3. **"Bail 很干净" 不等于没问题**。七条里三条修好后才露出后面的问题：
+   堆损坏掩盖了 fclosure 的类型缺失，逗号重发淹没了第 4 条的根因。
+   **第一个修复会改变后续失败的形状**，每修一条都要重新跑全集。
+4. **上限会在意外的地方生效**。`whale_expr_max` 是为待延范围设的，
+   但它也管到了立刻被消费的合并比较——多一个语句就是一次
+   内存访问，而合并的全部意义就是省掉它。
+
+见 current.md <157>

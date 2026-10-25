@@ -3852,7 +3852,15 @@ int JS_WhaleCpoolFuncInfo(JSContext *ctx, const JSValue *cpool, int idx,
     return 1;
 }
 
+/* js_closure() is defined much later in this file; the JIT helper below needs
+   it here. */
+static JSValue js_closure(JSContext *ctx, JSValue bfunc,
+                          JSVarRef **cur_var_refs, JSStackFrame *sf);
+static int JS_DefineObjectName(JSContext *ctx, JSValue obj,
+                               JSAtom name, int flags);
+
 /* Park a callable taken from the constant pool in slot k.
+
 
    A callee that this compilation can see is tracked as WHALE_T_FN, and the only
    route to it used to be inlining: if whale_inline_body could not expand it - the
@@ -3879,6 +3887,69 @@ int JS_WhaleCpoolSlot(JSContext *ctx, int idx, int slot)
         return 0;
     JS_WhaleObjSlot(ctx, slot, js_dup(v));
     return 1;
+}
+
+/* Build the closure `cpool[idx]` closes over *this* frame's variables and park
+   it in slot k - OP_fclosure8 semantics.
+
+   A closure in a value position is a real object with its own captured-variable
+   cells, so it cannot be represented by its constant-pool entry the way a
+   function declaration is. `var g = function (v) { ... }` inside a loop is the
+   shape: the body is compiled, only the making of the closure was refused, and
+   refusing it took the whole function down.
+
+   js_closure() wants the frame and the frame's var_refs array, which the JIT's
+   generated code has as an opaque pointer, so this runs on the engine side
+   where both are reachable. Reuses the current frame's var_refs, exactly as the
+   interpreter's OP_fclosure8 does - the cells are shared, not copied, so writes
+   to a captured variable stay visible in both. */
+int JS_WhaleCpoolClosure(JSContext *ctx, int idx, int slot)
+{
+    JSStackFrame *sf = ctx->rt->current_stack_frame;
+    JSFunctionBytecode *b;
+    JSValue v, f;
+
+    if (!sf || idx < 0)
+        return 0;
+    f = sf->cur_func;
+    if (!JS_IsFunction(ctx, f))
+        return 0;
+    b = JS_VALUE_GET_OBJ(f)->u.func.function_bytecode;
+    if (!b || idx >= b->cpool_count)
+        return 0;
+    v = js_dup(b->cpool[idx]);
+    if (!JS_IsFunction(ctx, v)) {
+        JS_FreeValue(ctx, v);
+        return 0;
+    }
+    v = js_closure(ctx, v, sf->var_refs, sf);
+    if (JS_IsException(v)) {
+        JS_FreeValue(ctx, v);
+        return 0;
+    }
+    JS_WhaleObjSlot(ctx, slot, v);
+    return 1;
+}
+
+/* Give the value in slot k the `name` property OP_set_name does. The name is
+   the atom whose index the opcode carries.
+
+   Only worth handling because it sits between an fclosure and its store: the
+   bytecode for `var g = function (v) {...}` is `fclosure8 M; set_name "g";
+   put_locN`, so without this the closure could be built and then thrown away.
+   The helper is intentionally silent about failure: a missing name is a
+   cosmetic difference, never a wrong answer, and the engine's own call would
+   raise an exception this side has no way to report. */
+int JS_WhaleObjSetName(JSContext *ctx, int slot, int atom)
+{
+    JSValue *slots;
+
+    if (atom < 0)
+        return 0;
+    slots = whale_frame_obj_slots(ctx);
+    if (slot < 0 || slot >= WHALE_OBJ_SLOTS)
+        return 0;
+    return JS_DefineObjectName(ctx, slots[slot], atom, JS_PROP_CONFIGURABLE) >= 0;
 }
 
 /* Park a number in slot k. Generated code needs this for a call argument: the
@@ -4890,6 +4961,7 @@ static void whale_memo_insert(JSContext *ctx, WhaleMemo *m, int argc,
         e->args[k] = argv[k];
     m->entries[m->count++] = e;
 }
+
 
 /* WhaleJS: record what an access site saw. Direct-mapped on the operand offset, and
    a slot claimed by a different offset is disabled rather than evicted - a wrong
@@ -20327,6 +20399,26 @@ int JS_WhaleBinopVal(JSContext *ctx, int op, int a_slot, int b_slot, int out_slo
         return 0;                       /* exception; the caller deopts */
     JS_WhaleObjSlot(ctx, out_slot, v[2]);   /* takes ownership */
     return 1;
+}
+
+/* Truthiness of whatever is parked in slot k, as a double 0/1.
+
+   `if_false8` tests a JSValue, and a value that came out of a helper - the
+   boolean `d.getTime() === 0` produces, a field read as a value, a call
+   result - is parked in a slot rather than held as a double. The branch then
+   had no numeric operand and refused the whole function, so `new Date(x)` (and
+   any other shape whose condition is an object comparison) stayed interpreted.
+
+   Doing the test here rather than through the engine's step path keeps the
+   loop compiled: JS_ToBool is one call, and the generated code turns the result
+   into a plain double that every existing branch site already handles. */
+int JS_WhaleObjToBool(JSContext *ctx, int slot)
+{
+    JSValue *slots = whale_frame_obj_slots(ctx);
+
+    if (slot < 0 || slot >= WHALE_OBJ_SLOTS)
+        return -1;
+    return JS_ToBool(ctx, slots[slot]);
 }
 
 /* A small bounded cache of the concatenations a front-end render loop repeats.

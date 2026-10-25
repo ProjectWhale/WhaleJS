@@ -213,7 +213,13 @@ enum {
 #define WHALE_IS_STRUCT(t)   (((t) & 0x0f) == WHALE_T_STRUCT)
 #define WHALE_STRUCT_SLOT(t) ((int)((t) >> 4) - 1)
 /* a closure slot resolved to a function at compile time: the byte carries the
-   var_ref index (0..3), not a slot number */
+   var_ref index (0..3), not a slot number. Only that small range: the high
+   nibble has four bits, so indices 0..14 fit and 15 would alias the type's own
+   low nibble. The VRFN path is guarded by WHALE_VRFN_MAX rather than
+   WHALE_VR_MAX for exactly this reason - the wider tables above serve the
+   `_p<n>` cells, which are named by an index that does not have to fit in a
+   type byte. */
+#define WHALE_VRFN_MAX 15
 #define WHALE_VRFN_T(idx)  ((uint8_t)(WHALE_T_VRFN | (((idx) + 1) << 4)))
 #define WHALE_IS_VRFN(t)   (((t) & 0x0f) == WHALE_T_VRFN)
 #define WHALE_VRFN_IDX(t)  ((int)((t) >> 4) - 1)
@@ -579,6 +585,39 @@ static int whale_is_push_op(int op)
     }
 }
 
+/* Does this instruction add exactly one value to the operand stack, and take
+   nothing away? Used to walk from a function read to the call that consumes it:
+   the call is what makes WHALE_T_FN legal, and it can be several instructions
+   away (`inner(k, 1)` is get_loc1; get_loc2; push_1; call2).
+
+   The test is the net stack effect from the interpreter's own arity table, not
+   a hand-kept list: an op that pops as much as it pushes would leave the
+   function itself as one of its operands (`get_loc1; add; call0`), and an op
+   that pops more would consume it outright. Either way the value the call site
+   reads out of whale_slot_fn[] would no longer be the one this read recorded.
+   Counting only net +1 ops cannot do that, and arithmetic counts correctly:
+   `inner(a + b, 1)` pushes two values across three ops.
+
+   dup is net +1 but is excluded: it duplicates the top of the stack, which may
+   be the function itself, so the count it inflates is not a count of arguments.
+   Anything else unlisted stops the walk, and a stopped walk refuses the
+   function - the conservative direction. */
+static int whale_fn_arg_push(int op)
+{
+    int n_pop = 0, n_push = 0;
+
+    switch (op) {
+    case OP_dup: case OP_insert2: case OP_insert3: case OP_insert4:
+    case OP_perm3: case OP_perm4: case OP_perm5:
+    case OP_rot3l: case OP_rot3r: case OP_rot4l: case OP_rot5l:
+        return 0;   /* rearranges or duplicates: the count would not be arguments */
+    default:
+        break;
+    }
+    JS_WhaleOpArity(op, &n_pop, &n_push);
+    return (n_pop == 0 && n_push == 1);
+}
+
 /* Pure-numeric opcodes: the generator lowers them to C operators and plain
    variable traffic without calling any helper. Anything else (calls, field /
    array / global access, conversions that need ToInt32/fmod, throws, catches)
@@ -597,11 +636,13 @@ static int whale_is_pure_num_op(int op)
     case OP_push_true: case OP_push_false:
     case OP_get_loc0: case OP_get_loc1: case OP_get_loc2: case OP_get_loc3:
     case OP_get_loc8: case OP_get_loc:
+    case OP_get_loc_check:
     case OP_get_loc0_loc1:
     case OP_get_arg0: case OP_get_arg1: case OP_get_arg2: case OP_get_arg3:
     case OP_get_arg:
     case OP_put_loc0: case OP_put_loc1: case OP_put_loc2: case OP_put_loc3:
     case OP_put_loc8: case OP_put_loc:
+    case OP_put_loc_check: case OP_put_loc_check_init:
     case OP_set_loc0: case OP_set_loc1: case OP_set_loc2: case OP_set_loc3:
     case OP_set_loc8: case OP_set_loc:
     case OP_add: case OP_sub: case OP_mul: case OP_div: case OP_mod:
@@ -611,6 +652,7 @@ static int whale_is_pure_num_op(int op)
     case OP_and: case OP_or: case OP_xor:
     case OP_shl: case OP_shr: case OP_sar:
     case OP_inc: case OP_dec: case OP_inc_loc: case OP_dec_loc: case OP_add_loc:
+    case OP_post_inc: case OP_post_dec:
     case OP_is_undefined_or_null:
     case OP_to_propkey: case OP_to_propkey2:
     case OP_goto: case OP_goto8: case OP_goto16:
@@ -735,10 +777,18 @@ static int whale_feeds_call_as_callee(const uint8_t *pc, int len, int pos, int s
         int o = (int)pc[k];
         int s;
 
-        if (whale_dbg_env("WHALE_JIT_DUMP"))
-            fprintf(stderr, "[feeds] k=%d o=%d dup=%d push=%d\n",
-                    k, o, OP_dup, whale_is_push_op(o));
+        if (getenv("WHALE_FEEDS_DBG"))
+            fprintf(stderr, "[feeds] pos=%d k=%d o=%d dup=%d push=%d call=%d\n",
+                    pos, k, o, o == OP_dup, whale_is_push_op(o),
+                    whale_is_call_op(o));
         if (whale_is_call_op(o))
+            return 1;
+        /* `console.log(x)` is get_var console; get_field2 log; <args>;
+           call_method - the global is the method's receiver, so it travels to
+           the engine the same way a callee does. Not folded into
+           whale_is_call_op: the other callers of that predicate ask "is the
+           value a function", and a receiver is not. */
+        if (o == OP_call_method || o == OP_tail_call_method)
             return 1;
         /* Two opcodes carry the callee or its arguments rather than starting
            something new, and neither is in whale_is_push_op:
@@ -748,11 +798,47 @@ static int whale_feeds_call_as_callee(const uint8_t *pc, int len, int pos, int s
                `throw new Error("negative")`.
            Stopping at either typed the callee as a number, and the whole function
            was then refused. */
-        if (o != OP_dup && o != OP_push_atom_value && !whale_is_push_op(o))
+        if (o != OP_dup && o != OP_push_atom_value &&
+            o != OP_get_field2 && !whale_is_push_op(o))
             return 0;
         s = whale_op_size_of(o);
         if (s <= 0)
             return 0;
+        k += s;
+        n++;
+    }
+    return 0;
+}
+
+/* Does the value a `get_field2` just read become the method of a
+   `call_method`? `console.log(a, b)` is `get_var console; get_field2 log;
+   <a>; <b>; call_method`, so the field value sits under the arguments. Counts
+   net +1 pushes from just after the read and requires the call they lead to to
+   take exactly that many arguments. Stops at anything else - the answer decides
+   whether the field is parked as a value or read as a number, and the numeric
+   path is the wrong shape for a method.
+
+   A `dup`/shuffle in the argument run refuses: it would move the method out of
+   the position call_method reads it from. */
+static int whale_feeds_method_call(const uint8_t *pc, int len, int pos_after)
+{
+    int nargs = 0, k = pos_after, n = 0;
+
+    while (k < len && n < 8) {
+        int o = (int)pc[k];
+        int s = whale_op_size_of(o);
+
+        if (s <= 0)
+            return 0;
+        if (o == OP_call_method || o == OP_tail_call_method)
+            return ((int)whale_get_u16(pc + k + 1) == nargs);
+        if (o >= OP_call0 && o <= OP_call3)
+            return 0;   /* a plain call consumes the value differently */
+        if (o == OP_call)
+            return 0;
+        if (!whale_fn_arg_push(o))
+            return 0;
+        nargs++;
         k += s;
         n++;
     }
@@ -2776,6 +2862,12 @@ static uint8_t    *whale_vmat;    /* 1 = already forced into a variable */
    `whale_vname[sp] = nm` at sp >= 64 landed in whatever static followed,
    which is why a wrong answer appeared or vanished depending on the
    process's memory layout. */
+/* How many closure slots (get_var_ref indices) the generator tracks. The
+   opcode family is only `get_var_ref0..3` plus a 16-bit `get_var_ref`, so the
+   index space is the function's closure_var_count - which for a CommonJS module
+   wrapper is five, and for a nested closure can be more. Sized generously: the
+   per-entry cost is a few pointers of generator stack, not generated code. */
+#define WHALE_VR_MAX 16
 #define WHALE_STACK_SLOTS (WHALE_JIT_MAX_SLOTS + WHALE_INLINE_EXTRA + 1)
 static int whale_vname[WHALE_STACK_SLOTS];  /* slot -> name number */
 /* Single-assignment constant locals: lo_c[d] means local d is a compile-time
@@ -2909,6 +3001,27 @@ static void fold_set(int k, int mark, int inv)
     }
 }
 
+/* fold_set() without the length ceiling.
+
+   The ceiling exists so an overlong pending expression becomes its own
+   statement instead of sitting inside a longer comma sequence, where it would
+   make TinyCC's expression evaluator spill. That reasoning is about *deferred*
+   ranges - ranges some later opcode may inline. A range that is going to be
+   consumed immediately, in the very next statement, has nothing to defer to,
+   and applying the ceiling to it does real damage: the compare-into-branch
+   fusion builds `<cmp>` and then folds it into the branch, and when the
+   comparison is longer than the ceiling (minmax's `v < lo` is 25 tokens
+   against a 24 limit only because the operands carry their full expression)
+   the fold_set spilled it to `_wsv[0]` and re-tested the temporary - two extra
+   memory ops per loop trip, in the one place the fusion exists to remove them. */
+static void fold_set_nocap(int k, int mark, int inv)
+{
+    whale_vexpr[k].off = mark;
+    whale_vexpr[k].len = JS_WhaleTokSinkLen() - mark;
+    whale_vmat[k] = 0;
+    whale_vexpr[k].inv = (uint8_t)(inv ? 1 : 0);
+}
+
 /* Loop-invariance of a peephole load operand: literals and parameters are
    constant; a local read is invariant iff the loop body never writes it. */
 static int whale_load_inv(int kind, int idx)
@@ -2938,7 +3051,7 @@ static void fold_inline_expr(const WhaleVExpr *e)
 /* Append the value of slot k to what is being built right now. */
 static void fold_inline(int k)
 {
-    if (whale_dbg_env("WHALE_EMPTY_DBG") && !whale_vmat[k] && whale_vexpr[k].len == 0)
+    if (getenv("WHALE_EMPTY_DBG") && !whale_vmat[k] && whale_vexpr[k].len == 0)
         fprintf(stderr, "[empty] slot=%d (len=0, off=%d)\n", k, whale_vexpr[k].off);
     if (whale_vmat[k]) {
         wt_vname(whale_vname[k]);   /* already a real variable */
@@ -4274,6 +4387,12 @@ static void fold_materialize(int k)
     int mark;
 
     if (whale_vmat[k])
+        return;
+    /* k < 0 used to index before whale_vexpr[] and corrupt the heap (see the
+       stack-depth guard in whale_jit_gen). Refuse it here too: the function is
+       called from operand-specific sites that cannot all know the stack depth
+       is sane. */
+    if (k < 0 || k >= WHALE_STACK_SLOTS)
         return;
     /* Take a fresh name: whatever inlined this slot beforehand recorded the old
        name as a token, and rewriting that variable would silently change those
@@ -6213,7 +6332,6 @@ static int whale_step_emit(int op, int pos, int *sp_io, uint8_t *cur, int var_co
         return 0;
     }
 
-    fm = fold_mark();
     /* The numeric operands have to be in variables before the pushes are
        emitted: fold_materialize emits a statement of its own, which cannot land
        in the middle of a call. */
@@ -6223,6 +6341,16 @@ static int whale_step_emit(int op, int pos, int *sp_io, uint8_t *cur, int var_co
         if (whale_type_is_num(cur[var_count + k]))
             fold_materialize(k);
     }
+    /* The mark is taken *after* the materialisations, not before: each of them
+       commits its own range into the output, and the sink keeps that range - so
+       a commit from a mark taken earlier copies it a second time. That is the
+       duplicated statement the report saw:
+           _wsv[1] = ((_wsv[0])), _wsv[2] = (0);      <- the real one
+           _wsv[1] = ((_wsv[0]));                    <- re-copy
+           , _wsv[2] = (0);                          <- re-copy, stray comma
+       The stray comma is there because the continuation's `,` is pushed into the
+       sink too. */
+    fm = fold_mark();
     for (i = 0; i < n_pop; i++) {
         int k = sp - n_pop + i;
         int t = cur[var_count + k];
@@ -6450,9 +6578,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     int *arg_obj_slot = NULL;   /* per argument: the slot it travels in, or -1 */
     int *loc_slot = NULL;       /* per local: its own slot when it is reassigned */
     int *loop_back = NULL;      /* per position: the backward jump that closes it */
-    uint8_t var_ref_used[4] = { 0, 0, 0, 0 };
-    uint8_t var_ref_val[4] = { 0, 0, 0, 0 };   /* closure reading: the slot is read as a value */
-    uint8_t var_ref_rw[4] = { 0, 0, 0, 0 };    /* any value read or write: the slot gets a pval */
+    uint8_t var_ref_used[WHALE_VR_MAX] = { 0 };
+    uint8_t var_ref_val[WHALE_VR_MAX] = { 0 };   /* closure reading: the slot is read as a value */
+    uint8_t var_ref_rw[WHALE_VR_MAX] = { 0 };    /* any value read or write: the slot gets a pval */
     unsigned *assign_cnt = NULL;   /* weighted access count */
     int unreachable = 0;
     int ret_is_bool = -1;
@@ -6555,13 +6683,22 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     /* pool index per layout column, sized for the whole pool (L* and M*) */
     int whale_str_L[WHALE_ATOM_MAX * 2];
     /* Per closure slot: the object slot its value is parked in, or -1. Filled
-       in the prologue for the slots this reading reads as values. */
-    int whale_vr_slot[4];
+       in the prologue for the slots this reading reads as values.
+
+       WHALE_VR_MAX wide, not 4: a `get_var_ref_5` is an ordinary
+       `get_var_ref` with a 16-bit operand, so the index space is the whole
+       closure_var_count. Four was a real limit that refused most real modules -
+       every CommonJS wrapper is `function (exports, require, module, __filename,
+       __dirname)`, five captured names, so the module body itself never
+       compiled. Raising the tables costs a few hundred bytes of stack here and
+       nothing in the generated code: the prologue only emits the slots
+       var_ref_rw/var_ref_val actually name. */
+    int whale_vr_slot[WHALE_VR_MAX];
     /* Speculative inline of a closure-slot call target: the function the slot
        held at compile time, its info, and the guard-table index. */
-    void *whale_vr_fn[4] = { 0 };
-    int whale_vr_expect_slot[4] = { -1, -1, -1, -1 };
-    JSWhaleFuncInfo whale_vr_info[4];
+    void *whale_vr_fn[WHALE_VR_MAX] = { 0 };
+    int whale_vr_expect_slot[WHALE_VR_MAX];
+    JSWhaleFuncInfo whale_vr_info[WHALE_VR_MAX];
     unsigned whale_plain_slots = 0;
     int prev_op;    /* the opcode before the current one, in the scan pass */
     /* The one object slot this layout is materialised into when it has to become a
@@ -6572,12 +6709,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     int whale_str_obj_slot = -1;
 
     if (!info->is_normal) {
-        if (whale_dbg_env("WHALE_JIT_DUMP"))
+        if (getenv("WHALE_JIT_DUMP"))
             fprintf(stderr, "[gen] refused: not a normal function\n");
         return 0;
     }
     if (stack_size < 0 || stack_size > WHALE_JIT_MAX_SLOTS) {
-        if (whale_dbg_env("WHALE_JIT_DUMP"))
+        if (getenv("WHALE_JIT_DUMP"))
             fprintf(stderr, "[gen] refused: stack_size=%d\n", stack_size);
         return 0;
     }
@@ -6589,19 +6726,23 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        on what the linker had placed after them, which is why the same script
        could pass in one build and fail in the next. */
     if (var_count < 0 || var_count > WHALE_JIT_MAX_SLOTS) {
-        if (whale_dbg_env("WHALE_JIT_DUMP"))
+        if (getenv("WHALE_JIT_DUMP"))
             fprintf(stderr, "[gen] refused: var_count=%d\n", var_count);
         return 0;
     }
     /* The closure-slot tables below (whale_vr_slot/_fn/_info, the _p cells) are
-       four entries wide, so a function that can name a fifth enclosing variable
-       is refused. The bound is closure_var_count - the get_var_ref index space -
-       NOT var_ref_count, which counts the function's own locals its children
-       captured. Checking the wrong one let a function with var_ref_count 0 and
-       six captured variables through: the generator then read whale_vr_info[4]
-       and emitted `_p4` for a cell it never declared. */
-    if (info->closure_var_count > 4) {
-        if (whale_dbg_env("WHALE_JIT_DUMP"))
+       WHALE_VR_MAX entries wide, so a function that can name a further enclosing
+       variable is refused. The bound is closure_var_count - the get_var_ref index
+       space - NOT var_ref_count, which counts the function's own locals its
+       children captured. Checking the wrong one let a function with var_ref_count
+       0 and six captured variables through: the generator then read
+       whale_vr_info[4] and emitted `_p4` for a cell it never declared.
+
+       This used to be 4, which refused every CommonJS module wrapper (five
+       captured names) and every three-deep closure - a large part of the reason
+       the JIT coverage looked like zero on real projects. */
+    if (info->closure_var_count > WHALE_VR_MAX) {
+        if (getenv("WHALE_JIT_DUMP"))
             fprintf(stderr, "[gen] refused: closure_var_count=%d\n",
                     info->closure_var_count);
         return 0;
@@ -6664,7 +6805,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     whale_inline_str_n = 0;
     whale_gen_has_wa = 0;
     whale_sp_reset_all();
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < WHALE_VR_MAX; i++) {
         whale_vr_fn[i] = NULL;
         whale_vr_expect_slot[i] = -1;
     }
@@ -6782,16 +6923,32 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                form follows a 'push_const M'. Either way this is a function
                declared in this body, and it lands in the local the next store
                writes - a compile-time fact, so a later call through that
-               local can be expanded in place. */
+               local can be expanded in place.
+
+               A function *expression* assigned to a variable -
+               `var g = function (v) { ... }` - has `set_name` between the
+               closure and the store, because the name is taken from the
+               assignment target. That is cosmetic, so the store is still the
+               one this declaration lands in; skipping the set_name here is
+               what lets `g(i)` expand inline instead of leaving `g` a parked
+               value that turns the accumulator into a slot and refuses the
+               whole function at the loop head. */
             int m = (op == OP_fclosure8)
                         ? (int)pc[pos + 1]
                         : ((pos >= 5 && pc[pos - 5] == OP_push_const)
                                ? (int)whale_get_u32(pc + pos - 5 + 1) : -1);
             int npos = pos + sz;
-            int ln = (npos < len) ? whale_store_local(pc, len, npos, whale_op_size_of(pc[npos])) : -1;
+            int s4 = (npos < len) ? whale_op_size_of(pc[npos]) : 0;
 
-            if (m >= 0 && ln >= 0 && ln < var_count)
-                whale_loc_fn[ln] = m;
+            if (s4 > 0 && pc[npos] == OP_set_name)
+                npos += s4;
+            if (npos < len) {
+                int s5 = whale_op_size_of(pc[npos]);
+                int ln = (s5 > 0) ? whale_store_local(pc, len, npos, s5) : -1;
+
+                if (m >= 0 && ln >= 0 && ln < var_count)
+                    whale_loc_fn[ln] = m;
+            }
         } else if (op == OP_object) {
             /* the next store into a local names the one holding this object */
             whale_obj_pending = 1;
@@ -6949,6 +7106,30 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     whale_obj_pending = 0;
                 }
             }
+        } else if (op == OP_put_loc_check || op == OP_put_loc_check_init) {
+            /* The TDZ-checked store. Missing it here is the `let`-counter
+               version of the set_loc hole below: `for (let i = 0; ...; i++)`
+               writes its counter with put_loc_check, so the counter was counted
+               as single-assignment and the constant propagator folded the loop
+               head to the literal 0 - the loop then never exited (measured: an
+               infinite loop, not a wrong number). */
+            int a = (int)whale_get_u16(pc + pos + 1);
+
+            if (a < var_count) {
+                assign_cnt[a]++;
+                if (whale_obj_pending) {
+                    whale_loc_obj[a] = 1;
+                    whale_obj_pending = 0;
+                }
+            }
+        } else if (op == OP_set_loc_uninitialized) {
+            /* The TDZ marker is a store too, and it must not leave the local
+               looking unwritten: a declaration alone would then read as a
+               constant nothing ever set. */
+            int a = (int)whale_get_u16(pc + pos + 1);
+
+            if (a < var_count)
+                assign_cnt[a]++;
         } else if ((op >= OP_set_loc0 && op <= OP_set_loc3) ||
                    op == OP_set_loc8 || op == OP_set_loc) {
             /* set_loc stores too (and leaves the value): missing it here
@@ -7044,7 +7225,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         } else if (op == OP_get_var_ref) {
             int a = (int)whale_get_u16(pc + pos + 1);
 
-            if (a >= 0 && a < 4 && whale_var_ref_feeds_call(pc, len, pos, sz)) {
+            if (a >= 0 && a < WHALE_VR_MAX && whale_var_ref_feeds_call(pc, len, pos, sz)) {
                 if (whale_assume_self) {
                     var_ref_used[a] = 1;
                     whale_gen_self_ref = 1;
@@ -7052,12 +7233,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     var_ref_val[a] = 1;
                 }
             }
-            if (a >= 0 && a < 4)
+            if (a >= 0 && a < WHALE_VR_MAX)
                 var_ref_rw[a] = 1;
         } else if (op == OP_put_var_ref || (op >= OP_put_var_ref0 && op <= OP_put_var_ref3)) {
             int w = (op == OP_put_var_ref) ? (int)whale_get_u16(pc + pos + 1) : op - OP_put_var_ref0;
 
-            if (w >= 0 && w < 4)
+            if (w >= 0 && w < WHALE_VR_MAX)
                 var_ref_rw[w] = 1;
         }
         prev_op = op;
@@ -7544,6 +7725,14 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleCpoolSlot"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("idx"); wt(',');
         wk(JS_WK_INT); wt_id("k"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleCpoolClosure"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("idx"); wt(',');
+        wk(JS_WK_INT); wt_id("k"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleObjSetName"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(',');
+        wk(JS_WK_INT); wt_id("atom"); wt(')'); wt(';');
+    wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleObjToBool"); wt('(');
+        wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("slot"); wt(')'); wt(';');
     wk(JS_WK_EXTERN); wk(JS_WK_INT); wt_id("JS_WhaleBinopVal"); wt('(');
         wk(JS_WK_VOID); wt('*'); wt_id("ctx"); wt(','); wk(JS_WK_INT); wt_id("op"); wt(',');
         wk(JS_WK_INT); wt_id("a_slot"); wt(','); wk(JS_WK_INT); wt_id("b_slot"); wt(',');
@@ -7756,11 +7945,16 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        is one TinyCC spills, on every call. */
     wt_id("JSValue"); wt_id("_cref"); wt(';');
     /* Closure-slot storage cells, fetched once in the prologue: get_var_ref
-       and put_var_ref read and write through them directly. */
-    wt_id("JSValue"); wt('*'); wt_id("_p0"); wt(';');
-    wt_id("JSValue"); wt('*'); wt_id("_p1"); wt(';');
-    wt_id("JSValue"); wt('*'); wt_id("_p2"); wt(';');
-    wt_id("JSValue"); wt('*'); wt_id("_p3"); wt(';');
+       and put_var_ref read and write through them directly. One per slot in
+       the closure_var_count index space - see WHALE_VR_MAX. Declaring all of
+       them unconditionally costs TinyCC a few symbol-table entries per unit and
+       nothing at run time. */
+    for (i = 0; i < WHALE_VR_MAX; i++) {
+        char pb[16];
+
+        snprintf(pb, sizeof pb, "_p%d", i);
+        wt_id("JSValue"); wt('*'); wt_id(pb); wt(';');
+    }
     /* The fresh struct's columns, set by JS_WhaleStructDataPtr right after
        JS_WhaleStructNew. Valid only while whale_str_fresh names this slot -
        no call, no jump target in between - which is exactly the run of
@@ -8044,9 +8238,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        structural prologue. The captured value cannot change during the call -
        the same fact the entry's self-check relies on - so re-parking per read
        was one helper call and one dup per loop iteration for nothing. */
-    for (i = 0; i < 4; i++)
+    for (i = 0; i < WHALE_VR_MAX; i++)
         whale_vr_slot[i] = -1;
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < WHALE_VR_MAX; i++) {
         if (!var_ref_val[i])
             continue;
         if (whale_objs >= WHALE_CALL_BASE) {
@@ -8064,7 +8258,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
        get_var_ref / put_var_ref then run as tag-checked loads and stores
        through the pointer - `n = n + 1` inside a compiled closure loop costs
        a load, an add and a store, with no helper call in sight. */
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < WHALE_VR_MAX; i++) {
         if (!var_ref_rw[i])
             continue;
         wk(JS_WK_IF); wt('('); wt('!'); wt('('); wt_slot("_p", i); wt('=');
@@ -8145,6 +8339,19 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         int op = pc[pos];
         int sz = whale_op_size_of(op);
         int ta, tb, t;
+
+        if (getenv("WHALE_SP_DBG")) {
+            int q;
+
+            fprintf(stderr, "[sp] pos=%d op=%d (%s) sp=%d loc=", pos, op,
+                    whale_op_name(op), sp);
+            for (q = 0; q < var_count && q < 8; q++)
+                fprintf(stderr, "%d,", cur[q]);
+            fprintf(stderr, " stk=");
+            for (q = 0; q < sp && q < 8; q++)
+                fprintf(stderr, "%d,", cur[var_count + q]);
+            fprintf(stderr, "\n");
+        }
 
         /* The foldable-constant marker describes the value pushed by the
            instruction immediately before a define_field. Any other opcode in
@@ -8299,7 +8506,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     if (sv == WHALE_T_UNKNOWN) {
                         snap[base + k] = cv; /* optimistic merge */
                     } else if (cv != WHALE_T_UNKNOWN) {
-                        if (whale_dbg_env("WHALE_MERGE_DBG"))
+                        if (getenv("WHALE_MERGE_DBG"))
                             fprintf(stderr, "[merge] pos=%d slot=%d (of %d) "
                                     "prev=%d now=%d varc=%d sp=%d snap_sp=%d len=%d\n",
                                     pos, k, live, sv, cv, var_count, sp, snap_sp, len);
@@ -8368,8 +8575,9 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             }
         }
 
-        /* --- peephole 1: <load> <load> <binop> [put_loc] -> one assignment --- */
-        ok1 = whale_load_analyze(info, pc, pos, cur, var_count, whale_lo_c, whale_lo_cv, &l1, &t1, &k1, &i1, &cv1);
+    /* --- peephole 1: <load> <load> <binop> [put_loc] -> one assignment --- */
+    ok1 = whale_load_analyze(info, pc, pos, cur, var_count, whale_lo_c, whale_lo_cv, &l1, &t1, &k1, &i1, &cv1);
+
         if (ok1) {
             p2 = pos + l1;
             if (p2 < len)
@@ -8648,6 +8856,36 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             op == OP_if_true || op == OP_if_true8)
             local_flush_all(var_count);
 
+        /* Every handler indexes cur[var_count + sp - k] for as many operands as
+           its opcode pops, so an `sp` below that is an out-of-bounds write, not
+           a wrong answer: fold_materialize(-1) writes before whale_vexpr[] and
+           the process dies later inside the allocator (0xC0000374). The
+           generator has to keep `sp` in step with the engine's stack at every
+           instruction; when it does not - as it did not after the fclosure
+           elision above skipped two opcodes - refusing the function is correct
+           and cheap, and the alternative is heap corruption. This is the one
+           place that sees every instruction, so the check lives here and not in
+           each of the hundred-odd handlers.
+
+           It has to sit after the jump-target restore above, not before it:
+           `sp` at a target comes from the edges that reach it, and the value the
+           linear scan happened to leave is meaningless there. Checked earlier,
+           this reported underflow at the first `put_loc` of a catch handler -
+           the dead code between the `goto` and the handler had dropped the
+           stack to 0. */
+        {
+            int n_pop = 0, n_push = 0;
+
+            JS_WhaleOpArity(op, &n_pop, &n_push);
+            if (n_pop > sp) {
+                if (getenv("WHALE_JIT_DUMP"))
+                    fprintf(stderr, "[bail] pos=%d op=%d (%s) stack underflow "
+                            "sp=%d np=%d\n", pos, op, whale_op_name(op), sp, n_pop);
+                whale_out_line = __LINE__;
+                goto out;
+            }
+        }
+
         switch (op) {
         case OP_push_minus1:
         case OP_push_0: case OP_push_1: case OP_push_2: case OP_push_3:
@@ -8709,17 +8947,110 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             {
                 int npos = pos + sz;
                 int s4 = (npos < len) ? whale_op_size_of(pc[npos]) : 0;
-                int ln = (s4 > 0) ? whale_store_local(pc, len, npos, s4) : -1;
+                int ln;
 
-                if (ln < 0)
-                    { WHALE_STEP_INSTEAD_OF_BAILING(); }   /* not a declaration */
-                /* The store is skipped, not emitted - so it must not be a jump
-                   target, or its label disappears and the unit fails to parse
-                   with "label used but not defined". Same rule as the fused
-                   compare+branch (see whale_fuse_span_clear). */
-                if (!whale_fuse_span_clear(targets, npos, npos + s4))
+                /* A function *expression* assigned to a variable carries a
+                   `set_name` between the closure and the store (the name comes
+                   from the assignment target). It is cosmetic, and the store it
+                   precedes is still the one this closure lands in - so step over
+                   it here, exactly as the pre-scan does. */
+                if (s4 > 0 && pc[npos] == OP_set_name) {
+                    npos += s4;
+                    s4 = (npos < len) ? whale_op_size_of(pc[npos]) : 0;
+                }
+                ln = (s4 > 0) ? whale_store_local(pc, len, npos, s4) : -1;
+
+                /* The declaration shape: the store that follows is part of the
+                   declaration, and both are elided - the local's own recorded
+                   callee stands in for the closure. */
+                if (ln >= 0) {
+                    /* The store is skipped, not emitted - so it must not be a jump
+                       target, or its label disappears and the unit fails to parse
+                       with "label used but not defined". Same rule as the fused
+                       compare+branch (see whale_fuse_span_clear). */
+                    if (!whale_fuse_span_clear(targets, npos, npos + s4))
+                        { WHALE_STEP_INSTEAD_OF_BAILING(); }
+                    /* The loop tail adds this instruction's own size, so the new
+                       position is the store's end minus one instruction size. It
+                       used to be `pos = npos + s4`, which lands on the opcode right
+                       after the store and then advances *again*: two opcodes were
+                       skipped and the whole stack state after the declaration was
+                       wrong. Against `var __m = {};` the skipped `object`/`set_loc0`
+                       left the object off the stack, so the next `swap` ran with
+                       sp=1 and fold_materialize(-1) wrote before whale_vexpr[] -
+                       the heap corruption behind 0xC0000374. */
+                    pos = npos + s4 - sz;
+                    /* The store that would have set this local's type is skipped,
+                       so the elision has to set it - otherwise every read of a
+                       declared function sees WHALE_T_UNKNOWN and the whole function
+                       bails. That masked itself behind the crash above for as long
+                       as the crash existed. WHALE_T_FN is the type get_loc already
+                       knows how to hand to a call site, and it is not numeric, so
+                       nothing else will consume it by accident. */
+                    if (ln < var_count)
+                        cur[ln] = WHALE_T_FN;
+                    break;
+                }
+
+                /* Anything else is a closure *value*: `var g = function (v) {}`
+                   in a loop, `return function () {}`, an IIFE's callee. It is a
+                   real object with its own captured-variable cells, so the
+                   engine builds it behind a helper and it travels as a parked
+                   value - into a local, a call argument, a return. Refusing it
+                   took the whole function down, and defining a callback per
+                   iteration is the ordinary front-end shape (React's render
+                   callbacks, every `arr.map(function (x) {})`).
+
+                   The pool index is recovered the same way the pre-scan does it:
+                   fclosure8 carries it inline, the 5-byte form follows a
+                   push_const. */
+                {
+                    int idx = (op == OP_fclosure8)
+                                  ? (int)pc[pos + 1]
+                                  : ((pos >= 5 && pc[pos - 5] == OP_push_const)
+                                         ? (int)whale_get_u32(pc + pos - 5 + 1) : -1);
+                    int os;
+
+                    if (idx < 0 || idx >= info->cpool_count)
+                        { WHALE_STEP_INSTEAD_OF_BAILING(); }
+                    if (whale_objs >= WHALE_CALL_BASE)
+                        { WHALE_STEP_INSTEAD_OF_BAILING(); }
+                    os = whale_objs++;
+                    {
+                        int fm = fold_mark();
+
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleCpoolClosure");
+                        wt('('); wt_id("ctx"); wt(','); wt_int(idx); wt(',');
+                        wt_int(os); wt(')'); wt(')');
+                        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        fold_commit(fm);
+                    }
+                    cur[var_count + sp] = WHALE_VAL_T(os);
+                    sp++;
+                }
+            }
+            break;
+
+        /* The name a function expression is given: `var g = function () {}` is
+           fclosure; set_name "g"; put_locN, and the closure sits on top of the
+           stack. The name is cosmetic - it only shows up in stack traces and
+           Function.name - so this is an in-place property write on the parked
+           value and nothing travels back to the stack. */
+        case OP_set_name:
+            {
+                int atom = (int)whale_get_u32(pc + pos + 1);
+                int ta = cur[var_count + sp - 1];
+
+                if (!WHALE_IS_SLOT(ta))
                     { WHALE_STEP_INSTEAD_OF_BAILING(); }
-                pos = npos + s4;
+                {
+                    int fm = fold_mark();
+
+                    wt_id("JS_WhaleObjSetName"); wt('('); wt_id("ctx"); wt(',');
+                    wt_int(WHALE_SLOT(ta)); wt(','); wt_int(atom); wt(')'); wt(';');
+                    fold_commit(fm);
+                }
             }
             break;
 
@@ -8794,7 +9125,16 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
 
         /* Exchange the top two values. Materialising both first reduces this to
            a swap of the two stack slots' bookkeeping - including the object slot
-           number, which rides in the type byte, so it needs nothing extra. */
+           number, which rides in the type byte, so it needs nothing extra.
+
+           Only a slot with a pending expression needs materialising, and only a
+           numeric one has an expression at all: an object/array/parked value
+           names its slot in the type byte and its fold buffer is deliberately
+           empty, so calling fold_materialize on it emitted `_wsv[n] = ( ) ;` -
+           which TinyCC rejects with "identifier expected" and which took the
+           whole function down. `{}` followed by `swap` is not exotic: it is what
+           every `obj[key] = v` compiles to (the parser pushes the container, a
+           key and a value, then swaps them into place). */
         case OP_swap:
             {
                 int a = sp - 2, b = sp - 1;
@@ -8802,8 +9142,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 uint8_t tb;
                 int tn;
 
-                fold_materialize(a);
-                fold_materialize(b);
+                if (!WHALE_IS_SLOT(cur[var_count + a]) &&
+                    !WHALE_IS_STRUCT(cur[var_count + a]))
+                    fold_materialize(a);
+                if (!WHALE_IS_SLOT(cur[var_count + b]) &&
+                    !WHALE_IS_STRUCT(cur[var_count + b]))
+                    fold_materialize(b);
                 ve = whale_vexpr[a]; whale_vexpr[a] = whale_vexpr[b]; whale_vexpr[b] = ve;
                 tb = whale_vmat[a];  whale_vmat[a]  = whale_vmat[b];  whale_vmat[b]  = tb;
                 tn = whale_vname[a]; whale_vname[a] = whale_vname[b]; whale_vname[b] = tn;
@@ -9921,6 +10265,41 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     sp++;
                     break;
                 }
+                /* A method read off a parked value: `console.log(x)` is
+                   get_var console (a VAL slot); get_field2 log; <args>;
+                   call_method. The receiver stays where it is (that is what the
+                   `2` means) and the method is parked in a slot of its own,
+                   which is exactly what call_method accepts. Without this arm
+                   the read fell through to the numeric helper below, deopted,
+                   and every function that logs - which is most module wrappers
+                   and every test script - stayed interpreted.
+
+                   Gated on the call actually following, because the numeric arm
+                   below is the right answer for an ordinary `o.field` that the
+                   rest of the body treats as a number. */
+                if (WHALE_IS_SLOT(ta) && whale_fields < WHALE_FIELD_CACHE &&
+                    whale_feeds_method_call(pc, len, pos + sz)) {
+                    int os = whale_objs++;
+
+                    if (os < WHALE_CALL_BASE) {
+                        int fm = fold_mark();
+
+                        fc = whale_fields++;
+                        wk(JS_WK_IF); wt('('); wt('!'); wt_id("JS_WhaleObjFieldVal");
+                        wt('('); wt_id("ctx"); wt(','); wt_int(WHALE_SLOT(ta)); wt(',');
+                        wt_int(atom); wt(',');
+                        wt('&'); wt_arr("fs", fc); wt(','); wt('&'); wt_arr("fp", fc); wt(',');
+                        wt_int(os); wt(','); wt_id("deopt"); wt(')'); wt(')');
+                        wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        fold_commit(fm);
+                        cur[var_count + sp] = WHALE_VAL_T(os);
+                        sp++;
+                        break;
+                    }
+                    whale_objs--;
+                    whale_fields--;
+                }
                 /* The receiver stays on the stack under the value - that is what
                    `get_field2` is for - so a struct receiver keeps its slot type
                    and the field value is pushed above it. */
@@ -10509,9 +10888,16 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         case OP_get_loc0: case OP_get_loc1: case OP_get_loc2: case OP_get_loc3:
         case OP_get_loc8:
         case OP_get_loc:
+        /* The TDZ-checked read. The check can only fail before the declaration,
+           where the interpreter throws and this code never runs, so the read is
+           the ordinary one - and it has to share this arm rather than have its
+           own, or a `let` loop counter misses the int-mirror read and loads the
+           stale boxed local instead (measured: an infinite loop). */
+        case OP_get_loc_check:
             {
                 int idx = (op == OP_get_loc8) ? (int)pc[pos + 1] :
                           (op == OP_get_loc) ? (int)whale_get_u16(pc + pos + 1) :
+                          (op == OP_get_loc_check) ? (int)whale_get_u16(pc + pos + 1) :
                           op - OP_get_loc0;
                 t = (idx >= 0 && idx < var_count) ? cur[idx] : WHALE_T_UNKNOWN;
                 if (t == WHALE_T_UNKNOWN)
@@ -10537,8 +10923,6 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                        check the one thing that makes the elision legal, rather
                        than trusting the type to be consumed. */
                     int npos2 = pos + sz;
-                    int s5 = (npos2 < len) ? whale_op_size_of(pc[npos2]) : 0;
-                    int nxt_op = (s5 > 0 && npos2 < len) ? (int)pc[npos2] : -1;
 
                     /* Only a call expands it. A store is NOT safe here even
                        though `var h = g; h()` looks like it should be: the
@@ -10547,12 +10931,46 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                        T_FN while its local has no recorded callee. Reading it
                        back then takes the general path and loads a C variable
                        that was never emitted. Calls only; everything else -
-                       stores, returns, arguments, fields - deopts. */
-                    if (nxt_op != OP_call0 && nxt_op != OP_call1 &&
-                        nxt_op != OP_call2 && nxt_op != OP_call3 &&
-                        nxt_op != OP_call && nxt_op != OP_call_method &&
-                        nxt_op != OP_tail_call && nxt_op != OP_tail_call_method) {
-                        { WHALE_STEP_INSTEAD_OF_BAILING(); }
+                       stores, returns, arguments, fields - deopts.
+
+                       "Is consumed by a call" is not "the next opcode is a
+                       call": `call(k, 1)` reads the function first and then
+                       pushes its arguments, so the bytecode is
+                       `get_loc1; get_loc2; push_1; call2`. Requiring the
+                       immediate next opcode to be the call refused that, and
+                       every function containing a call to a local declaration
+                       fell back to the interpreter - which is what the crash
+                       above was masking. Walk the argument pushes instead and
+                       require the call they lead to to take exactly that many
+                       arguments. The pushed values land above the function, so
+                       its stack slot - and with it whale_slot_fn[] - is still
+                       the one the call site reads. */
+                    {
+                        int nargs = 0, qpos = npos2, ok = 0;
+
+                        while (qpos < len) {
+                            int qop = (int)pc[qpos];
+                            int qsz = whale_op_size_of(qop);
+
+                            if (qsz <= 0)
+                                break;
+                            /* the call this read is the target of: argc has to
+                               match the arguments pushed since the read */
+                            if (qop >= OP_call0 && qop <= OP_call3) {
+                                ok = (qop - OP_call0 == nargs);
+                                break;
+                            }
+                            if (qop == OP_call) {
+                                ok = ((int)whale_get_u16(pc + qpos + 1) == nargs);
+                                break;
+                            }
+                            if (!whale_fn_arg_push(qop))
+                                break;      /* something else may consume it */
+                            nargs++;
+                            qpos += qsz;
+                        }
+                        if (!ok)
+                            { WHALE_STEP_INSTEAD_OF_BAILING(); }
                     }
                     cur[var_count + sp] = WHALE_T_FN;
                     whale_slot_fn[sp] = whale_loc_fn[idx];
@@ -10608,12 +11026,49 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 sp++;
             }
             break;
+        /* ---- lexical declarations (TDZ) ---------------------------------------
+           Entering a `let`/`const` scope writes an "uninitialized" sentinel into
+           the slot, and reads/writes of it then check for that sentinel. The
+           marker is emitted for every function that declares anything with
+           `let` or `const`, including a declaration nothing ever reads - so
+           without these arms every ES2015+ function in the world fell back to
+           the interpreter at its first bytecode instruction (measured 4.6x: 415
+           vs 90 ns/call).
+
+           The sentinel is the engine's JS_UNINITIALIZED, which no compiled value
+           can be: the JIT holds doubles, booleans, objects, arrays and parked
+           JSValues. So a marked slot is simply not live yet, and the generator's
+           own invariant - a TDZ slot is only read after the declaration that
+           initialises it, because a read before that throws - makes the check
+           unnecessary on every path this code can reach. Writing the marker is
+           all that is needed, and the slot is typed UNKNOWN so a read that does
+           reach here bails instead of reading a stale number. */
+        case OP_set_loc_uninitialized:
+            {
+                int idx = (int)whale_get_u16(pc + pos + 1);
+
+                if (idx < 0 || idx >= var_count)
+                    { WHALE_STEP_INSTEAD_OF_BAILING(); }
+                local_forget(idx);
+                cur[idx] = WHALE_T_UNKNOWN;
+                whale_lo_c[idx] = 0;
+            }
+            break;
+
         case OP_put_loc0: case OP_put_loc1: case OP_put_loc2: case OP_put_loc3:
         case OP_put_loc8:
         case OP_put_loc:
+        /* The TDZ-checked store. Same lowering as put_loc: the check it adds can
+           only fail on a path this generator cannot reach (a read before the
+           declaration throws, so the interpreter never runs such a path
+           compiled). put_loc_check_init is the `this`/class-field form. */
+        case OP_put_loc_check:
+        case OP_put_loc_check_init:
             {
                 int idx = (op == OP_put_loc8) ? (int)pc[pos + 1] :
                           (op == OP_put_loc) ? (int)whale_get_u16(pc + pos + 1) :
+                          (op == OP_put_loc_check || op == OP_put_loc_check_init)
+                              ? (int)whale_get_u16(pc + pos + 1) :
                           op - OP_put_loc0;
                 int fm;
 
@@ -11041,11 +11496,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
         case OP_get_var_ref:
             {
                 int idx = (op == OP_get_var_ref) ? (int)whale_get_u16(pc + pos + 1) : op - OP_get_var_ref0;
-                /* The closure tables are four entries wide; a stream that named a
-                   fifth variable would index past them. closure_var_count > 4 is
-                   refused up front, so this is a belt-and-braces check on a
-                   misaligned decode rather than a live case. */
-                if (idx < 0 || idx >= 4)
+                /* The closure tables are WHALE_VR_MAX entries wide; a stream that
+                   named a further variable would index past them.
+                   closure_var_count > WHALE_VR_MAX is refused up front, so this is
+                   a belt-and-braces check on a misaligned decode rather than a
+                   live case. */
+                if (idx < 0 || idx >= WHALE_VR_MAX)
                     { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 /* A slot used as a call target is checked once at the entry to
                    be this very function (self-recursion). Any other use is an
@@ -11101,7 +11557,12 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     if (slot < 0)
                         { WHALE_STEP_INSTEAD_OF_BAILING(); }
                     whale_gen_pure = 0;   /* depends on captured state */
-                    if (whale_vr_fn[idx]) {
+                    /* The VRFN encoding packs this index into a type byte, so it
+                       only exists for the first WHALE_VRFN_MAX slots. Above
+                       that the value still travels - as a parked VAL reference -
+                       and calls through it take the general path; the function
+                       stays compiled either way, which is the point. */
+                    if (idx < WHALE_VRFN_MAX && whale_vr_fn[idx]) {
                         /* resolved on an earlier read: the call site expands
                            this inline behind the identity guard. Note cur[idx]
                            is NOT set - the var_ref index and the local index
@@ -11111,7 +11572,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                     } else {
                         void *fn = NULL;
 
-                        if (whale_vr_inline_on() &&
+                        if (idx < WHALE_VRFN_MAX && whale_vr_inline_on() &&
                             JS_WhaleVarRefFuncInfo(ctx, idx, &fn,
                                                    &whale_vr_info[idx]) &&
                             whale_vr_info[idx].is_normal &&
@@ -11157,7 +11618,7 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                                                  : op - OP_put_var_ref0;
                 int fm;
 
-                if (idx < 0 || idx >= 4)
+                if (idx < 0 || idx >= WHALE_VR_MAX)
                     { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 if (!whale_type_is_num(cur[var_count + sp - 1]))
                     { WHALE_STEP_INSTEAD_OF_BAILING(); }
@@ -11866,7 +12327,15 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                         invb = whale_vexpr[sp - 1].inv;
                         fm = fold_mark();
                         wt('('); fold_inline(sp - 2); wt_op(opid); fold_inline(sp - 1); wt(')');
-                        fold_set(sp - 2, fm, inva && invb);
+                        /* The comparison must NOT be spilled. fold_set()
+                           materialises a range longer than whale_expr_max, and
+                           that defeats the whole point here: the fused form
+                           exists to keep the comparison inside the `if`. minmax's
+                           `v < lo` is 25 tokens against a 24 ceiling, so it was
+                           written to `_wsv[0]` and re-tested - two extra memory
+                           ops per trip. Record the range without the ceiling
+                           check; the commit below is what emits it. */
+                        fold_set_nocap(sp - 2, fm, inva && invb);
                         cur[var_count + sp - 2] = WHALE_T_BOOL;
                         sp--;
                         cf = fold_mark();
@@ -12208,6 +12677,35 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
             }
             cur[var_count + sp - 1] = WHALE_T_I32;
             break;
+        /* `x++` as an expression: the original value stays and the incremented
+           one is pushed above it (n_pop 1, n_push 2). It appears where the
+           parser could not fuse the increment into inc_loc: `let` counters in a
+           `for` head are the common case, because the fused form is only
+           recognised for a plain put_loc.
+
+           The old value has to be readable afterwards - that is what `post`
+           means - so it becomes a real variable first. Copying the source's
+           fold state into the new slot and re-inlining it there (what OP_dup
+           does, correctly, for a *pure* copy) is wrong here: the source's
+           tokens are still in the sink, and re-emitting them puts a second
+           copy in the output, which the next commit writes as a stray
+           expression - and a `let` counter that never advances is an infinite
+           loop, not a wrong number. */
+        case OP_post_inc: case OP_post_dec:
+            if (!whale_type_is_num(cur[var_count + sp - 1]))
+                { WHALE_STEP_INSTEAD_OF_BAILING(); }
+            {
+                int fm;
+
+                fold_materialize(sp - 1);
+                fm = fold_mark();
+                fold_inline(sp - 1);
+                wt(op == OP_post_inc ? '+' : '-'); wt_int(1);
+                fold_set(sp, fm, 0);   /* reads a variable that changes: never invariant */
+                cur[var_count + sp] = WHALE_T_NUM;
+                sp++;
+            }
+            break;
         case OP_inc: case OP_dec:
             if (!whale_type_is_num(cur[var_count + sp - 1]))
                 { WHALE_STEP_INSTEAD_OF_BAILING(); }
@@ -12294,6 +12792,38 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                 int fm;
 
                 t = cur[var_count + sp - 1];
+                /* A condition that is not a double: a boxed boolean from a
+                   comparison of objects, a value from a call, a field read as a
+                   value. `new Date(0); d.getTime() === 0 ? ...` is the shape -
+                   strict_eq on two parked values produces a parked boolean, and
+                   the branch then had no numeric operand and took the whole
+                   function down. Ask the engine for the truthiness instead; the
+                   result is a plain double, so everything downstream is
+                   unchanged. */
+                if (!whale_type_is_num(t)) {
+                    if (!WHALE_IS_SLOT(t))
+                        { WHALE_STEP_INSTEAD_OF_BAILING(); }
+                    {
+                        int nm = whale_vserial++;
+                        int bfm = fold_mark();
+
+                        wk(JS_WK_IF); wt('('); wt('!'); wt('(');
+                        wt_arr("v", nm); wt('='); wt('('); wk(JS_WK_DOUBLE); wt(')');
+                        wt_id("JS_WhaleObjToBool"); wt('('); wt_id("ctx"); wt(',');
+                        wt_int(WHALE_SLOT(t)); wt(')'); wt(')'); wt(')'); wt(';');
+                        /* -1 is the helper's "bad slot" answer; treat it like an
+                           engine failure and let the interpreter have the call. */
+                        wk(JS_WK_IF); wt('('); wt_arr("v", nm); wt_op(JS_OP_LT); wt_int(0);
+                        wt(')'); wt('{'); wt('*'); wt_id("deopt"); wt('='); wt_int(1); wt(';');
+                        wk(JS_WK_RETURN); wt_int(0); wt(';'); wt('}');
+                        fold_commit(bfm);
+                        whale_vname[sp - 1] = nm;
+                        whale_vmat[sp - 1] = 1;
+                        whale_vexpr[sp - 1].inv = 0;
+                        cur[var_count + sp - 1] = WHALE_T_NUM;
+                    }
+                    t = cur[var_count + sp - 1];
+                }
                 if (!whale_type_is_num(t))
                     { WHALE_STEP_INSTEAD_OF_BAILING(); }
                 /* Everything below the condition stays live across the branch:
@@ -12385,6 +12915,23 @@ static int whale_jit_gen(JSContext *ctx, const JSWhaleFuncInfo *info)
                    (and at OP_throw) keeps such a function out of the table. */
                 whale_gen_pure = 0;
                 sp++;
+                /* The handler is a jump target reached by an exception, not by
+                   a branch - so nothing else records its entry state, and the
+                   linear scan would snapshot whatever `sp` the dead code after
+                   the `goto` happens to leave (0 here, because the try body
+                   dropped its completion value). The handler then began with an
+                   empty stack and its first `put_loc` bailed the function.
+
+                   The interpreter's rule is the one to mirror: on a throw the
+                   stack unwinds to the depth that was current at `catch`, with
+                   the exception value in the catch slot. That is exactly `sp`
+                   after the push above, and cur[] already has the slot typed.
+                   Record it here, before the try body can change anything. */
+                if ((tgt >= 0) && (tgt <= len) && !seen[tgt]) {
+                    cur[state_len - 1] = (uint8_t)sp;
+                    seen[tgt] = 1;
+                    memcpy(snap + (size_t)tgt * state_len, cur, state_len);
+                }
             }
             break;
         case OP_nip_catch:
@@ -12918,6 +13465,9 @@ WHALE_HOST_SYM(JS_WhaleVarRefIsFn),
     WHALE_HOST_SYM(JS_WhaleBinopVal),
     WHALE_HOST_SYM(JS_WhaleConcatAtomInt),
     WHALE_HOST_SYM(JS_WhaleCpoolSlot),
+    WHALE_HOST_SYM(JS_WhaleCpoolClosure),
+    WHALE_HOST_SYM(JS_WhaleObjSetName),
+    WHALE_HOST_SYM(JS_WhaleObjToBool),
     WHALE_HOST_SYM(JS_WhaleObjStoreValue),
     WHALE_HOST_SYM(JS_WhaleShapeFields),
     WHALE_HOST_SYM(JS_WhaleObjNew),

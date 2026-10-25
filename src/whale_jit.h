@@ -318,6 +318,14 @@ JS_EXTERN JSValue JS_WhaleTakeException(JSContext *ctx);
 /* Move a callable from the constant pool into an object slot, so the general call
    path can use a callee that inlining could not expand. */
 JS_EXTERN int JS_WhaleCpoolSlot(JSContext *ctx, int idx, int k);
+/* Make the closure `cpool[idx]` closes over this frame and park it in slot k.
+   A closure is a real object with captured-variable cells, so unlike a
+   declaration it cannot be represented by its pool entry. */
+JS_EXTERN int JS_WhaleCpoolClosure(JSContext *ctx, int idx, int k);
+/* Give the value in slot k the name `atom` (OP_set_name). */
+JS_EXTERN int JS_WhaleObjSetName(JSContext *ctx, int slot, int atom);
+/* Truthiness of the value parked in slot k as 0/1, or -1 on a bad slot. */
+JS_EXTERN int JS_WhaleObjToBool(JSContext *ctx, int slot);
 JSValue JS_WhaleObjGet(JSContext *ctx, int k);            /* read it back */
 /* Park a plain number in slot k, so it can be a call argument (JS_Call takes
    JSValues, and an argument has to stay visible to GC while the callee runs). */
